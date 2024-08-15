@@ -1,0 +1,509 @@
+<html>
+<head>
+<title>pkcs1.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #5f826b; font-style: italic;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #6aab73;}
+.s6 { color: #a5c261;}
+.s7 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+pkcs1.py</font>
+</center></td></tr></table>
+<pre><span class="s0">#  Copyright 2011 Sybren A. Stüvel &lt;sybren@stuvel.eu&gt;</span>
+<span class="s0">#</span>
+<span class="s0">#  Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="s0">#  you may not use this file except in compliance with the License.</span>
+<span class="s0">#  You may obtain a copy of the License at</span>
+<span class="s0">#</span>
+<span class="s0">#      https://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="s0">#</span>
+<span class="s0">#  Unless required by applicable law or agreed to in writing, software</span>
+<span class="s0">#  distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="s0">#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="s0">#  See the License for the specific language governing permissions and</span>
+<span class="s0">#  limitations under the License.</span>
+
+<span class="s2">&quot;&quot;&quot;Functions for PKCS#1 version 1.5 encryption and signing 
+ 
+This module implements certain functionality from PKCS#1 version 1.5. For a 
+very clear example, read http://www.di-mgt.com.au/rsa_alg.html#pkcs1schemes 
+ 
+At least 8 bytes of random padding is used when encrypting a message. This makes 
+these methods much more secure than the ones in the ``rsa`` module. 
+ 
+WARNING: this module leaks information when decryption fails. The exceptions 
+that are raised contain the Python traceback information, which can be used to 
+deduce where in the process the failure occurred. DO NOT PASS SUCH INFORMATION 
+to your users. 
+&quot;&quot;&quot;</span>
+
+<span class="s3">import </span><span class="s1">hashlib</span>
+<span class="s3">import </span><span class="s1">os</span>
+<span class="s3">import </span><span class="s1">sys</span>
+<span class="s3">import </span><span class="s1">typing</span>
+<span class="s3">from </span><span class="s1">hmac </span><span class="s3">import </span><span class="s1">compare_digest</span>
+
+<span class="s3">from </span><span class="s4">. </span><span class="s3">import </span><span class="s1">common</span><span class="s4">, </span><span class="s1">transform</span><span class="s4">, </span><span class="s1">core</span><span class="s4">, </span><span class="s1">key</span>
+
+<span class="s3">if </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">TYPE_CHECKING</span><span class="s4">:</span>
+    <span class="s1">HashType </span><span class="s4">= </span><span class="s1">hashlib</span><span class="s4">.</span><span class="s1">_Hash</span>
+<span class="s3">else</span><span class="s4">:</span>
+    <span class="s1">HashType </span><span class="s4">= </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">Any</span>
+
+<span class="s0"># ASN.1 codes that describe the hash algorithm used.</span>
+<span class="s1">HASH_ASN1 </span><span class="s4">= {</span>
+    <span class="s5">&quot;MD5&quot;</span><span class="s4">: </span><span class="s6">b&quot;</span><span class="s3">\x30\x20\x30\x0c\x06\x08\x2a\x86\x48\x86\xf7\x0d\x02\x05\x05\x00\x04\x10</span><span class="s6">&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;SHA-1&quot;</span><span class="s4">: </span><span class="s6">b&quot;</span><span class="s3">\x30\x21\x30\x09\x06\x05\x2b\x0e\x03\x02\x1a\x05\x00\x04\x14</span><span class="s6">&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;SHA-224&quot;</span><span class="s4">: </span><span class="s6">b&quot;</span><span class="s3">\x30\x2d\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x04\x05\x00\x04\x1c</span><span class="s6">&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;SHA-256&quot;</span><span class="s4">: </span><span class="s6">b&quot;</span><span class="s3">\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20</span><span class="s6">&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;SHA-384&quot;</span><span class="s4">: </span><span class="s6">b&quot;</span><span class="s3">\x30\x41\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02\x05\x00\x04\x30</span><span class="s6">&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;SHA-512&quot;</span><span class="s4">: </span><span class="s6">b&quot;</span><span class="s3">\x30\x51\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03\x05\x00\x04\x40</span><span class="s6">&quot;</span><span class="s4">,</span>
+<span class="s4">}</span>
+
+<span class="s1">HASH_METHODS</span><span class="s4">: </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">Dict</span><span class="s4">[</span><span class="s1">str</span><span class="s4">, </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">Callable</span><span class="s4">[[], </span><span class="s1">HashType</span><span class="s4">]] = {</span>
+    <span class="s5">&quot;MD5&quot;</span><span class="s4">: </span><span class="s1">hashlib</span><span class="s4">.</span><span class="s1">md5</span><span class="s4">,</span>
+    <span class="s5">&quot;SHA-1&quot;</span><span class="s4">: </span><span class="s1">hashlib</span><span class="s4">.</span><span class="s1">sha1</span><span class="s4">,</span>
+    <span class="s5">&quot;SHA-224&quot;</span><span class="s4">: </span><span class="s1">hashlib</span><span class="s4">.</span><span class="s1">sha224</span><span class="s4">,</span>
+    <span class="s5">&quot;SHA-256&quot;</span><span class="s4">: </span><span class="s1">hashlib</span><span class="s4">.</span><span class="s1">sha256</span><span class="s4">,</span>
+    <span class="s5">&quot;SHA-384&quot;</span><span class="s4">: </span><span class="s1">hashlib</span><span class="s4">.</span><span class="s1">sha384</span><span class="s4">,</span>
+    <span class="s5">&quot;SHA-512&quot;</span><span class="s4">: </span><span class="s1">hashlib</span><span class="s4">.</span><span class="s1">sha512</span><span class="s4">,</span>
+<span class="s4">}</span>
+<span class="s5">&quot;&quot;&quot;Hash methods supported by this library.&quot;&quot;&quot;</span>
+
+
+<span class="s3">if </span><span class="s1">sys</span><span class="s4">.</span><span class="s1">version_info </span><span class="s4">&gt;= (</span><span class="s7">3</span><span class="s4">, </span><span class="s7">6</span><span class="s4">):</span>
+    <span class="s0"># Python 3.6 introduced SHA3 support.</span>
+    <span class="s1">HASH_ASN1</span><span class="s4">.</span><span class="s1">update</span><span class="s4">(</span>
+        <span class="s4">{</span>
+            <span class="s5">&quot;SHA3-256&quot;</span><span class="s4">: </span><span class="s6">b&quot;</span><span class="s3">\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x08\x05\x00\x04\x20</span><span class="s6">&quot;</span><span class="s4">,</span>
+            <span class="s5">&quot;SHA3-384&quot;</span><span class="s4">: </span><span class="s6">b&quot;</span><span class="s3">\x30\x41\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x09\x05\x00\x04\x30</span><span class="s6">&quot;</span><span class="s4">,</span>
+            <span class="s5">&quot;SHA3-512&quot;</span><span class="s4">: </span><span class="s6">b&quot;</span><span class="s3">\x30\x51\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x0a\x05\x00\x04\x40</span><span class="s6">&quot;</span><span class="s4">,</span>
+        <span class="s4">}</span>
+    <span class="s4">)</span>
+
+    <span class="s1">HASH_METHODS</span><span class="s4">.</span><span class="s1">update</span><span class="s4">(</span>
+        <span class="s4">{</span>
+            <span class="s5">&quot;SHA3-256&quot;</span><span class="s4">: </span><span class="s1">hashlib</span><span class="s4">.</span><span class="s1">sha3_256</span><span class="s4">,</span>
+            <span class="s5">&quot;SHA3-384&quot;</span><span class="s4">: </span><span class="s1">hashlib</span><span class="s4">.</span><span class="s1">sha3_384</span><span class="s4">,</span>
+            <span class="s5">&quot;SHA3-512&quot;</span><span class="s4">: </span><span class="s1">hashlib</span><span class="s4">.</span><span class="s1">sha3_512</span><span class="s4">,</span>
+        <span class="s4">}</span>
+    <span class="s4">)</span>
+
+
+<span class="s3">class </span><span class="s1">CryptoError</span><span class="s4">(</span><span class="s1">Exception</span><span class="s4">):</span>
+    <span class="s2">&quot;&quot;&quot;Base class for all exceptions in this module.&quot;&quot;&quot;</span>
+
+
+<span class="s3">class </span><span class="s1">DecryptionError</span><span class="s4">(</span><span class="s1">CryptoError</span><span class="s4">):</span>
+    <span class="s2">&quot;&quot;&quot;Raised when decryption fails.&quot;&quot;&quot;</span>
+
+
+<span class="s3">class </span><span class="s1">VerificationError</span><span class="s4">(</span><span class="s1">CryptoError</span><span class="s4">):</span>
+    <span class="s2">&quot;&quot;&quot;Raised when verification fails.&quot;&quot;&quot;</span>
+
+
+<span class="s3">def </span><span class="s1">_pad_for_encryption</span><span class="s4">(</span><span class="s1">message</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">, </span><span class="s1">target_length</span><span class="s4">: </span><span class="s1">int</span><span class="s4">) </span><span class="s1">-&gt; bytes</span><span class="s4">:</span>
+    <span class="s2">r&quot;&quot;&quot;Pads the message for encryption, returning the padded message. 
+ 
+    :return: 00 02 RANDOM_DATA 00 MESSAGE 
+ 
+    &gt;&gt;&gt; block = _pad_for_encryption(b'hello', 16) 
+    &gt;&gt;&gt; len(block) 
+    16 
+    &gt;&gt;&gt; block[0:2] 
+    b'\x00\x02' 
+    &gt;&gt;&gt; block[-6:] 
+    b'\x00hello' 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">max_msglength </span><span class="s4">= </span><span class="s1">target_length </span><span class="s4">- </span><span class="s7">11</span>
+    <span class="s1">msglength </span><span class="s4">= </span><span class="s1">len</span><span class="s4">(</span><span class="s1">message</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">msglength </span><span class="s4">&gt; </span><span class="s1">max_msglength</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">OverflowError</span><span class="s4">(</span>
+            <span class="s5">&quot;%i bytes needed for message, but there is only&quot;</span>
+            <span class="s5">&quot; space for %i&quot; </span><span class="s4">% (</span><span class="s1">msglength</span><span class="s4">, </span><span class="s1">max_msglength</span><span class="s4">)</span>
+        <span class="s4">)</span>
+
+    <span class="s0"># Get random padding</span>
+    <span class="s1">padding </span><span class="s4">= </span><span class="s6">b&quot;&quot;</span>
+    <span class="s1">padding_length </span><span class="s4">= </span><span class="s1">target_length </span><span class="s4">- </span><span class="s1">msglength </span><span class="s4">- </span><span class="s7">3</span>
+
+    <span class="s0"># We remove 0-bytes, so we'll end up with less padding than we've asked for,</span>
+    <span class="s0"># so keep adding data until we're at the correct length.</span>
+    <span class="s3">while </span><span class="s1">len</span><span class="s4">(</span><span class="s1">padding</span><span class="s4">) &lt; </span><span class="s1">padding_length</span><span class="s4">:</span>
+        <span class="s1">needed_bytes </span><span class="s4">= </span><span class="s1">padding_length </span><span class="s4">- </span><span class="s1">len</span><span class="s4">(</span><span class="s1">padding</span><span class="s4">)</span>
+
+        <span class="s0"># Always read at least 8 bytes more than we need, and trim off the rest</span>
+        <span class="s0"># after removing the 0-bytes. This increases the chance of getting</span>
+        <span class="s0"># enough bytes, especially when needed_bytes is small</span>
+        <span class="s1">new_padding </span><span class="s4">= </span><span class="s1">os</span><span class="s4">.</span><span class="s1">urandom</span><span class="s4">(</span><span class="s1">needed_bytes </span><span class="s4">+ </span><span class="s7">5</span><span class="s4">)</span>
+        <span class="s1">new_padding </span><span class="s4">= </span><span class="s1">new_padding</span><span class="s4">.</span><span class="s1">replace</span><span class="s4">(</span><span class="s6">b&quot;</span><span class="s3">\x00</span><span class="s6">&quot;</span><span class="s4">, </span><span class="s6">b&quot;&quot;</span><span class="s4">)</span>
+        <span class="s1">padding </span><span class="s4">= </span><span class="s1">padding </span><span class="s4">+ </span><span class="s1">new_padding</span><span class="s4">[:</span><span class="s1">needed_bytes</span><span class="s4">]</span>
+
+    <span class="s3">assert </span><span class="s1">len</span><span class="s4">(</span><span class="s1">padding</span><span class="s4">) == </span><span class="s1">padding_length</span>
+
+    <span class="s3">return </span><span class="s6">b&quot;&quot;</span><span class="s4">.</span><span class="s1">join</span><span class="s4">([</span><span class="s6">b&quot;</span><span class="s3">\x00\x02</span><span class="s6">&quot;</span><span class="s4">, </span><span class="s1">padding</span><span class="s4">, </span><span class="s6">b&quot;</span><span class="s3">\x00</span><span class="s6">&quot;</span><span class="s4">, </span><span class="s1">message</span><span class="s4">])</span>
+
+
+<span class="s3">def </span><span class="s1">_pad_for_signing</span><span class="s4">(</span><span class="s1">message</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">, </span><span class="s1">target_length</span><span class="s4">: </span><span class="s1">int</span><span class="s4">) </span><span class="s1">-&gt; bytes</span><span class="s4">:</span>
+    <span class="s2">r&quot;&quot;&quot;Pads the message for signing, returning the padded message. 
+ 
+    The padding is always a repetition of FF bytes. 
+ 
+    :return: 00 01 PADDING 00 MESSAGE 
+ 
+    &gt;&gt;&gt; block = _pad_for_signing(b'hello', 16) 
+    &gt;&gt;&gt; len(block) 
+    16 
+    &gt;&gt;&gt; block[0:2] 
+    b'\x00\x01' 
+    &gt;&gt;&gt; block[-6:] 
+    b'\x00hello' 
+    &gt;&gt;&gt; block[2:-6] 
+    b'\xff\xff\xff\xff\xff\xff\xff\xff' 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">max_msglength </span><span class="s4">= </span><span class="s1">target_length </span><span class="s4">- </span><span class="s7">11</span>
+    <span class="s1">msglength </span><span class="s4">= </span><span class="s1">len</span><span class="s4">(</span><span class="s1">message</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">msglength </span><span class="s4">&gt; </span><span class="s1">max_msglength</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">OverflowError</span><span class="s4">(</span>
+            <span class="s5">&quot;%i bytes needed for message, but there is only&quot;</span>
+            <span class="s5">&quot; space for %i&quot; </span><span class="s4">% (</span><span class="s1">msglength</span><span class="s4">, </span><span class="s1">max_msglength</span><span class="s4">)</span>
+        <span class="s4">)</span>
+
+    <span class="s1">padding_length </span><span class="s4">= </span><span class="s1">target_length </span><span class="s4">- </span><span class="s1">msglength </span><span class="s4">- </span><span class="s7">3</span>
+
+    <span class="s3">return </span><span class="s6">b&quot;&quot;</span><span class="s4">.</span><span class="s1">join</span><span class="s4">([</span><span class="s6">b&quot;</span><span class="s3">\x00\x01</span><span class="s6">&quot;</span><span class="s4">, </span><span class="s1">padding_length </span><span class="s4">* </span><span class="s6">b&quot;</span><span class="s3">\xff</span><span class="s6">&quot;</span><span class="s4">, </span><span class="s6">b&quot;</span><span class="s3">\x00</span><span class="s6">&quot;</span><span class="s4">, </span><span class="s1">message</span><span class="s4">])</span>
+
+
+<span class="s3">def </span><span class="s1">encrypt</span><span class="s4">(</span><span class="s1">message</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">, </span><span class="s1">pub_key</span><span class="s4">: </span><span class="s1">key</span><span class="s4">.</span><span class="s1">PublicKey</span><span class="s4">) </span><span class="s1">-&gt; bytes</span><span class="s4">:</span>
+    <span class="s2">&quot;&quot;&quot;Encrypts the given message using PKCS#1 v1.5 
+ 
+    :param message: the message to encrypt. Must be a byte string no longer than 
+        ``k-11`` bytes, where ``k`` is the number of bytes needed to encode 
+        the ``n`` component of the public key. 
+    :param pub_key: the :py:class:`rsa.PublicKey` to encrypt with. 
+    :raise OverflowError: when the message is too large to fit in the padded 
+        block. 
+ 
+    &gt;&gt;&gt; from rsa import key, common 
+    &gt;&gt;&gt; (pub_key, priv_key) = key.newkeys(256) 
+    &gt;&gt;&gt; message = b'hello' 
+    &gt;&gt;&gt; crypto = encrypt(message, pub_key) 
+ 
+    The crypto text should be just as long as the public key 'n' component: 
+ 
+    &gt;&gt;&gt; len(crypto) == common.byte_size(pub_key.n) 
+    True 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">keylength </span><span class="s4">= </span><span class="s1">common</span><span class="s4">.</span><span class="s1">byte_size</span><span class="s4">(</span><span class="s1">pub_key</span><span class="s4">.</span><span class="s1">n</span><span class="s4">)</span>
+    <span class="s1">padded </span><span class="s4">= </span><span class="s1">_pad_for_encryption</span><span class="s4">(</span><span class="s1">message</span><span class="s4">, </span><span class="s1">keylength</span><span class="s4">)</span>
+
+    <span class="s1">payload </span><span class="s4">= </span><span class="s1">transform</span><span class="s4">.</span><span class="s1">bytes2int</span><span class="s4">(</span><span class="s1">padded</span><span class="s4">)</span>
+    <span class="s1">encrypted </span><span class="s4">= </span><span class="s1">core</span><span class="s4">.</span><span class="s1">encrypt_int</span><span class="s4">(</span><span class="s1">payload</span><span class="s4">, </span><span class="s1">pub_key</span><span class="s4">.</span><span class="s1">e</span><span class="s4">, </span><span class="s1">pub_key</span><span class="s4">.</span><span class="s1">n</span><span class="s4">)</span>
+    <span class="s1">block </span><span class="s4">= </span><span class="s1">transform</span><span class="s4">.</span><span class="s1">int2bytes</span><span class="s4">(</span><span class="s1">encrypted</span><span class="s4">, </span><span class="s1">keylength</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">block</span>
+
+
+<span class="s3">def </span><span class="s1">decrypt</span><span class="s4">(</span><span class="s1">crypto</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">, </span><span class="s1">priv_key</span><span class="s4">: </span><span class="s1">key</span><span class="s4">.</span><span class="s1">PrivateKey</span><span class="s4">) </span><span class="s1">-&gt; bytes</span><span class="s4">:</span>
+    <span class="s2">r&quot;&quot;&quot;Decrypts the given message using PKCS#1 v1.5 
+ 
+    The decryption is considered 'failed' when the resulting cleartext doesn't 
+    start with the bytes 00 02, or when the 00 byte between the padding and 
+    the message cannot be found. 
+ 
+    :param crypto: the crypto text as returned by :py:func:`rsa.encrypt` 
+    :param priv_key: the :py:class:`rsa.PrivateKey` to decrypt with. 
+    :raise DecryptionError: when the decryption fails. No details are given as 
+        to why the code thinks the decryption fails, as this would leak 
+        information about the private key. 
+ 
+ 
+    &gt;&gt;&gt; import rsa 
+    &gt;&gt;&gt; (pub_key, priv_key) = rsa.newkeys(256) 
+ 
+    It works with strings: 
+ 
+    &gt;&gt;&gt; crypto = encrypt(b'hello', pub_key) 
+    &gt;&gt;&gt; decrypt(crypto, priv_key) 
+    b'hello' 
+ 
+    And with binary data: 
+ 
+    &gt;&gt;&gt; crypto = encrypt(b'\x00\x00\x00\x00\x01', pub_key) 
+    &gt;&gt;&gt; decrypt(crypto, priv_key) 
+    b'\x00\x00\x00\x00\x01' 
+ 
+    Altering the encrypted information will *likely* cause a 
+    :py:class:`rsa.pkcs1.DecryptionError`. If you want to be *sure*, use 
+    :py:func:`rsa.sign`. 
+ 
+ 
+    .. warning:: 
+ 
+        Never display the stack trace of a 
+        :py:class:`rsa.pkcs1.DecryptionError` exception. It shows where in the 
+        code the exception occurred, and thus leaks information about the key. 
+        It's only a tiny bit of information, but every bit makes cracking the 
+        keys easier. 
+ 
+    &gt;&gt;&gt; crypto = encrypt(b'hello', pub_key) 
+    &gt;&gt;&gt; crypto = crypto[0:5] + b'X' + crypto[6:] # change a byte 
+    &gt;&gt;&gt; decrypt(crypto, priv_key) 
+    Traceback (most recent call last): 
+    ... 
+    rsa.pkcs1.DecryptionError: Decryption failed 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">blocksize </span><span class="s4">= </span><span class="s1">common</span><span class="s4">.</span><span class="s1">byte_size</span><span class="s4">(</span><span class="s1">priv_key</span><span class="s4">.</span><span class="s1">n</span><span class="s4">)</span>
+    <span class="s1">encrypted </span><span class="s4">= </span><span class="s1">transform</span><span class="s4">.</span><span class="s1">bytes2int</span><span class="s4">(</span><span class="s1">crypto</span><span class="s4">)</span>
+    <span class="s1">decrypted </span><span class="s4">= </span><span class="s1">priv_key</span><span class="s4">.</span><span class="s1">blinded_decrypt</span><span class="s4">(</span><span class="s1">encrypted</span><span class="s4">)</span>
+    <span class="s1">cleartext </span><span class="s4">= </span><span class="s1">transform</span><span class="s4">.</span><span class="s1">int2bytes</span><span class="s4">(</span><span class="s1">decrypted</span><span class="s4">, </span><span class="s1">blocksize</span><span class="s4">)</span>
+
+    <span class="s0"># Detect leading zeroes in the crypto. These are not reflected in the</span>
+    <span class="s0"># encrypted value (as leading zeroes do not influence the value of an</span>
+    <span class="s0"># integer). This fixes CVE-2020-13757.</span>
+    <span class="s3">if </span><span class="s1">len</span><span class="s4">(</span><span class="s1">crypto</span><span class="s4">) &gt; </span><span class="s1">blocksize</span><span class="s4">:</span>
+        <span class="s0"># This is operating on public information, so doesn't need to be constant-time.</span>
+        <span class="s3">raise </span><span class="s1">DecryptionError</span><span class="s4">(</span><span class="s5">&quot;Decryption failed&quot;</span><span class="s4">)</span>
+
+    <span class="s0"># If we can't find the cleartext marker, decryption failed.</span>
+    <span class="s1">cleartext_marker_bad </span><span class="s4">= </span><span class="s3">not </span><span class="s1">compare_digest</span><span class="s4">(</span><span class="s1">cleartext</span><span class="s4">[:</span><span class="s7">2</span><span class="s4">], </span><span class="s6">b&quot;</span><span class="s3">\x00\x02</span><span class="s6">&quot;</span><span class="s4">)</span>
+
+    <span class="s0"># Find the 00 separator between the padding and the message</span>
+    <span class="s1">sep_idx </span><span class="s4">= </span><span class="s1">cleartext</span><span class="s4">.</span><span class="s1">find</span><span class="s4">(</span><span class="s6">b&quot;</span><span class="s3">\x00</span><span class="s6">&quot;</span><span class="s4">, </span><span class="s7">2</span><span class="s4">)</span>
+
+    <span class="s0"># sep_idx indicates the position of the `\x00` separator that separates the</span>
+    <span class="s0"># padding from the actual message. The padding should be at least 8 bytes</span>
+    <span class="s0"># long (see https://tools.ietf.org/html/rfc8017#section-7.2.2 step 3), which</span>
+    <span class="s0"># means the separator should be at least at index 10 (because of the</span>
+    <span class="s0"># `\x00\x02` marker that precedes it).</span>
+    <span class="s1">sep_idx_bad </span><span class="s4">= </span><span class="s1">sep_idx </span><span class="s4">&lt; </span><span class="s7">10</span>
+
+    <span class="s1">anything_bad </span><span class="s4">= </span><span class="s1">cleartext_marker_bad </span><span class="s4">| </span><span class="s1">sep_idx_bad</span>
+    <span class="s3">if </span><span class="s1">anything_bad</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">DecryptionError</span><span class="s4">(</span><span class="s5">&quot;Decryption failed&quot;</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">cleartext</span><span class="s4">[</span><span class="s1">sep_idx </span><span class="s4">+ </span><span class="s7">1 </span><span class="s4">:]</span>
+
+
+<span class="s3">def </span><span class="s1">sign_hash</span><span class="s4">(</span><span class="s1">hash_value</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">, </span><span class="s1">priv_key</span><span class="s4">: </span><span class="s1">key</span><span class="s4">.</span><span class="s1">PrivateKey</span><span class="s4">, </span><span class="s1">hash_method</span><span class="s4">: </span><span class="s1">str</span><span class="s4">) </span><span class="s1">-&gt; bytes</span><span class="s4">:</span>
+    <span class="s2">&quot;&quot;&quot;Signs a precomputed hash with the private key. 
+ 
+    Hashes the message, then signs the hash with the given key. This is known 
+    as a &quot;detached signature&quot;, because the message itself isn't altered. 
+ 
+    :param hash_value: A precomputed hash to sign (ignores message). 
+    :param priv_key: the :py:class:`rsa.PrivateKey` to sign with 
+    :param hash_method: the hash method used on the message. Use 'MD5', 'SHA-1', 
+        'SHA-224', SHA-256', 'SHA-384' or 'SHA-512'. 
+    :return: a message signature block. 
+    :raise OverflowError: if the private key is too small to contain the 
+        requested hash. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0"># Get the ASN1 code for this hash method</span>
+    <span class="s3">if </span><span class="s1">hash_method </span><span class="s3">not in </span><span class="s1">HASH_ASN1</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">&quot;Invalid hash method: %s&quot; </span><span class="s4">% </span><span class="s1">hash_method</span><span class="s4">)</span>
+    <span class="s1">asn1code </span><span class="s4">= </span><span class="s1">HASH_ASN1</span><span class="s4">[</span><span class="s1">hash_method</span><span class="s4">]</span>
+
+    <span class="s0"># Encrypt the hash with the private key</span>
+    <span class="s1">cleartext </span><span class="s4">= </span><span class="s1">asn1code </span><span class="s4">+ </span><span class="s1">hash_value</span>
+    <span class="s1">keylength </span><span class="s4">= </span><span class="s1">common</span><span class="s4">.</span><span class="s1">byte_size</span><span class="s4">(</span><span class="s1">priv_key</span><span class="s4">.</span><span class="s1">n</span><span class="s4">)</span>
+    <span class="s1">padded </span><span class="s4">= </span><span class="s1">_pad_for_signing</span><span class="s4">(</span><span class="s1">cleartext</span><span class="s4">, </span><span class="s1">keylength</span><span class="s4">)</span>
+
+    <span class="s1">payload </span><span class="s4">= </span><span class="s1">transform</span><span class="s4">.</span><span class="s1">bytes2int</span><span class="s4">(</span><span class="s1">padded</span><span class="s4">)</span>
+    <span class="s1">encrypted </span><span class="s4">= </span><span class="s1">priv_key</span><span class="s4">.</span><span class="s1">blinded_encrypt</span><span class="s4">(</span><span class="s1">payload</span><span class="s4">)</span>
+    <span class="s1">block </span><span class="s4">= </span><span class="s1">transform</span><span class="s4">.</span><span class="s1">int2bytes</span><span class="s4">(</span><span class="s1">encrypted</span><span class="s4">, </span><span class="s1">keylength</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">block</span>
+
+
+<span class="s3">def </span><span class="s1">sign</span><span class="s4">(</span><span class="s1">message</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">, </span><span class="s1">priv_key</span><span class="s4">: </span><span class="s1">key</span><span class="s4">.</span><span class="s1">PrivateKey</span><span class="s4">, </span><span class="s1">hash_method</span><span class="s4">: </span><span class="s1">str</span><span class="s4">) </span><span class="s1">-&gt; bytes</span><span class="s4">:</span>
+    <span class="s2">&quot;&quot;&quot;Signs the message with the private key. 
+ 
+    Hashes the message, then signs the hash with the given key. This is known 
+    as a &quot;detached signature&quot;, because the message itself isn't altered. 
+ 
+    :param message: the message to sign. Can be an 8-bit string or a file-like 
+        object. If ``message`` has a ``read()`` method, it is assumed to be a 
+        file-like object. 
+    :param priv_key: the :py:class:`rsa.PrivateKey` to sign with 
+    :param hash_method: the hash method used on the message. Use 'MD5', 'SHA-1', 
+        'SHA-224', SHA-256', 'SHA-384' or 'SHA-512'. 
+    :return: a message signature block. 
+    :raise OverflowError: if the private key is too small to contain the 
+        requested hash. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">msg_hash </span><span class="s4">= </span><span class="s1">compute_hash</span><span class="s4">(</span><span class="s1">message</span><span class="s4">, </span><span class="s1">hash_method</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">sign_hash</span><span class="s4">(</span><span class="s1">msg_hash</span><span class="s4">, </span><span class="s1">priv_key</span><span class="s4">, </span><span class="s1">hash_method</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">verify</span><span class="s4">(</span><span class="s1">message</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">, </span><span class="s1">signature</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">, </span><span class="s1">pub_key</span><span class="s4">: </span><span class="s1">key</span><span class="s4">.</span><span class="s1">PublicKey</span><span class="s4">) </span><span class="s1">-&gt; str</span><span class="s4">:</span>
+    <span class="s2">&quot;&quot;&quot;Verifies that the signature matches the message. 
+ 
+    The hash method is detected automatically from the signature. 
+ 
+    :param message: the signed message. Can be an 8-bit string or a file-like 
+        object. If ``message`` has a ``read()`` method, it is assumed to be a 
+        file-like object. 
+    :param signature: the signature block, as created with :py:func:`rsa.sign`. 
+    :param pub_key: the :py:class:`rsa.PublicKey` of the person signing the message. 
+    :raise VerificationError: when the signature doesn't match the message. 
+    :returns: the name of the used hash. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">keylength </span><span class="s4">= </span><span class="s1">common</span><span class="s4">.</span><span class="s1">byte_size</span><span class="s4">(</span><span class="s1">pub_key</span><span class="s4">.</span><span class="s1">n</span><span class="s4">)</span>
+    <span class="s1">encrypted </span><span class="s4">= </span><span class="s1">transform</span><span class="s4">.</span><span class="s1">bytes2int</span><span class="s4">(</span><span class="s1">signature</span><span class="s4">)</span>
+    <span class="s1">decrypted </span><span class="s4">= </span><span class="s1">core</span><span class="s4">.</span><span class="s1">decrypt_int</span><span class="s4">(</span><span class="s1">encrypted</span><span class="s4">, </span><span class="s1">pub_key</span><span class="s4">.</span><span class="s1">e</span><span class="s4">, </span><span class="s1">pub_key</span><span class="s4">.</span><span class="s1">n</span><span class="s4">)</span>
+    <span class="s1">clearsig </span><span class="s4">= </span><span class="s1">transform</span><span class="s4">.</span><span class="s1">int2bytes</span><span class="s4">(</span><span class="s1">decrypted</span><span class="s4">, </span><span class="s1">keylength</span><span class="s4">)</span>
+
+    <span class="s0"># Get the hash method</span>
+    <span class="s1">method_name </span><span class="s4">= </span><span class="s1">_find_method_hash</span><span class="s4">(</span><span class="s1">clearsig</span><span class="s4">)</span>
+    <span class="s1">message_hash </span><span class="s4">= </span><span class="s1">compute_hash</span><span class="s4">(</span><span class="s1">message</span><span class="s4">, </span><span class="s1">method_name</span><span class="s4">)</span>
+
+    <span class="s0"># Reconstruct the expected padded hash</span>
+    <span class="s1">cleartext </span><span class="s4">= </span><span class="s1">HASH_ASN1</span><span class="s4">[</span><span class="s1">method_name</span><span class="s4">] + </span><span class="s1">message_hash</span>
+    <span class="s1">expected </span><span class="s4">= </span><span class="s1">_pad_for_signing</span><span class="s4">(</span><span class="s1">cleartext</span><span class="s4">, </span><span class="s1">keylength</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">len</span><span class="s4">(</span><span class="s1">signature</span><span class="s4">) != </span><span class="s1">keylength</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">VerificationError</span><span class="s4">(</span><span class="s5">&quot;Verification failed&quot;</span><span class="s4">)</span>
+
+    <span class="s0"># Compare with the signed one</span>
+    <span class="s3">if </span><span class="s1">expected </span><span class="s4">!= </span><span class="s1">clearsig</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">VerificationError</span><span class="s4">(</span><span class="s5">&quot;Verification failed&quot;</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">method_name</span>
+
+
+<span class="s3">def </span><span class="s1">find_signature_hash</span><span class="s4">(</span><span class="s1">signature</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">, </span><span class="s1">pub_key</span><span class="s4">: </span><span class="s1">key</span><span class="s4">.</span><span class="s1">PublicKey</span><span class="s4">) </span><span class="s1">-&gt; str</span><span class="s4">:</span>
+    <span class="s2">&quot;&quot;&quot;Returns the hash name detected from the signature. 
+ 
+    If you also want to verify the message, use :py:func:`rsa.verify()` instead. 
+    It also returns the name of the used hash. 
+ 
+    :param signature: the signature block, as created with :py:func:`rsa.sign`. 
+    :param pub_key: the :py:class:`rsa.PublicKey` of the person signing the message. 
+    :returns: the name of the used hash. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">keylength </span><span class="s4">= </span><span class="s1">common</span><span class="s4">.</span><span class="s1">byte_size</span><span class="s4">(</span><span class="s1">pub_key</span><span class="s4">.</span><span class="s1">n</span><span class="s4">)</span>
+    <span class="s1">encrypted </span><span class="s4">= </span><span class="s1">transform</span><span class="s4">.</span><span class="s1">bytes2int</span><span class="s4">(</span><span class="s1">signature</span><span class="s4">)</span>
+    <span class="s1">decrypted </span><span class="s4">= </span><span class="s1">core</span><span class="s4">.</span><span class="s1">decrypt_int</span><span class="s4">(</span><span class="s1">encrypted</span><span class="s4">, </span><span class="s1">pub_key</span><span class="s4">.</span><span class="s1">e</span><span class="s4">, </span><span class="s1">pub_key</span><span class="s4">.</span><span class="s1">n</span><span class="s4">)</span>
+    <span class="s1">clearsig </span><span class="s4">= </span><span class="s1">transform</span><span class="s4">.</span><span class="s1">int2bytes</span><span class="s4">(</span><span class="s1">decrypted</span><span class="s4">, </span><span class="s1">keylength</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">_find_method_hash</span><span class="s4">(</span><span class="s1">clearsig</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">yield_fixedblocks</span><span class="s4">(</span><span class="s1">infile</span><span class="s4">: </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">BinaryIO</span><span class="s4">, </span><span class="s1">blocksize</span><span class="s4">: </span><span class="s1">int</span><span class="s4">) </span><span class="s1">-&gt; typing</span><span class="s4">.</span><span class="s1">Iterator</span><span class="s4">[</span><span class="s1">bytes</span><span class="s4">]:</span>
+    <span class="s2">&quot;&quot;&quot;Generator, yields each block of ``blocksize`` bytes in the input file. 
+ 
+    :param infile: file to read and separate in blocks. 
+    :param blocksize: block size in bytes. 
+    :returns: a generator that yields the contents of each block 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">while True</span><span class="s4">:</span>
+        <span class="s1">block </span><span class="s4">= </span><span class="s1">infile</span><span class="s4">.</span><span class="s1">read</span><span class="s4">(</span><span class="s1">blocksize</span><span class="s4">)</span>
+
+        <span class="s1">read_bytes </span><span class="s4">= </span><span class="s1">len</span><span class="s4">(</span><span class="s1">block</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">read_bytes </span><span class="s4">== </span><span class="s7">0</span><span class="s4">:</span>
+            <span class="s3">break</span>
+
+        <span class="s3">yield </span><span class="s1">block</span>
+
+        <span class="s3">if </span><span class="s1">read_bytes </span><span class="s4">&lt; </span><span class="s1">blocksize</span><span class="s4">:</span>
+            <span class="s3">break</span>
+
+
+<span class="s3">def </span><span class="s1">compute_hash</span><span class="s4">(</span><span class="s1">message</span><span class="s4">: </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">Union</span><span class="s4">[</span><span class="s1">bytes</span><span class="s4">, </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">BinaryIO</span><span class="s4">], </span><span class="s1">method_name</span><span class="s4">: </span><span class="s1">str</span><span class="s4">) </span><span class="s1">-&gt; bytes</span><span class="s4">:</span>
+    <span class="s2">&quot;&quot;&quot;Returns the message digest. 
+ 
+    :param message: the signed message. Can be an 8-bit string or a file-like 
+        object. If ``message`` has a ``read()`` method, it is assumed to be a 
+        file-like object. 
+    :param method_name: the hash method, must be a key of 
+        :py:const:`rsa.pkcs1.HASH_METHODS`. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">if </span><span class="s1">method_name </span><span class="s3">not in </span><span class="s1">HASH_METHODS</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">&quot;Invalid hash method: %s&quot; </span><span class="s4">% </span><span class="s1">method_name</span><span class="s4">)</span>
+
+    <span class="s1">method </span><span class="s4">= </span><span class="s1">HASH_METHODS</span><span class="s4">[</span><span class="s1">method_name</span><span class="s4">]</span>
+    <span class="s1">hasher </span><span class="s4">= </span><span class="s1">method</span><span class="s4">()</span>
+
+    <span class="s3">if </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">message</span><span class="s4">, </span><span class="s1">bytes</span><span class="s4">):</span>
+        <span class="s1">hasher</span><span class="s4">.</span><span class="s1">update</span><span class="s4">(</span><span class="s1">message</span><span class="s4">)</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s3">assert </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">message</span><span class="s4">, </span><span class="s5">&quot;read&quot;</span><span class="s4">) </span><span class="s3">and </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">message</span><span class="s4">.</span><span class="s1">read</span><span class="s4">, </span><span class="s5">&quot;__call__&quot;</span><span class="s4">)</span>
+        <span class="s0"># read as 1K blocks</span>
+        <span class="s3">for </span><span class="s1">block </span><span class="s3">in </span><span class="s1">yield_fixedblocks</span><span class="s4">(</span><span class="s1">message</span><span class="s4">, </span><span class="s7">1024</span><span class="s4">):</span>
+            <span class="s1">hasher</span><span class="s4">.</span><span class="s1">update</span><span class="s4">(</span><span class="s1">block</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">hasher</span><span class="s4">.</span><span class="s1">digest</span><span class="s4">()</span>
+
+
+<span class="s3">def </span><span class="s1">_find_method_hash</span><span class="s4">(</span><span class="s1">clearsig</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">) </span><span class="s1">-&gt; str</span><span class="s4">:</span>
+    <span class="s2">&quot;&quot;&quot;Finds the hash method. 
+ 
+    :param clearsig: full padded ASN1 and hash. 
+    :return: the used hash method. 
+    :raise VerificationFailed: when the hash method cannot be found 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">for </span><span class="s4">(</span><span class="s1">hashname</span><span class="s4">, </span><span class="s1">asn1code</span><span class="s4">) </span><span class="s3">in </span><span class="s1">HASH_ASN1</span><span class="s4">.</span><span class="s1">items</span><span class="s4">():</span>
+        <span class="s3">if </span><span class="s1">asn1code </span><span class="s3">in </span><span class="s1">clearsig</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">hashname</span>
+
+    <span class="s3">raise </span><span class="s1">VerificationError</span><span class="s4">(</span><span class="s5">&quot;Verification failed&quot;</span><span class="s4">)</span>
+
+
+<span class="s1">__all__ </span><span class="s4">= [</span>
+    <span class="s5">&quot;encrypt&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;decrypt&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;sign&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;verify&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;DecryptionError&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;VerificationError&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;CryptoError&quot;</span><span class="s4">,</span>
+<span class="s4">]</span>
+
+<span class="s3">if </span><span class="s1">__name__ </span><span class="s4">== </span><span class="s5">&quot;__main__&quot;</span><span class="s4">:</span>
+    <span class="s1">print</span><span class="s4">(</span><span class="s5">&quot;Running doctests 1000x or until failure&quot;</span><span class="s4">)</span>
+    <span class="s3">import </span><span class="s1">doctest</span>
+
+    <span class="s3">for </span><span class="s1">count </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s7">1000</span><span class="s4">):</span>
+        <span class="s4">(</span><span class="s1">failures</span><span class="s4">, </span><span class="s1">tests</span><span class="s4">) = </span><span class="s1">doctest</span><span class="s4">.</span><span class="s1">testmod</span><span class="s4">()</span>
+        <span class="s3">if </span><span class="s1">failures</span><span class="s4">:</span>
+            <span class="s3">break</span>
+
+        <span class="s3">if </span><span class="s1">count </span><span class="s4">% </span><span class="s7">100 </span><span class="s4">== </span><span class="s7">0 </span><span class="s3">and </span><span class="s1">count</span><span class="s4">:</span>
+            <span class="s1">print</span><span class="s4">(</span><span class="s5">&quot;%i times&quot; </span><span class="s4">% </span><span class="s1">count</span><span class="s4">)</span>
+
+    <span class="s1">print</span><span class="s4">(</span><span class="s5">&quot;Doctests done&quot;</span><span class="s4">)</span>
+</pre>
+</body>
+</html>

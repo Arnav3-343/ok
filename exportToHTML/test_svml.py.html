@@ -1,0 +1,434 @@
+<html>
+<head>
+<title>test_svml.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #7a7e85;}
+.s5 { color: #2aacb8;}
+.s6 { color: #5f826b; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_svml.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">math</span>
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">import </span><span class="s1">numbers</span>
+<span class="s0">import </span><span class="s1">re</span>
+<span class="s0">import </span><span class="s1">traceback</span>
+<span class="s0">import </span><span class="s1">multiprocessing </span><span class="s0">as </span><span class="s1">mp</span>
+
+<span class="s0">import </span><span class="s1">numba</span>
+<span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">njit</span><span class="s2">, </span><span class="s1">prange</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">config</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">tests</span><span class="s2">.</span><span class="s1">support </span><span class="s0">import </span><span class="s1">TestCase</span><span class="s2">, </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">override_env_config</span>
+<span class="s0">import </span><span class="s1">unittest</span>
+
+<span class="s1">needs_svml </span><span class="s2">= </span><span class="s1">unittest</span><span class="s2">.</span><span class="s1">skipUnless</span><span class="s2">(</span><span class="s1">config</span><span class="s2">.</span><span class="s1">USING_SVML</span><span class="s2">,</span>
+                                 <span class="s3">&quot;SVML tests need SVML to be present&quot;</span><span class="s2">)</span>
+
+<span class="s4"># a map of float64 vector lengths with corresponding CPU architecture</span>
+<span class="s1">vlen2cpu </span><span class="s2">= {</span><span class="s5">2</span><span class="s2">: </span><span class="s3">'nehalem'</span><span class="s2">, </span><span class="s5">4</span><span class="s2">: </span><span class="s3">'haswell'</span><span class="s2">, </span><span class="s5">8</span><span class="s2">: </span><span class="s3">'skylake-avx512'</span><span class="s2">}</span>
+<span class="s4"># force LLVM to use AVX512 registers for vectorization</span>
+<span class="s4"># https://reviews.llvm.org/D67259</span>
+<span class="s1">vlen2cpu_features </span><span class="s2">= {</span><span class="s5">2</span><span class="s2">: </span><span class="s3">''</span><span class="s2">, </span><span class="s5">4</span><span class="s2">: </span><span class="s3">''</span><span class="s2">, </span><span class="s5">8</span><span class="s2">: </span><span class="s3">'-prefer-256-bit'</span><span class="s2">}</span>
+
+<span class="s4"># env vars to force CPU as skylake-avx512.</span>
+<span class="s4"># force LLVM to use AVX512 registers for vectorization</span>
+<span class="s4"># https://reviews.llvm.org/D67259</span>
+<span class="s1">_skylake_axv512_envvars </span><span class="s2">= {</span><span class="s3">'NUMBA_CPU_NAME'</span><span class="s2">: </span><span class="s3">'skylake-avx512'</span><span class="s2">,</span>
+                           <span class="s3">'NUMBA_CPU_FEATURES'</span><span class="s2">: </span><span class="s3">'-prefer-256-bit'</span><span class="s2">}</span>
+
+<span class="s4"># K: SVML functions, V: python functions which are expected to be SIMD-vectorized</span>
+<span class="s4"># using SVML, explicit references to Python functions here are mostly for sake of</span>
+<span class="s4"># instant import checks.</span>
+<span class="s4"># TODO: [] and comments below mean unused/untested SVML function, it's to be</span>
+<span class="s4">#       either enabled or to be replaced with the explanation why the function</span>
+<span class="s4">#       cannot be used in Numba</span>
+<span class="s4"># TODO: this test does not support functions with more than 1 arguments yet</span>
+<span class="s4"># The test logic should be modified if there is an SVML function being used under</span>
+<span class="s4"># different name or module from Python</span>
+<span class="s1">svml_funcs </span><span class="s2">= {</span>
+    <span class="s3">&quot;sin&quot;</span><span class="s2">:     [</span><span class="s1">np</span><span class="s2">.</span><span class="s1">sin</span><span class="s2">, </span><span class="s1">math</span><span class="s2">.</span><span class="s1">sin</span><span class="s2">],</span>
+    <span class="s3">&quot;cos&quot;</span><span class="s2">:     [</span><span class="s1">np</span><span class="s2">.</span><span class="s1">cos</span><span class="s2">, </span><span class="s1">math</span><span class="s2">.</span><span class="s1">cos</span><span class="s2">],</span>
+    <span class="s3">&quot;pow&quot;</span><span class="s2">:        [],  </span><span class="s4"># pow, math.pow],</span>
+    <span class="s3">&quot;exp&quot;</span><span class="s2">:     [</span><span class="s1">np</span><span class="s2">.</span><span class="s1">exp</span><span class="s2">, </span><span class="s1">math</span><span class="s2">.</span><span class="s1">exp</span><span class="s2">],</span>
+    <span class="s3">&quot;log&quot;</span><span class="s2">:     [</span><span class="s1">np</span><span class="s2">.</span><span class="s1">log</span><span class="s2">, </span><span class="s1">math</span><span class="s2">.</span><span class="s1">log</span><span class="s2">],</span>
+    <span class="s3">&quot;acos&quot;</span><span class="s2">:    [</span><span class="s1">math</span><span class="s2">.</span><span class="s1">acos</span><span class="s2">],</span>
+    <span class="s3">&quot;acosh&quot;</span><span class="s2">:   [</span><span class="s1">math</span><span class="s2">.</span><span class="s1">acosh</span><span class="s2">],</span>
+    <span class="s3">&quot;asin&quot;</span><span class="s2">:    [</span><span class="s1">math</span><span class="s2">.</span><span class="s1">asin</span><span class="s2">],</span>
+    <span class="s3">&quot;asinh&quot;</span><span class="s2">:   [</span><span class="s1">math</span><span class="s2">.</span><span class="s1">asinh</span><span class="s2">],</span>
+    <span class="s3">&quot;atan2&quot;</span><span class="s2">:      [],  </span><span class="s4"># math.atan2],</span>
+    <span class="s3">&quot;atan&quot;</span><span class="s2">:    [</span><span class="s1">math</span><span class="s2">.</span><span class="s1">atan</span><span class="s2">],</span>
+    <span class="s3">&quot;atanh&quot;</span><span class="s2">:   [</span><span class="s1">math</span><span class="s2">.</span><span class="s1">atanh</span><span class="s2">],</span>
+    <span class="s3">&quot;cbrt&quot;</span><span class="s2">:       [],  </span><span class="s4"># np.cbrt],</span>
+    <span class="s3">&quot;cdfnorm&quot;</span><span class="s2">:    [],</span>
+    <span class="s3">&quot;cdfnorminv&quot;</span><span class="s2">: [],</span>
+    <span class="s3">&quot;ceil&quot;</span><span class="s2">:       [],  </span><span class="s4"># np.ceil, math.ceil],</span>
+    <span class="s3">&quot;cosd&quot;</span><span class="s2">:       [],</span>
+    <span class="s3">&quot;cosh&quot;</span><span class="s2">:    [</span><span class="s1">np</span><span class="s2">.</span><span class="s1">cosh</span><span class="s2">, </span><span class="s1">math</span><span class="s2">.</span><span class="s1">cosh</span><span class="s2">],</span>
+    <span class="s3">&quot;erf&quot;</span><span class="s2">:     [</span><span class="s1">math</span><span class="s2">.</span><span class="s1">erf</span><span class="s2">],  </span><span class="s4"># np.erf is available in Intel Distribution</span>
+    <span class="s3">&quot;erfc&quot;</span><span class="s2">:    [</span><span class="s1">math</span><span class="s2">.</span><span class="s1">erfc</span><span class="s2">],</span>
+    <span class="s3">&quot;erfcinv&quot;</span><span class="s2">:    [],</span>
+    <span class="s3">&quot;erfinv&quot;</span><span class="s2">:     [],</span>
+    <span class="s3">&quot;exp10&quot;</span><span class="s2">:      [],</span>
+    <span class="s3">&quot;exp2&quot;</span><span class="s2">:       [],  </span><span class="s4"># np.exp2],</span>
+    <span class="s3">&quot;expm1&quot;</span><span class="s2">:   [</span><span class="s1">np</span><span class="s2">.</span><span class="s1">expm1</span><span class="s2">, </span><span class="s1">math</span><span class="s2">.</span><span class="s1">expm1</span><span class="s2">],</span>
+    <span class="s3">&quot;floor&quot;</span><span class="s2">:      [],  </span><span class="s4"># np.floor, math.floor],</span>
+    <span class="s3">&quot;fmod&quot;</span><span class="s2">:       [],  </span><span class="s4"># np.fmod, math.fmod],</span>
+    <span class="s3">&quot;hypot&quot;</span><span class="s2">:      [],  </span><span class="s4"># np.hypot, math.hypot],</span>
+    <span class="s3">&quot;invsqrt&quot;</span><span class="s2">:    [],  </span><span class="s4"># available in Intel Distribution</span>
+    <span class="s3">&quot;log10&quot;</span><span class="s2">:   [</span><span class="s1">np</span><span class="s2">.</span><span class="s1">log10</span><span class="s2">, </span><span class="s1">math</span><span class="s2">.</span><span class="s1">log10</span><span class="s2">],</span>
+    <span class="s3">&quot;log1p&quot;</span><span class="s2">:   [</span><span class="s1">np</span><span class="s2">.</span><span class="s1">log1p</span><span class="s2">, </span><span class="s1">math</span><span class="s2">.</span><span class="s1">log1p</span><span class="s2">],</span>
+    <span class="s3">&quot;log2&quot;</span><span class="s2">:       [],  </span><span class="s4"># np.log2],</span>
+    <span class="s3">&quot;logb&quot;</span><span class="s2">:       [],</span>
+    <span class="s3">&quot;nearbyint&quot;</span><span class="s2">:  [],</span>
+    <span class="s3">&quot;rint&quot;</span><span class="s2">:       [],  </span><span class="s4"># np.rint],</span>
+    <span class="s3">&quot;round&quot;</span><span class="s2">:      [],  </span><span class="s4"># round],</span>
+    <span class="s3">&quot;sind&quot;</span><span class="s2">:       [],</span>
+    <span class="s3">&quot;sinh&quot;</span><span class="s2">:    [</span><span class="s1">np</span><span class="s2">.</span><span class="s1">sinh</span><span class="s2">, </span><span class="s1">math</span><span class="s2">.</span><span class="s1">sinh</span><span class="s2">],</span>
+    <span class="s3">&quot;tan&quot;</span><span class="s2">:     [</span><span class="s1">np</span><span class="s2">.</span><span class="s1">tan</span><span class="s2">, </span><span class="s1">math</span><span class="s2">.</span><span class="s1">tan</span><span class="s2">],</span>
+    <span class="s3">&quot;tanh&quot;</span><span class="s2">:    [</span><span class="s1">np</span><span class="s2">.</span><span class="s1">tanh</span><span class="s2">, </span><span class="s1">math</span><span class="s2">.</span><span class="s1">tanh</span><span class="s2">],</span>
+    <span class="s3">&quot;trunc&quot;</span><span class="s2">:      [],  </span><span class="s4"># np.trunc, math.trunc],</span>
+<span class="s2">}</span>
+<span class="s4"># TODO: these functions are not vectorizable with complex types</span>
+<span class="s1">complex_funcs_exclude </span><span class="s2">= [</span><span class="s3">&quot;tan&quot;</span><span class="s2">, </span><span class="s3">&quot;log10&quot;</span><span class="s2">, </span><span class="s3">&quot;expm1&quot;</span><span class="s2">, </span><span class="s3">&quot;log1p&quot;</span><span class="s2">, </span><span class="s3">&quot;tanh&quot;</span><span class="s2">, </span><span class="s3">&quot;log&quot;</span><span class="s2">]</span>
+
+<span class="s4"># remove untested entries</span>
+<span class="s1">svml_funcs </span><span class="s2">= {</span><span class="s1">k</span><span class="s2">: </span><span class="s1">v </span><span class="s0">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">svml_funcs</span><span class="s2">.</span><span class="s1">items</span><span class="s2">() </span><span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">v</span><span class="s2">) &gt; </span><span class="s5">0</span><span class="s2">}</span>
+<span class="s4"># lists for functions which belong to numpy and math modules correpondently</span>
+<span class="s1">numpy_funcs </span><span class="s2">= [</span><span class="s1">f </span><span class="s0">for </span><span class="s1">f</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">svml_funcs</span><span class="s2">.</span><span class="s1">items</span><span class="s2">() </span><span class="s0">if </span><span class="s3">&quot;&lt;ufunc&quot; </span><span class="s0">in </span><span class="s1">\</span>
+                  <span class="s2">[</span><span class="s1">str</span><span class="s2">(</span><span class="s1">p</span><span class="s2">).</span><span class="s1">split</span><span class="s2">(</span><span class="s3">' '</span><span class="s2">)[</span><span class="s5">0</span><span class="s2">] </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">v</span><span class="s2">]]</span>
+<span class="s1">other_funcs </span><span class="s2">= [</span><span class="s1">f </span><span class="s0">for </span><span class="s1">f</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">svml_funcs</span><span class="s2">.</span><span class="s1">items</span><span class="s2">() </span><span class="s0">if </span><span class="s3">&quot;&lt;built-in&quot; </span><span class="s0">in </span><span class="s1">\</span>
+                  <span class="s2">[</span><span class="s1">str</span><span class="s2">(</span><span class="s1">p</span><span class="s2">).</span><span class="s1">split</span><span class="s2">(</span><span class="s3">' '</span><span class="s2">)[</span><span class="s5">0</span><span class="s2">] </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">v</span><span class="s2">]]</span>
+
+
+<span class="s0">def </span><span class="s1">func_patterns</span><span class="s2">(</span><span class="s1">func</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">res</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">mode</span><span class="s2">, </span><span class="s1">vlen</span><span class="s2">, </span><span class="s1">fastmath</span><span class="s2">, </span><span class="s1">pad</span><span class="s2">=</span><span class="s3">' '</span><span class="s2">*</span><span class="s5">8</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    For a given function and its usage modes, 
+    returns python code and assembly patterns it should and should not generate 
+    &quot;&quot;&quot;</span>
+
+    <span class="s4"># generate a function call according to the usecase</span>
+    <span class="s0">if </span><span class="s1">mode </span><span class="s2">== </span><span class="s3">&quot;scalar&quot;</span><span class="s2">:</span>
+        <span class="s1">arg_list </span><span class="s2">= </span><span class="s3">','</span><span class="s2">.</span><span class="s1">join</span><span class="s2">([</span><span class="s1">a</span><span class="s2">+</span><span class="s3">'[0]' </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">args</span><span class="s2">])</span>
+        <span class="s1">body </span><span class="s2">= </span><span class="s3">'%s%s[0] += math.%s(%s)</span><span class="s0">\n</span><span class="s3">' </span><span class="s2">% (</span><span class="s1">pad</span><span class="s2">, </span><span class="s1">res</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">arg_list</span><span class="s2">)</span>
+    <span class="s0">elif </span><span class="s1">mode </span><span class="s2">== </span><span class="s3">&quot;numpy&quot;</span><span class="s2">:</span>
+        <span class="s1">body </span><span class="s2">= </span><span class="s3">'%s%s += np.%s(%s)' </span><span class="s2">% (</span><span class="s1">pad</span><span class="s2">, </span><span class="s1">res</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s3">','</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">args</span><span class="s2">))</span>
+        <span class="s1">body </span><span class="s2">+= </span><span class="s3">'.astype(np.%s)</span><span class="s0">\n</span><span class="s3">' </span><span class="s2">% </span><span class="s1">dtype </span><span class="s0">if </span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">startswith</span><span class="s2">(</span><span class="s3">'int'</span><span class="s2">) </span><span class="s0">else </span><span class="s3">'</span><span class="s0">\n</span><span class="s3">'</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s0">assert </span><span class="s1">mode </span><span class="s2">== </span><span class="s3">&quot;range&quot; </span><span class="s0">or </span><span class="s1">mode </span><span class="s2">== </span><span class="s3">&quot;prange&quot;</span>
+        <span class="s1">arg_list </span><span class="s2">= </span><span class="s3">','</span><span class="s2">.</span><span class="s1">join</span><span class="s2">([</span><span class="s1">a</span><span class="s2">+</span><span class="s3">'[i]' </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">args</span><span class="s2">])</span>
+        <span class="s1">body </span><span class="s2">= </span><span class="s3">'{pad}for i in {mode}({res}.size):</span><span class="s0">\n</span><span class="s3">' </span><span class="s1">\</span>
+               <span class="s3">'{pad}{pad}{res}[i] += math.{func}({arg_list})</span><span class="s0">\n</span><span class="s3">'</span><span class="s2">. </span><span class="s1">\</span>
+               <span class="s1">format</span><span class="s2">(**</span><span class="s1">locals</span><span class="s2">())</span>
+    <span class="s4"># TODO: refactor so this for-loop goes into umbrella function,</span>
+    <span class="s4">#       'mode' can be 'numpy', '0', 'i' instead</span>
+    <span class="s4"># TODO: it will enable mixed usecases like prange + numpy</span>
+
+    <span class="s4"># type specialization</span>
+    <span class="s1">is_f32 </span><span class="s2">= </span><span class="s1">dtype </span><span class="s2">== </span><span class="s3">'float32' </span><span class="s0">or </span><span class="s1">dtype </span><span class="s2">== </span><span class="s3">'complex64'</span>
+    <span class="s1">f </span><span class="s2">= </span><span class="s1">func</span><span class="s2">+</span><span class="s3">'f' </span><span class="s0">if </span><span class="s1">is_f32 </span><span class="s0">else </span><span class="s1">func</span>
+    <span class="s1">v </span><span class="s2">= </span><span class="s1">vlen</span><span class="s2">*</span><span class="s5">2 </span><span class="s0">if </span><span class="s1">is_f32 </span><span class="s0">else </span><span class="s1">vlen</span>
+    <span class="s4"># general expectations</span>
+    <span class="s1">prec_suff </span><span class="s2">= </span><span class="s3">'' </span><span class="s0">if </span><span class="s1">fastmath </span><span class="s0">else </span><span class="s3">'_ha'</span>
+    <span class="s1">scalar_func </span><span class="s2">= </span><span class="s3">'$_'</span><span class="s2">+</span><span class="s1">f </span><span class="s0">if </span><span class="s1">config</span><span class="s2">.</span><span class="s1">IS_OSX </span><span class="s0">else </span><span class="s3">'$'</span><span class="s2">+</span><span class="s1">f</span>
+    <span class="s1">svml_func </span><span class="s2">= </span><span class="s3">'__svml_%s%d%s,' </span><span class="s2">% (</span><span class="s1">f</span><span class="s2">, </span><span class="s1">v</span><span class="s2">, </span><span class="s1">prec_suff</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">mode </span><span class="s2">== </span><span class="s3">&quot;scalar&quot;</span><span class="s2">:</span>
+        <span class="s1">contains </span><span class="s2">= [</span><span class="s1">scalar_func</span><span class="s2">]</span>
+        <span class="s1">avoids </span><span class="s2">= [</span><span class="s3">'__svml_'</span><span class="s2">, </span><span class="s1">svml_func</span><span class="s2">]</span>
+    <span class="s0">else</span><span class="s2">:            </span><span class="s4"># will vectorize</span>
+        <span class="s1">contains </span><span class="s2">= [</span><span class="s1">svml_func</span><span class="s2">]</span>
+        <span class="s1">avoids </span><span class="s2">= []  </span><span class="s4"># [scalar_func] - TODO: if possible, force LLVM to prevent</span>
+                     <span class="s4">#                     generating the failsafe scalar paths</span>
+        <span class="s0">if </span><span class="s1">vlen </span><span class="s2">!= </span><span class="s5">8 </span><span class="s0">and </span><span class="s2">(</span><span class="s1">is_f32 </span><span class="s0">or </span><span class="s1">dtype </span><span class="s2">== </span><span class="s3">'int32'</span><span class="s2">):  </span><span class="s4"># Issue #3016</span>
+            <span class="s1">avoids </span><span class="s2">+= [</span><span class="s3">'%zmm'</span><span class="s2">, </span><span class="s3">'__svml_%s%d%s,' </span><span class="s2">% (</span><span class="s1">f</span><span class="s2">, </span><span class="s1">v</span><span class="s2">*</span><span class="s5">2</span><span class="s2">, </span><span class="s1">prec_suff</span><span class="s2">)]</span>
+    <span class="s0">return </span><span class="s1">body</span><span class="s2">, </span><span class="s1">contains</span><span class="s2">, </span><span class="s1">avoids</span>
+
+
+<span class="s0">def </span><span class="s1">usecase_name</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">mode</span><span class="s2">, </span><span class="s1">vlen</span><span class="s2">, </span><span class="s1">name</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; Returns pretty name for given set of modes &quot;&quot;&quot;</span>
+
+    <span class="s0">return </span><span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">dtype</span><span class="s0">}</span><span class="s3">_</span><span class="s0">{</span><span class="s1">mode</span><span class="s0">}{</span><span class="s1">vlen</span><span class="s0">}</span><span class="s3">_</span><span class="s0">{</span><span class="s1">name</span><span class="s0">}</span><span class="s3">&quot;</span>
+
+
+<span class="s0">def </span><span class="s1">combo_svml_usecase</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">mode</span><span class="s2">, </span><span class="s1">vlen</span><span class="s2">, </span><span class="s1">fastmath</span><span class="s2">, </span><span class="s1">name</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; Combine multiple function calls under single umbrella usecase &quot;&quot;&quot;</span>
+
+    <span class="s1">name </span><span class="s2">= </span><span class="s1">usecase_name</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">mode</span><span class="s2">, </span><span class="s1">vlen</span><span class="s2">, </span><span class="s1">name</span><span class="s2">)</span>
+    <span class="s1">body </span><span class="s2">= </span><span class="s3">&quot;&quot;&quot;def {name}(n): 
+        x   = np.empty(n*8, dtype=np.{dtype}) 
+        ret = np.empty_like(x)</span><span class="s0">\n</span><span class="s3">&quot;&quot;&quot;</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(**</span><span class="s1">locals</span><span class="s2">())</span>
+    <span class="s1">funcs </span><span class="s2">= </span><span class="s1">set</span><span class="s2">(</span><span class="s1">numpy_funcs </span><span class="s0">if </span><span class="s1">mode </span><span class="s2">== </span><span class="s3">&quot;numpy&quot; </span><span class="s0">else </span><span class="s1">other_funcs</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">startswith</span><span class="s2">(</span><span class="s3">'complex'</span><span class="s2">):</span>
+        <span class="s1">funcs </span><span class="s2">= </span><span class="s1">funcs</span><span class="s2">.</span><span class="s1">difference</span><span class="s2">(</span><span class="s1">complex_funcs_exclude</span><span class="s2">)</span>
+    <span class="s1">contains </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+    <span class="s1">avoids </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+    <span class="s4"># fill body and expectation patterns</span>
+    <span class="s0">for </span><span class="s1">f </span><span class="s0">in </span><span class="s1">funcs</span><span class="s2">:</span>
+        <span class="s1">b</span><span class="s2">, </span><span class="s1">c</span><span class="s2">, </span><span class="s1">a </span><span class="s2">= </span><span class="s1">func_patterns</span><span class="s2">(</span><span class="s1">f</span><span class="s2">, [</span><span class="s3">'x'</span><span class="s2">], </span><span class="s3">'ret'</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">mode</span><span class="s2">, </span><span class="s1">vlen</span><span class="s2">, </span><span class="s1">fastmath</span><span class="s2">)</span>
+        <span class="s1">avoids</span><span class="s2">.</span><span class="s1">update</span><span class="s2">(</span><span class="s1">a</span><span class="s2">)</span>
+        <span class="s1">body </span><span class="s2">+= </span><span class="s1">b</span>
+        <span class="s1">contains</span><span class="s2">.</span><span class="s1">update</span><span class="s2">(</span><span class="s1">c</span><span class="s2">)</span>
+    <span class="s1">body </span><span class="s2">+= </span><span class="s3">&quot; &quot;</span><span class="s2">*</span><span class="s5">8 </span><span class="s2">+ </span><span class="s3">&quot;return ret&quot;</span>
+    <span class="s4"># now compile and return it along with its body in __doc__  and patterns</span>
+    <span class="s1">ldict </span><span class="s2">= {}</span>
+    <span class="s1">exec</span><span class="s2">(</span><span class="s1">body</span><span class="s2">, </span><span class="s1">globals</span><span class="s2">(), </span><span class="s1">ldict</span><span class="s2">)</span>
+    <span class="s1">ldict</span><span class="s2">[</span><span class="s1">name</span><span class="s2">].</span><span class="s1">__doc__ </span><span class="s2">= </span><span class="s1">body</span>
+    <span class="s0">return </span><span class="s1">ldict</span><span class="s2">[</span><span class="s1">name</span><span class="s2">], </span><span class="s1">contains</span><span class="s2">, </span><span class="s1">avoids</span>
+
+
+<span class="s2">@</span><span class="s1">needs_svml</span>
+<span class="s0">class </span><span class="s1">TestSVMLGeneration</span><span class="s2">(</span><span class="s1">TestCase</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; Tests all SVML-generating functions produce desired calls &quot;&quot;&quot;</span>
+
+    <span class="s4"># env mutating, must not run in parallel</span>
+    <span class="s1">_numba_parallel_test_ </span><span class="s2">= </span><span class="s0">False</span>
+    <span class="s4"># RE for a generic symbol reference and for each particular SVML function</span>
+    <span class="s1">asm_filter </span><span class="s2">= </span><span class="s1">re</span><span class="s2">.</span><span class="s1">compile</span><span class="s2">(</span><span class="s3">'|'</span><span class="s2">.</span><span class="s1">join</span><span class="s2">([</span><span class="s3">r'\$[a-z_]\w+,'</span><span class="s2">]+</span><span class="s1">list</span><span class="s2">(</span><span class="s1">svml_funcs</span><span class="s2">)))</span>
+
+    <span class="s2">@</span><span class="s1">classmethod</span>
+    <span class="s0">def </span><span class="s1">mp_runner</span><span class="s2">(</span><span class="s1">cls</span><span class="s2">, </span><span class="s1">testname</span><span class="s2">, </span><span class="s1">outqueue</span><span class="s2">):</span>
+        <span class="s1">method </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">cls</span><span class="s2">, </span><span class="s1">testname</span><span class="s2">)</span>
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s1">ok</span><span class="s2">, </span><span class="s1">msg </span><span class="s2">= </span><span class="s1">method</span><span class="s2">()</span>
+        <span class="s0">except </span><span class="s1">Exception</span><span class="s2">:</span>
+            <span class="s1">msg </span><span class="s2">= </span><span class="s1">traceback</span><span class="s2">.</span><span class="s1">format_exc</span><span class="s2">()</span>
+            <span class="s1">ok </span><span class="s2">= </span><span class="s0">False</span>
+        <span class="s1">outqueue</span><span class="s2">.</span><span class="s1">put</span><span class="s2">({</span><span class="s3">'status'</span><span class="s2">: </span><span class="s1">ok</span><span class="s2">, </span><span class="s3">'msg'</span><span class="s2">: </span><span class="s1">msg</span><span class="s2">})</span>
+
+    <span class="s2">@</span><span class="s1">classmethod</span>
+    <span class="s0">def </span><span class="s1">_inject_test</span><span class="s2">(</span><span class="s1">cls</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">mode</span><span class="s2">, </span><span class="s1">vlen</span><span class="s2">, </span><span class="s1">flags</span><span class="s2">):</span>
+        <span class="s4"># unsupported combinations</span>
+        <span class="s0">if </span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">startswith</span><span class="s2">(</span><span class="s3">'complex'</span><span class="s2">) </span><span class="s0">and </span><span class="s1">mode </span><span class="s2">!= </span><span class="s3">'numpy'</span><span class="s2">:</span>
+            <span class="s0">return</span>
+        <span class="s4"># TODO: address skipped tests below</span>
+        <span class="s1">skipped </span><span class="s2">= </span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">startswith</span><span class="s2">(</span><span class="s3">'int'</span><span class="s2">) </span><span class="s0">and </span><span class="s1">vlen </span><span class="s2">== </span><span class="s5">2</span>
+        <span class="s1">sig </span><span class="s2">= (</span><span class="s1">numba</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">,)</span>
+        <span class="s4"># unit test body template</span>
+        <span class="s2">@</span><span class="s1">staticmethod</span>
+        <span class="s0">def </span><span class="s1">run_template</span><span class="s2">():</span>
+            <span class="s1">fn</span><span class="s2">, </span><span class="s1">contains</span><span class="s2">, </span><span class="s1">avoids </span><span class="s2">= </span><span class="s1">combo_svml_usecase</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">mode</span><span class="s2">, </span><span class="s1">vlen</span><span class="s2">,</span>
+                                                      <span class="s1">flags</span><span class="s2">[</span><span class="s3">'fastmath'</span><span class="s2">],</span>
+                                                      <span class="s1">flags</span><span class="s2">[</span><span class="s3">'name'</span><span class="s2">])</span>
+            <span class="s4"># look for specific patterns in the asm for a given target</span>
+            <span class="s0">with </span><span class="s1">override_env_config</span><span class="s2">(</span><span class="s3">'NUMBA_CPU_NAME'</span><span class="s2">, </span><span class="s1">vlen2cpu</span><span class="s2">[</span><span class="s1">vlen</span><span class="s2">]), </span><span class="s1">\</span>
+                 <span class="s1">override_env_config</span><span class="s2">(</span><span class="s3">'NUMBA_CPU_FEATURES'</span><span class="s2">, </span><span class="s1">vlen2cpu_features</span><span class="s2">[</span><span class="s1">vlen</span><span class="s2">]):</span>
+                <span class="s4"># recompile for overridden CPU</span>
+                <span class="s0">try</span><span class="s2">:</span>
+                    <span class="s1">jitted_fn </span><span class="s2">= </span><span class="s1">njit</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">, </span><span class="s1">fastmath</span><span class="s2">=</span><span class="s1">flags</span><span class="s2">[</span><span class="s3">'fastmath'</span><span class="s2">],</span>
+                                     <span class="s1">error_model</span><span class="s2">=</span><span class="s1">flags</span><span class="s2">[</span><span class="s3">'error_model'</span><span class="s2">],)(</span><span class="s1">fn</span><span class="s2">)</span>
+                <span class="s0">except</span><span class="s2">:</span>
+                    <span class="s0">raise </span><span class="s1">Exception</span><span class="s2">(</span><span class="s3">&quot;raised while compiling &quot;</span><span class="s2">+</span><span class="s1">fn</span><span class="s2">.</span><span class="s1">__doc__</span><span class="s2">)</span>
+            <span class="s1">asm </span><span class="s2">= </span><span class="s1">jitted_fn</span><span class="s2">.</span><span class="s1">inspect_asm</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">)</span>
+            <span class="s1">missed </span><span class="s2">= [</span><span class="s1">pattern </span><span class="s0">for </span><span class="s1">pattern </span><span class="s0">in </span><span class="s1">contains </span><span class="s0">if not </span><span class="s1">pattern </span><span class="s0">in </span><span class="s1">asm</span><span class="s2">]</span>
+            <span class="s1">found </span><span class="s2">= [</span><span class="s1">pattern </span><span class="s0">for </span><span class="s1">pattern </span><span class="s0">in </span><span class="s1">avoids </span><span class="s0">if </span><span class="s1">pattern </span><span class="s0">in </span><span class="s1">asm</span><span class="s2">]</span>
+            <span class="s1">ok </span><span class="s2">= </span><span class="s0">not </span><span class="s1">missed </span><span class="s0">and not </span><span class="s1">found</span>
+            <span class="s1">detail </span><span class="s2">= </span><span class="s3">'</span><span class="s0">\n</span><span class="s3">'</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span>
+                <span class="s2">[</span><span class="s1">line </span><span class="s0">for </span><span class="s1">line </span><span class="s0">in </span><span class="s1">asm</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s3">'</span><span class="s0">\n</span><span class="s3">'</span><span class="s2">)</span>
+                 <span class="s0">if </span><span class="s1">cls</span><span class="s2">.</span><span class="s1">asm_filter</span><span class="s2">.</span><span class="s1">search</span><span class="s2">(</span><span class="s1">line</span><span class="s2">) </span><span class="s0">and not </span><span class="s3">'&quot;' </span><span class="s0">in </span><span class="s1">line</span><span class="s2">])</span>
+            <span class="s1">msg </span><span class="s2">= (</span>
+                <span class="s3">f&quot;While expecting </span><span class="s0">{</span><span class="s1">missed</span><span class="s0">} </span><span class="s3">and not </span><span class="s0">{</span><span class="s1">found</span><span class="s0">}</span><span class="s3">,</span><span class="s0">\n</span><span class="s3">&quot;</span>
+                <span class="s3">f&quot;it contains:</span><span class="s0">\n{</span><span class="s1">detail</span><span class="s0">}\n</span><span class="s3">&quot;</span>
+                <span class="s3">f&quot;when compiling </span><span class="s0">{</span><span class="s1">fn</span><span class="s2">.</span><span class="s1">__doc__</span><span class="s0">}</span><span class="s3">&quot;</span>
+            <span class="s2">)</span>
+            <span class="s0">return </span><span class="s1">ok</span><span class="s2">, </span><span class="s1">msg</span>
+        <span class="s4"># inject it into the class</span>
+        <span class="s1">postfix </span><span class="s2">= </span><span class="s1">usecase_name</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">mode</span><span class="s2">, </span><span class="s1">vlen</span><span class="s2">, </span><span class="s1">flags</span><span class="s2">[</span><span class="s3">'name'</span><span class="s2">])</span>
+        <span class="s1">testname </span><span class="s2">= </span><span class="s3">f&quot;run_</span><span class="s0">{</span><span class="s1">postfix</span><span class="s0">}</span><span class="s3">&quot;</span>
+        <span class="s1">setattr</span><span class="s2">(</span><span class="s1">cls</span><span class="s2">, </span><span class="s1">testname</span><span class="s2">, </span><span class="s1">run_template</span><span class="s2">)</span>
+
+        <span class="s2">@</span><span class="s1">unittest</span><span class="s2">.</span><span class="s1">skipUnless</span><span class="s2">(</span><span class="s0">not </span><span class="s1">skipped</span><span class="s2">, </span><span class="s3">&quot;Not implemented&quot;</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">test_runner</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+            <span class="s1">ctx </span><span class="s2">= </span><span class="s1">mp</span><span class="s2">.</span><span class="s1">get_context</span><span class="s2">(</span><span class="s3">&quot;spawn&quot;</span><span class="s2">)</span>
+            <span class="s1">q </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">Queue</span><span class="s2">()</span>
+            <span class="s1">p </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">Process</span><span class="s2">(</span><span class="s1">target</span><span class="s2">=</span><span class="s1">type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">).</span><span class="s1">mp_runner</span><span class="s2">, </span><span class="s1">args</span><span class="s2">=[</span><span class="s1">testname</span><span class="s2">, </span><span class="s1">q</span><span class="s2">])</span>
+            <span class="s1">p</span><span class="s2">.</span><span class="s1">start</span><span class="s2">()</span>
+            <span class="s4"># timeout to avoid hanging and long enough to avoid bailing too</span>
+            <span class="s4"># early. Note: this was timeout=10 but that seemed to caused</span>
+            <span class="s4"># intermittent failures on heavily loaded machines.</span>
+            <span class="s1">term_or_timeout </span><span class="s2">= </span><span class="s1">p</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">timeout</span><span class="s2">=</span><span class="s5">30</span><span class="s2">)</span>
+            <span class="s1">exitcode </span><span class="s2">= </span><span class="s1">p</span><span class="s2">.</span><span class="s1">exitcode</span>
+            <span class="s0">if </span><span class="s1">term_or_timeout </span><span class="s0">is None</span><span class="s2">:</span>
+                <span class="s0">if </span><span class="s1">exitcode </span><span class="s0">is None</span><span class="s2">:</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">fail</span><span class="s2">(</span><span class="s3">&quot;Process timed out.&quot;</span><span class="s2">)</span>
+                <span class="s0">elif </span><span class="s1">exitcode </span><span class="s2">&lt; </span><span class="s5">0</span><span class="s2">:</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">fail</span><span class="s2">(</span><span class="s3">f&quot;Process terminated with signal </span><span class="s0">{</span><span class="s2">-</span><span class="s1">exitcode</span><span class="s0">}</span><span class="s3">.&quot;</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">exitcode</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">msg</span><span class="s2">=</span><span class="s3">&quot;process ended unexpectedly&quot;</span><span class="s2">)</span>
+            <span class="s1">out </span><span class="s2">= </span><span class="s1">q</span><span class="s2">.</span><span class="s1">get</span><span class="s2">()</span>
+            <span class="s1">status </span><span class="s2">= </span><span class="s1">out</span><span class="s2">[</span><span class="s3">'status'</span><span class="s2">]</span>
+            <span class="s1">msg </span><span class="s2">= </span><span class="s1">out</span><span class="s2">[</span><span class="s3">'msg'</span><span class="s2">]</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">status</span><span class="s2">, </span><span class="s1">msg</span><span class="s2">=</span><span class="s1">msg</span><span class="s2">)</span>
+
+        <span class="s1">setattr</span><span class="s2">(</span><span class="s1">cls</span><span class="s2">, </span><span class="s3">f&quot;test_</span><span class="s0">{</span><span class="s1">postfix</span><span class="s0">}</span><span class="s3">&quot;</span><span class="s2">, </span><span class="s1">test_runner</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">classmethod</span>
+    <span class="s0">def </span><span class="s1">autogenerate</span><span class="s2">(</span><span class="s1">cls</span><span class="s2">):</span>
+        <span class="s1">flag_list </span><span class="s2">= [{</span><span class="s3">'fastmath'</span><span class="s2">:</span><span class="s0">False</span><span class="s2">, </span><span class="s3">'error_model'</span><span class="s2">:</span><span class="s3">'numpy'</span><span class="s2">,</span>
+                     <span class="s3">'name'</span><span class="s2">:</span><span class="s3">'usecase'</span><span class="s2">},</span>
+                     <span class="s2">{</span><span class="s3">'fastmath'</span><span class="s2">:</span><span class="s0">True</span><span class="s2">, </span><span class="s3">'error_model'</span><span class="s2">:</span><span class="s3">'numpy'</span><span class="s2">,</span>
+                     <span class="s3">'name'</span><span class="s2">:</span><span class="s3">'fastmath_usecase'</span><span class="s2">},]</span>
+        <span class="s4"># main loop covering all the modes and use-cases</span>
+        <span class="s0">for </span><span class="s1">dtype </span><span class="s0">in </span><span class="s2">(</span><span class="s3">'complex64'</span><span class="s2">, </span><span class="s3">'float64'</span><span class="s2">, </span><span class="s3">'float32'</span><span class="s2">, </span><span class="s3">'int32'</span><span class="s2">, ):</span>
+            <span class="s0">for </span><span class="s1">vlen </span><span class="s0">in </span><span class="s1">vlen2cpu</span><span class="s2">:</span>
+                <span class="s0">for </span><span class="s1">flags </span><span class="s0">in </span><span class="s1">flag_list</span><span class="s2">:</span>
+                    <span class="s0">for </span><span class="s1">mode </span><span class="s0">in </span><span class="s3">&quot;scalar&quot;</span><span class="s2">, </span><span class="s3">&quot;range&quot;</span><span class="s2">, </span><span class="s3">&quot;prange&quot;</span><span class="s2">, </span><span class="s3">&quot;numpy&quot;</span><span class="s2">:</span>
+                        <span class="s1">cls</span><span class="s2">.</span><span class="s1">_inject_test</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">mode</span><span class="s2">, </span><span class="s1">vlen</span><span class="s2">, </span><span class="s1">dict</span><span class="s2">(</span><span class="s1">flags</span><span class="s2">))</span>
+        <span class="s4"># mark important</span>
+        <span class="s0">for </span><span class="s1">n </span><span class="s0">in </span><span class="s2">( </span><span class="s3">&quot;test_int32_range4_usecase&quot;</span><span class="s2">,  </span><span class="s4"># issue #3016</span>
+                    <span class="s2">):</span>
+            <span class="s1">setattr</span><span class="s2">(</span><span class="s1">cls</span><span class="s2">, </span><span class="s1">n</span><span class="s2">, </span><span class="s1">tag</span><span class="s2">(</span><span class="s3">&quot;important&quot;</span><span class="s2">)(</span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">cls</span><span class="s2">, </span><span class="s1">n</span><span class="s2">)))</span>
+
+
+<span class="s1">TestSVMLGeneration</span><span class="s2">.</span><span class="s1">autogenerate</span><span class="s2">()</span>
+
+
+<span class="s0">def </span><span class="s1">math_sin_scalar</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+    <span class="s0">return </span><span class="s1">math</span><span class="s2">.</span><span class="s1">sin</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">math_sin_loop</span><span class="s2">(</span><span class="s1">n</span><span class="s2">):</span>
+    <span class="s1">ret </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">empty</span><span class="s2">(</span><span class="s1">n</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+    <span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">n</span><span class="s2">):</span>
+        <span class="s1">ret</span><span class="s2">[</span><span class="s1">x</span><span class="s2">] = </span><span class="s1">math</span><span class="s2">.</span><span class="s1">sin</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">(</span><span class="s1">x</span><span class="s2">))</span>
+    <span class="s0">return </span><span class="s1">ret</span>
+
+
+<span class="s2">@</span><span class="s1">needs_svml</span>
+<span class="s0">class </span><span class="s1">TestSVML</span><span class="s2">(</span><span class="s1">TestCase</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; Tests SVML behaves as expected &quot;&quot;&quot;</span>
+
+    <span class="s4"># env mutating, must not run in parallel</span>
+    <span class="s1">_numba_parallel_test_ </span><span class="s2">= </span><span class="s0">False</span>
+
+    <span class="s0">def </span><span class="s1">compile</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s0">assert not </span><span class="s1">kwargs</span>
+        <span class="s1">sig </span><span class="s2">= </span><span class="s1">tuple</span><span class="s2">([</span><span class="s1">numba</span><span class="s2">.</span><span class="s1">typeof</span><span class="s2">(</span><span class="s1">x</span><span class="s2">) </span><span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s1">args</span><span class="s2">])</span>
+
+        <span class="s1">std </span><span class="s2">= </span><span class="s1">njit</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">)(</span><span class="s1">func</span><span class="s2">)</span>
+        <span class="s1">fast </span><span class="s2">= </span><span class="s1">njit</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">, </span><span class="s1">fastmath</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">func</span><span class="s2">)</span>
+
+        <span class="s0">return </span><span class="s1">std</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">[</span><span class="s1">sig</span><span class="s2">], </span><span class="s1">fast</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">[</span><span class="s1">sig</span><span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">copy_args</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">):</span>
+        <span class="s0">if not </span><span class="s1">args</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">tuple</span><span class="s2">()</span>
+        <span class="s1">new_args </span><span class="s2">= []</span>
+        <span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s1">args</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">ndarray</span><span class="s2">):</span>
+                <span class="s1">new_args</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">x</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s3">'k'</span><span class="s2">))</span>
+            <span class="s0">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">number</span><span class="s2">):</span>
+                <span class="s1">new_args</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">x</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">())</span>
+            <span class="s0">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">numbers</span><span class="s2">.</span><span class="s1">Number</span><span class="s2">):</span>
+                <span class="s1">new_args</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s3">'Unsupported argument type encountered'</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">new_args</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">check_result</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">pyfunc</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s1">jitstd</span><span class="s2">, </span><span class="s1">jitfast </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">compile</span><span class="s2">(</span><span class="s1">pyfunc</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">)</span>
+
+        <span class="s4"># python result</span>
+        <span class="s1">py_expected </span><span class="s2">= </span><span class="s1">pyfunc</span><span class="s2">(*</span><span class="s1">self</span><span class="s2">.</span><span class="s1">copy_args</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">))</span>
+
+        <span class="s4"># jit result</span>
+        <span class="s1">jitstd_result </span><span class="s2">= </span><span class="s1">jitstd</span><span class="s2">.</span><span class="s1">entry_point</span><span class="s2">(*</span><span class="s1">self</span><span class="s2">.</span><span class="s1">copy_args</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">))</span>
+
+        <span class="s4"># fastmath result</span>
+        <span class="s1">jitfast_result </span><span class="s2">= </span><span class="s1">jitfast</span><span class="s2">.</span><span class="s1">entry_point</span><span class="s2">(*</span><span class="s1">self</span><span class="s2">.</span><span class="s1">copy_args</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">))</span>
+
+        <span class="s4"># assert numerical equality</span>
+        <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_almost_equal</span><span class="s2">(</span><span class="s1">jitstd_result</span><span class="s2">, </span><span class="s1">py_expected</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">)</span>
+        <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_almost_equal</span><span class="s2">(</span><span class="s1">jitfast_result</span><span class="s2">, </span><span class="s1">py_expected</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">check_asm</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">pyfunc</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s1">std_pattern </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s3">'std_pattern'</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+        <span class="s1">fast_pattern </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s3">'fast_pattern'</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+
+        <span class="s4"># look for specific patterns in the asm for a given target</span>
+        <span class="s4"># recompile for overridden CPU</span>
+        <span class="s1">jitstd</span><span class="s2">, </span><span class="s1">jitfast </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">compile</span><span class="s2">(</span><span class="s1">pyfunc</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">std_pattern</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">check_svml_presence</span><span class="s2">(</span><span class="s1">jitstd</span><span class="s2">, </span><span class="s1">std_pattern</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">fast_pattern</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">check_svml_presence</span><span class="s2">(</span><span class="s1">jitfast</span><span class="s2">, </span><span class="s1">fast_pattern</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">check</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">pyfunc</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, </span><span class="s1">what</span><span class="s2">=</span><span class="s3">&quot;both&quot;</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s0">assert </span><span class="s1">what </span><span class="s0">in </span><span class="s2">(</span><span class="s3">&quot;both&quot;</span><span class="s2">, </span><span class="s3">&quot;result&quot;</span><span class="s2">, </span><span class="s3">&quot;asm&quot;</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">what </span><span class="s2">== </span><span class="s3">&quot;both&quot; </span><span class="s0">or </span><span class="s1">what </span><span class="s2">== </span><span class="s3">&quot;result&quot;</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">check_result</span><span class="s2">(</span><span class="s1">pyfunc</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">what </span><span class="s2">== </span><span class="s3">&quot;both&quot; </span><span class="s0">or </span><span class="s1">what </span><span class="s2">== </span><span class="s3">&quot;asm&quot;</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">check_asm</span><span class="s2">(</span><span class="s1">pyfunc</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">check_svml_presence</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">pattern</span><span class="s2">):</span>
+        <span class="s1">asm </span><span class="s2">= </span><span class="s1">func</span><span class="s2">.</span><span class="s1">library</span><span class="s2">.</span><span class="s1">get_asm_str</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s1">pattern</span><span class="s2">, </span><span class="s1">asm</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">TestCase</span><span class="s2">.</span><span class="s1">run_test_in_subprocess</span><span class="s2">(</span><span class="s1">envvars</span><span class="s2">=</span><span class="s1">_skylake_axv512_envvars</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">test_scalar_context_asm</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4"># SVML will not be used.</span>
+        <span class="s1">pat </span><span class="s2">= </span><span class="s3">'$_sin' </span><span class="s0">if </span><span class="s1">config</span><span class="s2">.</span><span class="s1">IS_OSX </span><span class="s0">else </span><span class="s3">'$sin'</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check</span><span class="s2">(</span><span class="s1">math_sin_scalar</span><span class="s2">, </span><span class="s5">7.</span><span class="s2">, </span><span class="s1">what</span><span class="s2">=</span><span class="s3">&quot;asm&quot;</span><span class="s2">, </span><span class="s1">std_pattern</span><span class="s2">=</span><span class="s1">pat</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check</span><span class="s2">(</span><span class="s1">math_sin_scalar</span><span class="s2">, </span><span class="s5">7.</span><span class="s2">, </span><span class="s1">what</span><span class="s2">=</span><span class="s3">&quot;asm&quot;</span><span class="s2">, </span><span class="s1">fast_pattern</span><span class="s2">=</span><span class="s1">pat</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_scalar_context_result</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4"># checks result for test_scalar_context_asm</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check</span><span class="s2">(</span><span class="s1">math_sin_scalar</span><span class="s2">, </span><span class="s5">7.</span><span class="s2">, </span><span class="s1">what</span><span class="s2">=</span><span class="s3">&quot;result&quot;</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">TestCase</span><span class="s2">.</span><span class="s1">run_test_in_subprocess</span><span class="s2">(</span><span class="s1">envvars</span><span class="s2">=</span><span class="s1">_skylake_axv512_envvars</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">test_svml_asm</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4"># loops both with and without fastmath should use SVML.</span>
+        <span class="s4"># The high accuracy routines are dropped if `fastmath` is set</span>
+        <span class="s1">std </span><span class="s2">= </span><span class="s3">&quot;__svml_sin8_ha,&quot;</span>
+        <span class="s1">fast </span><span class="s2">= </span><span class="s3">&quot;__svml_sin8,&quot;  </span><span class="s4"># No `_ha`!</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check</span><span class="s2">(</span><span class="s1">math_sin_loop</span><span class="s2">, </span><span class="s5">10</span><span class="s2">, </span><span class="s1">what</span><span class="s2">=</span><span class="s3">&quot;asm&quot;</span><span class="s2">, </span><span class="s1">std_pattern</span><span class="s2">=</span><span class="s1">std</span><span class="s2">,</span>
+                   <span class="s1">fast_pattern</span><span class="s2">=</span><span class="s1">fast</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_svml_result</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4"># checks result for test_svml_asm</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check</span><span class="s2">(</span><span class="s1">math_sin_loop</span><span class="s2">, </span><span class="s5">10</span><span class="s2">, </span><span class="s1">what</span><span class="s2">=</span><span class="s3">&quot;result&quot;</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">TestCase</span><span class="s2">.</span><span class="s1">run_test_in_subprocess</span><span class="s2">(</span><span class="s1">envvars</span><span class="s2">={</span><span class="s3">'NUMBA_DISABLE_INTEL_SVML'</span><span class="s2">: </span><span class="s3">&quot;1&quot;</span><span class="s2">,</span>
+                                              <span class="s2">**</span><span class="s1">_skylake_axv512_envvars</span><span class="s2">})</span>
+    <span class="s0">def </span><span class="s1">test_svml_disabled</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+
+        <span class="s0">def </span><span class="s1">math_sin_loop</span><span class="s2">(</span><span class="s1">n</span><span class="s2">):</span>
+            <span class="s1">ret </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">empty</span><span class="s2">(</span><span class="s1">n</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+            <span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">n</span><span class="s2">):</span>
+                <span class="s1">ret</span><span class="s2">[</span><span class="s1">x</span><span class="s2">] = </span><span class="s1">math</span><span class="s2">.</span><span class="s1">sin</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">(</span><span class="s1">x</span><span class="s2">))</span>
+            <span class="s0">return </span><span class="s1">ret</span>
+
+        <span class="s1">sig </span><span class="s2">= (</span><span class="s1">numba</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">,)</span>
+        <span class="s1">std </span><span class="s2">= </span><span class="s1">njit</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">)(</span><span class="s1">math_sin_loop</span><span class="s2">)</span>
+        <span class="s1">fast </span><span class="s2">= </span><span class="s1">njit</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">, </span><span class="s1">fastmath</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">math_sin_loop</span><span class="s2">)</span>
+        <span class="s1">fns </span><span class="s2">= </span><span class="s1">std</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">[</span><span class="s1">sig</span><span class="s2">], </span><span class="s1">fast</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">[</span><span class="s1">sig</span><span class="s2">]</span>
+
+        <span class="s4"># assert no SVML call is present in the asm</span>
+        <span class="s0">for </span><span class="s1">fn </span><span class="s0">in </span><span class="s1">fns</span><span class="s2">:</span>
+            <span class="s1">asm </span><span class="s2">= </span><span class="s1">fn</span><span class="s2">.</span><span class="s1">library</span><span class="s2">.</span><span class="s1">get_asm_str</span><span class="s2">()</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertNotIn</span><span class="s2">(</span><span class="s3">'__svml_sin'</span><span class="s2">, </span><span class="s1">asm</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_svml_working_in_non_isolated_context</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s2">@</span><span class="s1">njit</span><span class="s2">(</span><span class="s1">fastmath</span><span class="s2">={</span><span class="s3">'fast'</span><span class="s2">}, </span><span class="s1">error_model</span><span class="s2">=</span><span class="s3">&quot;numpy&quot;</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">impl</span><span class="s2">(</span><span class="s1">n</span><span class="s2">):</span>
+            <span class="s1">x   </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">empty</span><span class="s2">(</span><span class="s1">n </span><span class="s2">* </span><span class="s5">8</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+            <span class="s1">ret </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">empty_like</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+            <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">ret</span><span class="s2">.</span><span class="s1">size</span><span class="s2">):</span>
+                <span class="s1">ret</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] += </span><span class="s1">math</span><span class="s2">.</span><span class="s1">cosh</span><span class="s2">(</span><span class="s1">x</span><span class="s2">[</span><span class="s1">i</span><span class="s2">])</span>
+            <span class="s0">return </span><span class="s1">ret</span>
+        <span class="s1">impl</span><span class="s2">(</span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s3">'intel_svmlcc' </span><span class="s0">in </span><span class="s1">impl</span><span class="s2">.</span><span class="s1">inspect_llvm</span><span class="s2">(</span><span class="s1">impl</span><span class="s2">.</span><span class="s1">signatures</span><span class="s2">[</span><span class="s5">0</span><span class="s2">]))</span>
+
+
+<span class="s0">if </span><span class="s1">__name__ </span><span class="s2">== </span><span class="s3">'__main__'</span><span class="s2">:</span>
+    <span class="s1">unittest</span><span class="s2">.</span><span class="s1">main</span><span class="s2">()</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,508 @@
+<html>
+<head>
+<title>event.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+event.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+The ``numba.core.event`` module provides a simple event system for applications 
+to register callbacks to listen to specific compiler events. 
+ 
+The following events are built in: 
+ 
+- ``&quot;numba:compile&quot;`` is broadcast when a dispatcher is compiling. Events of 
+  this kind have ``data`` defined to be a ``dict`` with the following 
+  key-values: 
+ 
+  - ``&quot;dispatcher&quot;``: the dispatcher object that is compiling. 
+  - ``&quot;args&quot;``: the argument types. 
+  - ``&quot;return_type&quot;``: the return type. 
+ 
+- ``&quot;numba:compiler_lock&quot;`` is broadcast when the internal compiler-lock is 
+  acquired. This is mostly used internally to measure time spent with the lock 
+  acquired. 
+ 
+- ``&quot;numba:llvm_lock&quot;`` is broadcast when the internal LLVM-lock is acquired. 
+  This is used internally to measure time spent with the lock acquired. 
+ 
+- ``&quot;numba:run_pass&quot;`` is broadcast when a compiler pass is running. 
+ 
+    - ``&quot;name&quot;``: pass name. 
+    - ``&quot;qualname&quot;``: qualified name of the function being compiled. 
+    - ``&quot;module&quot;``: module name of the function being compiled. 
+    - ``&quot;flags&quot;``: compilation flags. 
+    - ``&quot;args&quot;``: argument types. 
+    - ``&quot;return_type&quot;`` return type. 
+ 
+Applications can register callbacks that are listening for specific events using 
+``register(kind: str, listener: Listener)``, where ``listener`` is an instance 
+of ``Listener`` that defines custom actions on occurrence of the specific event. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">json</span>
+<span class="s2">import </span><span class="s1">atexit</span>
+<span class="s2">import </span><span class="s1">abc</span>
+<span class="s2">import </span><span class="s1">enum</span>
+<span class="s2">import </span><span class="s1">time</span>
+<span class="s2">import </span><span class="s1">threading</span>
+<span class="s2">from </span><span class="s1">timeit </span><span class="s2">import </span><span class="s1">default_timer </span><span class="s2">as </span><span class="s1">timer</span>
+<span class="s2">from </span><span class="s1">contextlib </span><span class="s2">import </span><span class="s1">contextmanager</span><span class="s3">, </span><span class="s1">ExitStack</span>
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">defaultdict</span>
+
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">config</span>
+
+
+<span class="s2">class </span><span class="s1">EventStatus</span><span class="s3">(</span><span class="s1">enum</span><span class="s3">.</span><span class="s1">Enum</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Status of an event. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">START </span><span class="s3">= </span><span class="s1">enum</span><span class="s3">.</span><span class="s1">auto</span><span class="s3">()</span>
+    <span class="s1">END </span><span class="s3">= </span><span class="s1">enum</span><span class="s3">.</span><span class="s1">auto</span><span class="s3">()</span>
+
+
+<span class="s4"># Builtin event kinds.</span>
+<span class="s1">_builtin_kinds </span><span class="s3">= </span><span class="s1">frozenset</span><span class="s3">([</span>
+    <span class="s5">&quot;numba:compiler_lock&quot;</span><span class="s3">,</span>
+    <span class="s5">&quot;numba:compile&quot;</span><span class="s3">,</span>
+    <span class="s5">&quot;numba:llvm_lock&quot;</span><span class="s3">,</span>
+    <span class="s5">&quot;numba:run_pass&quot;</span><span class="s3">,</span>
+<span class="s3">])</span>
+
+
+<span class="s2">def </span><span class="s1">_guard_kind</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Guard to ensure that an event kind is valid. 
+ 
+    All event kinds with a &quot;numba:&quot; prefix must be defined in the pre-defined 
+    ``numba.core.event._builtin_kinds``. 
+    Custom event kinds are allowed by not using the above prefix. 
+ 
+    Parameters 
+    ---------- 
+    kind : str 
+ 
+    Return 
+    ------ 
+    res : str 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">kind</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s5">&quot;numba:&quot;</span><span class="s3">) </span><span class="s2">and </span><span class="s1">kind </span><span class="s2">not in </span><span class="s1">_builtin_kinds</span><span class="s3">:</span>
+        <span class="s1">msg </span><span class="s3">= (</span><span class="s5">f&quot;</span><span class="s2">{</span><span class="s1">kind</span><span class="s2">} </span><span class="s5">is not a valid event kind, &quot;</span>
+               <span class="s5">&quot;it starts with the reserved prefix 'numba:'&quot;</span><span class="s3">)</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">kind</span>
+
+
+<span class="s2">class </span><span class="s1">Event</span><span class="s3">:</span>
+    <span class="s0">&quot;&quot;&quot;An event. 
+ 
+    Parameters 
+    ---------- 
+    kind : str 
+    status : EventStatus 
+    data : any; optional 
+        Additional data for the event. 
+    exc_details : 3-tuple; optional 
+        Same 3-tuple for ``__exit__``. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">kind</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">data</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">exc_details</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_kind </span><span class="s3">= </span><span class="s1">_guard_kind</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_status </span><span class="s3">= </span><span class="s1">status</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_data </span><span class="s3">= </span><span class="s1">data</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_exc_details </span><span class="s3">= (</span><span class="s2">None</span>
+                             <span class="s2">if </span><span class="s1">exc_details </span><span class="s2">is None or </span><span class="s1">exc_details</span><span class="s3">[</span><span class="s6">0</span><span class="s3">] </span><span class="s2">is None</span>
+                             <span class="s2">else </span><span class="s1">exc_details</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">kind</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Event kind 
+ 
+        Returns 
+        ------- 
+        res : str 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_kind</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">status</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Event status 
+ 
+        Returns 
+        ------- 
+        res : EventStatus 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_status</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">data</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Event data 
+ 
+        Returns 
+        ------- 
+        res : object 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_data</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">is_start</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Is it a *START* event? 
+ 
+        Returns 
+        ------- 
+        res : bool 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_status </span><span class="s3">== </span><span class="s1">EventStatus</span><span class="s3">.</span><span class="s1">START</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">is_end</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Is it an *END* event? 
+ 
+        Returns 
+        ------- 
+        res : bool 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_status </span><span class="s3">== </span><span class="s1">EventStatus</span><span class="s3">.</span><span class="s1">END</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">is_failed</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Is the event carrying an exception? 
+ 
+        This is used for *END* event. This method will never return ``True`` 
+        in a *START* event. 
+ 
+        Returns 
+        ------- 
+        res : bool 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_exc_details </span><span class="s2">is None</span>
+
+    <span class="s2">def </span><span class="s1">__str__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">data </span><span class="s3">= (</span><span class="s5">f&quot;</span><span class="s2">{</span><span class="s1">type</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">data</span><span class="s3">).</span><span class="s1">__qualname__</span><span class="s2">}</span><span class="s5">&quot;</span>
+                <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">data </span><span class="s2">is not None else </span><span class="s5">&quot;None&quot;</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s5">f&quot;Event(</span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_kind</span><span class="s2">}</span><span class="s5">, </span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_status</span><span class="s2">}</span><span class="s5">, data: </span><span class="s2">{</span><span class="s1">data</span><span class="s2">}</span><span class="s5">)&quot;</span>
+
+    <span class="s1">__repr__ </span><span class="s3">= </span><span class="s1">__str__</span>
+
+
+<span class="s1">_registered </span><span class="s3">= </span><span class="s1">defaultdict</span><span class="s3">(</span><span class="s1">list</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">register</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">, </span><span class="s1">listener</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Register a listener for a given event kind. 
+ 
+    Parameters 
+    ---------- 
+    kind : str 
+    listener : Listener 
+    &quot;&quot;&quot;</span>
+    <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">listener</span><span class="s3">, </span><span class="s1">Listener</span><span class="s3">)</span>
+    <span class="s1">kind </span><span class="s3">= </span><span class="s1">_guard_kind</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">)</span>
+    <span class="s1">_registered</span><span class="s3">[</span><span class="s1">kind</span><span class="s3">].</span><span class="s1">append</span><span class="s3">(</span><span class="s1">listener</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">unregister</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">, </span><span class="s1">listener</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Unregister a listener for a given event kind. 
+ 
+    Parameters 
+    ---------- 
+    kind : str 
+    listener : Listener 
+    &quot;&quot;&quot;</span>
+    <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">listener</span><span class="s3">, </span><span class="s1">Listener</span><span class="s3">)</span>
+    <span class="s1">kind </span><span class="s3">= </span><span class="s1">_guard_kind</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">)</span>
+    <span class="s1">lst </span><span class="s3">= </span><span class="s1">_registered</span><span class="s3">[</span><span class="s1">kind</span><span class="s3">]</span>
+    <span class="s1">lst</span><span class="s3">.</span><span class="s1">remove</span><span class="s3">(</span><span class="s1">listener</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">broadcast</span><span class="s3">(</span><span class="s1">event</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Broadcast an event to all registered listeners. 
+ 
+    Parameters 
+    ---------- 
+    event : Event 
+    &quot;&quot;&quot;</span>
+    <span class="s2">for </span><span class="s1">listener </span><span class="s2">in </span><span class="s1">_registered</span><span class="s3">[</span><span class="s1">event</span><span class="s3">.</span><span class="s1">kind</span><span class="s3">]:</span>
+        <span class="s1">listener</span><span class="s3">.</span><span class="s1">notify</span><span class="s3">(</span><span class="s1">event</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">Listener</span><span class="s3">(</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">ABC</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Base class for all event listeners. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">@</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">on_start</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">event</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Called when there is a *START* event. 
+ 
+        Parameters 
+        ---------- 
+        event : Event 
+        &quot;&quot;&quot;</span>
+        <span class="s2">pass</span>
+
+    <span class="s3">@</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">on_end</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">event</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Called when there is a *END* event. 
+ 
+        Parameters 
+        ---------- 
+        event : Event 
+        &quot;&quot;&quot;</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">notify</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">event</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Notify this Listener with the given Event. 
+ 
+        Parameters 
+        ---------- 
+        event : Event 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">event</span><span class="s3">.</span><span class="s1">is_start</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">on_start</span><span class="s3">(</span><span class="s1">event</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">event</span><span class="s3">.</span><span class="s1">is_end</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">on_end</span><span class="s3">(</span><span class="s1">event</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">AssertionError</span><span class="s3">(</span><span class="s5">&quot;unreachable&quot;</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">TimingListener</span><span class="s3">(</span><span class="s1">Listener</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;A listener that measures the total time spent between *START* and 
+    *END* events during the time this listener is active. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_depth </span><span class="s3">= </span><span class="s6">0</span>
+
+    <span class="s2">def </span><span class="s1">on_start</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">event</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_depth </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_ts </span><span class="s3">= </span><span class="s1">timer</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_depth </span><span class="s3">+= </span><span class="s6">1</span>
+
+    <span class="s2">def </span><span class="s1">on_end</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">event</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_depth </span><span class="s3">-= </span><span class="s6">1</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_depth </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s1">last </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s5">&quot;_duration&quot;</span><span class="s3">, </span><span class="s6">0</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_duration </span><span class="s3">= (</span><span class="s1">timer</span><span class="s3">() - </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_ts</span><span class="s3">) + </span><span class="s1">last</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">done</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Returns a ``bool`` indicating whether a measurement has been made. 
+ 
+        When this returns ``False``, the matching event has never fired. 
+        If and only if this returns ``True``, ``.duration`` can be read without 
+        error. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s5">&quot;_duration&quot;</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">duration</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Returns the measured duration. 
+ 
+        This may raise ``AttributeError``. Users can use ``.done`` to check 
+        that a measurement has been made. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_duration</span>
+
+
+<span class="s2">class </span><span class="s1">RecordingListener</span><span class="s3">(</span><span class="s1">Listener</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;A listener that records all events and stores them in the ``.buffer`` 
+    attribute as a list of 2-tuple ``(float, Event)``, where the first element 
+    is the time the event occurred as returned by ``time.time()`` and the second 
+    element is the event. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">buffer </span><span class="s3">= []</span>
+
+    <span class="s2">def </span><span class="s1">on_start</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">event</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">buffer</span><span class="s3">.</span><span class="s1">append</span><span class="s3">((</span><span class="s1">time</span><span class="s3">.</span><span class="s1">time</span><span class="s3">(), </span><span class="s1">event</span><span class="s3">))</span>
+
+    <span class="s2">def </span><span class="s1">on_end</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">event</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">buffer</span><span class="s3">.</span><span class="s1">append</span><span class="s3">((</span><span class="s1">time</span><span class="s3">.</span><span class="s1">time</span><span class="s3">(), </span><span class="s1">event</span><span class="s3">))</span>
+
+
+<span class="s3">@</span><span class="s1">contextmanager</span>
+<span class="s2">def </span><span class="s1">install_listener</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">, </span><span class="s1">listener</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Install a listener for event &quot;kind&quot; temporarily within the duration of 
+    the context. 
+ 
+    Returns 
+    ------- 
+    res : Listener 
+        The *listener* provided. 
+ 
+    Examples 
+    -------- 
+ 
+    &gt;&gt;&gt; with install_listener(&quot;numba:compile&quot;, listener): 
+    &gt;&gt;&gt;     some_code()  # listener will be active here. 
+    &gt;&gt;&gt; other_code()     # listener will be unregistered by this point. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">register</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">, </span><span class="s1">listener</span><span class="s3">)</span>
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s2">yield </span><span class="s1">listener</span>
+    <span class="s2">finally</span><span class="s3">:</span>
+        <span class="s1">unregister</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">, </span><span class="s1">listener</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">contextmanager</span>
+<span class="s2">def </span><span class="s1">install_timer</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">, </span><span class="s1">callback</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Install a TimingListener temporarily to measure the duration of 
+    an event. 
+ 
+    If the context completes successfully, the *callback* function is executed. 
+    The *callback* function is expected to take a float argument for the 
+    duration in seconds. 
+ 
+    Returns 
+    ------- 
+    res : TimingListener 
+ 
+    Examples 
+    -------- 
+ 
+    This is equivalent to: 
+ 
+    &gt;&gt;&gt; with install_listener(kind, TimingListener()) as res: 
+    &gt;&gt;&gt;    ... 
+    &quot;&quot;&quot;</span>
+    <span class="s1">tl </span><span class="s3">= </span><span class="s1">TimingListener</span><span class="s3">()</span>
+    <span class="s2">with </span><span class="s1">install_listener</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">, </span><span class="s1">tl</span><span class="s3">):</span>
+        <span class="s2">yield </span><span class="s1">tl</span>
+
+    <span class="s2">if </span><span class="s1">tl</span><span class="s3">.</span><span class="s1">done</span><span class="s3">:</span>
+        <span class="s1">callback</span><span class="s3">(</span><span class="s1">tl</span><span class="s3">.</span><span class="s1">duration</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">contextmanager</span>
+<span class="s2">def </span><span class="s1">install_recorder</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Install a RecordingListener temporarily to record all events. 
+ 
+    Once the context is closed, users can use ``RecordingListener.buffer`` 
+    to access the recorded events. 
+ 
+    Returns 
+    ------- 
+    res : RecordingListener 
+ 
+    Examples 
+    -------- 
+ 
+    This is equivalent to: 
+ 
+    &gt;&gt;&gt; with install_listener(kind, RecordingListener()) as res: 
+    &gt;&gt;&gt;    ... 
+    &quot;&quot;&quot;</span>
+    <span class="s1">rl </span><span class="s3">= </span><span class="s1">RecordingListener</span><span class="s3">()</span>
+    <span class="s2">with </span><span class="s1">install_listener</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">, </span><span class="s1">rl</span><span class="s3">):</span>
+        <span class="s2">yield </span><span class="s1">rl</span>
+
+
+<span class="s2">def </span><span class="s1">start_event</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">, </span><span class="s1">data</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Trigger the start of an event of *kind* with *data*. 
+ 
+    Parameters 
+    ---------- 
+    kind : str 
+        Event kind. 
+    data : any; optional 
+        Extra event data. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">evt </span><span class="s3">= </span><span class="s1">Event</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">=</span><span class="s1">kind</span><span class="s3">, </span><span class="s1">status</span><span class="s3">=</span><span class="s1">EventStatus</span><span class="s3">.</span><span class="s1">START</span><span class="s3">, </span><span class="s1">data</span><span class="s3">=</span><span class="s1">data</span><span class="s3">)</span>
+    <span class="s1">broadcast</span><span class="s3">(</span><span class="s1">evt</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">end_event</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">, </span><span class="s1">data</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">exc_details</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Trigger the end of an event of *kind*, *exc_details*. 
+ 
+    Parameters 
+    ---------- 
+    kind : str 
+        Event kind. 
+    data : any; optional 
+        Extra event data. 
+    exc_details : 3-tuple; optional 
+        Same 3-tuple for ``__exit__``. Or, ``None`` if no error. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">evt </span><span class="s3">= </span><span class="s1">Event</span><span class="s3">(</span>
+        <span class="s1">kind</span><span class="s3">=</span><span class="s1">kind</span><span class="s3">, </span><span class="s1">status</span><span class="s3">=</span><span class="s1">EventStatus</span><span class="s3">.</span><span class="s1">END</span><span class="s3">, </span><span class="s1">data</span><span class="s3">=</span><span class="s1">data</span><span class="s3">, </span><span class="s1">exc_details</span><span class="s3">=</span><span class="s1">exc_details</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">broadcast</span><span class="s3">(</span><span class="s1">evt</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">contextmanager</span>
+<span class="s2">def </span><span class="s1">trigger_event</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">, </span><span class="s1">data</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;A context manager to trigger the start and end events of *kind* with 
+    *data*. The start event is triggered when entering the context. 
+    The end event is triggered when exiting the context. 
+ 
+    Parameters 
+    ---------- 
+    kind : str 
+        Event kind. 
+    data : any; optional 
+        Extra event data. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">with </span><span class="s1">ExitStack</span><span class="s3">() </span><span class="s2">as </span><span class="s1">scope</span><span class="s3">:</span>
+        <span class="s3">@</span><span class="s1">scope</span><span class="s3">.</span><span class="s1">push</span>
+        <span class="s2">def </span><span class="s1">on_exit</span><span class="s3">(*</span><span class="s1">exc_details</span><span class="s3">):</span>
+            <span class="s1">end_event</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">, </span><span class="s1">data</span><span class="s3">=</span><span class="s1">data</span><span class="s3">, </span><span class="s1">exc_details</span><span class="s3">=</span><span class="s1">exc_details</span><span class="s3">)</span>
+
+        <span class="s1">start_event</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">, </span><span class="s1">data</span><span class="s3">=</span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s2">yield</span>
+
+
+<span class="s2">def </span><span class="s1">_prepare_chrome_trace_data</span><span class="s3">(</span><span class="s1">listener</span><span class="s3">: </span><span class="s1">RecordingListener</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Prepare events in `listener` for serializing as chrome trace data. 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># The spec for the trace event format can be found at:</span>
+    <span class="s4"># https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/edit   # noqa</span>
+    <span class="s4"># This code only uses the JSON Array Format for simplicity.</span>
+    <span class="s1">pid </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">getpid</span><span class="s3">()</span>
+    <span class="s1">tid </span><span class="s3">= </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">get_native_id</span><span class="s3">()</span>
+    <span class="s1">evs </span><span class="s3">= []</span>
+    <span class="s2">for </span><span class="s1">ts</span><span class="s3">, </span><span class="s1">rec </span><span class="s2">in </span><span class="s1">listener</span><span class="s3">.</span><span class="s1">buffer</span><span class="s3">:</span>
+        <span class="s1">data </span><span class="s3">= </span><span class="s1">rec</span><span class="s3">.</span><span class="s1">data</span>
+        <span class="s1">cat </span><span class="s3">= </span><span class="s1">str</span><span class="s3">(</span><span class="s1">rec</span><span class="s3">.</span><span class="s1">kind</span><span class="s3">)</span>
+        <span class="s1">ts_scaled </span><span class="s3">= </span><span class="s1">ts </span><span class="s3">* </span><span class="s6">1_000_000   </span><span class="s4"># scale to microseconds</span>
+        <span class="s1">ph </span><span class="s3">= </span><span class="s5">'B' </span><span class="s2">if </span><span class="s1">rec</span><span class="s3">.</span><span class="s1">is_start </span><span class="s2">else </span><span class="s5">'E'</span>
+        <span class="s1">name </span><span class="s3">= </span><span class="s1">data</span><span class="s3">[</span><span class="s5">'name'</span><span class="s3">]</span>
+        <span class="s1">args </span><span class="s3">= </span><span class="s1">data</span>
+        <span class="s1">ev </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span>
+            <span class="s1">cat</span><span class="s3">=</span><span class="s1">cat</span><span class="s3">, </span><span class="s1">pid</span><span class="s3">=</span><span class="s1">pid</span><span class="s3">, </span><span class="s1">tid</span><span class="s3">=</span><span class="s1">tid</span><span class="s3">, </span><span class="s1">ts</span><span class="s3">=</span><span class="s1">ts_scaled</span><span class="s3">, </span><span class="s1">ph</span><span class="s3">=</span><span class="s1">ph</span><span class="s3">, </span><span class="s1">name</span><span class="s3">=</span><span class="s1">name</span><span class="s3">,</span>
+            <span class="s1">args</span><span class="s3">=</span><span class="s1">args</span><span class="s3">,</span>
+        <span class="s3">)</span>
+        <span class="s1">evs</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">ev</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">evs</span>
+
+
+<span class="s2">def </span><span class="s1">_setup_chrome_trace_exit_handler</span><span class="s3">():</span>
+    <span class="s0">&quot;&quot;&quot;Setup a RecordingListener and an exit handler to write the captured 
+    events to file. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">listener </span><span class="s3">= </span><span class="s1">RecordingListener</span><span class="s3">()</span>
+    <span class="s1">register</span><span class="s3">(</span><span class="s5">&quot;numba:run_pass&quot;</span><span class="s3">, </span><span class="s1">listener</span><span class="s3">)</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">config</span><span class="s3">.</span><span class="s1">CHROME_TRACE</span>
+
+    <span class="s3">@</span><span class="s1">atexit</span><span class="s3">.</span><span class="s1">register</span>
+    <span class="s2">def </span><span class="s1">_write_chrome_trace</span><span class="s3">():</span>
+        <span class="s4"># The following output file is not multi-process safe.</span>
+        <span class="s1">evs </span><span class="s3">= </span><span class="s1">_prepare_chrome_trace_data</span><span class="s3">(</span><span class="s1">listener</span><span class="s3">)</span>
+        <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s5">&quot;w&quot;</span><span class="s3">) </span><span class="s2">as </span><span class="s1">out</span><span class="s3">:</span>
+            <span class="s1">json</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">evs</span><span class="s3">, </span><span class="s1">out</span><span class="s3">)</span>
+
+
+<span class="s2">if </span><span class="s1">config</span><span class="s3">.</span><span class="s1">CHROME_TRACE</span><span class="s3">:</span>
+    <span class="s1">_setup_chrome_trace_exit_handler</span><span class="s3">()</span>
+</pre>
+</body>
+</html>

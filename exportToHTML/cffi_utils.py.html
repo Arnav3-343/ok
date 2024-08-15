@@ -1,0 +1,252 @@
+<html>
+<head>
+<title>cffi_utils.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #5f826b; font-style: italic;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+cffi_utils.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># -*- coding: utf-8 -*-</span>
+<span class="s2">&quot;&quot;&quot; 
+Support for CFFI. Allows checking whether objects are CFFI functions and 
+obtaining the pointer and numba signature. 
+&quot;&quot;&quot;</span>
+
+<span class="s3">from </span><span class="s1">types </span><span class="s3">import </span><span class="s1">BuiltinFunctionType</span>
+<span class="s3">import </span><span class="s1">ctypes</span>
+<span class="s3">from </span><span class="s1">functools </span><span class="s3">import </span><span class="s1">partial</span>
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+
+<span class="s3">from </span><span class="s1">numba</span><span class="s4">.</span><span class="s1">core </span><span class="s3">import </span><span class="s1">types</span>
+<span class="s3">from </span><span class="s1">numba</span><span class="s4">.</span><span class="s1">core</span><span class="s4">.</span><span class="s1">errors </span><span class="s3">import </span><span class="s1">TypingError</span>
+<span class="s3">from </span><span class="s1">numba</span><span class="s4">.</span><span class="s1">core</span><span class="s4">.</span><span class="s1">typing </span><span class="s3">import </span><span class="s1">templates</span>
+<span class="s3">from </span><span class="s1">numba</span><span class="s4">.</span><span class="s1">np </span><span class="s3">import </span><span class="s1">numpy_support</span>
+
+<span class="s3">try</span><span class="s4">:</span>
+    <span class="s3">import </span><span class="s1">cffi</span>
+    <span class="s1">ffi </span><span class="s4">= </span><span class="s1">cffi</span><span class="s4">.</span><span class="s1">FFI</span><span class="s4">()</span>
+<span class="s3">except </span><span class="s1">ImportError</span><span class="s4">:</span>
+    <span class="s1">ffi </span><span class="s4">= </span><span class="s3">None</span>
+
+<span class="s1">SUPPORTED </span><span class="s4">= </span><span class="s1">ffi </span><span class="s3">is not None</span>
+<span class="s1">_ool_func_types </span><span class="s4">= {}</span>
+<span class="s1">_ool_func_ptr </span><span class="s4">= {}</span>
+<span class="s1">_ffi_instances </span><span class="s4">= </span><span class="s1">set</span><span class="s4">()</span>
+
+
+<span class="s3">def </span><span class="s1">is_ffi_instance</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">):</span>
+    <span class="s0"># Compiled FFI modules have a member, ffi, which is an instance of</span>
+    <span class="s0"># CompiledFFI, which behaves similarly to an instance of cffi.FFI. In</span>
+    <span class="s0"># order to simplify handling a CompiledFFI object, we treat them as</span>
+    <span class="s0"># if they're cffi.FFI instances for typing and lowering purposes.</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">obj </span><span class="s3">in </span><span class="s1">_ffi_instances </span><span class="s3">or </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">, </span><span class="s1">cffi</span><span class="s4">.</span><span class="s1">FFI</span><span class="s4">)</span>
+    <span class="s3">except </span><span class="s1">TypeError</span><span class="s4">: </span><span class="s0"># Unhashable type possible</span>
+        <span class="s3">return False</span>
+
+<span class="s3">def </span><span class="s1">is_cffi_func</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">):</span>
+    <span class="s2">&quot;&quot;&quot;Check whether the obj is a CFFI function&quot;&quot;&quot;</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">).</span><span class="s1">kind </span><span class="s4">== </span><span class="s5">'function'</span>
+    <span class="s3">except </span><span class="s1">TypeError</span><span class="s4">:</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">obj </span><span class="s3">in </span><span class="s1">_ool_func_types</span>
+        <span class="s3">except</span><span class="s4">:</span>
+            <span class="s3">return False</span>
+
+<span class="s3">def </span><span class="s1">get_pointer</span><span class="s4">(</span><span class="s1">cffi_func</span><span class="s4">):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Get a pointer to the underlying function for a CFFI function as an 
+    integer. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">cffi_func </span><span class="s3">in </span><span class="s1">_ool_func_ptr</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">_ool_func_ptr</span><span class="s4">[</span><span class="s1">cffi_func</span><span class="s4">]</span>
+    <span class="s3">return </span><span class="s1">int</span><span class="s4">(</span><span class="s1">ffi</span><span class="s4">.</span><span class="s1">cast</span><span class="s4">(</span><span class="s5">&quot;uintptr_t&quot;</span><span class="s4">, </span><span class="s1">cffi_func</span><span class="s4">))</span>
+
+
+<span class="s1">_cached_type_map </span><span class="s4">= </span><span class="s3">None</span>
+
+<span class="s3">def </span><span class="s1">_type_map</span><span class="s4">():</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Lazily compute type map, as calling ffi.typeof() involves costly 
+    parsing of C code... 
+    &quot;&quot;&quot;</span>
+    <span class="s3">global </span><span class="s1">_cached_type_map</span>
+    <span class="s3">if </span><span class="s1">_cached_type_map </span><span class="s3">is None</span><span class="s4">:</span>
+        <span class="s1">_cached_type_map </span><span class="s4">= {</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'bool'</span><span class="s4">) :                </span><span class="s1">types</span><span class="s4">.</span><span class="s1">boolean</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'char'</span><span class="s4">) :                </span><span class="s1">types</span><span class="s4">.</span><span class="s1">char</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'short'</span><span class="s4">) :               </span><span class="s1">types</span><span class="s4">.</span><span class="s1">short</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'int'</span><span class="s4">) :                 </span><span class="s1">types</span><span class="s4">.</span><span class="s1">intc</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'long'</span><span class="s4">) :                </span><span class="s1">types</span><span class="s4">.</span><span class="s1">long_</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'long long'</span><span class="s4">) :           </span><span class="s1">types</span><span class="s4">.</span><span class="s1">longlong</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'unsigned char'</span><span class="s4">) :       </span><span class="s1">types</span><span class="s4">.</span><span class="s1">uchar</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'unsigned short'</span><span class="s4">) :      </span><span class="s1">types</span><span class="s4">.</span><span class="s1">ushort</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'unsigned int'</span><span class="s4">) :        </span><span class="s1">types</span><span class="s4">.</span><span class="s1">uintc</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'unsigned long'</span><span class="s4">) :       </span><span class="s1">types</span><span class="s4">.</span><span class="s1">ulong</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'unsigned long long'</span><span class="s4">) :  </span><span class="s1">types</span><span class="s4">.</span><span class="s1">ulonglong</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'int8_t'</span><span class="s4">) :              </span><span class="s1">types</span><span class="s4">.</span><span class="s1">char</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'uint8_t'</span><span class="s4">) :             </span><span class="s1">types</span><span class="s4">.</span><span class="s1">uchar</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'int16_t'</span><span class="s4">) :             </span><span class="s1">types</span><span class="s4">.</span><span class="s1">short</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'uint16_t'</span><span class="s4">) :            </span><span class="s1">types</span><span class="s4">.</span><span class="s1">ushort</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'int32_t'</span><span class="s4">) :             </span><span class="s1">types</span><span class="s4">.</span><span class="s1">intc</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'uint32_t'</span><span class="s4">) :            </span><span class="s1">types</span><span class="s4">.</span><span class="s1">uintc</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'int64_t'</span><span class="s4">) :             </span><span class="s1">types</span><span class="s4">.</span><span class="s1">longlong</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'uint64_t'</span><span class="s4">) :            </span><span class="s1">types</span><span class="s4">.</span><span class="s1">ulonglong</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'float'</span><span class="s4">) :               </span><span class="s1">types</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'double'</span><span class="s4">) :              </span><span class="s1">types</span><span class="s4">.</span><span class="s1">double</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'ssize_t'</span><span class="s4">) :             </span><span class="s1">types</span><span class="s4">.</span><span class="s1">intp</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'size_t'</span><span class="s4">) :              </span><span class="s1">types</span><span class="s4">.</span><span class="s1">uintp</span><span class="s4">,</span>
+            <span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s5">'void'</span><span class="s4">) :                </span><span class="s1">types</span><span class="s4">.</span><span class="s1">void</span><span class="s4">,</span>
+        <span class="s4">}</span>
+    <span class="s3">return </span><span class="s1">_cached_type_map</span>
+
+
+<span class="s3">def </span><span class="s1">map_type</span><span class="s4">(</span><span class="s1">cffi_type</span><span class="s4">, </span><span class="s1">use_record_dtype</span><span class="s4">=</span><span class="s3">False</span><span class="s4">):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Map CFFI type to numba type. 
+ 
+    Parameters 
+    ---------- 
+    cffi_type: 
+        The CFFI type to be converted. 
+    use_record_dtype: bool (default: False) 
+        When True, struct types are mapped to a NumPy Record dtype. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">primed_map_type </span><span class="s4">= </span><span class="s1">partial</span><span class="s4">(</span><span class="s1">map_type</span><span class="s4">, </span><span class="s1">use_record_dtype</span><span class="s4">=</span><span class="s1">use_record_dtype</span><span class="s4">)</span>
+    <span class="s1">kind </span><span class="s4">= </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">cffi_type</span><span class="s4">, </span><span class="s5">'kind'</span><span class="s4">, </span><span class="s5">''</span><span class="s4">)</span>
+    <span class="s3">if </span><span class="s1">kind </span><span class="s4">== </span><span class="s5">'union'</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">TypeError</span><span class="s4">(</span><span class="s5">&quot;No support for CFFI union&quot;</span><span class="s4">)</span>
+    <span class="s3">elif </span><span class="s1">kind </span><span class="s4">== </span><span class="s5">'function'</span><span class="s4">:</span>
+        <span class="s3">if </span><span class="s1">cffi_type</span><span class="s4">.</span><span class="s1">ellipsis</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">TypeError</span><span class="s4">(</span><span class="s5">&quot;vararg function is not supported&quot;</span><span class="s4">)</span>
+        <span class="s1">restype </span><span class="s4">= </span><span class="s1">primed_map_type</span><span class="s4">(</span><span class="s1">cffi_type</span><span class="s4">.</span><span class="s1">result</span><span class="s4">)</span>
+        <span class="s1">argtypes </span><span class="s4">= [</span><span class="s1">primed_map_type</span><span class="s4">(</span><span class="s1">arg</span><span class="s4">) </span><span class="s3">for </span><span class="s1">arg </span><span class="s3">in </span><span class="s1">cffi_type</span><span class="s4">.</span><span class="s1">args</span><span class="s4">]</span>
+        <span class="s3">return </span><span class="s1">templates</span><span class="s4">.</span><span class="s1">signature</span><span class="s4">(</span><span class="s1">restype</span><span class="s4">, *</span><span class="s1">argtypes</span><span class="s4">)</span>
+    <span class="s3">elif </span><span class="s1">kind </span><span class="s4">== </span><span class="s5">'pointer'</span><span class="s4">:</span>
+        <span class="s1">pointee </span><span class="s4">= </span><span class="s1">cffi_type</span><span class="s4">.</span><span class="s1">item</span>
+        <span class="s3">if </span><span class="s1">pointee</span><span class="s4">.</span><span class="s1">kind </span><span class="s4">== </span><span class="s5">'void'</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">types</span><span class="s4">.</span><span class="s1">voidptr</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">types</span><span class="s4">.</span><span class="s1">CPointer</span><span class="s4">(</span><span class="s1">primed_map_type</span><span class="s4">(</span><span class="s1">pointee</span><span class="s4">))</span>
+    <span class="s3">elif </span><span class="s1">kind </span><span class="s4">== </span><span class="s5">'array'</span><span class="s4">:</span>
+        <span class="s1">dtype </span><span class="s4">= </span><span class="s1">primed_map_type</span><span class="s4">(</span><span class="s1">cffi_type</span><span class="s4">.</span><span class="s1">item</span><span class="s4">)</span>
+        <span class="s1">nelem </span><span class="s4">= </span><span class="s1">cffi_type</span><span class="s4">.</span><span class="s1">length</span>
+        <span class="s3">return </span><span class="s1">types</span><span class="s4">.</span><span class="s1">NestedArray</span><span class="s4">(</span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">dtype</span><span class="s4">, </span><span class="s1">shape</span><span class="s4">=(</span><span class="s1">nelem</span><span class="s4">,))</span>
+    <span class="s3">elif </span><span class="s1">kind </span><span class="s4">== </span><span class="s5">'struct' </span><span class="s3">and </span><span class="s1">use_record_dtype</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">map_struct_to_record_dtype</span><span class="s4">(</span><span class="s1">cffi_type</span><span class="s4">)</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s1">result </span><span class="s4">= </span><span class="s1">_type_map</span><span class="s4">().</span><span class="s1">get</span><span class="s4">(</span><span class="s1">cffi_type</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">result </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">TypeError</span><span class="s4">(</span><span class="s1">cffi_type</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">result</span>
+
+
+<span class="s3">def </span><span class="s1">map_struct_to_record_dtype</span><span class="s4">(</span><span class="s1">cffi_type</span><span class="s4">):</span>
+    <span class="s2">&quot;&quot;&quot;Convert a cffi type into a NumPy Record dtype 
+    &quot;&quot;&quot;</span>
+    <span class="s1">fields </span><span class="s4">= {</span>
+            <span class="s5">'names'</span><span class="s4">: [],</span>
+            <span class="s5">'formats'</span><span class="s4">: [],</span>
+            <span class="s5">'offsets'</span><span class="s4">: [],</span>
+            <span class="s5">'itemsize'</span><span class="s4">: </span><span class="s1">ffi</span><span class="s4">.</span><span class="s1">sizeof</span><span class="s4">(</span><span class="s1">cffi_type</span><span class="s4">),</span>
+    <span class="s4">}</span>
+    <span class="s1">is_aligned </span><span class="s4">= </span><span class="s3">True</span>
+    <span class="s3">for </span><span class="s1">k</span><span class="s4">, </span><span class="s1">v </span><span class="s3">in </span><span class="s1">cffi_type</span><span class="s4">.</span><span class="s1">fields</span><span class="s4">:</span>
+        <span class="s0"># guard unsupported values</span>
+        <span class="s3">if </span><span class="s1">v</span><span class="s4">.</span><span class="s1">bitshift </span><span class="s4">!= -</span><span class="s6">1</span><span class="s4">:</span>
+            <span class="s1">msg </span><span class="s4">= </span><span class="s5">&quot;field {!r} has bitshift, this is not supported&quot;</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s1">msg</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">k</span><span class="s4">))</span>
+        <span class="s3">if </span><span class="s1">v</span><span class="s4">.</span><span class="s1">flags </span><span class="s4">!= </span><span class="s6">0</span><span class="s4">:</span>
+            <span class="s1">msg </span><span class="s4">= </span><span class="s5">&quot;field {!r} has flags, this is not supported&quot;</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s1">msg</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">k</span><span class="s4">))</span>
+        <span class="s3">if </span><span class="s1">v</span><span class="s4">.</span><span class="s1">bitsize </span><span class="s4">!= -</span><span class="s6">1</span><span class="s4">:</span>
+            <span class="s1">msg </span><span class="s4">= </span><span class="s5">&quot;field {!r} has bitsize, this is not supported&quot;</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s1">msg</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">k</span><span class="s4">))</span>
+        <span class="s1">dtype </span><span class="s4">= </span><span class="s1">numpy_support</span><span class="s4">.</span><span class="s1">as_dtype</span><span class="s4">(</span>
+            <span class="s1">map_type</span><span class="s4">(</span><span class="s1">v</span><span class="s4">.</span><span class="s1">type</span><span class="s4">, </span><span class="s1">use_record_dtype</span><span class="s4">=</span><span class="s3">True</span><span class="s4">),</span>
+        <span class="s4">)</span>
+        <span class="s1">fields</span><span class="s4">[</span><span class="s5">'names'</span><span class="s4">].</span><span class="s1">append</span><span class="s4">(</span><span class="s1">k</span><span class="s4">)</span>
+        <span class="s1">fields</span><span class="s4">[</span><span class="s5">'formats'</span><span class="s4">].</span><span class="s1">append</span><span class="s4">(</span><span class="s1">dtype</span><span class="s4">)</span>
+        <span class="s1">fields</span><span class="s4">[</span><span class="s5">'offsets'</span><span class="s4">].</span><span class="s1">append</span><span class="s4">(</span><span class="s1">v</span><span class="s4">.</span><span class="s1">offset</span><span class="s4">)</span>
+        <span class="s0"># Check alignment</span>
+        <span class="s1">is_aligned </span><span class="s4">&amp;= (</span><span class="s1">v</span><span class="s4">.</span><span class="s1">offset </span><span class="s4">% </span><span class="s1">dtype</span><span class="s4">.</span><span class="s1">alignment </span><span class="s4">== </span><span class="s6">0</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">numpy_support</span><span class="s4">.</span><span class="s1">from_dtype</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">(</span><span class="s1">fields</span><span class="s4">, </span><span class="s1">align</span><span class="s4">=</span><span class="s1">is_aligned</span><span class="s4">))</span>
+
+
+<span class="s3">def </span><span class="s1">make_function_type</span><span class="s4">(</span><span class="s1">cffi_func</span><span class="s4">, </span><span class="s1">use_record_dtype</span><span class="s4">=</span><span class="s3">False</span><span class="s4">):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Return a Numba type for the given CFFI function pointer. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">cffi_type </span><span class="s4">= </span><span class="s1">_ool_func_types</span><span class="s4">.</span><span class="s1">get</span><span class="s4">(</span><span class="s1">cffi_func</span><span class="s4">) </span><span class="s3">or </span><span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s1">cffi_func</span><span class="s4">)</span>
+    <span class="s3">if </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">cffi_type</span><span class="s4">, </span><span class="s5">'kind'</span><span class="s4">, </span><span class="s5">''</span><span class="s4">) == </span><span class="s5">'struct'</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">TypeError</span><span class="s4">(</span><span class="s5">'No support for CFFI struct values'</span><span class="s4">)</span>
+    <span class="s1">sig </span><span class="s4">= </span><span class="s1">map_type</span><span class="s4">(</span><span class="s1">cffi_type</span><span class="s4">, </span><span class="s1">use_record_dtype</span><span class="s4">=</span><span class="s1">use_record_dtype</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">types</span><span class="s4">.</span><span class="s1">ExternalFunctionPointer</span><span class="s4">(</span><span class="s1">sig</span><span class="s4">, </span><span class="s1">get_pointer</span><span class="s4">=</span><span class="s1">get_pointer</span><span class="s4">)</span>
+
+
+<span class="s1">registry </span><span class="s4">= </span><span class="s1">templates</span><span class="s4">.</span><span class="s1">Registry</span><span class="s4">()</span>
+
+<span class="s4">@</span><span class="s1">registry</span><span class="s4">.</span><span class="s1">register</span>
+<span class="s3">class </span><span class="s1">FFI_from_buffer</span><span class="s4">(</span><span class="s1">templates</span><span class="s4">.</span><span class="s1">AbstractTemplate</span><span class="s4">):</span>
+    <span class="s1">key </span><span class="s4">= </span><span class="s5">'ffi.from_buffer'</span>
+
+    <span class="s3">def </span><span class="s1">generic</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">args</span><span class="s4">, </span><span class="s1">kws</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">kws </span><span class="s3">or </span><span class="s1">len</span><span class="s4">(</span><span class="s1">args</span><span class="s4">) != </span><span class="s6">1</span><span class="s4">:</span>
+            <span class="s3">return</span>
+        <span class="s4">[</span><span class="s1">ary</span><span class="s4">] = </span><span class="s1">args</span>
+        <span class="s3">if not </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">ary</span><span class="s4">, </span><span class="s1">types</span><span class="s4">.</span><span class="s1">Buffer</span><span class="s4">):</span>
+            <span class="s3">raise </span><span class="s1">TypingError</span><span class="s4">(</span><span class="s5">&quot;from_buffer() expected a buffer object, got %s&quot;</span>
+                              <span class="s4">% (</span><span class="s1">ary</span><span class="s4">,))</span>
+        <span class="s3">if </span><span class="s1">ary</span><span class="s4">.</span><span class="s1">layout </span><span class="s3">not in </span><span class="s4">(</span><span class="s5">'C'</span><span class="s4">, </span><span class="s5">'F'</span><span class="s4">):</span>
+            <span class="s3">raise </span><span class="s1">TypingError</span><span class="s4">(</span><span class="s5">&quot;from_buffer() unsupported on non-contiguous buffers (got %s)&quot;</span>
+                              <span class="s4">% (</span><span class="s1">ary</span><span class="s4">,))</span>
+        <span class="s3">if </span><span class="s1">ary</span><span class="s4">.</span><span class="s1">layout </span><span class="s4">!= </span><span class="s5">'C' </span><span class="s3">and </span><span class="s1">ary</span><span class="s4">.</span><span class="s1">ndim </span><span class="s4">&gt; </span><span class="s6">1</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">TypingError</span><span class="s4">(</span><span class="s5">&quot;from_buffer() only supports multidimensional arrays with C layout (got %s)&quot;</span>
+                              <span class="s4">% (</span><span class="s1">ary</span><span class="s4">,))</span>
+        <span class="s1">ptr </span><span class="s4">= </span><span class="s1">types</span><span class="s4">.</span><span class="s1">CPointer</span><span class="s4">(</span><span class="s1">ary</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">templates</span><span class="s4">.</span><span class="s1">signature</span><span class="s4">(</span><span class="s1">ptr</span><span class="s4">, </span><span class="s1">ary</span><span class="s4">)</span>
+
+<span class="s4">@</span><span class="s1">registry</span><span class="s4">.</span><span class="s1">register_attr</span>
+<span class="s3">class </span><span class="s1">FFIAttribute</span><span class="s4">(</span><span class="s1">templates</span><span class="s4">.</span><span class="s1">AttributeTemplate</span><span class="s4">):</span>
+    <span class="s1">key </span><span class="s4">= </span><span class="s1">types</span><span class="s4">.</span><span class="s1">ffi</span>
+
+    <span class="s3">def </span><span class="s1">resolve_from_buffer</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">ffi</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">types</span><span class="s4">.</span><span class="s1">BoundFunction</span><span class="s4">(</span><span class="s1">FFI_from_buffer</span><span class="s4">, </span><span class="s1">types</span><span class="s4">.</span><span class="s1">ffi</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">register_module</span><span class="s4">(</span><span class="s1">mod</span><span class="s4">):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Add typing for all functions in an out-of-line CFFI module to the typemap 
+    &quot;&quot;&quot;</span>
+    <span class="s3">for </span><span class="s1">f </span><span class="s3">in </span><span class="s1">dir</span><span class="s4">(</span><span class="s1">mod</span><span class="s4">.</span><span class="s1">lib</span><span class="s4">):</span>
+        <span class="s1">f </span><span class="s4">= </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">mod</span><span class="s4">.</span><span class="s1">lib</span><span class="s4">, </span><span class="s1">f</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">f</span><span class="s4">, </span><span class="s1">BuiltinFunctionType</span><span class="s4">):</span>
+            <span class="s1">_ool_func_types</span><span class="s4">[</span><span class="s1">f</span><span class="s4">] = </span><span class="s1">mod</span><span class="s4">.</span><span class="s1">ffi</span><span class="s4">.</span><span class="s1">typeof</span><span class="s4">(</span><span class="s1">f</span><span class="s4">)</span>
+            <span class="s1">addr </span><span class="s4">= </span><span class="s1">mod</span><span class="s4">.</span><span class="s1">ffi</span><span class="s4">.</span><span class="s1">addressof</span><span class="s4">(</span><span class="s1">mod</span><span class="s4">.</span><span class="s1">lib</span><span class="s4">, </span><span class="s1">f</span><span class="s4">.</span><span class="s1">__name__</span><span class="s4">)</span>
+            <span class="s1">_ool_func_ptr</span><span class="s4">[</span><span class="s1">f</span><span class="s4">] = </span><span class="s1">int</span><span class="s4">(</span><span class="s1">mod</span><span class="s4">.</span><span class="s1">ffi</span><span class="s4">.</span><span class="s1">cast</span><span class="s4">(</span><span class="s5">&quot;uintptr_t&quot;</span><span class="s4">, </span><span class="s1">addr</span><span class="s4">))</span>
+        <span class="s1">_ffi_instances</span><span class="s4">.</span><span class="s1">add</span><span class="s4">(</span><span class="s1">mod</span><span class="s4">.</span><span class="s1">ffi</span><span class="s4">)</span>
+
+<span class="s3">def </span><span class="s1">register_type</span><span class="s4">(</span><span class="s1">cffi_type</span><span class="s4">, </span><span class="s1">numba_type</span><span class="s4">):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Add typing for a given CFFI type to the typemap 
+    &quot;&quot;&quot;</span>
+    <span class="s1">tm </span><span class="s4">= </span><span class="s1">_type_map</span><span class="s4">()</span>
+    <span class="s1">tm</span><span class="s4">[</span><span class="s1">cffi_type</span><span class="s4">] = </span><span class="s1">numba_type</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,282 @@
+<html>
+<head>
+<title>test_slices.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #5f826b; font-style: italic;}
+.s4 { color: #7a7e85;}
+.s5 { color: #2aacb8;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_slices.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">functools </span><span class="s0">import </span><span class="s1">partial</span>
+<span class="s0">import </span><span class="s1">itertools</span>
+<span class="s0">from </span><span class="s1">itertools </span><span class="s0">import </span><span class="s1">chain</span><span class="s2">, </span><span class="s1">product</span><span class="s2">, </span><span class="s1">starmap</span>
+<span class="s0">import </span><span class="s1">sys</span>
+
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+
+<span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">jit</span><span class="s2">, </span><span class="s1">literally</span><span class="s2">, </span><span class="s1">njit</span><span class="s2">, </span><span class="s1">typeof</span><span class="s2">, </span><span class="s1">TypingError</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">utils</span><span class="s2">, </span><span class="s1">types</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">tests</span><span class="s2">.</span><span class="s1">support </span><span class="s0">import </span><span class="s1">TestCase</span><span class="s2">, </span><span class="s1">MemoryLeakMixin</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">types</span><span class="s2">.</span><span class="s1">functions </span><span class="s0">import </span><span class="s1">_header_lead</span>
+<span class="s0">import </span><span class="s1">unittest</span>
+
+
+<span class="s0">def </span><span class="s1">slice_passing</span><span class="s2">(</span><span class="s1">sl</span><span class="s2">):</span>
+    <span class="s0">return </span><span class="s1">sl</span><span class="s2">.</span><span class="s1">start</span><span class="s2">, </span><span class="s1">sl</span><span class="s2">.</span><span class="s1">stop</span><span class="s2">, </span><span class="s1">sl</span><span class="s2">.</span><span class="s1">step</span>
+
+<span class="s0">def </span><span class="s1">slice_constructor</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">):</span>
+    <span class="s1">sl </span><span class="s2">= </span><span class="s1">slice</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">sl</span><span class="s2">.</span><span class="s1">start</span><span class="s2">, </span><span class="s1">sl</span><span class="s2">.</span><span class="s1">stop</span><span class="s2">, </span><span class="s1">sl</span><span class="s2">.</span><span class="s1">step</span>
+
+<span class="s0">def </span><span class="s1">slice_construct_and_use</span><span class="s2">(</span><span class="s1">args</span><span class="s2">, </span><span class="s1">l</span><span class="s2">):</span>
+    <span class="s1">sl </span><span class="s2">= </span><span class="s1">slice</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">l</span><span class="s2">[</span><span class="s1">sl</span><span class="s2">]</span>
+
+<span class="s0">def </span><span class="s1">slice_indices</span><span class="s2">(</span><span class="s1">s</span><span class="s2">, *</span><span class="s1">indargs</span><span class="s2">):</span>
+    <span class="s0">return </span><span class="s1">s</span><span class="s2">.</span><span class="s1">indices</span><span class="s2">(*</span><span class="s1">indargs</span><span class="s2">)</span>
+
+<span class="s0">class </span><span class="s1">TestSlices</span><span class="s2">(</span><span class="s1">MemoryLeakMixin</span><span class="s2">, </span><span class="s1">TestCase</span><span class="s2">):</span>
+
+    <span class="s0">def </span><span class="s1">test_slice_passing</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Check passing a slice object to a Numba function. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># NOTE this also checks slice attributes</span>
+        <span class="s0">def </span><span class="s1">check</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">c</span><span class="s2">, </span><span class="s1">d</span><span class="s2">, </span><span class="s1">e</span><span class="s2">, </span><span class="s1">f</span><span class="s2">):</span>
+            <span class="s1">sl </span><span class="s2">= </span><span class="s1">slice</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">c</span><span class="s2">)</span>
+            <span class="s1">got </span><span class="s2">= </span><span class="s1">cfunc</span><span class="s2">(</span><span class="s1">sl</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">got</span><span class="s2">, (</span><span class="s1">d</span><span class="s2">, </span><span class="s1">e</span><span class="s2">, </span><span class="s1">f</span><span class="s2">))</span>
+
+        <span class="s1">maxposint </span><span class="s2">= </span><span class="s1">sys</span><span class="s2">.</span><span class="s1">maxsize</span>
+        <span class="s1">maxnegint </span><span class="s2">= -</span><span class="s1">maxposint </span><span class="s2">- </span><span class="s5">1</span>
+        <span class="s1">cfunc </span><span class="s2">= </span><span class="s1">jit</span><span class="s2">(</span><span class="s1">nopython</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">slice_passing</span><span class="s2">)</span>
+
+        <span class="s4"># Positive steps</span>
+        <span class="s1">start_cases </span><span class="s2">= [(</span><span class="s0">None</span><span class="s2">, </span><span class="s5">0</span><span class="s2">), (</span><span class="s5">42</span><span class="s2">, </span><span class="s5">42</span><span class="s2">), (-</span><span class="s5">1</span><span class="s2">, -</span><span class="s5">1</span><span class="s2">)]</span>
+        <span class="s1">stop_cases </span><span class="s2">= [(</span><span class="s0">None</span><span class="s2">, </span><span class="s1">maxposint</span><span class="s2">), (</span><span class="s5">9</span><span class="s2">, </span><span class="s5">9</span><span class="s2">), (-</span><span class="s5">11</span><span class="s2">, -</span><span class="s5">11</span><span class="s2">)]</span>
+        <span class="s1">step_cases </span><span class="s2">= [(</span><span class="s0">None</span><span class="s2">, </span><span class="s5">1</span><span class="s2">), (</span><span class="s5">12</span><span class="s2">, </span><span class="s5">12</span><span class="s2">)]</span>
+        <span class="s0">for </span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">d</span><span class="s2">), (</span><span class="s1">b</span><span class="s2">, </span><span class="s1">e</span><span class="s2">), (</span><span class="s1">c</span><span class="s2">, </span><span class="s1">f</span><span class="s2">) </span><span class="s0">in </span><span class="s1">itertools</span><span class="s2">.</span><span class="s1">product</span><span class="s2">(</span><span class="s1">start_cases</span><span class="s2">,</span>
+                                                        <span class="s1">stop_cases</span><span class="s2">,</span>
+                                                        <span class="s1">step_cases</span><span class="s2">):</span>
+            <span class="s1">check</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">c</span><span class="s2">, </span><span class="s1">d</span><span class="s2">, </span><span class="s1">e</span><span class="s2">, </span><span class="s1">f</span><span class="s2">)</span>
+
+        <span class="s4"># Negative steps</span>
+        <span class="s1">start_cases </span><span class="s2">= [(</span><span class="s0">None</span><span class="s2">, </span><span class="s1">maxposint</span><span class="s2">), (</span><span class="s5">42</span><span class="s2">, </span><span class="s5">42</span><span class="s2">), (-</span><span class="s5">1</span><span class="s2">, -</span><span class="s5">1</span><span class="s2">)]</span>
+        <span class="s1">stop_cases </span><span class="s2">= [(</span><span class="s0">None</span><span class="s2">, </span><span class="s1">maxnegint</span><span class="s2">), (</span><span class="s5">9</span><span class="s2">, </span><span class="s5">9</span><span class="s2">), (-</span><span class="s5">11</span><span class="s2">, -</span><span class="s5">11</span><span class="s2">)]</span>
+        <span class="s1">step_cases </span><span class="s2">= [(-</span><span class="s5">1</span><span class="s2">, -</span><span class="s5">1</span><span class="s2">), (-</span><span class="s5">12</span><span class="s2">, -</span><span class="s5">12</span><span class="s2">)]</span>
+        <span class="s0">for </span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">d</span><span class="s2">), (</span><span class="s1">b</span><span class="s2">, </span><span class="s1">e</span><span class="s2">), (</span><span class="s1">c</span><span class="s2">, </span><span class="s1">f</span><span class="s2">) </span><span class="s0">in </span><span class="s1">itertools</span><span class="s2">.</span><span class="s1">product</span><span class="s2">(</span><span class="s1">start_cases</span><span class="s2">,</span>
+                                                        <span class="s1">stop_cases</span><span class="s2">,</span>
+                                                        <span class="s1">step_cases</span><span class="s2">):</span>
+            <span class="s1">check</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">c</span><span class="s2">, </span><span class="s1">d</span><span class="s2">, </span><span class="s1">e</span><span class="s2">, </span><span class="s1">f</span><span class="s2">)</span>
+
+        <span class="s4"># Some member is neither integer nor None</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaises</span><span class="s2">(</span><span class="s1">TypeError</span><span class="s2">):</span>
+            <span class="s1">cfunc</span><span class="s2">(</span><span class="s1">slice</span><span class="s2">(</span><span class="s5">1.5</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s2">))</span>
+
+    <span class="s0">def </span><span class="s1">test_slice_constructor</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Test the 'happy path' for slice() constructor in nopython mode. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">maxposint </span><span class="s2">= </span><span class="s1">sys</span><span class="s2">.</span><span class="s1">maxsize</span>
+        <span class="s1">maxnegint </span><span class="s2">= -</span><span class="s1">maxposint </span><span class="s2">- </span><span class="s5">1</span>
+        <span class="s1">a </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s5">10</span><span class="s2">)</span>
+        <span class="s1">cfunc </span><span class="s2">= </span><span class="s1">jit</span><span class="s2">(</span><span class="s1">nopython</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">slice_constructor</span><span class="s2">)</span>
+        <span class="s1">cfunc_use </span><span class="s2">= </span><span class="s1">jit</span><span class="s2">(</span><span class="s1">nopython</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">slice_construct_and_use</span><span class="s2">)</span>
+        <span class="s0">for </span><span class="s1">args</span><span class="s2">, </span><span class="s1">expected </span><span class="s0">in </span><span class="s2">[</span>
+            <span class="s2">((</span><span class="s0">None</span><span class="s2">,), (</span><span class="s5">0</span><span class="s2">, </span><span class="s1">maxposint</span><span class="s2">, </span><span class="s5">1</span><span class="s2">)),</span>
+            <span class="s2">((</span><span class="s5">5</span><span class="s2">,), (</span><span class="s5">0</span><span class="s2">, </span><span class="s5">5</span><span class="s2">, </span><span class="s5">1</span><span class="s2">)),</span>
+            <span class="s2">((</span><span class="s0">None</span><span class="s2">, </span><span class="s0">None</span><span class="s2">), (</span><span class="s5">0</span><span class="s2">, </span><span class="s1">maxposint</span><span class="s2">, </span><span class="s5">1</span><span class="s2">)),</span>
+            <span class="s2">((</span><span class="s5">1</span><span class="s2">, </span><span class="s0">None</span><span class="s2">), (</span><span class="s5">1</span><span class="s2">, </span><span class="s1">maxposint</span><span class="s2">, </span><span class="s5">1</span><span class="s2">)),</span>
+            <span class="s2">((</span><span class="s0">None</span><span class="s2">, </span><span class="s5">2</span><span class="s2">), (</span><span class="s5">0</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">1</span><span class="s2">)),</span>
+            <span class="s2">((</span><span class="s5">1</span><span class="s2">, </span><span class="s5">2</span><span class="s2">), (</span><span class="s5">1</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">1</span><span class="s2">)),</span>
+            <span class="s2">((</span><span class="s0">None</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), (</span><span class="s5">0</span><span class="s2">, </span><span class="s1">maxposint</span><span class="s2">, </span><span class="s5">3</span><span class="s2">)),</span>
+            <span class="s2">((</span><span class="s0">None</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), (</span><span class="s5">0</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">)),</span>
+            <span class="s2">((</span><span class="s5">1</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), (</span><span class="s5">1</span><span class="s2">, </span><span class="s1">maxposint</span><span class="s2">, </span><span class="s5">3</span><span class="s2">)),</span>
+            <span class="s2">((</span><span class="s5">1</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), (</span><span class="s5">1</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">)),</span>
+            <span class="s2">((</span><span class="s0">None</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, -</span><span class="s5">1</span><span class="s2">), (</span><span class="s1">maxposint</span><span class="s2">, </span><span class="s1">maxnegint</span><span class="s2">, -</span><span class="s5">1</span><span class="s2">)),</span>
+            <span class="s2">((</span><span class="s5">10</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, -</span><span class="s5">1</span><span class="s2">), (</span><span class="s5">10</span><span class="s2">, </span><span class="s1">maxnegint</span><span class="s2">, -</span><span class="s5">1</span><span class="s2">)),</span>
+            <span class="s2">((</span><span class="s0">None</span><span class="s2">, </span><span class="s5">5</span><span class="s2">, -</span><span class="s5">1</span><span class="s2">), (</span><span class="s1">maxposint</span><span class="s2">, </span><span class="s5">5</span><span class="s2">, -</span><span class="s5">1</span><span class="s2">)),</span>
+            <span class="s2">((</span><span class="s5">10</span><span class="s2">, </span><span class="s5">5</span><span class="s2">, -</span><span class="s5">1</span><span class="s2">), (</span><span class="s5">10</span><span class="s2">, </span><span class="s5">5</span><span class="s2">, -</span><span class="s5">1</span><span class="s2">)),</span>
+        <span class="s2">]:</span>
+            <span class="s1">got </span><span class="s2">= </span><span class="s1">cfunc</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">got</span><span class="s2">, </span><span class="s1">expected</span><span class="s2">)</span>
+            <span class="s1">usage </span><span class="s2">= </span><span class="s1">slice_construct_and_use</span><span class="s2">(</span><span class="s1">args</span><span class="s2">, </span><span class="s1">a</span><span class="s2">)</span>
+            <span class="s1">cusage </span><span class="s2">= </span><span class="s1">cfunc_use</span><span class="s2">(</span><span class="s1">args</span><span class="s2">, </span><span class="s1">a</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">usage</span><span class="s2">, </span><span class="s1">cusage</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_slice_constructor_cases</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Test that slice constructor behaves same in python and compiled code. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">options </span><span class="s2">= (</span><span class="s0">None</span><span class="s2">, -</span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">arg_cases </span><span class="s2">= </span><span class="s1">chain</span><span class="s2">.</span><span class="s1">from_iterable</span><span class="s2">(</span>
+            <span class="s1">product</span><span class="s2">(</span><span class="s1">options</span><span class="s2">, </span><span class="s1">repeat</span><span class="s2">=</span><span class="s1">n</span><span class="s2">) </span><span class="s0">for </span><span class="s1">n </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s5">5</span><span class="s2">)</span>
+        <span class="s2">)</span>
+        <span class="s1">array </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s5">10</span><span class="s2">)</span>
+
+        <span class="s1">cfunc </span><span class="s2">= </span><span class="s1">jit</span><span class="s2">(</span><span class="s1">nopython</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">slice_construct_and_use</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">disable_leak_check</span><span class="s2">()</span>
+        <span class="s0">for </span><span class="s1">args </span><span class="s0">in </span><span class="s1">arg_cases</span><span class="s2">:</span>
+            <span class="s0">try</span><span class="s2">:</span>
+                <span class="s1">expected </span><span class="s2">= </span><span class="s1">slice_construct_and_use</span><span class="s2">(</span><span class="s1">args</span><span class="s2">, </span><span class="s1">array</span><span class="s2">)</span>
+            <span class="s0">except </span><span class="s1">TypeError </span><span class="s0">as </span><span class="s1">py_type_e</span><span class="s2">:</span>
+                <span class="s4"># Catch cases of 0, or more than 3 arguments.</span>
+                <span class="s4"># This becomes a typing error in numba</span>
+                <span class="s1">n_args </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">args</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">assertRegex</span><span class="s2">(</span>
+                    <span class="s1">str</span><span class="s2">(</span><span class="s1">py_type_e</span><span class="s2">),</span>
+                    <span class="s6">r&quot;slice expected at (most|least) (3|1) arguments?, got {}&quot;</span>
+                    <span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">n_args</span><span class="s2">)</span>
+                <span class="s2">)</span>
+                <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaises</span><span class="s2">(</span><span class="s1">TypingError</span><span class="s2">) </span><span class="s0">as </span><span class="s1">numba_e</span><span class="s2">:</span>
+                    <span class="s1">cfunc</span><span class="s2">(</span><span class="s1">args</span><span class="s2">, </span><span class="s1">array</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span>
+                    <span class="s1">_header_lead</span><span class="s2">,</span>
+                    <span class="s1">str</span><span class="s2">(</span><span class="s1">numba_e</span><span class="s2">.</span><span class="s1">exception</span><span class="s2">)</span>
+                <span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span>
+                    <span class="s6">&quot;, &quot;</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">str</span><span class="s2">(</span><span class="s1">typeof</span><span class="s2">(</span><span class="s1">arg</span><span class="s2">)) </span><span class="s0">for </span><span class="s1">arg </span><span class="s0">in </span><span class="s1">args</span><span class="s2">),</span>
+                    <span class="s1">str</span><span class="s2">(</span><span class="s1">numba_e</span><span class="s2">.</span><span class="s1">exception</span><span class="s2">)</span>
+                <span class="s2">)</span>
+            <span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">py_e</span><span class="s2">:</span>
+                <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaises</span><span class="s2">(</span><span class="s1">type</span><span class="s2">(</span><span class="s1">py_e</span><span class="s2">)) </span><span class="s0">as </span><span class="s1">numba_e</span><span class="s2">:</span>
+                    <span class="s1">cfunc</span><span class="s2">(</span><span class="s1">args</span><span class="s2">, </span><span class="s1">array</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span>
+                    <span class="s1">str</span><span class="s2">(</span><span class="s1">py_e</span><span class="s2">),</span>
+                    <span class="s1">str</span><span class="s2">(</span><span class="s1">numba_e</span><span class="s2">.</span><span class="s1">exception</span><span class="s2">)</span>
+                <span class="s2">)</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">expected</span><span class="s2">, </span><span class="s1">cfunc</span><span class="s2">(</span><span class="s1">args</span><span class="s2">, </span><span class="s1">array</span><span class="s2">))</span>
+
+    <span class="s0">def </span><span class="s1">test_slice_indices</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Test that a numba slice returns same result for .indices as a python one.&quot;&quot;&quot;</span>
+        <span class="s1">slices </span><span class="s2">= </span><span class="s1">starmap</span><span class="s2">(</span>
+            <span class="s1">slice</span><span class="s2">,</span>
+            <span class="s1">product</span><span class="s2">(</span>
+                <span class="s1">chain</span><span class="s2">(</span><span class="s1">range</span><span class="s2">(-</span><span class="s5">5</span><span class="s2">, </span><span class="s5">5</span><span class="s2">), (</span><span class="s0">None</span><span class="s2">,)),</span>
+                <span class="s1">chain</span><span class="s2">(</span><span class="s1">range</span><span class="s2">(-</span><span class="s5">5</span><span class="s2">, </span><span class="s5">5</span><span class="s2">), (</span><span class="s0">None</span><span class="s2">,)),</span>
+                <span class="s1">chain</span><span class="s2">(</span><span class="s1">range</span><span class="s2">(-</span><span class="s5">5</span><span class="s2">, </span><span class="s5">5</span><span class="s2">), (</span><span class="s0">None</span><span class="s2">,))</span>
+            <span class="s2">)</span>
+        <span class="s2">)</span>
+        <span class="s1">lengths </span><span class="s2">= </span><span class="s1">range</span><span class="s2">(-</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">)</span>
+
+        <span class="s1">cfunc </span><span class="s2">= </span><span class="s1">jit</span><span class="s2">(</span><span class="s1">nopython</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">slice_indices</span><span class="s2">)</span>
+
+        <span class="s0">for </span><span class="s1">s</span><span class="s2">, </span><span class="s1">l </span><span class="s0">in </span><span class="s1">product</span><span class="s2">(</span><span class="s1">slices</span><span class="s2">, </span><span class="s1">lengths</span><span class="s2">):</span>
+            <span class="s0">try</span><span class="s2">:</span>
+                <span class="s1">expected </span><span class="s2">= </span><span class="s1">slice_indices</span><span class="s2">(</span><span class="s1">s</span><span class="s2">, </span><span class="s1">l</span><span class="s2">)</span>
+            <span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">py_e</span><span class="s2">:</span>
+                <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaises</span><span class="s2">(</span><span class="s1">type</span><span class="s2">(</span><span class="s1">py_e</span><span class="s2">)) </span><span class="s0">as </span><span class="s1">numba_e</span><span class="s2">:</span>
+                    <span class="s1">cfunc</span><span class="s2">(</span><span class="s1">s</span><span class="s2">, </span><span class="s1">l</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span>
+                    <span class="s1">str</span><span class="s2">(</span><span class="s1">py_e</span><span class="s2">),</span>
+                    <span class="s1">str</span><span class="s2">(</span><span class="s1">numba_e</span><span class="s2">.</span><span class="s1">exception</span><span class="s2">)</span>
+                <span class="s2">)</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">expected</span><span class="s2">, </span><span class="s1">cfunc</span><span class="s2">(</span><span class="s1">s</span><span class="s2">, </span><span class="s1">l</span><span class="s2">))</span>
+
+    <span class="s0">def </span><span class="s1">test_slice_indices_examples</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Tests for specific error cases.&quot;&quot;&quot;</span>
+        <span class="s1">cslice_indices </span><span class="s2">= </span><span class="s1">jit</span><span class="s2">(</span><span class="s1">nopython</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">slice_indices</span><span class="s2">)</span>
+
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaises</span><span class="s2">(</span><span class="s1">TypingError</span><span class="s2">) </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+            <span class="s1">cslice_indices</span><span class="s2">(</span><span class="s1">slice</span><span class="s2">(</span><span class="s0">None</span><span class="s2">), </span><span class="s5">1</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span>
+             <span class="s6">&quot;indices() takes exactly one argument (3 given)&quot;</span><span class="s2">,</span>
+             <span class="s1">str</span><span class="s2">(</span><span class="s1">e</span><span class="s2">.</span><span class="s1">exception</span><span class="s2">)</span>
+        <span class="s2">)</span>
+
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaises</span><span class="s2">(</span><span class="s1">TypingError</span><span class="s2">) </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+            <span class="s1">cslice_indices</span><span class="s2">(</span><span class="s1">slice</span><span class="s2">(</span><span class="s0">None</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, </span><span class="s5">0</span><span class="s2">), </span><span class="s5">1.2</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span>
+            <span class="s6">&quot;'%s' object cannot be interpreted as an integer&quot; </span><span class="s2">% </span><span class="s1">typeof</span><span class="s2">(</span><span class="s5">1.2</span><span class="s2">),</span>
+            <span class="s1">str</span><span class="s2">(</span><span class="s1">e</span><span class="s2">.</span><span class="s1">exception</span><span class="s2">)</span>
+        <span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_slice_from_constant</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">test_tuple </span><span class="s2">= (</span><span class="s5">1</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">, </span><span class="s5">4</span><span class="s2">)</span>
+
+        <span class="s0">for </span><span class="s1">ts </span><span class="s0">in </span><span class="s1">itertools</span><span class="s2">.</span><span class="s1">product</span><span class="s2">(</span>
+            <span class="s2">[</span><span class="s0">None</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">], [</span><span class="s0">None</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">], [</span><span class="s0">None</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, -</span><span class="s5">1</span><span class="s2">, -</span><span class="s5">2</span><span class="s2">]</span>
+        <span class="s2">):</span>
+            <span class="s1">ts </span><span class="s2">= </span><span class="s1">slice</span><span class="s2">(*</span><span class="s1">ts</span><span class="s2">)</span>
+
+            <span class="s2">@</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">nopython</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+            <span class="s0">def </span><span class="s1">test_fn</span><span class="s2">():</span>
+                <span class="s0">return </span><span class="s1">test_tuple</span><span class="s2">[</span><span class="s1">ts</span><span class="s2">]</span>
+
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">test_fn</span><span class="s2">(), </span><span class="s1">test_fn</span><span class="s2">.</span><span class="s1">py_func</span><span class="s2">())</span>
+
+    <span class="s0">def </span><span class="s1">test_literal_slice_distinct</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">sl1 </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">misc</span><span class="s2">.</span><span class="s1">SliceLiteral</span><span class="s2">(</span><span class="s1">slice</span><span class="s2">(</span><span class="s5">1</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, </span><span class="s0">None</span><span class="s2">))</span>
+        <span class="s1">sl2 </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">misc</span><span class="s2">.</span><span class="s1">SliceLiteral</span><span class="s2">(</span><span class="s1">slice</span><span class="s2">(</span><span class="s0">None</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, </span><span class="s0">None</span><span class="s2">))</span>
+        <span class="s1">sl3 </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">misc</span><span class="s2">.</span><span class="s1">SliceLiteral</span><span class="s2">(</span><span class="s1">slice</span><span class="s2">(</span><span class="s5">1</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, </span><span class="s0">None</span><span class="s2">))</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertNotEqual</span><span class="s2">(</span><span class="s1">sl1</span><span class="s2">, </span><span class="s1">sl2</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">sl1</span><span class="s2">, </span><span class="s1">sl3</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_literal_slice_boxing</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4"># Tests that a literal slice can be</span>
+        <span class="s4"># returned from a JIT function.</span>
+        <span class="s2">@</span><span class="s1">njit</span>
+        <span class="s0">def </span><span class="s1">f</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">literally</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+
+        <span class="s1">slices </span><span class="s2">= (</span>
+            <span class="s1">slice</span><span class="s2">(</span><span class="s5">1</span><span class="s2">, </span><span class="s5">4</span><span class="s2">, </span><span class="s5">2</span><span class="s2">),</span>
+            <span class="s1">slice</span><span class="s2">(</span><span class="s5">1</span><span class="s2">, </span><span class="s5">2</span><span class="s2">),</span>
+            <span class="s1">slice</span><span class="s2">(</span><span class="s5">1</span><span class="s2">),</span>
+            <span class="s1">slice</span><span class="s2">(</span><span class="s0">None</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s2">),</span>
+            <span class="s1">slice</span><span class="s2">(</span><span class="s5">1</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, </span><span class="s5">1</span><span class="s2">),</span>
+            <span class="s1">slice</span><span class="s2">(</span><span class="s0">None</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, </span><span class="s5">1</span><span class="s2">),</span>
+            <span class="s1">slice</span><span class="s2">(</span><span class="s0">None</span><span class="s2">),</span>
+            <span class="s1">slice</span><span class="s2">(</span><span class="s0">None</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+        <span class="s2">)</span>
+        <span class="s0">for </span><span class="s1">sl </span><span class="s0">in </span><span class="s1">slices</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">sl</span><span class="s2">, </span><span class="s1">f</span><span class="s2">(</span><span class="s1">sl</span><span class="s2">))</span>
+
+
+    <span class="s0">def </span><span class="s1">test_literal_slice_freevar</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4"># Tests passing a literal slice as a freevar</span>
+        <span class="s4"># in a closure.</span>
+        <span class="s1">z </span><span class="s2">= </span><span class="s1">slice</span><span class="s2">(</span><span class="s5">1</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">)</span>
+        <span class="s2">@</span><span class="s1">njit</span>
+        <span class="s0">def </span><span class="s1">foo</span><span class="s2">():</span>
+            <span class="s0">return </span><span class="s1">z</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">z</span><span class="s2">, </span><span class="s1">foo</span><span class="s2">())</span>
+
+    <span class="s0">def </span><span class="s1">test_literal_slice_maxint</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4"># Tests that passing a slice with an integer</span>
+        <span class="s4"># that exceeds the maxint size throws a reasonable</span>
+        <span class="s4"># error message.</span>
+        <span class="s2">@</span><span class="s1">njit</span><span class="s2">()</span>
+        <span class="s0">def </span><span class="s1">foo</span><span class="s2">(</span><span class="s1">z</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">literally</span><span class="s2">(</span><span class="s1">z</span><span class="s2">)</span>
+
+        <span class="s1">maxval </span><span class="s2">= </span><span class="s1">int</span><span class="s2">(</span><span class="s5">2</span><span class="s2">**</span><span class="s5">63</span><span class="s2">)</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaises</span><span class="s2">(</span><span class="s1">ValueError</span><span class="s2">) </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+            <span class="s1">foo</span><span class="s2">(</span><span class="s1">slice</span><span class="s2">(</span><span class="s0">None</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, -</span><span class="s1">maxval</span><span class="s2">-</span><span class="s5">1</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span>
+            <span class="s6">&quot;Int value is too large&quot;</span><span class="s2">,</span>
+            <span class="s1">str</span><span class="s2">(</span><span class="s1">e</span><span class="s2">.</span><span class="s1">exception</span><span class="s2">)</span>
+        <span class="s2">)</span>
+
+
+<span class="s0">if </span><span class="s1">__name__ </span><span class="s2">== </span><span class="s6">'__main__'</span><span class="s2">:</span>
+    <span class="s1">unittest</span><span class="s2">.</span><span class="s1">main</span><span class="s2">()</span>
+</pre>
+</body>
+</html>

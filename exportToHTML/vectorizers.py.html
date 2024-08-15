@@ -1,0 +1,275 @@
+<html>
+<head>
+<title>vectorizers.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #5f826b; font-style: italic;}
+.s4 { color: #2aacb8;}
+.s5 { color: #6aab73;}
+.s6 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+vectorizers.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">cuda</span>
+<span class="s0">from </span><span class="s1">numpy </span><span class="s0">import </span><span class="s1">array </span><span class="s0">as </span><span class="s1">np_array</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">np</span><span class="s2">.</span><span class="s1">ufunc </span><span class="s0">import </span><span class="s1">deviceufunc</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">np</span><span class="s2">.</span><span class="s1">ufunc</span><span class="s2">.</span><span class="s1">deviceufunc </span><span class="s0">import </span><span class="s2">(</span><span class="s1">UFuncMechanism</span><span class="s2">, </span><span class="s1">GeneralizedUFunc</span><span class="s2">,</span>
+                                        <span class="s1">GUFuncCallSteps</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">CUDAUFuncDispatcher</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Invoke the CUDA ufunc specialization for the given inputs. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">types_to_retty_kernels</span><span class="s2">, </span><span class="s1">pyfunc</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">functions </span><span class="s2">= </span><span class="s1">types_to_retty_kernels</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">__name__ </span><span class="s2">= </span><span class="s1">pyfunc</span><span class="s2">.</span><span class="s1">__name__</span>
+
+    <span class="s0">def </span><span class="s1">__call__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        *args: numpy arrays or DeviceArrayBase (created by cuda.to_device). 
+               Cannot mix the two types in one call. 
+ 
+        **kws: 
+            stream -- cuda stream; when defined, asynchronous mode is used. 
+            out    -- output array. Can be a numpy array or DeviceArrayBase 
+                      depending on the input arguments.  Type must match 
+                      the input arguments. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">CUDAUFuncMechanism</span><span class="s2">.</span><span class="s1">call</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">functions</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">reduce</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">arg</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s4">0</span><span class="s2">):</span>
+        <span class="s0">assert </span><span class="s1">len</span><span class="s2">(</span><span class="s1">list</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">functions</span><span class="s2">.</span><span class="s1">keys</span><span class="s2">())[</span><span class="s4">0</span><span class="s2">]) == </span><span class="s4">2</span><span class="s2">, </span><span class="s5">&quot;must be a binary &quot; </span><span class="s1">\</span>
+                                                         <span class="s5">&quot;ufunc&quot;</span>
+        <span class="s0">assert </span><span class="s1">arg</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">== </span><span class="s4">1</span><span class="s2">, </span><span class="s5">&quot;must use 1d array&quot;</span>
+
+        <span class="s1">n </span><span class="s2">= </span><span class="s1">arg</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s4">0</span><span class="s2">]</span>
+        <span class="s1">gpu_mems </span><span class="s2">= []</span>
+
+        <span class="s0">if </span><span class="s1">n </span><span class="s2">== </span><span class="s4">0</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">TypeError</span><span class="s2">(</span><span class="s5">&quot;Reduction on an empty array.&quot;</span><span class="s2">)</span>
+        <span class="s0">elif </span><span class="s1">n </span><span class="s2">== </span><span class="s4">1</span><span class="s2">:  </span><span class="s6"># nothing to do</span>
+            <span class="s0">return </span><span class="s1">arg</span><span class="s2">[</span><span class="s4">0</span><span class="s2">]</span>
+
+        <span class="s6"># always use a stream</span>
+        <span class="s1">stream </span><span class="s2">= </span><span class="s1">stream </span><span class="s0">or </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">stream</span><span class="s2">()</span>
+        <span class="s0">with </span><span class="s1">stream</span><span class="s2">.</span><span class="s1">auto_synchronize</span><span class="s2">():</span>
+            <span class="s6"># transfer memory to device if necessary</span>
+            <span class="s0">if </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">cudadrv</span><span class="s2">.</span><span class="s1">devicearray</span><span class="s2">.</span><span class="s1">is_cuda_ndarray</span><span class="s2">(</span><span class="s1">arg</span><span class="s2">):</span>
+                <span class="s1">mem </span><span class="s2">= </span><span class="s1">arg</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s1">mem </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">arg</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">)</span>
+                <span class="s6"># do reduction</span>
+            <span class="s1">out </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">__reduce</span><span class="s2">(</span><span class="s1">mem</span><span class="s2">, </span><span class="s1">gpu_mems</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">)</span>
+            <span class="s6"># use a small buffer to store the result element</span>
+            <span class="s1">buf </span><span class="s2">= </span><span class="s1">np_array</span><span class="s2">((</span><span class="s4">1</span><span class="s2">,), </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">arg</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+            <span class="s1">out</span><span class="s2">.</span><span class="s1">copy_to_host</span><span class="s2">(</span><span class="s1">buf</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">stream</span><span class="s2">)</span>
+
+        <span class="s0">return </span><span class="s1">buf</span><span class="s2">[</span><span class="s4">0</span><span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">__reduce</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mem</span><span class="s2">, </span><span class="s1">gpu_mems</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">):</span>
+        <span class="s1">n </span><span class="s2">= </span><span class="s1">mem</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s4">0</span><span class="s2">]</span>
+        <span class="s0">if </span><span class="s1">n </span><span class="s2">% </span><span class="s4">2 </span><span class="s2">!= </span><span class="s4">0</span><span class="s2">:  </span><span class="s6"># odd?</span>
+            <span class="s1">fatcut</span><span class="s2">, </span><span class="s1">thincut </span><span class="s2">= </span><span class="s1">mem</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s1">n </span><span class="s2">- </span><span class="s4">1</span><span class="s2">)</span>
+            <span class="s6"># prevent freeing during async mode</span>
+            <span class="s1">gpu_mems</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">fatcut</span><span class="s2">)</span>
+            <span class="s1">gpu_mems</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">thincut</span><span class="s2">)</span>
+            <span class="s6"># execute the kernel</span>
+            <span class="s1">out </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">__reduce</span><span class="s2">(</span><span class="s1">fatcut</span><span class="s2">, </span><span class="s1">gpu_mems</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">)</span>
+            <span class="s1">gpu_mems</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">out</span><span class="s2">)</span>
+            <span class="s0">return </span><span class="s1">self</span><span class="s2">(</span><span class="s1">out</span><span class="s2">, </span><span class="s1">thincut</span><span class="s2">, </span><span class="s1">out</span><span class="s2">=</span><span class="s1">out</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">stream</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:  </span><span class="s6"># even?</span>
+            <span class="s1">left</span><span class="s2">, </span><span class="s1">right </span><span class="s2">= </span><span class="s1">mem</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s1">n </span><span class="s2">// </span><span class="s4">2</span><span class="s2">)</span>
+            <span class="s6"># prevent freeing during async mode</span>
+            <span class="s1">gpu_mems</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">left</span><span class="s2">)</span>
+            <span class="s1">gpu_mems</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">right</span><span class="s2">)</span>
+            <span class="s6"># execute the kernel</span>
+            <span class="s1">self</span><span class="s2">(</span><span class="s1">left</span><span class="s2">, </span><span class="s1">right</span><span class="s2">, </span><span class="s1">out</span><span class="s2">=</span><span class="s1">left</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">stream</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">n </span><span class="s2">// </span><span class="s4">2 </span><span class="s2">&gt; </span><span class="s4">1</span><span class="s2">:</span>
+                <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">__reduce</span><span class="s2">(</span><span class="s1">left</span><span class="s2">, </span><span class="s1">gpu_mems</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">)</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s0">return </span><span class="s1">left</span>
+
+
+<span class="s0">class </span><span class="s1">_CUDAGUFuncCallSteps</span><span class="s2">(</span><span class="s1">GUFuncCallSteps</span><span class="s2">):</span>
+    <span class="s1">__slots__ </span><span class="s2">= [</span>
+        <span class="s5">'_stream'</span><span class="s2">,</span>
+    <span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">nin</span><span class="s2">, </span><span class="s1">nout</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">nin</span><span class="s2">, </span><span class="s1">nout</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kwargs</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_stream </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s5">'stream'</span><span class="s2">, </span><span class="s4">0</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">is_device_array</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">obj</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">is_cuda_array</span><span class="s2">(</span><span class="s1">obj</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">as_device_array</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">obj</span><span class="s2">):</span>
+        <span class="s6"># We don't want to call as_cuda_array on objects that are already Numba</span>
+        <span class="s6"># device arrays, because this results in exporting the array as a</span>
+        <span class="s6"># Producer then importing it as a Consumer, which causes a</span>
+        <span class="s6"># synchronization on the array's stream (if it has one) by default.</span>
+        <span class="s6"># When we have a Numba device array, we can simply return it.</span>
+        <span class="s0">if </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">cudadrv</span><span class="s2">.</span><span class="s1">devicearray</span><span class="s2">.</span><span class="s1">is_cuda_ndarray</span><span class="s2">(</span><span class="s1">obj</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">obj</span>
+        <span class="s0">return </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">as_cuda_array</span><span class="s2">(</span><span class="s1">obj</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">hostary</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">hostary</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_stream</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">to_host</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">devary</span><span class="s2">, </span><span class="s1">hostary</span><span class="s2">):</span>
+        <span class="s1">out </span><span class="s2">= </span><span class="s1">devary</span><span class="s2">.</span><span class="s1">copy_to_host</span><span class="s2">(</span><span class="s1">hostary</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_stream</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">out</span>
+
+    <span class="s0">def </span><span class="s1">allocate_device_array</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">shape</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">device_array</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">=</span><span class="s1">shape</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_stream</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">launch_kernel</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">kernel</span><span class="s2">, </span><span class="s1">nelem</span><span class="s2">, </span><span class="s1">args</span><span class="s2">):</span>
+        <span class="s1">kernel</span><span class="s2">.</span><span class="s1">forall</span><span class="s2">(</span><span class="s1">nelem</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_stream</span><span class="s2">)(*</span><span class="s1">args</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">CUDAGeneralizedUFunc</span><span class="s2">(</span><span class="s1">GeneralizedUFunc</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">kernelmap</span><span class="s2">, </span><span class="s1">engine</span><span class="s2">, </span><span class="s1">pyfunc</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">__name__ </span><span class="s2">= </span><span class="s1">pyfunc</span><span class="s2">.</span><span class="s1">__name__</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">kernelmap</span><span class="s2">, </span><span class="s1">engine</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">_call_steps</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">_CUDAGUFuncCallSteps</span>
+
+    <span class="s0">def </span><span class="s1">_broadcast_scalar_input</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">shape</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">cudadrv</span><span class="s2">.</span><span class="s1">devicearray</span><span class="s2">.</span><span class="s1">DeviceNDArray</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">=</span><span class="s1">shape</span><span class="s2">,</span>
+                                                      <span class="s1">strides</span><span class="s2">=(</span><span class="s4">0</span><span class="s2">,),</span>
+                                                      <span class="s1">dtype</span><span class="s2">=</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">,</span>
+                                                      <span class="s1">gpu_data</span><span class="s2">=</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">gpu_data</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">_broadcast_add_axis</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">newshape</span><span class="s2">):</span>
+        <span class="s1">newax </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">newshape</span><span class="s2">) - </span><span class="s1">len</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">)</span>
+        <span class="s6"># Add 0 strides for missing dimension</span>
+        <span class="s1">newstrides </span><span class="s2">= (</span><span class="s4">0</span><span class="s2">,) * </span><span class="s1">newax </span><span class="s2">+ </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">strides</span>
+        <span class="s0">return </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">cudadrv</span><span class="s2">.</span><span class="s1">devicearray</span><span class="s2">.</span><span class="s1">DeviceNDArray</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">=</span><span class="s1">newshape</span><span class="s2">,</span>
+                                                      <span class="s1">strides</span><span class="s2">=</span><span class="s1">newstrides</span><span class="s2">,</span>
+                                                      <span class="s1">dtype</span><span class="s2">=</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">,</span>
+                                                      <span class="s1">gpu_data</span><span class="s2">=</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">gpu_data</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">CUDAUFuncMechanism</span><span class="s2">(</span><span class="s1">UFuncMechanism</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Provide CUDA specialization 
+    &quot;&quot;&quot;</span>
+    <span class="s1">DEFAULT_STREAM </span><span class="s2">= </span><span class="s4">0</span>
+
+    <span class="s0">def </span><span class="s1">launch</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">count</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">, </span><span class="s1">args</span><span class="s2">):</span>
+        <span class="s1">func</span><span class="s2">.</span><span class="s1">forall</span><span class="s2">(</span><span class="s1">count</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">stream</span><span class="s2">)(*</span><span class="s1">args</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">is_device_array</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">obj</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">is_cuda_array</span><span class="s2">(</span><span class="s1">obj</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">as_device_array</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">obj</span><span class="s2">):</span>
+        <span class="s6"># We don't want to call as_cuda_array on objects that are already Numba</span>
+        <span class="s6"># device arrays, because this results in exporting the array as a</span>
+        <span class="s6"># Producer then importing it as a Consumer, which causes a</span>
+        <span class="s6"># synchronization on the array's stream (if it has one) by default.</span>
+        <span class="s6"># When we have a Numba device array, we can simply return it.</span>
+        <span class="s0">if </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">cudadrv</span><span class="s2">.</span><span class="s1">devicearray</span><span class="s2">.</span><span class="s1">is_cuda_ndarray</span><span class="s2">(</span><span class="s1">obj</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">obj</span>
+        <span class="s0">return </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">as_cuda_array</span><span class="s2">(</span><span class="s1">obj</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">hostary</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">hostary</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">stream</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">to_host</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">devary</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">devary</span><span class="s2">.</span><span class="s1">copy_to_host</span><span class="s2">(</span><span class="s1">stream</span><span class="s2">=</span><span class="s1">stream</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">allocate_device_array</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">shape</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">device_array</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">=</span><span class="s1">shape</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">stream</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">broadcast_device</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">shape</span><span class="s2">):</span>
+        <span class="s1">ax_differs </span><span class="s2">= [</span><span class="s1">ax </span><span class="s0">for </span><span class="s1">ax </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">))</span>
+                      <span class="s0">if </span><span class="s1">ax </span><span class="s2">&gt;= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim</span>
+                      <span class="s0">or </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s1">ax</span><span class="s2">] != </span><span class="s1">shape</span><span class="s2">[</span><span class="s1">ax</span><span class="s2">]]</span>
+
+        <span class="s1">missingdim </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">) - </span><span class="s1">len</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">)</span>
+        <span class="s1">strides </span><span class="s2">= [</span><span class="s4">0</span><span class="s2">] * </span><span class="s1">missingdim </span><span class="s2">+ </span><span class="s1">list</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">strides</span><span class="s2">)</span>
+
+        <span class="s0">for </span><span class="s1">ax </span><span class="s0">in </span><span class="s1">ax_differs</span><span class="s2">:</span>
+            <span class="s1">strides</span><span class="s2">[</span><span class="s1">ax</span><span class="s2">] = </span><span class="s4">0</span>
+
+        <span class="s0">return </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">cudadrv</span><span class="s2">.</span><span class="s1">devicearray</span><span class="s2">.</span><span class="s1">DeviceNDArray</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">=</span><span class="s1">shape</span><span class="s2">,</span>
+                                                      <span class="s1">strides</span><span class="s2">=</span><span class="s1">strides</span><span class="s2">,</span>
+                                                      <span class="s1">dtype</span><span class="s2">=</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">,</span>
+                                                      <span class="s1">gpu_data</span><span class="s2">=</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">gpu_data</span><span class="s2">)</span>
+
+
+<span class="s1">vectorizer_stager_source </span><span class="s2">= </span><span class="s5">''' 
+def __vectorized_{name}({args}, __out__): 
+    __tid__ = __cuda__.grid(1) 
+    if __tid__ &lt; __out__.shape[0]: 
+        __out__[__tid__] = __core__({argitems}) 
+'''</span>
+
+
+<span class="s0">class </span><span class="s1">CUDAVectorize</span><span class="s2">(</span><span class="s1">deviceufunc</span><span class="s2">.</span><span class="s1">DeviceVectorize</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">_compile_core</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">):</span>
+        <span class="s1">cudevfn </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">, </span><span class="s1">device</span><span class="s2">=</span><span class="s0">True</span><span class="s2">, </span><span class="s1">inline</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">pyfunc</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">cudevfn</span><span class="s2">, </span><span class="s1">cudevfn</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">[</span><span class="s1">sig</span><span class="s2">.</span><span class="s1">args</span><span class="s2">].</span><span class="s1">signature</span><span class="s2">.</span><span class="s1">return_type</span>
+
+    <span class="s0">def </span><span class="s1">_get_globals</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">corefn</span><span class="s2">):</span>
+        <span class="s1">glbl </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">pyfunc</span><span class="s2">.</span><span class="s1">__globals__</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">()</span>
+        <span class="s1">glbl</span><span class="s2">.</span><span class="s1">update</span><span class="s2">({</span><span class="s5">'__cuda__'</span><span class="s2">: </span><span class="s1">cuda</span><span class="s2">,</span>
+                     <span class="s5">'__core__'</span><span class="s2">: </span><span class="s1">corefn</span><span class="s2">})</span>
+        <span class="s0">return </span><span class="s1">glbl</span>
+
+    <span class="s0">def </span><span class="s1">_compile_kernel</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">fnobj</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">fnobj</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">build_ufunc</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">CUDAUFuncDispatcher</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">kernelmap</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">pyfunc</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">_kernel_template</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">vectorizer_stager_source</span>
+
+
+<span class="s6"># ------------------------------------------------------------------------------</span>
+<span class="s6"># Generalized CUDA ufuncs</span>
+
+<span class="s1">_gufunc_stager_source </span><span class="s2">= </span><span class="s5">''' 
+def __gufunc_{name}({args}): 
+    __tid__ = __cuda__.grid(1) 
+    if __tid__ &lt; {checkedarg}: 
+        __core__({argitems}) 
+'''</span>
+
+
+<span class="s0">class </span><span class="s1">CUDAGUFuncVectorize</span><span class="s2">(</span><span class="s1">deviceufunc</span><span class="s2">.</span><span class="s1">DeviceGUFuncVectorize</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">build_ufunc</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">engine </span><span class="s2">= </span><span class="s1">deviceufunc</span><span class="s2">.</span><span class="s1">GUFuncEngine</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">inputsig</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">outputsig</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">CUDAGeneralizedUFunc</span><span class="s2">(</span><span class="s1">kernelmap</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">kernelmap</span><span class="s2">,</span>
+                                    <span class="s1">engine</span><span class="s2">=</span><span class="s1">engine</span><span class="s2">,</span>
+                                    <span class="s1">pyfunc</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">pyfunc</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">_compile_kernel</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">fnobj</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">)(</span><span class="s1">fnobj</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">_kernel_template</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">_gufunc_stager_source</span>
+
+    <span class="s0">def </span><span class="s1">_get_globals</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">):</span>
+        <span class="s1">corefn </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">, </span><span class="s1">device</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">pyfunc</span><span class="s2">)</span>
+        <span class="s1">glbls </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">py_func</span><span class="s2">.</span><span class="s1">__globals__</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">()</span>
+        <span class="s1">glbls</span><span class="s2">.</span><span class="s1">update</span><span class="s2">({</span><span class="s5">'__cuda__'</span><span class="s2">: </span><span class="s1">cuda</span><span class="s2">,</span>
+                      <span class="s5">'__core__'</span><span class="s2">: </span><span class="s1">corefn</span><span class="s2">})</span>
+        <span class="s0">return </span><span class="s1">glbls</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,383 @@
+<html>
+<head>
+<title>generators.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+generators.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Support for lowering generators. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">llvmlite</span><span class="s3">.</span><span class="s1">ir</span>
+<span class="s2">from </span><span class="s1">llvmlite</span><span class="s3">.</span><span class="s1">ir </span><span class="s2">import </span><span class="s1">Constant</span><span class="s3">, </span><span class="s1">IRBuilder</span>
+
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">types</span><span class="s3">, </span><span class="s1">config</span><span class="s3">, </span><span class="s1">cgutils</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">funcdesc </span><span class="s2">import </span><span class="s1">FunctionDescriptor</span>
+
+
+<span class="s2">class </span><span class="s1">GeneratorDescriptor</span><span class="s3">(</span><span class="s1">FunctionDescriptor</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    The descriptor for a generator's next function. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">__slots__ </span><span class="s3">= ()</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">from_generator_fndesc</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">fndesc</span><span class="s3">, </span><span class="s1">gentype</span><span class="s3">, </span><span class="s1">mangler</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Build a GeneratorDescriptor for the generator returned by the 
+        function described by *fndesc*, with type *gentype*. 
+ 
+        The generator inherits the env_name from the *fndesc*. 
+        All emitted functions for the generator shares the same Env. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">gentype</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">Generator</span><span class="s3">)</span>
+        <span class="s1">restype </span><span class="s3">= </span><span class="s1">gentype</span><span class="s3">.</span><span class="s1">yield_type</span>
+        <span class="s1">args </span><span class="s3">= [</span><span class="s4">'gen'</span><span class="s3">]</span>
+        <span class="s1">argtypes </span><span class="s3">= (</span><span class="s1">gentype</span><span class="s3">,)</span>
+        <span class="s1">qualname </span><span class="s3">= </span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">qualname </span><span class="s3">+ </span><span class="s4">'.next'</span>
+        <span class="s1">unique_name </span><span class="s3">= </span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">unique_name </span><span class="s3">+ </span><span class="s4">'.next'</span>
+        <span class="s1">self </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">(</span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">native</span><span class="s3">, </span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">modname</span><span class="s3">, </span><span class="s1">qualname</span><span class="s3">, </span><span class="s1">unique_name</span><span class="s3">,</span>
+                   <span class="s1">fndesc</span><span class="s3">.</span><span class="s1">doc</span><span class="s3">, </span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">typemap</span><span class="s3">, </span><span class="s1">restype</span><span class="s3">, </span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">calltypes</span><span class="s3">,</span>
+                   <span class="s1">args</span><span class="s3">, </span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">kws</span><span class="s3">, </span><span class="s1">argtypes</span><span class="s3">=</span><span class="s1">argtypes</span><span class="s3">, </span><span class="s1">mangler</span><span class="s3">=</span><span class="s1">mangler</span><span class="s3">,</span>
+                   <span class="s1">inline</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, </span><span class="s1">env_name</span><span class="s3">=</span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">env_name</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">self</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">llvm_finalizer_name</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        The LLVM name of the generator's finalizer function 
+        (if &lt;generator type&gt;.has_finalizer is true). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s4">'finalize_' </span><span class="s3">+ </span><span class="s1">self</span><span class="s3">.</span><span class="s1">mangled_name</span>
+
+
+<span class="s2">class </span><span class="s1">BaseGeneratorLower</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Base support class for lowering generators. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">lower</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">context </span><span class="s3">= </span><span class="s1">lower</span><span class="s3">.</span><span class="s1">context</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">fndesc </span><span class="s3">= </span><span class="s1">lower</span><span class="s3">.</span><span class="s1">fndesc</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">library </span><span class="s3">= </span><span class="s1">lower</span><span class="s3">.</span><span class="s1">library</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">func_ir </span><span class="s3">= </span><span class="s1">lower</span><span class="s3">.</span><span class="s1">func_ir</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">lower </span><span class="s3">= </span><span class="s1">lower</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">geninfo </span><span class="s3">= </span><span class="s1">lower</span><span class="s3">.</span><span class="s1">generator_info</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">gentype </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_generator_type</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">gendesc </span><span class="s3">= </span><span class="s1">GeneratorDescriptor</span><span class="s3">.</span><span class="s1">from_generator_fndesc</span><span class="s3">(</span>
+            <span class="s1">lower</span><span class="s3">.</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fndesc</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">gentype</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">mangler</span><span class="s3">)</span>
+        <span class="s5"># Helps packing non-omitted arguments into a structure</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">arg_packer </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">get_data_packer</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">argtypes</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">resume_blocks </span><span class="s3">= {}</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">call_conv</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">lower</span><span class="s3">.</span><span class="s1">call_conv</span>
+
+    <span class="s2">def </span><span class="s1">get_args_ptr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">, </span><span class="s1">genptr</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">gep_inbounds</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">genptr</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">1</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">get_resume_index_ptr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">, </span><span class="s1">genptr</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">gep_inbounds</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">genptr</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">,</span>
+                                    <span class="s1">name</span><span class="s3">=</span><span class="s4">'gen.resume_index'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">get_state_ptr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">, </span><span class="s1">genptr</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">gep_inbounds</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">genptr</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">2</span><span class="s3">,</span>
+                                    <span class="s1">name</span><span class="s3">=</span><span class="s4">'gen.state'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">lower_init_func</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">lower</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Lower the generator's initialization function (which will fill up 
+        the passed-by-reference generator structure). 
+        &quot;&quot;&quot;</span>
+        <span class="s1">lower</span><span class="s3">.</span><span class="s1">setup_function</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">fndesc</span><span class="s3">)</span>
+
+        <span class="s1">builder </span><span class="s3">= </span><span class="s1">lower</span><span class="s3">.</span><span class="s1">builder</span>
+
+        <span class="s5"># Insert the generator into the target context in order to allow</span>
+        <span class="s5"># calling from other Numba-compiled functions.</span>
+        <span class="s1">lower</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">insert_generator</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">gentype</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">gendesc</span><span class="s3">,</span>
+                                       <span class="s3">[</span><span class="s1">self</span><span class="s3">.</span><span class="s1">library</span><span class="s3">])</span>
+
+        <span class="s5"># Init argument values</span>
+        <span class="s1">lower</span><span class="s3">.</span><span class="s1">extract_function_arguments</span><span class="s3">()</span>
+
+        <span class="s1">lower</span><span class="s3">.</span><span class="s1">pre_lower</span><span class="s3">()</span>
+
+        <span class="s5"># Initialize the return structure (i.e. the generator structure).</span>
+        <span class="s1">retty </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">get_return_type</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">gentype</span><span class="s3">)</span>
+        <span class="s5"># Structure index #0: the initial resume index (0 == start of generator)</span>
+        <span class="s1">resume_index </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">get_constant</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">int32</span><span class="s3">, </span><span class="s6">0</span><span class="s3">)</span>
+        <span class="s5"># Structure index #1: the function arguments</span>
+        <span class="s1">argsty </span><span class="s3">= </span><span class="s1">retty</span><span class="s3">.</span><span class="s1">elements</span><span class="s3">[</span><span class="s6">1</span><span class="s3">]</span>
+        <span class="s1">statesty </span><span class="s3">= </span><span class="s1">retty</span><span class="s3">.</span><span class="s1">elements</span><span class="s3">[</span><span class="s6">2</span><span class="s3">]</span>
+
+        <span class="s1">lower</span><span class="s3">.</span><span class="s1">debug_print</span><span class="s3">(</span><span class="s4">&quot;# low_init_func incref&quot;</span><span class="s3">)</span>
+        <span class="s5"># Incref all NRT arguments before storing into generator states</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">enable_nrt</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">argty</span><span class="s3">, </span><span class="s1">argval </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">argtypes</span><span class="s3">, </span><span class="s1">lower</span><span class="s3">.</span><span class="s1">fnargs</span><span class="s3">):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">nrt</span><span class="s3">.</span><span class="s1">incref</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">argty</span><span class="s3">, </span><span class="s1">argval</span><span class="s3">)</span>
+
+        <span class="s5"># Filter out omitted arguments</span>
+        <span class="s1">argsval </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">arg_packer</span><span class="s3">.</span><span class="s1">as_data</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">lower</span><span class="s3">.</span><span class="s1">fnargs</span><span class="s3">)</span>
+
+        <span class="s5"># Zero initialize states</span>
+        <span class="s1">statesval </span><span class="s3">= </span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">statesty</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">gen_struct </span><span class="s3">= </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">make_anonymous_struct</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">,</span>
+                                                   <span class="s3">[</span><span class="s1">resume_index</span><span class="s3">, </span><span class="s1">argsval</span><span class="s3">,</span>
+                                                    <span class="s1">statesval</span><span class="s3">],</span>
+                                                   <span class="s1">retty</span><span class="s3">)</span>
+
+        <span class="s1">retval </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">box_generator_struct</span><span class="s3">(</span><span class="s1">lower</span><span class="s3">, </span><span class="s1">gen_struct</span><span class="s3">)</span>
+
+        <span class="s1">lower</span><span class="s3">.</span><span class="s1">debug_print</span><span class="s3">(</span><span class="s4">&quot;# low_init_func before return&quot;</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">call_conv</span><span class="s3">.</span><span class="s1">return_value</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">retval</span><span class="s3">)</span>
+        <span class="s1">lower</span><span class="s3">.</span><span class="s1">post_lower</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">lower_next_func</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">lower</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Lower the generator's next() function (which takes the 
+        passed-by-reference generator structure and returns the next 
+        yielded value). 
+        &quot;&quot;&quot;</span>
+        <span class="s1">lower</span><span class="s3">.</span><span class="s1">setup_function</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">gendesc</span><span class="s3">)</span>
+        <span class="s1">lower</span><span class="s3">.</span><span class="s1">debug_print</span><span class="s3">(</span><span class="s4">&quot;# lower_next_func: {0}&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">gendesc</span><span class="s3">.</span><span class="s1">unique_name</span><span class="s3">))</span>
+        <span class="s2">assert </span><span class="s1">self</span><span class="s3">.</span><span class="s1">gendesc</span><span class="s3">.</span><span class="s1">argtypes</span><span class="s3">[</span><span class="s6">0</span><span class="s3">] == </span><span class="s1">self</span><span class="s3">.</span><span class="s1">gentype</span>
+        <span class="s1">builder </span><span class="s3">= </span><span class="s1">lower</span><span class="s3">.</span><span class="s1">builder</span>
+        <span class="s1">function </span><span class="s3">= </span><span class="s1">lower</span><span class="s3">.</span><span class="s1">function</span>
+
+        <span class="s5"># Extract argument values and other information from generator struct</span>
+        <span class="s1">genptr</span><span class="s3">, = </span><span class="s1">self</span><span class="s3">.</span><span class="s1">call_conv</span><span class="s3">.</span><span class="s1">get_arguments</span><span class="s3">(</span><span class="s1">function</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">arg_packer</span><span class="s3">.</span><span class="s1">load_into</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">,</span>
+                                  <span class="s1">self</span><span class="s3">.</span><span class="s1">get_args_ptr</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">genptr</span><span class="s3">),</span>
+                                  <span class="s1">lower</span><span class="s3">.</span><span class="s1">fnargs</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">resume_index_ptr </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_resume_index_ptr</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">genptr</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">gen_state_ptr </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_state_ptr</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">genptr</span><span class="s3">)</span>
+
+        <span class="s1">prologue </span><span class="s3">= </span><span class="s1">function</span><span class="s3">.</span><span class="s1">append_basic_block</span><span class="s3">(</span><span class="s4">&quot;generator_prologue&quot;</span><span class="s3">)</span>
+
+        <span class="s5"># Lower the generator's Python code</span>
+        <span class="s1">entry_block_tail </span><span class="s3">= </span><span class="s1">lower</span><span class="s3">.</span><span class="s1">lower_function_body</span><span class="s3">()</span>
+
+        <span class="s5"># Add block for StopIteration on entry</span>
+        <span class="s1">stop_block </span><span class="s3">= </span><span class="s1">function</span><span class="s3">.</span><span class="s1">append_basic_block</span><span class="s3">(</span><span class="s4">&quot;stop_iteration&quot;</span><span class="s3">)</span>
+        <span class="s1">builder</span><span class="s3">.</span><span class="s1">position_at_end</span><span class="s3">(</span><span class="s1">stop_block</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">call_conv</span><span class="s3">.</span><span class="s1">return_stop_iteration</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">)</span>
+
+        <span class="s5"># Add prologue switch to resume blocks</span>
+        <span class="s1">builder</span><span class="s3">.</span><span class="s1">position_at_end</span><span class="s3">(</span><span class="s1">prologue</span><span class="s3">)</span>
+        <span class="s5"># First Python block is also the resume point on first next() call</span>
+        <span class="s1">first_block </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">resume_blocks</span><span class="s3">[</span><span class="s6">0</span><span class="s3">] = </span><span class="s1">lower</span><span class="s3">.</span><span class="s1">blkmap</span><span class="s3">[</span><span class="s1">lower</span><span class="s3">.</span><span class="s1">firstblk</span><span class="s3">]</span>
+
+        <span class="s5"># Create front switch to resume points</span>
+        <span class="s1">switch </span><span class="s3">= </span><span class="s1">builder</span><span class="s3">.</span><span class="s1">switch</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">resume_index_ptr</span><span class="s3">),</span>
+                                <span class="s1">stop_block</span><span class="s3">)</span>
+        <span class="s2">for </span><span class="s1">index</span><span class="s3">, </span><span class="s1">block </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">resume_blocks</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+            <span class="s1">switch</span><span class="s3">.</span><span class="s1">add_case</span><span class="s3">(</span><span class="s1">index</span><span class="s3">, </span><span class="s1">block</span><span class="s3">)</span>
+
+        <span class="s5"># Close tail of entry block</span>
+        <span class="s1">builder</span><span class="s3">.</span><span class="s1">position_at_end</span><span class="s3">(</span><span class="s1">entry_block_tail</span><span class="s3">)</span>
+        <span class="s1">builder</span><span class="s3">.</span><span class="s1">branch</span><span class="s3">(</span><span class="s1">prologue</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">lower_finalize_func</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">lower</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Lower the generator's finalizer. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">fnty </span><span class="s3">= </span><span class="s1">llvmlite</span><span class="s3">.</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">FunctionType</span><span class="s3">(</span><span class="s1">llvmlite</span><span class="s3">.</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">VoidType</span><span class="s3">(),</span>
+                                        <span class="s3">[</span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">get_value_type</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">gentype</span><span class="s3">)])</span>
+        <span class="s1">function </span><span class="s3">= </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">get_or_insert_function</span><span class="s3">(</span>
+            <span class="s1">lower</span><span class="s3">.</span><span class="s1">module</span><span class="s3">, </span><span class="s1">fnty</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">gendesc</span><span class="s3">.</span><span class="s1">llvm_finalizer_name</span><span class="s3">)</span>
+        <span class="s1">entry_block </span><span class="s3">= </span><span class="s1">function</span><span class="s3">.</span><span class="s1">append_basic_block</span><span class="s3">(</span><span class="s4">'entry'</span><span class="s3">)</span>
+        <span class="s1">builder </span><span class="s3">= </span><span class="s1">IRBuilder</span><span class="s3">(</span><span class="s1">entry_block</span><span class="s3">)</span>
+
+        <span class="s1">genptrty </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">get_value_type</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">gentype</span><span class="s3">)</span>
+        <span class="s1">genptr </span><span class="s3">= </span><span class="s1">builder</span><span class="s3">.</span><span class="s1">bitcast</span><span class="s3">(</span><span class="s1">function</span><span class="s3">.</span><span class="s1">args</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">genptrty</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">lower_finalize_func_body</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">genptr</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">return_from_generator</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">lower</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Emit a StopIteration at generator end and mark the generator exhausted. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">indexval </span><span class="s3">= </span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">resume_index_ptr</span><span class="s3">.</span><span class="s1">type</span><span class="s3">.</span><span class="s1">pointee</span><span class="s3">, -</span><span class="s6">1</span><span class="s3">)</span>
+        <span class="s1">lower</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">store</span><span class="s3">(</span><span class="s1">indexval</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">resume_index_ptr</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">call_conv</span><span class="s3">.</span><span class="s1">return_stop_iteration</span><span class="s3">(</span><span class="s1">lower</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">create_resumption_block</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">lower</span><span class="s3">, </span><span class="s1">index</span><span class="s3">):</span>
+        <span class="s1">block_name </span><span class="s3">= </span><span class="s4">&quot;generator_resume%d&quot; </span><span class="s3">% (</span><span class="s1">index</span><span class="s3">,)</span>
+        <span class="s1">block </span><span class="s3">= </span><span class="s1">lower</span><span class="s3">.</span><span class="s1">function</span><span class="s3">.</span><span class="s1">append_basic_block</span><span class="s3">(</span><span class="s1">block_name</span><span class="s3">)</span>
+        <span class="s1">lower</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">position_at_end</span><span class="s3">(</span><span class="s1">block</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">resume_blocks</span><span class="s3">[</span><span class="s1">index</span><span class="s3">] = </span><span class="s1">block</span>
+
+    <span class="s2">def </span><span class="s1">debug_print</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">, </span><span class="s1">msg</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">config</span><span class="s3">.</span><span class="s1">DEBUG_JIT</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">debug_print</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s4">&quot;DEBUGJIT: {0}&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">))</span>
+
+<span class="s2">class </span><span class="s1">GeneratorLower</span><span class="s3">(</span><span class="s1">BaseGeneratorLower</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Support class for lowering nopython generators. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">get_generator_type</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">restype</span>
+
+    <span class="s2">def </span><span class="s1">box_generator_struct</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">lower</span><span class="s3">, </span><span class="s1">gen_struct</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">gen_struct</span>
+
+    <span class="s2">def </span><span class="s1">lower_finalize_func_body</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">, </span><span class="s1">genptr</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Lower the body of the generator's finalizer: decref all live 
+        state variables. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">debug_print</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s4">&quot;# generator: finalize&quot;</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">enable_nrt</span><span class="s3">:</span>
+
+            <span class="s5"># Always dereference all arguments</span>
+            <span class="s5"># self.debug_print(builder, &quot;# generator: clear args&quot;)</span>
+            <span class="s1">args_ptr </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_args_ptr</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">genptr</span><span class="s3">)</span>
+            <span class="s2">for </span><span class="s1">ty</span><span class="s3">, </span><span class="s1">val </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">arg_packer</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">args_ptr</span><span class="s3">):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">nrt</span><span class="s3">.</span><span class="s1">decref</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">ty</span><span class="s3">, </span><span class="s1">val</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">debug_print</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s4">&quot;# generator: finalize end&quot;</span><span class="s3">)</span>
+        <span class="s1">builder</span><span class="s3">.</span><span class="s1">ret_void</span><span class="s3">()</span>
+
+<span class="s2">class </span><span class="s1">PyGeneratorLower</span><span class="s3">(</span><span class="s1">BaseGeneratorLower</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Support class for lowering object mode generators. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">get_generator_type</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Compute the actual generator type (the generator function's return 
+        type is simply &quot;pyobject&quot;). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">types</span><span class="s3">.</span><span class="s1">Generator</span><span class="s3">(</span>
+            <span class="s1">gen_func</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">func_id</span><span class="s3">.</span><span class="s1">func</span><span class="s3">,</span>
+            <span class="s1">yield_type</span><span class="s3">=</span><span class="s1">types</span><span class="s3">.</span><span class="s1">pyobject</span><span class="s3">,</span>
+            <span class="s1">arg_types</span><span class="s3">=(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">pyobject</span><span class="s3">,) * </span><span class="s1">self</span><span class="s3">.</span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">arg_count</span><span class="s3">,</span>
+            <span class="s1">state_types</span><span class="s3">=(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">pyobject</span><span class="s3">,) * </span><span class="s1">len</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">geninfo</span><span class="s3">.</span><span class="s1">state_vars</span><span class="s3">),</span>
+            <span class="s1">has_finalizer</span><span class="s3">=</span><span class="s2">True</span><span class="s3">,</span>
+            <span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">box_generator_struct</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">lower</span><span class="s3">, </span><span class="s1">gen_struct</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Box the raw *gen_struct* as a Python object. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">gen_ptr </span><span class="s3">= </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">alloca_once_value</span><span class="s3">(</span><span class="s1">lower</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">gen_struct</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">lower</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">from_native_generator</span><span class="s3">(</span><span class="s1">gen_ptr</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">gentype</span><span class="s3">, </span><span class="s1">lower</span><span class="s3">.</span><span class="s1">envarg</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">init_generator_state</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">lower</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        NULL-initialize all generator state variables, to avoid spurious 
+        decref's on cleanup. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">lower</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">store</span><span class="s3">(</span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">gen_state_ptr</span><span class="s3">.</span><span class="s1">type</span><span class="s3">.</span><span class="s1">pointee</span><span class="s3">, </span><span class="s2">None</span><span class="s3">),</span>
+                            <span class="s1">self</span><span class="s3">.</span><span class="s1">gen_state_ptr</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">lower_finalize_func_body</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">, </span><span class="s1">genptr</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Lower the body of the generator's finalizer: decref all live 
+        state variables. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">pyapi </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">get_python_api</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">)</span>
+        <span class="s1">resume_index_ptr </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_resume_index_ptr</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">genptr</span><span class="s3">)</span>
+        <span class="s1">resume_index </span><span class="s3">= </span><span class="s1">builder</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">resume_index_ptr</span><span class="s3">)</span>
+        <span class="s5"># If resume_index is 0, next() was never called</span>
+        <span class="s5"># If resume_index is -1, generator terminated cleanly</span>
+        <span class="s5"># (note function arguments are saved in state variables,</span>
+        <span class="s5">#  so they don't need a separate cleanup step)</span>
+        <span class="s1">need_cleanup </span><span class="s3">= </span><span class="s1">builder</span><span class="s3">.</span><span class="s1">icmp_signed</span><span class="s3">(</span>
+            <span class="s4">'&gt;'</span><span class="s3">, </span><span class="s1">resume_index</span><span class="s3">, </span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">resume_index</span><span class="s3">.</span><span class="s1">type</span><span class="s3">, </span><span class="s6">0</span><span class="s3">))</span>
+
+        <span class="s2">with </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">if_unlikely</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">need_cleanup</span><span class="s3">):</span>
+            <span class="s5"># Decref all live vars (some may be NULL)</span>
+            <span class="s1">gen_state_ptr </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_state_ptr</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">genptr</span><span class="s3">)</span>
+            <span class="s2">for </span><span class="s1">state_index </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">gentype</span><span class="s3">.</span><span class="s1">state_types</span><span class="s3">)):</span>
+                <span class="s1">state_slot </span><span class="s3">= </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">gep_inbounds</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">gen_state_ptr</span><span class="s3">,</span>
+                                                  <span class="s6">0</span><span class="s3">, </span><span class="s1">state_index</span><span class="s3">)</span>
+                <span class="s1">ty </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">gentype</span><span class="s3">.</span><span class="s1">state_types</span><span class="s3">[</span><span class="s1">state_index</span><span class="s3">]</span>
+                <span class="s1">val </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">unpack_value</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">ty</span><span class="s3">, </span><span class="s1">state_slot</span><span class="s3">)</span>
+                <span class="s1">pyapi</span><span class="s3">.</span><span class="s1">decref</span><span class="s3">(</span><span class="s1">val</span><span class="s3">)</span>
+
+        <span class="s1">builder</span><span class="s3">.</span><span class="s1">ret_void</span><span class="s3">()</span>
+
+
+<span class="s2">class </span><span class="s1">LowerYield</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Support class for lowering a particular yield point. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">lower</span><span class="s3">, </span><span class="s1">yield_point</span><span class="s3">, </span><span class="s1">live_vars</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">lower </span><span class="s3">= </span><span class="s1">lower</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">context </span><span class="s3">= </span><span class="s1">lower</span><span class="s3">.</span><span class="s1">context</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">builder </span><span class="s3">= </span><span class="s1">lower</span><span class="s3">.</span><span class="s1">builder</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">genlower </span><span class="s3">= </span><span class="s1">lower</span><span class="s3">.</span><span class="s1">genlower</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">gentype </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">genlower</span><span class="s3">.</span><span class="s1">gentype</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">gen_state_ptr </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">genlower</span><span class="s3">.</span><span class="s1">gen_state_ptr</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">resume_index_ptr </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">genlower</span><span class="s3">.</span><span class="s1">resume_index_ptr</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">yp </span><span class="s3">= </span><span class="s1">yield_point</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">inst </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">yp</span><span class="s3">.</span><span class="s1">inst</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">live_vars </span><span class="s3">= </span><span class="s1">live_vars</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">live_var_indices </span><span class="s3">= [</span><span class="s1">lower</span><span class="s3">.</span><span class="s1">generator_info</span><span class="s3">.</span><span class="s1">state_vars</span><span class="s3">.</span><span class="s1">index</span><span class="s3">(</span><span class="s1">v</span><span class="s3">)</span>
+                                 <span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">live_vars</span><span class="s3">]</span>
+
+    <span class="s2">def </span><span class="s1">lower_yield_suspend</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">lower</span><span class="s3">.</span><span class="s1">debug_print</span><span class="s3">(</span><span class="s4">&quot;# generator suspend&quot;</span><span class="s3">)</span>
+        <span class="s5"># Save live vars in state</span>
+        <span class="s2">for </span><span class="s1">state_index</span><span class="s3">, </span><span class="s1">name </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">live_var_indices</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">live_vars</span><span class="s3">):</span>
+            <span class="s1">state_slot </span><span class="s3">= </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">gep_inbounds</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">gen_state_ptr</span><span class="s3">,</span>
+                                              <span class="s6">0</span><span class="s3">, </span><span class="s1">state_index</span><span class="s3">)</span>
+            <span class="s1">ty </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">gentype</span><span class="s3">.</span><span class="s1">state_types</span><span class="s3">[</span><span class="s1">state_index</span><span class="s3">]</span>
+            <span class="s5"># The yield might be in a loop, in which case the state might</span>
+            <span class="s5"># contain a predicate var that branches back to the loop head, in</span>
+            <span class="s5"># this case the var is live but in sequential lowering won't have</span>
+            <span class="s5"># been alloca'd yet, so do this here.</span>
+            <span class="s1">fetype </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">lower</span><span class="s3">.</span><span class="s1">typeof</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">lower</span><span class="s3">.</span><span class="s1">_alloca_var</span><span class="s3">(</span><span class="s1">name</span><span class="s3">, </span><span class="s1">fetype</span><span class="s3">)</span>
+            <span class="s1">val </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">lower</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s5"># IncRef newly stored value</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">enable_nrt</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">nrt</span><span class="s3">.</span><span class="s1">incref</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">ty</span><span class="s3">, </span><span class="s1">val</span><span class="s3">)</span>
+
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">pack_value</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">ty</span><span class="s3">, </span><span class="s1">val</span><span class="s3">, </span><span class="s1">state_slot</span><span class="s3">)</span>
+        <span class="s5"># Save resume index</span>
+        <span class="s1">indexval </span><span class="s3">= </span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">resume_index_ptr</span><span class="s3">.</span><span class="s1">type</span><span class="s3">.</span><span class="s1">pointee</span><span class="s3">,</span>
+                            <span class="s1">self</span><span class="s3">.</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">index</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">store</span><span class="s3">(</span><span class="s1">indexval</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">resume_index_ptr</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">lower</span><span class="s3">.</span><span class="s1">debug_print</span><span class="s3">(</span><span class="s4">&quot;# generator suspend end&quot;</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">lower_yield_resume</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5"># Emit resumption point</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">genlower</span><span class="s3">.</span><span class="s1">create_resumption_block</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">lower</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">index</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">lower</span><span class="s3">.</span><span class="s1">debug_print</span><span class="s3">(</span><span class="s4">&quot;# generator resume&quot;</span><span class="s3">)</span>
+        <span class="s5"># Reload live vars from state</span>
+        <span class="s2">for </span><span class="s1">state_index</span><span class="s3">, </span><span class="s1">name </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">live_var_indices</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">live_vars</span><span class="s3">):</span>
+            <span class="s1">state_slot </span><span class="s3">= </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">gep_inbounds</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">gen_state_ptr</span><span class="s3">,</span>
+                                              <span class="s6">0</span><span class="s3">, </span><span class="s1">state_index</span><span class="s3">)</span>
+            <span class="s1">ty </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">gentype</span><span class="s3">.</span><span class="s1">state_types</span><span class="s3">[</span><span class="s1">state_index</span><span class="s3">]</span>
+            <span class="s1">val </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">unpack_value</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">ty</span><span class="s3">, </span><span class="s1">state_slot</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">lower</span><span class="s3">.</span><span class="s1">storevar</span><span class="s3">(</span><span class="s1">val</span><span class="s3">, </span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s5"># Previous storevar is making an extra incref</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">enable_nrt</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">nrt</span><span class="s3">.</span><span class="s1">decref</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">ty</span><span class="s3">, </span><span class="s1">val</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">lower</span><span class="s3">.</span><span class="s1">debug_print</span><span class="s3">(</span><span class="s4">&quot;# generator resume end&quot;</span><span class="s3">)</span>
+</pre>
+</body>
+</html>

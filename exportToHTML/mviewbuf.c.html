@@ -1,0 +1,404 @@
+<html>
+<head>
+<title>mviewbuf.c</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #6aab73;}
+.s3 { color: #7a7e85;}
+.s4 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+mviewbuf.c</font>
+</center></td></tr></table>
+<pre><span class="s0">#include </span><span class="s2">&quot;_pymodule.h&quot;</span>
+
+<span class="s0">static int </span><span class="s1">get_writable_buffer(PyObject* obj, Py_buffer *buf, </span><span class="s0">int </span><span class="s1">force)</span>
+<span class="s1">{</span>
+    <span class="s1">Py_buffer read_buf;</span>
+    <span class="s0">int </span><span class="s1">flags = PyBUF_ND|PyBUF_STRIDES|PyBUF_FORMAT;</span>
+    <span class="s0">int </span><span class="s1">ret;</span>
+
+    <span class="s3">/* Attempt to get a writable buffer */</span>
+    <span class="s0">if </span><span class="s1">(!PyObject_GetBuffer(obj, buf, flags|PyBUF_WRITABLE))</span>
+        <span class="s0">return </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s0">if </span><span class="s1">(!force)</span>
+        <span class="s0">return </span><span class="s1">-</span><span class="s4">1</span><span class="s1">;</span>
+
+    <span class="s3">/* Make a writable buffer from a read-only buffer */</span>
+    <span class="s1">PyErr_Clear();</span>
+    <span class="s0">if</span><span class="s1">(-</span><span class="s4">1 </span><span class="s1">== PyObject_GetBuffer(obj, &amp;read_buf, flags))</span>
+        <span class="s0">return </span><span class="s1">-</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">ret = PyBuffer_FillInfo(buf, NULL, read_buf.buf, read_buf.len, </span><span class="s4">0</span><span class="s1">,</span>
+                             <span class="s1">flags|PyBUF_WRITABLE);</span>
+    <span class="s1">PyBuffer_Release(&amp;read_buf);</span>
+    <span class="s0">return </span><span class="s1">ret;</span>
+<span class="s1">}</span>
+
+<span class="s0">static int </span><span class="s1">get_readonly_buffer(PyObject* obj, Py_buffer *buf)</span>
+<span class="s1">{</span>
+    <span class="s0">int </span><span class="s1">flags = PyBUF_ND|PyBUF_STRIDES|PyBUF_FORMAT;</span>
+
+    <span class="s0">return </span><span class="s1">PyObject_GetBuffer(obj, buf, flags);</span>
+<span class="s1">}</span>
+
+
+<span class="s0">static void </span><span class="s1">free_buffer(Py_buffer * buf)</span>
+<span class="s1">{</span>
+    <span class="s1">PyBuffer_Release(buf);</span>
+<span class="s1">}</span>
+
+<span class="s3">/** 
+ * Return a pointer to the data of a writable buffer from obj. If only a 
+ * read-only buffer is available and force is True, a read-write buffer based on 
+ * the read-only buffer is obtained. Note that this may have some surprising 
+ * effects on buffers which expect the data from their read-only buffer not to 
+ * be modified. 
+ */</span>
+<span class="s0">static </span><span class="s1">PyObject*</span>
+<span class="s1">memoryview_get_buffer(PyObject *self, PyObject *args){</span>
+    <span class="s1">PyObject *obj = NULL;</span>
+    <span class="s0">int </span><span class="s1">force = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s0">int </span><span class="s1">readonly = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">PyObject *ret = NULL;</span>
+    <span class="s1">Py_buffer buf;</span>
+
+    <span class="s0">if </span><span class="s1">(!PyArg_ParseTuple(args, </span><span class="s2">&quot;O|ii&quot;</span><span class="s1">, &amp;obj, &amp;force, &amp;readonly))</span>
+        <span class="s0">return </span><span class="s1">NULL;</span>
+
+    <span class="s0">if </span><span class="s1">(readonly) {</span>
+        <span class="s0">if </span><span class="s1">(get_readonly_buffer(obj, &amp;buf))</span>
+            <span class="s0">return </span><span class="s1">NULL;</span>
+    <span class="s1">} </span><span class="s0">else </span><span class="s1">{</span>
+        <span class="s0">if </span><span class="s1">(get_writable_buffer(obj, &amp;buf, force))</span>
+            <span class="s0">return </span><span class="s1">NULL;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">ret = PyLong_FromVoidPtr(buf.buf);</span>
+    <span class="s1">free_buffer(&amp;buf);</span>
+    <span class="s0">return </span><span class="s1">ret;</span>
+<span class="s1">}</span>
+
+<span class="s3">/** 
+ * Gets a half-open range [start, end) which contains the array data 
+ * Modified from numpy/core/src/multiarray/array_assign.c 
+ */</span>
+<span class="s0">static </span><span class="s1">PyObject*</span>
+<span class="s1">get_extents(Py_ssize_t *shape, Py_ssize_t *strides, </span><span class="s0">int </span><span class="s1">ndim,</span>
+            <span class="s1">Py_ssize_t itemsize, Py_ssize_t ptr)</span>
+<span class="s1">{</span>
+    <span class="s1">Py_ssize_t start, end;</span>
+    <span class="s0">int </span><span class="s1">idim;</span>
+    <span class="s1">Py_ssize_t *dimensions = shape;</span>
+    <span class="s1">PyObject *ret = NULL;</span>
+
+    <span class="s0">if </span><span class="s1">(ndim &lt; </span><span class="s4">0 </span><span class="s1">){</span>
+        <span class="s1">PyErr_SetString(PyExc_ValueError, </span><span class="s2">&quot;buffer ndim &lt; 0&quot;</span><span class="s1">);</span>
+        <span class="s0">return </span><span class="s1">NULL;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">if </span><span class="s1">(!dimensions) {</span>
+        <span class="s0">if </span><span class="s1">(ndim == </span><span class="s4">0</span><span class="s1">) {</span>
+            <span class="s1">start = end = ptr;</span>
+            <span class="s1">end += itemsize;</span>
+            <span class="s0">return </span><span class="s1">Py_BuildValue(</span><span class="s2">&quot;nn&quot;</span><span class="s1">, start, end);</span>
+        <span class="s1">}</span>
+        <span class="s1">PyErr_SetString(PyExc_ValueError, </span><span class="s2">&quot;buffer shape is not defined&quot;</span><span class="s1">);</span>
+        <span class="s0">return </span><span class="s1">NULL;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">if </span><span class="s1">(!strides) {</span>
+        <span class="s1">PyErr_SetString(PyExc_ValueError, </span><span class="s2">&quot;buffer strides is not defined&quot;</span><span class="s1">);</span>
+        <span class="s0">return </span><span class="s1">NULL;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">/* Calculate with a closed range [start, end] */</span>
+    <span class="s1">start = end = ptr;</span>
+    <span class="s0">for </span><span class="s1">(idim = </span><span class="s4">0</span><span class="s1">; idim &lt; ndim; ++idim) {</span>
+        <span class="s1">Py_ssize_t stride = strides[idim], dim = dimensions[idim];</span>
+        <span class="s3">/* If the array size is zero, return an empty range */</span>
+        <span class="s0">if </span><span class="s1">(dim == </span><span class="s4">0</span><span class="s1">) {</span>
+            <span class="s1">start = end = ptr;</span>
+            <span class="s1">ret = Py_BuildValue(</span><span class="s2">&quot;nn&quot;</span><span class="s1">, start, end);</span>
+            <span class="s0">break</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s3">/* Expand either upwards or downwards depending on stride */</span>
+        <span class="s0">else </span><span class="s1">{</span>
+            <span class="s0">if </span><span class="s1">(stride &gt; </span><span class="s4">0</span><span class="s1">) {</span>
+                <span class="s1">end += stride * (dim - </span><span class="s4">1</span><span class="s1">);</span>
+            <span class="s1">}</span>
+            <span class="s0">else if </span><span class="s1">(stride &lt; </span><span class="s4">0</span><span class="s1">) {</span>
+                <span class="s1">start += stride * (dim - </span><span class="s4">1</span><span class="s1">);</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">if </span><span class="s1">(!ret) {</span>
+        <span class="s3">/* Return a half-open range */</span>
+        <span class="s1">Py_ssize_t out_start = start;</span>
+        <span class="s1">Py_ssize_t out_end = end + itemsize;</span>
+
+        <span class="s1">ret = Py_BuildValue(</span><span class="s2">&quot;nn&quot;</span><span class="s1">, out_start, out_end);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">return </span><span class="s1">ret;</span>
+<span class="s1">}</span>
+
+<span class="s0">static </span><span class="s1">PyObject*</span>
+<span class="s1">memoryview_get_extents(PyObject *self, PyObject *args)</span>
+<span class="s1">{</span>
+    <span class="s1">PyObject *obj = NULL;</span>
+    <span class="s1">PyObject *ret = NULL;</span>
+    <span class="s1">Py_buffer b;</span>
+    <span class="s0">if </span><span class="s1">(!PyArg_ParseTuple(args, </span><span class="s2">&quot;O&quot;</span><span class="s1">, &amp;obj))</span>
+        <span class="s0">return </span><span class="s1">NULL;</span>
+
+    <span class="s0">if </span><span class="s1">(get_readonly_buffer(obj, &amp;b))</span>
+        <span class="s0">return </span><span class="s1">NULL;</span>
+
+    <span class="s1">ret = get_extents(b.shape, b.strides, b.ndim, b.itemsize,</span>
+                      <span class="s1">(Py_ssize_t)b.buf);</span>
+    <span class="s1">free_buffer(&amp;b);</span>
+    <span class="s0">return </span><span class="s1">ret;</span>
+<span class="s1">}</span>
+
+<span class="s0">static </span><span class="s1">PyObject*</span>
+<span class="s1">memoryview_get_extents_info(PyObject *self, PyObject *args)</span>
+<span class="s1">{</span>
+    <span class="s0">int </span><span class="s1">i;</span>
+    <span class="s1">Py_ssize_t *shape_ary = NULL;</span>
+    <span class="s1">Py_ssize_t *strides_ary = NULL;</span>
+    <span class="s1">PyObject *shape_tuple = NULL;</span>
+    <span class="s1">PyObject *strides_tuple = NULL;</span>
+    <span class="s1">PyObject *shape = NULL, *strides = NULL;</span>
+    <span class="s1">Py_ssize_t itemsize = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s0">int </span><span class="s1">ndim = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">PyObject* res = NULL;</span>
+
+    <span class="s0">if </span><span class="s1">(!PyArg_ParseTuple(args, </span><span class="s2">&quot;OOin&quot;</span><span class="s1">, &amp;shape, &amp;strides, &amp;ndim, &amp;itemsize))</span>
+        <span class="s0">goto </span><span class="s1">cleanup;</span>
+
+    <span class="s0">if </span><span class="s1">(ndim &lt; </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s1">PyErr_SetString(PyExc_ValueError, </span><span class="s2">&quot;ndim is negative&quot;</span><span class="s1">);</span>
+        <span class="s0">goto </span><span class="s1">cleanup;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">if </span><span class="s1">(itemsize &lt;= </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s1">PyErr_SetString(PyExc_ValueError, </span><span class="s2">&quot;ndim &lt;= 0&quot;</span><span class="s1">);</span>
+        <span class="s0">goto </span><span class="s1">cleanup;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">shape_ary = malloc(</span><span class="s0">sizeof</span><span class="s1">(Py_ssize_t) * ndim + </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">strides_ary = malloc(</span><span class="s0">sizeof</span><span class="s1">(Py_ssize_t) * ndim + </span><span class="s4">1</span><span class="s1">);</span>
+
+    <span class="s1">shape_tuple = PySequence_Fast(shape, </span><span class="s2">&quot;shape is not a sequence&quot;</span><span class="s1">);</span>
+    <span class="s0">if </span><span class="s1">(!shape_tuple) </span><span class="s0">goto </span><span class="s1">cleanup;</span>
+
+    <span class="s0">for </span><span class="s1">(i = </span><span class="s4">0</span><span class="s1">; i &lt; ndim; ++i) {</span>
+        <span class="s1">shape_ary[i] = PyNumber_AsSsize_t(</span>
+                           <span class="s1">PySequence_Fast_GET_ITEM(shape_tuple, i),</span>
+                           <span class="s1">PyExc_OverflowError);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">strides_tuple = PySequence_Fast(strides, </span><span class="s2">&quot;strides is not a sequence&quot;</span><span class="s1">);</span>
+    <span class="s0">if </span><span class="s1">(!strides_tuple) </span><span class="s0">goto </span><span class="s1">cleanup;</span>
+
+    <span class="s0">for </span><span class="s1">(i = </span><span class="s4">0</span><span class="s1">; i &lt; ndim; ++i) {</span>
+        <span class="s1">strides_ary[i] = PyNumber_AsSsize_t(</span>
+                           <span class="s1">PySequence_Fast_GET_ITEM(strides_tuple, i),</span>
+                           <span class="s1">PyExc_OverflowError);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">res = get_extents(shape_ary, strides_ary, ndim, itemsize, </span><span class="s4">0</span><span class="s1">);</span>
+<span class="s1">cleanup:</span>
+    <span class="s1">free(shape_ary);</span>
+    <span class="s1">free(strides_ary);</span>
+    <span class="s1">Py_XDECREF(shape_tuple);</span>
+    <span class="s1">Py_XDECREF(strides_tuple);</span>
+    <span class="s0">return </span><span class="s1">res;</span>
+<span class="s1">}</span>
+
+
+<span class="s3">/* new type to expose buffer interface */</span>
+<span class="s0">typedef struct </span><span class="s1">{</span>
+    <span class="s1">PyObject_HEAD</span>
+    <span class="s3">/* Type-specific fields go here. */</span>
+<span class="s1">} MemAllocObject;</span>
+
+
+<span class="s0">static int</span>
+<span class="s1">get_bufinfo(PyObject *self, Py_ssize_t *psize, </span><span class="s0">void </span><span class="s1">**pptr)</span>
+<span class="s1">{</span>
+    <span class="s1">PyObject *buflen = NULL;</span>
+    <span class="s1">PyObject *bufptr = NULL;</span>
+    <span class="s1">Py_ssize_t size = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s0">void</span><span class="s1">* ptr = NULL;</span>
+    <span class="s0">int </span><span class="s1">ret = -</span><span class="s4">1</span><span class="s1">;</span>
+
+    <span class="s1">buflen = PyObject_GetAttrString(self, </span><span class="s2">&quot;_buflen_&quot;</span><span class="s1">);</span>
+    <span class="s0">if </span><span class="s1">(!buflen) </span><span class="s0">goto </span><span class="s1">cleanup;</span>
+
+    <span class="s1">bufptr = PyObject_GetAttrString(self, </span><span class="s2">&quot;_bufptr_&quot;</span><span class="s1">);</span>
+    <span class="s0">if </span><span class="s1">(!bufptr) </span><span class="s0">goto </span><span class="s1">cleanup;</span>
+
+    <span class="s1">size = PyNumber_AsSsize_t(buflen, PyExc_OverflowError);</span>
+    <span class="s0">if </span><span class="s1">(size == -</span><span class="s4">1 </span><span class="s1">&amp;&amp; PyErr_Occurred()) </span><span class="s0">goto </span><span class="s1">cleanup;</span>
+    <span class="s0">else if </span><span class="s1">(size &lt; </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s1">PyErr_SetString(PyExc_ValueError, </span><span class="s2">&quot;negative buffer size&quot;</span><span class="s1">);</span>
+        <span class="s0">goto </span><span class="s1">cleanup;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">ptr = PyLong_AsVoidPtr(PyNumber_Long(bufptr));</span>
+    <span class="s0">if </span><span class="s1">(PyErr_Occurred())</span>
+        <span class="s0">goto </span><span class="s1">cleanup;</span>
+    <span class="s0">else if </span><span class="s1">(!ptr) {</span>
+        <span class="s1">PyErr_SetString(PyExc_ValueError, </span><span class="s2">&quot;null buffer pointer&quot;</span><span class="s1">);</span>
+        <span class="s0">goto </span><span class="s1">cleanup;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">*psize = size;</span>
+    <span class="s1">*pptr = ptr;</span>
+    <span class="s1">ret = </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">cleanup:</span>
+    <span class="s1">Py_XDECREF(buflen);</span>
+    <span class="s1">Py_XDECREF(bufptr);</span>
+    <span class="s0">return </span><span class="s1">ret;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">static int</span>
+<span class="s1">MemAllocObject_getbuffer(PyObject *self, Py_buffer *view, </span><span class="s0">int </span><span class="s1">flags)</span>
+<span class="s1">{</span>
+    <span class="s1">Py_ssize_t size = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s0">void </span><span class="s1">*ptr = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s0">int </span><span class="s1">readonly;</span>
+
+    <span class="s0">if</span><span class="s1">(-</span><span class="s4">1 </span><span class="s1">== get_bufinfo(self, &amp;size, &amp;ptr))</span>
+        <span class="s0">return </span><span class="s1">-</span><span class="s4">1</span><span class="s1">;</span>
+
+    <span class="s1">readonly = (PyBUF_WRITABLE &amp; flags) != PyBUF_WRITABLE;</span>
+
+    <span class="s3">/* fill buffer */</span>
+    <span class="s0">if </span><span class="s1">(-</span><span class="s4">1 </span><span class="s1">== PyBuffer_FillInfo(view, self, (</span><span class="s0">void</span><span class="s1">*)ptr, size, readonly, flags))</span>
+        <span class="s0">return </span><span class="s1">-</span><span class="s4">1</span><span class="s1">;</span>
+
+    <span class="s0">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">static void</span>
+<span class="s1">MemAllocObject_releasebuffer(PyObject *self, Py_buffer *view)</span>
+<span class="s1">{</span>
+    <span class="s3">/* Do nothing */</span>
+<span class="s1">}</span>
+
+<span class="s0">static </span><span class="s1">PyBufferProcs MemAlloc_as_buffer = {</span>
+    <span class="s1">MemAllocObject_getbuffer,</span>
+    <span class="s1">MemAllocObject_releasebuffer,</span>
+<span class="s1">};</span>
+
+
+<span class="s0">static </span><span class="s1">PyTypeObject MemAllocType = {</span>
+    <span class="s1">PyVarObject_HEAD_INIT(NULL, </span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s2">&quot;mviewbuf.MemAlloc&quot;</span><span class="s1">,                        </span><span class="s3">/* tp_name */</span>
+    <span class="s0">sizeof</span><span class="s1">(MemAllocObject),                     </span><span class="s3">/* tp_basicsize */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_itemsize */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_dealloc */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_vectorcall_offset */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_getattr */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_setattr */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_as_async */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_repr */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_as_number */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_as_sequence */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_as_mapping */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_hash */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_call */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_str */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_getattro */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_setattro */</span>
+    <span class="s1">&amp;MemAlloc_as_buffer,                        </span><span class="s3">/* tp_as_buffer */</span>
+    <span class="s1">(Py_TPFLAGS_DEFAULT| Py_TPFLAGS_BASETYPE),  </span><span class="s3">/* tp_flags */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_doc */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_traverse */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_clear */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_richcompare */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_weaklistoffset */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_iter */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_iternext */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_methods */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_members */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_getset */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_base */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_dict */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_descr_get */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_descr_set */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_dictoffset */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_init */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_alloc */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_new */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_free */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_is_gc */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_bases */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_mro */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_cache */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_subclasses */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_weaklist */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_del */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_version_tag */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_finalize */</span>
+    <span class="s4">0</span><span class="s1">,                                          </span><span class="s3">/* tp_vectorcall */</span>
+<span class="s0">#if </span><span class="s1">(PY_MAJOR_VERSION == </span><span class="s4">3</span><span class="s1">) &amp;&amp; (PY_MINOR_VERSION == </span><span class="s4">12</span><span class="s1">)</span>
+<span class="s3">/* This was introduced first in 3.12 
+ * https://github.com/python/cpython/issues/91051 
+ */</span>
+    <span class="s4">0</span><span class="s1">,                                           </span><span class="s3">/* tp_watched */</span>
+<span class="s0">#endif</span>
+
+<span class="s3">/* WARNING: Do not remove this, only modify it! It is a version guard to 
+ * act as a reminder to update this struct on Python version update! */</span>
+<span class="s0">#if </span><span class="s1">(PY_MAJOR_VERSION == </span><span class="s4">3</span><span class="s1">)</span>
+<span class="s0">#if </span><span class="s1">! ((PY_MINOR_VERSION == </span><span class="s4">9</span><span class="s1">) || (PY_MINOR_VERSION == </span><span class="s4">10</span><span class="s1">) || (PY_MINOR_VERSION == </span><span class="s4">11</span><span class="s1">) || (PY_MINOR_VERSION == </span><span class="s4">12</span><span class="s1">))</span>
+<span class="s0">#error </span><span class="s2">&quot;Python minor version is not supported.&quot;</span>
+<span class="s0">#endif</span>
+<span class="s0">#else</span>
+<span class="s0">#error </span><span class="s2">&quot;Python major version is not supported.&quot;</span>
+<span class="s0">#endif</span>
+<span class="s3">/* END WARNING*/</span>
+<span class="s1">};</span>
+
+
+<span class="s0">static </span><span class="s1">PyMethodDef core_methods[] = {</span>
+<span class="s0">#define </span><span class="s1">declmethod(func) { #func , ( PyCFunction )func , METH_VARARGS , NULL }</span>
+    <span class="s1">declmethod(memoryview_get_buffer),</span>
+    <span class="s1">declmethod(memoryview_get_extents),</span>
+    <span class="s1">declmethod(memoryview_get_extents_info),</span>
+    <span class="s1">{ NULL },</span>
+<span class="s0">#undef </span><span class="s1">declmethod</span>
+<span class="s1">};</span>
+
+
+<span class="s1">MOD_INIT(mviewbuf) {</span>
+    <span class="s1">PyObject *module;</span>
+    <span class="s1">MOD_DEF(module, </span><span class="s2">&quot;mviewbuf&quot;</span><span class="s1">, </span><span class="s2">&quot;No docs&quot;</span><span class="s1">, core_methods)</span>
+    <span class="s0">if </span><span class="s1">(module == NULL)</span>
+        <span class="s0">return </span><span class="s1">MOD_ERROR_VAL;</span>
+
+    <span class="s1">MemAllocType.tp_new = PyType_GenericNew;</span>
+    <span class="s0">if </span><span class="s1">(PyType_Ready(&amp;MemAllocType) &lt; </span><span class="s4">0</span><span class="s1">){</span>
+        <span class="s0">return </span><span class="s1">MOD_ERROR_VAL;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">Py_INCREF(&amp;MemAllocType);</span>
+    <span class="s1">PyModule_AddObject(module, </span><span class="s2">&quot;MemAlloc&quot;</span><span class="s1">, (PyObject*)&amp;MemAllocType);</span>
+
+    <span class="s0">return </span><span class="s1">MOD_SUCCESS_VAL(module);</span>
+<span class="s1">}</span>
+
+</pre>
+</body>
+</html>

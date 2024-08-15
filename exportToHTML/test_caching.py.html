@@ -1,0 +1,1098 @@
+<html>
+<head>
+<title>test_caching.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #7a7e85;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+.s6 { color: #5f826b; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_caching.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">inspect</span>
+<span class="s0">import </span><span class="s1">llvmlite</span><span class="s2">.</span><span class="s1">binding </span><span class="s0">as </span><span class="s1">ll</span>
+<span class="s0">import </span><span class="s1">multiprocessing</span>
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">stat</span>
+<span class="s0">import </span><span class="s1">shutil</span>
+<span class="s0">import </span><span class="s1">subprocess</span>
+<span class="s0">import </span><span class="s1">sys</span>
+<span class="s0">import </span><span class="s1">traceback</span>
+<span class="s0">import </span><span class="s1">unittest</span>
+<span class="s0">import </span><span class="s1">warnings</span>
+<span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">njit</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">codegen</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">caching </span><span class="s0">import </span><span class="s1">_UserWideCacheLocator</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">errors </span><span class="s0">import </span><span class="s1">NumbaWarning</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">parfors </span><span class="s0">import </span><span class="s1">parfor</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">tests</span><span class="s2">.</span><span class="s1">support </span><span class="s0">import </span><span class="s2">(</span>
+    <span class="s1">TestCase</span><span class="s2">,</span>
+    <span class="s1">SerialMixin</span><span class="s2">,</span>
+    <span class="s1">capture_cache_log</span><span class="s2">,</span>
+    <span class="s1">import_dynamic</span><span class="s2">,</span>
+    <span class="s1">override_config</span><span class="s2">,</span>
+    <span class="s1">run_in_new_process_caching</span><span class="s2">,</span>
+    <span class="s1">skip_if_typeguard</span><span class="s2">,</span>
+    <span class="s1">skip_parfors_unsupported</span><span class="s2">,</span>
+    <span class="s1">temp_directory</span><span class="s2">,</span>
+<span class="s2">)</span>
+
+<span class="s0">try</span><span class="s2">:</span>
+    <span class="s0">import </span><span class="s1">ipykernel</span>
+<span class="s0">except </span><span class="s1">ImportError</span><span class="s2">:</span>
+    <span class="s1">ipykernel </span><span class="s2">= </span><span class="s0">None</span>
+
+
+<span class="s0">def </span><span class="s1">check_access_is_preventable</span><span class="s2">():</span>
+    <span class="s3"># This exists to check whether it is possible to prevent access to</span>
+    <span class="s3"># a file/directory through the use of `chmod 500`. If a user has</span>
+    <span class="s3"># elevated rights (e.g. root) then writes are likely to be possible</span>
+    <span class="s3"># anyway. Tests that require functioning access prevention are</span>
+    <span class="s3"># therefore skipped based on the result of this check.</span>
+    <span class="s1">tempdir </span><span class="s2">= </span><span class="s1">temp_directory</span><span class="s2">(</span><span class="s4">'test_cache'</span><span class="s2">)</span>
+    <span class="s1">test_dir </span><span class="s2">= (</span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">tempdir</span><span class="s2">, </span><span class="s4">'writable_test'</span><span class="s2">))</span>
+    <span class="s1">os</span><span class="s2">.</span><span class="s1">mkdir</span><span class="s2">(</span><span class="s1">test_dir</span><span class="s2">)</span>
+    <span class="s3"># check a write is possible</span>
+    <span class="s0">with </span><span class="s1">open</span><span class="s2">(</span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">test_dir</span><span class="s2">, </span><span class="s4">'write_ok'</span><span class="s2">), </span><span class="s4">'wt'</span><span class="s2">) </span><span class="s0">as </span><span class="s1">f</span><span class="s2">:</span>
+        <span class="s1">f</span><span class="s2">.</span><span class="s1">write</span><span class="s2">(</span><span class="s4">'check1'</span><span class="s2">)</span>
+    <span class="s3"># now forbid access</span>
+    <span class="s1">os</span><span class="s2">.</span><span class="s1">chmod</span><span class="s2">(</span><span class="s1">test_dir</span><span class="s2">, </span><span class="s5">0o500</span><span class="s2">)</span>
+    <span class="s0">try</span><span class="s2">:</span>
+        <span class="s0">with </span><span class="s1">open</span><span class="s2">(</span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">test_dir</span><span class="s2">, </span><span class="s4">'write_forbidden'</span><span class="s2">), </span><span class="s4">'wt'</span><span class="s2">) </span><span class="s0">as </span><span class="s1">f</span><span class="s2">:</span>
+            <span class="s1">f</span><span class="s2">.</span><span class="s1">write</span><span class="s2">(</span><span class="s4">'check2'</span><span class="s2">)</span>
+        <span class="s3"># access prevention is not possible</span>
+        <span class="s0">return False</span>
+    <span class="s0">except </span><span class="s1">PermissionError</span><span class="s2">:</span>
+        <span class="s3"># Check that the cause of the exception is due to access/permission</span>
+        <span class="s3"># as per</span>
+        <span class="s3"># https://github.com/conda/conda/blob/4.5.0/conda/gateways/disk/permissions.py#L35-L37  # noqa: E501</span>
+        <span class="s3"># errno reports access/perm fail so access prevention via</span>
+        <span class="s3"># `chmod 500` works for this user.</span>
+        <span class="s0">return True</span>
+    <span class="s0">finally</span><span class="s2">:</span>
+        <span class="s1">os</span><span class="s2">.</span><span class="s1">chmod</span><span class="s2">(</span><span class="s1">test_dir</span><span class="s2">, </span><span class="s5">0o775</span><span class="s2">)</span>
+        <span class="s1">shutil</span><span class="s2">.</span><span class="s1">rmtree</span><span class="s2">(</span><span class="s1">test_dir</span><span class="s2">)</span>
+
+
+<span class="s1">_access_preventable </span><span class="s2">= </span><span class="s1">check_access_is_preventable</span><span class="s2">()</span>
+<span class="s1">_access_msg </span><span class="s2">= </span><span class="s4">&quot;Cannot create a directory to which writes are preventable&quot;</span>
+<span class="s1">skip_bad_access </span><span class="s2">= </span><span class="s1">unittest</span><span class="s2">.</span><span class="s1">skipUnless</span><span class="s2">(</span><span class="s1">_access_preventable</span><span class="s2">, </span><span class="s1">_access_msg</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">constant_unicode_cache</span><span class="s2">():</span>
+    <span class="s1">c </span><span class="s2">= </span><span class="s4">&quot;abcd&quot;</span>
+    <span class="s0">return </span><span class="s1">hash</span><span class="s2">(</span><span class="s1">c</span><span class="s2">), </span><span class="s1">c</span>
+
+
+<span class="s0">def </span><span class="s1">check_constant_unicode_cache</span><span class="s2">():</span>
+    <span class="s1">pyfunc </span><span class="s2">= </span><span class="s1">constant_unicode_cache</span>
+    <span class="s1">cfunc </span><span class="s2">= </span><span class="s1">njit</span><span class="s2">(</span><span class="s1">cache</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">pyfunc</span><span class="s2">)</span>
+    <span class="s1">exp_hv</span><span class="s2">, </span><span class="s1">exp_str </span><span class="s2">= </span><span class="s1">pyfunc</span><span class="s2">()</span>
+    <span class="s1">got_hv</span><span class="s2">, </span><span class="s1">got_str </span><span class="s2">= </span><span class="s1">cfunc</span><span class="s2">()</span>
+    <span class="s0">assert </span><span class="s1">exp_hv </span><span class="s2">== </span><span class="s1">got_hv</span>
+    <span class="s0">assert </span><span class="s1">exp_str </span><span class="s2">== </span><span class="s1">got_str</span>
+
+
+<span class="s0">def </span><span class="s1">dict_cache</span><span class="s2">():</span>
+    <span class="s0">return </span><span class="s2">{</span><span class="s4">'a'</span><span class="s2">: </span><span class="s5">1</span><span class="s2">, </span><span class="s4">'b'</span><span class="s2">: </span><span class="s5">2</span><span class="s2">}</span>
+
+
+<span class="s0">def </span><span class="s1">check_dict_cache</span><span class="s2">():</span>
+    <span class="s1">pyfunc </span><span class="s2">= </span><span class="s1">dict_cache</span>
+    <span class="s1">cfunc </span><span class="s2">= </span><span class="s1">njit</span><span class="s2">(</span><span class="s1">cache</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">pyfunc</span><span class="s2">)</span>
+    <span class="s1">exp </span><span class="s2">= </span><span class="s1">pyfunc</span><span class="s2">()</span>
+    <span class="s1">got </span><span class="s2">= </span><span class="s1">cfunc</span><span class="s2">()</span>
+    <span class="s0">assert </span><span class="s1">exp </span><span class="s2">== </span><span class="s1">got</span>
+
+
+<span class="s0">def </span><span class="s1">generator_cache</span><span class="s2">():</span>
+    <span class="s0">for </span><span class="s1">v </span><span class="s0">in </span><span class="s2">(</span><span class="s5">1</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">):</span>
+        <span class="s0">yield </span><span class="s1">v</span>
+
+
+<span class="s0">def </span><span class="s1">check_generator_cache</span><span class="s2">():</span>
+    <span class="s1">pyfunc </span><span class="s2">= </span><span class="s1">generator_cache</span>
+    <span class="s1">cfunc </span><span class="s2">= </span><span class="s1">njit</span><span class="s2">(</span><span class="s1">cache</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">pyfunc</span><span class="s2">)</span>
+    <span class="s1">exp </span><span class="s2">= </span><span class="s1">list</span><span class="s2">(</span><span class="s1">pyfunc</span><span class="s2">())</span>
+    <span class="s1">got </span><span class="s2">= </span><span class="s1">list</span><span class="s2">(</span><span class="s1">cfunc</span><span class="s2">())</span>
+    <span class="s0">assert </span><span class="s1">exp </span><span class="s2">== </span><span class="s1">got</span>
+
+
+<span class="s0">class </span><span class="s1">TestCaching</span><span class="s2">(</span><span class="s1">SerialMixin</span><span class="s2">, </span><span class="s1">TestCase</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">run_test</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func</span><span class="s2">):</span>
+        <span class="s1">func</span><span class="s2">()</span>
+        <span class="s1">res </span><span class="s2">= </span><span class="s1">run_in_new_process_caching</span><span class="s2">(</span><span class="s1">func</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">res</span><span class="s2">[</span><span class="s4">'exitcode'</span><span class="s2">], </span><span class="s5">0</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_constant_unicode_cache</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">run_test</span><span class="s2">(</span><span class="s1">check_constant_unicode_cache</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_dict_cache</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">run_test</span><span class="s2">(</span><span class="s1">check_dict_cache</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_generator_cache</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">run_test</span><span class="s2">(</span><span class="s1">check_generator_cache</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_omitted</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+
+        <span class="s3"># Test in a new directory</span>
+        <span class="s1">cache_dir </span><span class="s2">= </span><span class="s1">temp_directory</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">__class__</span><span class="s2">.</span><span class="s1">__name__</span><span class="s2">)</span>
+        <span class="s1">ctx </span><span class="s2">= </span><span class="s1">multiprocessing</span><span class="s2">.</span><span class="s1">get_context</span><span class="s2">()</span>
+        <span class="s1">result_queue </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">Queue</span><span class="s2">()</span>
+        <span class="s1">proc </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">Process</span><span class="s2">(</span>
+            <span class="s1">target</span><span class="s2">=</span><span class="s1">omitted_child_test_wrapper</span><span class="s2">,</span>
+            <span class="s1">args</span><span class="s2">=(</span><span class="s1">result_queue</span><span class="s2">, </span><span class="s1">cache_dir</span><span class="s2">, </span><span class="s0">False</span><span class="s2">),</span>
+        <span class="s2">)</span>
+        <span class="s1">proc</span><span class="s2">.</span><span class="s1">start</span><span class="s2">()</span>
+        <span class="s1">proc</span><span class="s2">.</span><span class="s1">join</span><span class="s2">()</span>
+        <span class="s1">success</span><span class="s2">, </span><span class="s1">output </span><span class="s2">= </span><span class="s1">result_queue</span><span class="s2">.</span><span class="s1">get</span><span class="s2">()</span>
+
+        <span class="s3"># Ensure the child process is completed before checking its output</span>
+        <span class="s0">if not </span><span class="s1">success</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">fail</span><span class="s2">(</span><span class="s1">output</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span>
+            <span class="s1">output</span><span class="s2">,</span>
+            <span class="s5">1000</span><span class="s2">,</span>
+            <span class="s4">&quot;Omitted function returned an incorrect output&quot;</span>
+        <span class="s2">)</span>
+
+        <span class="s1">proc </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">Process</span><span class="s2">(</span>
+            <span class="s1">target</span><span class="s2">=</span><span class="s1">omitted_child_test_wrapper</span><span class="s2">,</span>
+            <span class="s1">args</span><span class="s2">=(</span><span class="s1">result_queue</span><span class="s2">, </span><span class="s1">cache_dir</span><span class="s2">, </span><span class="s0">True</span><span class="s2">)</span>
+        <span class="s2">)</span>
+        <span class="s1">proc</span><span class="s2">.</span><span class="s1">start</span><span class="s2">()</span>
+        <span class="s1">proc</span><span class="s2">.</span><span class="s1">join</span><span class="s2">()</span>
+        <span class="s1">success</span><span class="s2">, </span><span class="s1">output </span><span class="s2">= </span><span class="s1">result_queue</span><span class="s2">.</span><span class="s1">get</span><span class="s2">()</span>
+
+        <span class="s3"># Ensure the child process is completed before checking its output</span>
+        <span class="s0">if not </span><span class="s1">success</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">fail</span><span class="s2">(</span><span class="s1">output</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span>
+            <span class="s1">output</span><span class="s2">,</span>
+            <span class="s5">1000</span><span class="s2">,</span>
+            <span class="s4">&quot;Omitted function returned an incorrect output&quot;</span>
+        <span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">omitted_child_test_wrapper</span><span class="s2">(</span><span class="s1">result_queue</span><span class="s2">, </span><span class="s1">cache_dir</span><span class="s2">, </span><span class="s1">second_call</span><span class="s2">):</span>
+    <span class="s0">with </span><span class="s1">override_config</span><span class="s2">(</span><span class="s4">&quot;CACHE_DIR&quot;</span><span class="s2">, </span><span class="s1">cache_dir</span><span class="s2">):</span>
+        <span class="s2">@</span><span class="s1">njit</span><span class="s2">(</span><span class="s1">cache</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">test</span><span class="s2">(</span><span class="s1">num</span><span class="s2">=</span><span class="s5">1000</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">num</span>
+
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s1">output </span><span class="s2">= </span><span class="s1">test</span><span class="s2">()</span>
+            <span class="s3"># If we have a second call, we should have a cache hit.</span>
+            <span class="s3"># Otherwise, we expect a cache miss.</span>
+            <span class="s0">if </span><span class="s1">second_call</span><span class="s2">:</span>
+                <span class="s0">assert </span><span class="s1">test</span><span class="s2">.</span><span class="s1">_cache_hits</span><span class="s2">[</span><span class="s1">test</span><span class="s2">.</span><span class="s1">signatures</span><span class="s2">[</span><span class="s5">0</span><span class="s2">]] == </span><span class="s5">1</span><span class="s2">, </span><span class="s1">\</span>
+                    <span class="s4">&quot;Cache did not hit as expected&quot;</span>
+                <span class="s0">assert </span><span class="s1">test</span><span class="s2">.</span><span class="s1">_cache_misses</span><span class="s2">[</span><span class="s1">test</span><span class="s2">.</span><span class="s1">signatures</span><span class="s2">[</span><span class="s5">0</span><span class="s2">]] == </span><span class="s5">0</span><span class="s2">, </span><span class="s1">\</span>
+                    <span class="s4">&quot;Cache has an unexpected miss&quot;</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s0">assert </span><span class="s1">test</span><span class="s2">.</span><span class="s1">_cache_misses</span><span class="s2">[</span><span class="s1">test</span><span class="s2">.</span><span class="s1">signatures</span><span class="s2">[</span><span class="s5">0</span><span class="s2">]] == </span><span class="s5">1</span><span class="s2">, </span><span class="s1">\</span>
+                    <span class="s4">&quot;Cache did not miss as expected&quot;</span>
+                <span class="s0">assert </span><span class="s1">test</span><span class="s2">.</span><span class="s1">_cache_hits</span><span class="s2">[</span><span class="s1">test</span><span class="s2">.</span><span class="s1">signatures</span><span class="s2">[</span><span class="s5">0</span><span class="s2">]] == </span><span class="s5">0</span><span class="s2">, </span><span class="s1">\</span>
+                    <span class="s4">&quot;Cache has an unexpected hit&quot;</span>
+            <span class="s1">success </span><span class="s2">= </span><span class="s0">True</span>
+        <span class="s3"># Catch anything raised so it can be propagated</span>
+        <span class="s0">except</span><span class="s2">: </span><span class="s3"># noqa: E722</span>
+            <span class="s1">output </span><span class="s2">= </span><span class="s1">traceback</span><span class="s2">.</span><span class="s1">format_exc</span><span class="s2">()</span>
+            <span class="s1">success </span><span class="s2">= </span><span class="s0">False</span>
+        <span class="s1">result_queue</span><span class="s2">.</span><span class="s1">put</span><span class="s2">((</span><span class="s1">success</span><span class="s2">, </span><span class="s1">output</span><span class="s2">))</span>
+
+
+<span class="s0">class </span><span class="s1">BaseCacheTest</span><span class="s2">(</span><span class="s1">TestCase</span><span class="s2">):</span>
+    <span class="s3"># The source file that will be copied</span>
+    <span class="s1">usecases_file </span><span class="s2">= </span><span class="s0">None</span>
+    <span class="s3"># Make sure this doesn't conflict with another module</span>
+    <span class="s1">modname </span><span class="s2">= </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">setUp</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir </span><span class="s2">= </span><span class="s1">temp_directory</span><span class="s2">(</span><span class="s4">'test_cache'</span><span class="s2">)</span>
+        <span class="s1">sys</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">insert</span><span class="s2">(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">modfile </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">modname </span><span class="s2">+ </span><span class="s4">&quot;.py&quot;</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">cache_dir </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir</span><span class="s2">, </span><span class="s4">&quot;__pycache__&quot;</span><span class="s2">)</span>
+        <span class="s1">shutil</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">usecases_file</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">modfile</span><span class="s2">)</span>
+        <span class="s1">os</span><span class="s2">.</span><span class="s1">chmod</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">modfile</span><span class="s2">, </span><span class="s1">stat</span><span class="s2">.</span><span class="s1">S_IREAD </span><span class="s2">| </span><span class="s1">stat</span><span class="s2">.</span><span class="s1">S_IWRITE</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">maxDiff </span><span class="s2">= </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">tearDown</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">sys</span><span class="s2">.</span><span class="s1">modules</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">modname</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+        <span class="s1">sys</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">remove</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">import_module</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Import a fresh version of the test module.  All jitted functions</span>
+        <span class="s3"># in the test module will start anew and load overloads from</span>
+        <span class="s3"># the on-disk cache if possible.</span>
+        <span class="s1">old </span><span class="s2">= </span><span class="s1">sys</span><span class="s2">.</span><span class="s1">modules</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">modname</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">old </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s3"># Make sure cached bytecode is removed</span>
+            <span class="s1">cached </span><span class="s2">= [</span><span class="s1">old</span><span class="s2">.</span><span class="s1">__cached__</span><span class="s2">]</span>
+            <span class="s0">for </span><span class="s1">fn </span><span class="s0">in </span><span class="s1">cached</span><span class="s2">:</span>
+                <span class="s0">try</span><span class="s2">:</span>
+                    <span class="s1">os</span><span class="s2">.</span><span class="s1">unlink</span><span class="s2">(</span><span class="s1">fn</span><span class="s2">)</span>
+                <span class="s0">except </span><span class="s1">FileNotFoundError</span><span class="s2">:</span>
+                    <span class="s0">pass</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">import_dynamic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">modname</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">__file__</span><span class="s2">.</span><span class="s1">rstrip</span><span class="s2">(</span><span class="s4">'co'</span><span class="s2">), </span><span class="s1">self</span><span class="s2">.</span><span class="s1">modfile</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">mod</span>
+
+    <span class="s0">def </span><span class="s1">cache_contents</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s2">[</span><span class="s1">fn </span><span class="s0">for </span><span class="s1">fn </span><span class="s0">in </span><span class="s1">os</span><span class="s2">.</span><span class="s1">listdir</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">cache_dir</span><span class="s2">)</span>
+                    <span class="s0">if not </span><span class="s1">fn</span><span class="s2">.</span><span class="s1">endswith</span><span class="s2">((</span><span class="s4">'.pyc'</span><span class="s2">, </span><span class="s4">&quot;.pyo&quot;</span><span class="s2">))]</span>
+        <span class="s0">except </span><span class="s1">FileNotFoundError</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s2">[]</span>
+
+    <span class="s0">def </span><span class="s1">get_cache_mtimes</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">dict</span><span class="s2">((</span><span class="s1">fn</span><span class="s2">, </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">getmtime</span><span class="s2">(</span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">cache_dir</span><span class="s2">, </span><span class="s1">fn</span><span class="s2">)))</span>
+                    <span class="s0">for </span><span class="s1">fn </span><span class="s0">in </span><span class="s1">sorted</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">cache_contents</span><span class="s2">()))</span>
+
+    <span class="s0">def </span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">n</span><span class="s2">):</span>
+        <span class="s1">c </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">cache_contents</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">c</span><span class="s2">), </span><span class="s1">n</span><span class="s2">, </span><span class="s1">c</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">dummy_test</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">pass</span>
+
+
+<span class="s0">class </span><span class="s1">DispatcherCacheUsecasesTest</span><span class="s2">(</span><span class="s1">BaseCacheTest</span><span class="s2">):</span>
+    <span class="s1">here </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">dirname</span><span class="s2">(</span><span class="s1">__file__</span><span class="s2">)</span>
+    <span class="s1">usecases_file </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">here</span><span class="s2">, </span><span class="s4">&quot;cache_usecases.py&quot;</span><span class="s2">)</span>
+    <span class="s1">modname </span><span class="s2">= </span><span class="s4">&quot;dispatcher_caching_test_fodder&quot;</span>
+
+    <span class="s0">def </span><span class="s1">run_in_separate_process</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *, </span><span class="s1">envvars</span><span class="s2">={}):</span>
+        <span class="s3"># Cached functions can be run from a distinct process.</span>
+        <span class="s3"># Also stresses issue #1603: uncached function calling cached function</span>
+        <span class="s3"># shouldn't fail compiling.</span>
+        <span class="s1">code </span><span class="s2">= </span><span class="s4">&quot;&quot;&quot;if 1: 
+            import sys 
+ 
+            sys.path.insert(0, %(tempdir)r) 
+            mod = __import__(%(modname)r) 
+            mod.self_test() 
+            &quot;&quot;&quot; </span><span class="s2">% </span><span class="s1">dict</span><span class="s2">(</span><span class="s1">tempdir</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir</span><span class="s2">, </span><span class="s1">modname</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">modname</span><span class="s2">)</span>
+
+        <span class="s1">subp_env </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">environ</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">()</span>
+        <span class="s1">subp_env</span><span class="s2">.</span><span class="s1">update</span><span class="s2">(</span><span class="s1">envvars</span><span class="s2">)</span>
+        <span class="s1">popen </span><span class="s2">= </span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">Popen</span><span class="s2">([</span><span class="s1">sys</span><span class="s2">.</span><span class="s1">executable</span><span class="s2">, </span><span class="s4">&quot;-c&quot;</span><span class="s2">, </span><span class="s1">code</span><span class="s2">],</span>
+                                 <span class="s1">stdout</span><span class="s2">=</span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">PIPE</span><span class="s2">, </span><span class="s1">stderr</span><span class="s2">=</span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">PIPE</span><span class="s2">,</span>
+                                 <span class="s1">env</span><span class="s2">=</span><span class="s1">subp_env</span><span class="s2">)</span>
+        <span class="s1">out</span><span class="s2">, </span><span class="s1">err </span><span class="s2">= </span><span class="s1">popen</span><span class="s2">.</span><span class="s1">communicate</span><span class="s2">()</span>
+        <span class="s0">if </span><span class="s1">popen</span><span class="s2">.</span><span class="s1">returncode </span><span class="s2">!= </span><span class="s5">0</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">AssertionError</span><span class="s2">(</span>
+                <span class="s4">&quot;process failed with code %s: </span><span class="s0">\n</span><span class="s4">&quot;</span>
+                <span class="s4">&quot;stdout follows</span><span class="s0">\n</span><span class="s4">%s</span><span class="s0">\n</span><span class="s4">&quot;</span>
+                <span class="s4">&quot;stderr follows</span><span class="s0">\n</span><span class="s4">%s</span><span class="s0">\n</span><span class="s4">&quot;</span>
+                <span class="s2">% (</span><span class="s1">popen</span><span class="s2">.</span><span class="s1">returncode</span><span class="s2">, </span><span class="s1">out</span><span class="s2">.</span><span class="s1">decode</span><span class="s2">(), </span><span class="s1">err</span><span class="s2">.</span><span class="s1">decode</span><span class="s2">()),</span>
+            <span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">check_hits</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">hits</span><span class="s2">, </span><span class="s1">misses</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s1">st </span><span class="s2">= </span><span class="s1">func</span><span class="s2">.</span><span class="s1">stats</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">sum</span><span class="s2">(</span><span class="s1">st</span><span class="s2">.</span><span class="s1">cache_hits</span><span class="s2">.</span><span class="s1">values</span><span class="s2">()), </span><span class="s1">hits</span><span class="s2">, </span><span class="s1">st</span><span class="s2">.</span><span class="s1">cache_hits</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">misses </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">sum</span><span class="s2">(</span><span class="s1">st</span><span class="s2">.</span><span class="s1">cache_misses</span><span class="s2">.</span><span class="s1">values</span><span class="s2">()), </span><span class="s1">misses</span><span class="s2">,</span>
+                             <span class="s1">st</span><span class="s2">.</span><span class="s1">cache_misses</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">TestCache</span><span class="s2">(</span><span class="s1">DispatcherCacheUsecasesTest</span><span class="s2">):</span>
+
+    <span class="s0">def </span><span class="s1">test_caching</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">0</span><span class="s2">)</span>
+
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">add_usecase</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), </span><span class="s5">6</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">2</span><span class="s2">)  </span><span class="s3"># 1 index, 1 data</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">2.5</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), </span><span class="s5">6.5</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">3</span><span class="s2">)  </span><span class="s3"># 1 index, 2 data</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_hits</span><span class="s2">(</span><span class="s1">f</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">2</span><span class="s2">)</span>
+
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">add_objmode_usecase</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), </span><span class="s5">6</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">5</span><span class="s2">)  </span><span class="s3"># 2 index, 3 data</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">2.5</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), </span><span class="s5">6.5</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">6</span><span class="s2">)  </span><span class="s3"># 2 index, 4 data</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_hits</span><span class="s2">(</span><span class="s1">f</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">2</span><span class="s2">)</span>
+
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">record_return</span>
+        <span class="s1">rec </span><span class="s2">= </span><span class="s1">f</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">aligned_arr</span><span class="s2">, </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">rec</span><span class="s2">), (</span><span class="s5">2</span><span class="s2">, </span><span class="s5">43.5</span><span class="s2">))</span>
+        <span class="s1">rec </span><span class="s2">= </span><span class="s1">f</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">packed_arr</span><span class="s2">, </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">rec</span><span class="s2">), (</span><span class="s5">2</span><span class="s2">, </span><span class="s5">43.5</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">9</span><span class="s2">)  </span><span class="s3"># 3 index, 6 data</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_hits</span><span class="s2">(</span><span class="s1">f</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">2</span><span class="s2">)</span>
+
+        <span class="s3"># Check the code runs ok from another process</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">run_in_separate_process</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">test_caching_nrt_pruned</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">0</span><span class="s2">)</span>
+
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">add_usecase</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), </span><span class="s5">6</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">2</span><span class="s2">)  </span><span class="s3"># 1 index, 1 data</span>
+        <span class="s3"># NRT pruning may affect cache</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s5">3</span><span class="s2">)), </span><span class="s5">2 </span><span class="s2">+ </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s5">3</span><span class="s2">) + </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">3</span><span class="s2">)  </span><span class="s3"># 1 index, 2 data</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_hits</span><span class="s2">(</span><span class="s1">f</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">2</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_inner_then_outer</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Caching inner then outer function is ok</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">inner</span><span class="s2">(</span><span class="s5">3</span><span class="s2">, </span><span class="s5">2</span><span class="s2">), </span><span class="s5">6</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">2</span><span class="s2">)  </span><span class="s3"># 1 index, 1 data</span>
+        <span class="s3"># Uncached outer function shouldn't fail (issue #1603)</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">outer_uncached</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">3</span><span class="s2">, </span><span class="s5">2</span><span class="s2">), </span><span class="s5">2</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">2</span><span class="s2">)  </span><span class="s3"># 1 index, 1 data</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">outer_uncached</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">3</span><span class="s2">, </span><span class="s5">2</span><span class="s2">), </span><span class="s5">2</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">2</span><span class="s2">)  </span><span class="s3"># 1 index, 1 data</span>
+        <span class="s3"># Cached outer will create new cache entries</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">outer</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">3</span><span class="s2">, </span><span class="s5">2</span><span class="s2">), </span><span class="s5">2</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">4</span><span class="s2">)  </span><span class="s3"># 2 index, 2 data</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">3.5</span><span class="s2">, </span><span class="s5">2</span><span class="s2">), </span><span class="s5">2.5</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">6</span><span class="s2">)  </span><span class="s3"># 2 index, 4 data</span>
+
+    <span class="s0">def </span><span class="s1">test_outer_then_inner</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Caching outer then inner function is ok</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">outer</span><span class="s2">(</span><span class="s5">3</span><span class="s2">, </span><span class="s5">2</span><span class="s2">), </span><span class="s5">2</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">4</span><span class="s2">)  </span><span class="s3"># 2 index, 2 data</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">outer_uncached</span><span class="s2">(</span><span class="s5">3</span><span class="s2">, </span><span class="s5">2</span><span class="s2">), </span><span class="s5">2</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">4</span><span class="s2">)  </span><span class="s3"># same</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">inner</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">3</span><span class="s2">, </span><span class="s5">2</span><span class="s2">), </span><span class="s5">6</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">4</span><span class="s2">)  </span><span class="s3"># same</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">3.5</span><span class="s2">, </span><span class="s5">2</span><span class="s2">), </span><span class="s5">6.5</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">5</span><span class="s2">)  </span><span class="s3"># 2 index, 3 data</span>
+
+    <span class="s0">def </span><span class="s1">test_no_caching</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">add_nocache_usecase</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), </span><span class="s5">6</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">0</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_looplifted</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Loop-lifted functions can't be cached and raise a warning</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+
+        <span class="s0">with </span><span class="s1">warnings</span><span class="s2">.</span><span class="s1">catch_warnings</span><span class="s2">(</span><span class="s1">record</span><span class="s2">=</span><span class="s0">True</span><span class="s2">) </span><span class="s0">as </span><span class="s1">w</span><span class="s2">:</span>
+            <span class="s1">warnings</span><span class="s2">.</span><span class="s1">simplefilter</span><span class="s2">(</span><span class="s4">'always'</span><span class="s2">, </span><span class="s1">NumbaWarning</span><span class="s2">)</span>
+
+            <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">looplifted</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">4</span><span class="s2">), </span><span class="s5">6</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">0</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">w</span><span class="s2">), </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s4">'Cannot cache compiled function &quot;looplifted&quot; '</span>
+                      <span class="s4">'as it uses lifted code'</span><span class="s2">, </span><span class="s1">str</span><span class="s2">(</span><span class="s1">w</span><span class="s2">[</span><span class="s5">0</span><span class="s2">].</span><span class="s1">message</span><span class="s2">))</span>
+
+    <span class="s0">def </span><span class="s1">test_big_array</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Code references big array globals cannot be cached</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s0">with </span><span class="s1">warnings</span><span class="s2">.</span><span class="s1">catch_warnings</span><span class="s2">(</span><span class="s1">record</span><span class="s2">=</span><span class="s0">True</span><span class="s2">) </span><span class="s0">as </span><span class="s1">w</span><span class="s2">:</span>
+            <span class="s1">warnings</span><span class="s2">.</span><span class="s1">simplefilter</span><span class="s2">(</span><span class="s4">'always'</span><span class="s2">, </span><span class="s1">NumbaWarning</span><span class="s2">)</span>
+
+            <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">use_big_array</span>
+            <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_equal</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(), </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">biggie</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">0</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">w</span><span class="s2">), </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s4">'Cannot cache compiled function &quot;use_big_array&quot; '</span>
+                      <span class="s4">'as it uses dynamic globals'</span><span class="s2">, </span><span class="s1">str</span><span class="s2">(</span><span class="s1">w</span><span class="s2">[</span><span class="s5">0</span><span class="s2">].</span><span class="s1">message</span><span class="s2">))</span>
+
+    <span class="s0">def </span><span class="s1">test_ctypes</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Functions using a ctypes pointer can't be cached and raise</span>
+        <span class="s3"># a warning.</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+
+        <span class="s0">for </span><span class="s1">f </span><span class="s0">in </span><span class="s2">[</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">use_c_sin</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">use_c_sin_nest1</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">use_c_sin_nest2</span><span class="s2">]:</span>
+            <span class="s0">with </span><span class="s1">warnings</span><span class="s2">.</span><span class="s1">catch_warnings</span><span class="s2">(</span><span class="s1">record</span><span class="s2">=</span><span class="s0">True</span><span class="s2">) </span><span class="s0">as </span><span class="s1">w</span><span class="s2">:</span>
+                <span class="s1">warnings</span><span class="s2">.</span><span class="s1">simplefilter</span><span class="s2">(</span><span class="s4">'always'</span><span class="s2">, </span><span class="s1">NumbaWarning</span><span class="s2">)</span>
+
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">0.0</span><span class="s2">), </span><span class="s5">0.0</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">0</span><span class="s2">)</span>
+
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">w</span><span class="s2">), </span><span class="s5">1</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span>
+                <span class="s4">'Cannot cache compiled function &quot;{}&quot;'</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">f</span><span class="s2">.</span><span class="s1">__name__</span><span class="s2">),</span>
+                <span class="s1">str</span><span class="s2">(</span><span class="s1">w</span><span class="s2">[</span><span class="s5">0</span><span class="s2">].</span><span class="s1">message</span><span class="s2">),</span>
+            <span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_closure</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+
+        <span class="s0">with </span><span class="s1">warnings</span><span class="s2">.</span><span class="s1">catch_warnings</span><span class="s2">():</span>
+            <span class="s1">warnings</span><span class="s2">.</span><span class="s1">simplefilter</span><span class="s2">(</span><span class="s4">'error'</span><span class="s2">, </span><span class="s1">NumbaWarning</span><span class="s2">)</span>
+
+            <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">closure1</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">3</span><span class="s2">), </span><span class="s5">6</span><span class="s2">) </span><span class="s3"># 3 + 3 = 6</span>
+            <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">closure2</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">3</span><span class="s2">), </span><span class="s5">8</span><span class="s2">) </span><span class="s3"># 3 + 5 = 8</span>
+            <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">closure3</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">3</span><span class="s2">), </span><span class="s5">10</span><span class="s2">) </span><span class="s3"># 3 + 7 = 10</span>
+            <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">closure4</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">3</span><span class="s2">), </span><span class="s5">12</span><span class="s2">) </span><span class="s3"># 3 + 9 = 12</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">5</span><span class="s2">) </span><span class="s3"># 1 nbi, 4 nbc</span>
+
+    <span class="s0">def </span><span class="s1">test_first_class_function</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">first_class_function_usecase</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">first_class_function_mul</span><span class="s2">, </span><span class="s5">1</span><span class="s2">), </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">first_class_function_mul</span><span class="s2">, </span><span class="s5">10</span><span class="s2">), </span><span class="s5">100</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">first_class_function_add</span><span class="s2">, </span><span class="s5">1</span><span class="s2">), </span><span class="s5">2</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">first_class_function_add</span><span class="s2">, </span><span class="s5">10</span><span class="s2">), </span><span class="s5">20</span><span class="s2">)</span>
+        <span class="s3"># 1 + 1 + 1 nbi, 1 + 1 + 2 nbc - a separate cache for each call to `f`</span>
+        <span class="s3"># with a different callback.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">7</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_cache_reuse</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">mod</span><span class="s2">.</span><span class="s1">add_usecase</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">)</span>
+        <span class="s1">mod</span><span class="s2">.</span><span class="s1">add_usecase</span><span class="s2">(</span><span class="s5">2.5</span><span class="s2">, </span><span class="s5">3.5</span><span class="s2">)</span>
+        <span class="s1">mod</span><span class="s2">.</span><span class="s1">add_objmode_usecase</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">)</span>
+        <span class="s1">mod</span><span class="s2">.</span><span class="s1">outer_uncached</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">)</span>
+        <span class="s1">mod</span><span class="s2">.</span><span class="s1">outer</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">)</span>
+        <span class="s1">mod</span><span class="s2">.</span><span class="s1">record_return</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">packed_arr</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">mod</span><span class="s2">.</span><span class="s1">record_return</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">aligned_arr</span><span class="s2">, </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">mtimes </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_cache_mtimes</span><span class="s2">()</span>
+        <span class="s3"># Two signatures compiled</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_hits</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">add_usecase</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">2</span><span class="s2">)</span>
+
+        <span class="s1">mod2 </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsNot</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">, </span><span class="s1">mod2</span><span class="s2">)</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod2</span><span class="s2">.</span><span class="s1">add_usecase</span>
+        <span class="s1">f</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_hits</span><span class="s2">(</span><span class="s1">f</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">f</span><span class="s2">(</span><span class="s5">2.5</span><span class="s2">, </span><span class="s5">3.5</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_hits</span><span class="s2">(</span><span class="s1">f</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod2</span><span class="s2">.</span><span class="s1">add_objmode_usecase</span>
+        <span class="s1">f</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_hits</span><span class="s2">(</span><span class="s1">f</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+
+        <span class="s3"># The files haven't changed</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_cache_mtimes</span><span class="s2">(), </span><span class="s1">mtimes</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">run_in_separate_process</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_cache_mtimes</span><span class="s2">(), </span><span class="s1">mtimes</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_cache_invalidate</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">add_usecase</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), </span><span class="s5">6</span><span class="s2">)</span>
+
+        <span class="s3"># This should change the functions' results</span>
+        <span class="s0">with </span><span class="s1">open</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">modfile</span><span class="s2">, </span><span class="s4">&quot;a&quot;</span><span class="s2">) </span><span class="s0">as </span><span class="s1">f</span><span class="s2">:</span>
+            <span class="s1">f</span><span class="s2">.</span><span class="s1">write</span><span class="s2">(</span><span class="s4">&quot;</span><span class="s0">\n</span><span class="s4">Z = 10</span><span class="s0">\n</span><span class="s4">&quot;</span><span class="s2">)</span>
+
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">add_usecase</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), </span><span class="s5">15</span><span class="s2">)</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">add_objmode_usecase</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), </span><span class="s5">15</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_recompile</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Explicit call to recompile() should overwrite the cache</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">add_usecase</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), </span><span class="s5">6</span><span class="s2">)</span>
+
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">add_usecase</span>
+        <span class="s1">mod</span><span class="s2">.</span><span class="s1">Z </span><span class="s2">= </span><span class="s5">10</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), </span><span class="s5">6</span><span class="s2">)</span>
+        <span class="s1">f</span><span class="s2">.</span><span class="s1">recompile</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), </span><span class="s5">15</span><span class="s2">)</span>
+
+        <span class="s3"># Freshly recompiled version is re-used from other imports</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">add_usecase</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), </span><span class="s5">15</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_same_names</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Function with the same names should still disambiguate</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">renamed_function1</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">2</span><span class="s2">), </span><span class="s5">4</span><span class="s2">)</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">renamed_function2</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">2</span><span class="s2">), </span><span class="s5">8</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_frozen</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">from </span><span class="s2">.</span><span class="s1">dummy_module </span><span class="s0">import </span><span class="s1">function</span>
+        <span class="s1">old_code </span><span class="s2">= </span><span class="s1">function</span><span class="s2">.</span><span class="s1">__code__</span>
+        <span class="s1">code_obj </span><span class="s2">= </span><span class="s1">compile</span><span class="s2">(</span><span class="s4">'pass'</span><span class="s2">, </span><span class="s4">'tests/dummy_module.py'</span><span class="s2">, </span><span class="s4">'exec'</span><span class="s2">)</span>
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s1">function</span><span class="s2">.</span><span class="s1">__code__ </span><span class="s2">= </span><span class="s1">code_obj</span>
+
+            <span class="s1">source </span><span class="s2">= </span><span class="s1">inspect</span><span class="s2">.</span><span class="s1">getfile</span><span class="s2">(</span><span class="s1">function</span><span class="s2">)</span>
+            <span class="s3"># doesn't return anything, since it cannot find the module</span>
+            <span class="s3"># fails unless the executable is frozen</span>
+            <span class="s1">locator </span><span class="s2">= </span><span class="s1">_UserWideCacheLocator</span><span class="s2">.</span><span class="s1">from_function</span><span class="s2">(</span><span class="s1">function</span><span class="s2">, </span><span class="s1">source</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsNone</span><span class="s2">(</span><span class="s1">locator</span><span class="s2">)</span>
+
+            <span class="s1">sys</span><span class="s2">.</span><span class="s1">frozen </span><span class="s2">= </span><span class="s0">True</span>
+            <span class="s3"># returns a cache locator object, only works when the executable</span>
+            <span class="s3"># is frozen</span>
+            <span class="s1">locator </span><span class="s2">= </span><span class="s1">_UserWideCacheLocator</span><span class="s2">.</span><span class="s1">from_function</span><span class="s2">(</span><span class="s1">function</span><span class="s2">, </span><span class="s1">source</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsInstance</span><span class="s2">(</span><span class="s1">locator</span><span class="s2">, </span><span class="s1">_UserWideCacheLocator</span><span class="s2">)</span>
+
+        <span class="s0">finally</span><span class="s2">:</span>
+            <span class="s1">function</span><span class="s2">.</span><span class="s1">__code__ </span><span class="s2">= </span><span class="s1">old_code</span>
+            <span class="s0">del </span><span class="s1">sys</span><span class="s2">.</span><span class="s1">frozen</span>
+
+    <span class="s0">def </span><span class="s1">_test_pycache_fallback</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        With a disabled __pycache__, test there is a working fallback 
+        (e.g. on the user-wide cache dir) 
+        &quot;&quot;&quot;</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">add_usecase</span>
+        <span class="s3"># Remove this function's cache files at the end, to avoid accumulation</span>
+        <span class="s3"># across test calls.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">addCleanup</span><span class="s2">(</span><span class="s1">shutil</span><span class="s2">.</span><span class="s1">rmtree</span><span class="s2">, </span><span class="s1">f</span><span class="s2">.</span><span class="s1">stats</span><span class="s2">.</span><span class="s1">cache_path</span><span class="s2">, </span><span class="s1">ignore_errors</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), </span><span class="s5">6</span><span class="s2">)</span>
+        <span class="s3"># It's a cache miss since the file was copied to a new temp location</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_hits</span><span class="s2">(</span><span class="s1">f</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s2">)</span>
+
+        <span class="s3"># Test re-use</span>
+        <span class="s1">mod2 </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod2</span><span class="s2">.</span><span class="s1">add_usecase</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">3</span><span class="s2">), </span><span class="s5">6</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_hits</span><span class="s2">(</span><span class="s1">f</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+
+        <span class="s3"># The __pycache__ is empty (otherwise the test's preconditions</span>
+        <span class="s3"># wouldn't be met)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">0</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">skip_bad_access</span>
+    <span class="s2">@</span><span class="s1">unittest</span><span class="s2">.</span><span class="s1">skipIf</span><span class="s2">(</span><span class="s1">os</span><span class="s2">.</span><span class="s1">name </span><span class="s2">== </span><span class="s4">&quot;nt&quot;</span><span class="s2">,</span>
+                     <span class="s4">&quot;cannot easily make a directory read-only on Windows&quot;</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">test_non_creatable_pycache</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Make it impossible to create the __pycache__ directory</span>
+        <span class="s1">old_perms </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">stat</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir</span><span class="s2">).</span><span class="s1">st_mode</span>
+        <span class="s1">os</span><span class="s2">.</span><span class="s1">chmod</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir</span><span class="s2">, </span><span class="s5">0o500</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">addCleanup</span><span class="s2">(</span><span class="s1">os</span><span class="s2">.</span><span class="s1">chmod</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir</span><span class="s2">, </span><span class="s1">old_perms</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_test_pycache_fallback</span><span class="s2">()</span>
+
+    <span class="s2">@</span><span class="s1">skip_bad_access</span>
+    <span class="s2">@</span><span class="s1">unittest</span><span class="s2">.</span><span class="s1">skipIf</span><span class="s2">(</span><span class="s1">os</span><span class="s2">.</span><span class="s1">name </span><span class="s2">== </span><span class="s4">&quot;nt&quot;</span><span class="s2">,</span>
+                     <span class="s4">&quot;cannot easily make a directory read-only on Windows&quot;</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">test_non_writable_pycache</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Make it impossible to write to the __pycache__ directory</span>
+        <span class="s1">pycache </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir</span><span class="s2">, </span><span class="s4">'__pycache__'</span><span class="s2">)</span>
+        <span class="s1">os</span><span class="s2">.</span><span class="s1">mkdir</span><span class="s2">(</span><span class="s1">pycache</span><span class="s2">)</span>
+        <span class="s1">old_perms </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">stat</span><span class="s2">(</span><span class="s1">pycache</span><span class="s2">).</span><span class="s1">st_mode</span>
+        <span class="s1">os</span><span class="s2">.</span><span class="s1">chmod</span><span class="s2">(</span><span class="s1">pycache</span><span class="s2">, </span><span class="s5">0o500</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">addCleanup</span><span class="s2">(</span><span class="s1">os</span><span class="s2">.</span><span class="s1">chmod</span><span class="s2">, </span><span class="s1">pycache</span><span class="s2">, </span><span class="s1">old_perms</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_test_pycache_fallback</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">test_ipython</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Test caching in an IPython session</span>
+        <span class="s1">base_cmd </span><span class="s2">= [</span><span class="s1">sys</span><span class="s2">.</span><span class="s1">executable</span><span class="s2">, </span><span class="s4">'-m'</span><span class="s2">, </span><span class="s4">'IPython'</span><span class="s2">]</span>
+        <span class="s1">base_cmd </span><span class="s2">+= [</span><span class="s4">'--quiet'</span><span class="s2">, </span><span class="s4">'--quick'</span><span class="s2">, </span><span class="s4">'--no-banner'</span><span class="s2">, </span><span class="s4">'--colors=NoColor'</span><span class="s2">]</span>
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s1">ver </span><span class="s2">= </span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">check_output</span><span class="s2">(</span><span class="s1">base_cmd </span><span class="s2">+ [</span><span class="s4">'--version'</span><span class="s2">])</span>
+        <span class="s0">except </span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">CalledProcessError </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">skipTest</span><span class="s2">(</span><span class="s4">&quot;ipython not available: return code %d&quot;</span>
+                          <span class="s2">% </span><span class="s1">e</span><span class="s2">.</span><span class="s1">returncode</span><span class="s2">)</span>
+        <span class="s1">ver </span><span class="s2">= </span><span class="s1">ver</span><span class="s2">.</span><span class="s1">strip</span><span class="s2">().</span><span class="s1">decode</span><span class="s2">()</span>
+        <span class="s3"># Create test input</span>
+        <span class="s1">inputfn </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir</span><span class="s2">, </span><span class="s4">&quot;ipython_cache_usecase.txt&quot;</span><span class="s2">)</span>
+        <span class="s0">with </span><span class="s1">open</span><span class="s2">(</span><span class="s1">inputfn</span><span class="s2">, </span><span class="s4">&quot;w&quot;</span><span class="s2">) </span><span class="s0">as </span><span class="s1">f</span><span class="s2">:</span>
+            <span class="s1">f</span><span class="s2">.</span><span class="s1">write</span><span class="s2">(</span><span class="s4">r&quot;&quot;&quot; 
+                import os 
+                import sys 
+ 
+                from numba import jit 
+ 
+                # IPython 5 does not support multiline input if stdin isn't 
+                # a tty (https://github.com/ipython/ipython/issues/9752) 
+                f = jit(cache=True)(lambda: 42) 
+ 
+                res = f() 
+                # IPython writes on stdout, so use stderr instead 
+                sys.stderr.write(u&quot;cache hits = %d\n&quot; % f.stats.cache_hits[()]) 
+ 
+                # IPython hijacks sys.exit(), bypass it 
+                sys.stdout.flush() 
+                sys.stderr.flush() 
+                os._exit(res) 
+                &quot;&quot;&quot;</span><span class="s2">)</span>
+
+        <span class="s0">def </span><span class="s1">execute_with_input</span><span class="s2">():</span>
+            <span class="s3"># Feed the test input as stdin, to execute it in REPL context</span>
+            <span class="s0">with </span><span class="s1">open</span><span class="s2">(</span><span class="s1">inputfn</span><span class="s2">, </span><span class="s4">&quot;rb&quot;</span><span class="s2">) </span><span class="s0">as </span><span class="s1">stdin</span><span class="s2">:</span>
+                <span class="s1">p </span><span class="s2">= </span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">Popen</span><span class="s2">(</span><span class="s1">base_cmd</span><span class="s2">, </span><span class="s1">stdin</span><span class="s2">=</span><span class="s1">stdin</span><span class="s2">,</span>
+                                     <span class="s1">stdout</span><span class="s2">=</span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">PIPE</span><span class="s2">,</span>
+                                     <span class="s1">stderr</span><span class="s2">=</span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">PIPE</span><span class="s2">,</span>
+                                     <span class="s1">universal_newlines</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+                <span class="s1">out</span><span class="s2">, </span><span class="s1">err </span><span class="s2">= </span><span class="s1">p</span><span class="s2">.</span><span class="s1">communicate</span><span class="s2">()</span>
+                <span class="s0">if </span><span class="s1">p</span><span class="s2">.</span><span class="s1">returncode </span><span class="s2">!= </span><span class="s5">42</span><span class="s2">:</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">fail</span><span class="s2">(</span><span class="s4">&quot;unexpected return code %d</span><span class="s0">\n</span><span class="s4">&quot;</span>
+                              <span class="s4">&quot;-- stdout:</span><span class="s0">\n</span><span class="s4">%s</span><span class="s0">\n</span><span class="s4">&quot;</span>
+                              <span class="s4">&quot;-- stderr:</span><span class="s0">\n</span><span class="s4">%s</span><span class="s0">\n</span><span class="s4">&quot;</span>
+                              <span class="s2">% (</span><span class="s1">p</span><span class="s2">.</span><span class="s1">returncode</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">err</span><span class="s2">))</span>
+                <span class="s0">return </span><span class="s1">err</span>
+
+        <span class="s1">execute_with_input</span><span class="s2">()</span>
+        <span class="s3"># Run a second time and check caching</span>
+        <span class="s1">err </span><span class="s2">= </span><span class="s1">execute_with_input</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s4">&quot;cache hits = 1&quot;</span><span class="s2">, </span><span class="s1">err</span><span class="s2">.</span><span class="s1">strip</span><span class="s2">())</span>
+
+    <span class="s2">@</span><span class="s1">unittest</span><span class="s2">.</span><span class="s1">skipIf</span><span class="s2">((</span><span class="s1">ipykernel </span><span class="s0">is None</span><span class="s2">) </span><span class="s0">or </span><span class="s2">(</span><span class="s1">ipykernel</span><span class="s2">.</span><span class="s1">version_info</span><span class="s2">[</span><span class="s5">0</span><span class="s2">] &lt; </span><span class="s5">6</span><span class="s2">),</span>
+                     <span class="s4">&quot;requires ipykernel &gt;= 6&quot;</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">test_ipykernel</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Test caching in an IPython session using ipykernel</span>
+
+        <span class="s1">base_cmd </span><span class="s2">= [</span><span class="s1">sys</span><span class="s2">.</span><span class="s1">executable</span><span class="s2">, </span><span class="s4">'-m'</span><span class="s2">, </span><span class="s4">'IPython'</span><span class="s2">]</span>
+        <span class="s1">base_cmd </span><span class="s2">+= [</span><span class="s4">'--quiet'</span><span class="s2">, </span><span class="s4">'--quick'</span><span class="s2">, </span><span class="s4">'--no-banner'</span><span class="s2">, </span><span class="s4">'--colors=NoColor'</span><span class="s2">]</span>
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s1">ver </span><span class="s2">= </span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">check_output</span><span class="s2">(</span><span class="s1">base_cmd </span><span class="s2">+ [</span><span class="s4">'--version'</span><span class="s2">])</span>
+        <span class="s0">except </span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">CalledProcessError </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">skipTest</span><span class="s2">(</span><span class="s4">&quot;ipython not available: return code %d&quot;</span>
+                          <span class="s2">% </span><span class="s1">e</span><span class="s2">.</span><span class="s1">returncode</span><span class="s2">)</span>
+        <span class="s1">ver </span><span class="s2">= </span><span class="s1">ver</span><span class="s2">.</span><span class="s1">strip</span><span class="s2">().</span><span class="s1">decode</span><span class="s2">()</span>
+        <span class="s3"># Create test input</span>
+        <span class="s0">from </span><span class="s1">ipykernel </span><span class="s0">import </span><span class="s1">compiler</span>
+        <span class="s1">inputfn </span><span class="s2">= </span><span class="s1">compiler</span><span class="s2">.</span><span class="s1">get_tmp_directory</span><span class="s2">()</span>
+        <span class="s0">with </span><span class="s1">open</span><span class="s2">(</span><span class="s1">inputfn</span><span class="s2">, </span><span class="s4">&quot;w&quot;</span><span class="s2">) </span><span class="s0">as </span><span class="s1">f</span><span class="s2">:</span>
+            <span class="s1">f</span><span class="s2">.</span><span class="s1">write</span><span class="s2">(</span><span class="s4">r&quot;&quot;&quot; 
+                import os 
+                import sys 
+ 
+                from numba import jit 
+ 
+                # IPython 5 does not support multiline input if stdin isn't 
+                # a tty (https://github.com/ipython/ipython/issues/9752) 
+                f = jit(cache=True)(lambda: 42) 
+ 
+                res = f() 
+                # IPython writes on stdout, so use stderr instead 
+                sys.stderr.write(u&quot;cache hits = %d\n&quot; % f.stats.cache_hits[()]) 
+ 
+                # IPython hijacks sys.exit(), bypass it 
+                sys.stdout.flush() 
+                sys.stderr.flush() 
+                os._exit(res) 
+                &quot;&quot;&quot;</span><span class="s2">)</span>
+
+        <span class="s0">def </span><span class="s1">execute_with_input</span><span class="s2">():</span>
+            <span class="s3"># Feed the test input as stdin, to execute it in REPL context</span>
+            <span class="s0">with </span><span class="s1">open</span><span class="s2">(</span><span class="s1">inputfn</span><span class="s2">, </span><span class="s4">&quot;rb&quot;</span><span class="s2">) </span><span class="s0">as </span><span class="s1">stdin</span><span class="s2">:</span>
+                <span class="s1">p </span><span class="s2">= </span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">Popen</span><span class="s2">(</span><span class="s1">base_cmd</span><span class="s2">, </span><span class="s1">stdin</span><span class="s2">=</span><span class="s1">stdin</span><span class="s2">,</span>
+                                     <span class="s1">stdout</span><span class="s2">=</span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">PIPE</span><span class="s2">,</span>
+                                     <span class="s1">stderr</span><span class="s2">=</span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">PIPE</span><span class="s2">,</span>
+                                     <span class="s1">universal_newlines</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+                <span class="s1">out</span><span class="s2">, </span><span class="s1">err </span><span class="s2">= </span><span class="s1">p</span><span class="s2">.</span><span class="s1">communicate</span><span class="s2">()</span>
+                <span class="s0">if </span><span class="s1">p</span><span class="s2">.</span><span class="s1">returncode </span><span class="s2">!= </span><span class="s5">42</span><span class="s2">:</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">fail</span><span class="s2">(</span><span class="s4">&quot;unexpected return code %d</span><span class="s0">\n</span><span class="s4">&quot;</span>
+                              <span class="s4">&quot;-- stdout:</span><span class="s0">\n</span><span class="s4">%s</span><span class="s0">\n</span><span class="s4">&quot;</span>
+                              <span class="s4">&quot;-- stderr:</span><span class="s0">\n</span><span class="s4">%s</span><span class="s0">\n</span><span class="s4">&quot;</span>
+                              <span class="s2">% (</span><span class="s1">p</span><span class="s2">.</span><span class="s1">returncode</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">err</span><span class="s2">))</span>
+                <span class="s0">return </span><span class="s1">err</span>
+
+        <span class="s1">execute_with_input</span><span class="s2">()</span>
+        <span class="s3"># Run a second time and check caching</span>
+        <span class="s1">err </span><span class="s2">= </span><span class="s1">execute_with_input</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s4">&quot;cache hits = 1&quot;</span><span class="s2">, </span><span class="s1">err</span><span class="s2">.</span><span class="s1">strip</span><span class="s2">())</span>
+
+
+<span class="s2">@</span><span class="s1">skip_parfors_unsupported</span>
+<span class="s0">class </span><span class="s1">TestSequentialParForsCache</span><span class="s2">(</span><span class="s1">DispatcherCacheUsecasesTest</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">setUp</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">TestSequentialParForsCache</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">setUp</span><span class="s2">()</span>
+        <span class="s3"># Turn on sequential parfor lowering</span>
+        <span class="s1">parfor</span><span class="s2">.</span><span class="s1">sequential_parfor_lowering </span><span class="s2">= </span><span class="s0">True</span>
+
+    <span class="s0">def </span><span class="s1">tearDown</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">TestSequentialParForsCache</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">tearDown</span><span class="s2">()</span>
+        <span class="s3"># Turn off sequential parfor lowering</span>
+        <span class="s1">parfor</span><span class="s2">.</span><span class="s1">sequential_parfor_lowering </span><span class="s2">= </span><span class="s0">False</span>
+
+    <span class="s0">def </span><span class="s1">test_caching</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">parfor_usecase</span>
+        <span class="s1">ary </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">ones</span><span class="s2">(</span><span class="s5">10</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">f</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">), </span><span class="s1">ary </span><span class="s2">* </span><span class="s1">ary </span><span class="s2">+ </span><span class="s1">ary</span><span class="s2">)</span>
+        <span class="s1">dynamic_globals </span><span class="s2">= [</span><span class="s1">cres</span><span class="s2">.</span><span class="s1">library</span><span class="s2">.</span><span class="s1">has_dynamic_globals</span>
+                           <span class="s0">for </span><span class="s1">cres </span><span class="s0">in </span><span class="s1">f</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">.</span><span class="s1">values</span><span class="s2">()]</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">dynamic_globals</span><span class="s2">, [</span><span class="s0">False</span><span class="s2">])</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">2</span><span class="s2">)  </span><span class="s3"># 1 index, 1 data</span>
+
+
+<span class="s0">class </span><span class="s1">TestCacheWithCpuSetting</span><span class="s2">(</span><span class="s1">DispatcherCacheUsecasesTest</span><span class="s2">):</span>
+    <span class="s3"># Disable parallel testing due to envvars modification</span>
+    <span class="s1">_numba_parallel_test_ </span><span class="s2">= </span><span class="s0">False</span>
+
+    <span class="s0">def </span><span class="s1">check_later_mtimes</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mtimes_old</span><span class="s2">):</span>
+        <span class="s1">match_count </span><span class="s2">= </span><span class="s5">0</span>
+        <span class="s0">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_cache_mtimes</span><span class="s2">().</span><span class="s1">items</span><span class="s2">():</span>
+            <span class="s0">if </span><span class="s1">k </span><span class="s0">in </span><span class="s1">mtimes_old</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreaterEqual</span><span class="s2">(</span><span class="s1">v</span><span class="s2">, </span><span class="s1">mtimes_old</span><span class="s2">[</span><span class="s1">k</span><span class="s2">])</span>
+                <span class="s1">match_count </span><span class="s2">+= </span><span class="s5">1</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreater</span><span class="s2">(</span><span class="s1">match_count</span><span class="s2">, </span><span class="s5">0</span><span class="s2">,</span>
+                           <span class="s1">msg</span><span class="s2">=</span><span class="s4">'nothing to compare'</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_user_set_cpu_name</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">mod</span><span class="s2">.</span><span class="s1">self_test</span><span class="s2">()</span>
+        <span class="s1">cache_size </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">cache_contents</span><span class="s2">())</span>
+
+        <span class="s1">mtimes </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_cache_mtimes</span><span class="s2">()</span>
+        <span class="s3"># Change CPU name to generic</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">run_in_separate_process</span><span class="s2">(</span><span class="s1">envvars</span><span class="s2">={</span><span class="s4">'NUMBA_CPU_NAME'</span><span class="s2">: </span><span class="s4">'generic'</span><span class="s2">})</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_later_mtimes</span><span class="s2">(</span><span class="s1">mtimes</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreater</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">cache_contents</span><span class="s2">()), </span><span class="s1">cache_size</span><span class="s2">)</span>
+        <span class="s3"># Check cache index</span>
+        <span class="s1">cache </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">add_usecase</span><span class="s2">.</span><span class="s1">_cache</span>
+        <span class="s1">cache_file </span><span class="s2">= </span><span class="s1">cache</span><span class="s2">.</span><span class="s1">_cache_file</span>
+        <span class="s1">cache_index </span><span class="s2">= </span><span class="s1">cache_file</span><span class="s2">.</span><span class="s1">_load_index</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">cache_index</span><span class="s2">), </span><span class="s5">2</span><span class="s2">)</span>
+        <span class="s2">[</span><span class="s1">key_a</span><span class="s2">, </span><span class="s1">key_b</span><span class="s2">] = </span><span class="s1">cache_index</span><span class="s2">.</span><span class="s1">keys</span><span class="s2">()</span>
+        <span class="s0">if </span><span class="s1">key_a</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">1</span><span class="s2">] == </span><span class="s1">ll</span><span class="s2">.</span><span class="s1">get_host_cpu_name</span><span class="s2">():</span>
+            <span class="s1">key_host</span><span class="s2">, </span><span class="s1">key_generic </span><span class="s2">= </span><span class="s1">key_a</span><span class="s2">, </span><span class="s1">key_b</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">key_host</span><span class="s2">, </span><span class="s1">key_generic </span><span class="s2">= </span><span class="s1">key_b</span><span class="s2">, </span><span class="s1">key_a</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">key_host</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">1</span><span class="s2">], </span><span class="s1">ll</span><span class="s2">.</span><span class="s1">get_host_cpu_name</span><span class="s2">())</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">key_host</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">2</span><span class="s2">], </span><span class="s1">codegen</span><span class="s2">.</span><span class="s1">get_host_cpu_features</span><span class="s2">())</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">key_generic</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">1</span><span class="s2">], </span><span class="s4">'generic'</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">key_generic</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">2</span><span class="s2">], </span><span class="s4">''</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_user_set_cpu_features</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">mod</span><span class="s2">.</span><span class="s1">self_test</span><span class="s2">()</span>
+        <span class="s1">cache_size </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">cache_contents</span><span class="s2">())</span>
+
+        <span class="s1">mtimes </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_cache_mtimes</span><span class="s2">()</span>
+        <span class="s3"># Change CPU feature</span>
+        <span class="s1">my_cpu_features </span><span class="s2">= </span><span class="s4">'-sse;-avx'</span>
+
+        <span class="s1">system_features </span><span class="s2">= </span><span class="s1">codegen</span><span class="s2">.</span><span class="s1">get_host_cpu_features</span><span class="s2">()</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertNotEqual</span><span class="s2">(</span><span class="s1">system_features</span><span class="s2">, </span><span class="s1">my_cpu_features</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">run_in_separate_process</span><span class="s2">(</span>
+            <span class="s1">envvars</span><span class="s2">={</span><span class="s4">'NUMBA_CPU_FEATURES'</span><span class="s2">: </span><span class="s1">my_cpu_features</span><span class="s2">},</span>
+        <span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_later_mtimes</span><span class="s2">(</span><span class="s1">mtimes</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreater</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">cache_contents</span><span class="s2">()), </span><span class="s1">cache_size</span><span class="s2">)</span>
+        <span class="s3"># Check cache index</span>
+        <span class="s1">cache </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">add_usecase</span><span class="s2">.</span><span class="s1">_cache</span>
+        <span class="s1">cache_file </span><span class="s2">= </span><span class="s1">cache</span><span class="s2">.</span><span class="s1">_cache_file</span>
+        <span class="s1">cache_index </span><span class="s2">= </span><span class="s1">cache_file</span><span class="s2">.</span><span class="s1">_load_index</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">cache_index</span><span class="s2">), </span><span class="s5">2</span><span class="s2">)</span>
+        <span class="s2">[</span><span class="s1">key_a</span><span class="s2">, </span><span class="s1">key_b</span><span class="s2">] = </span><span class="s1">cache_index</span><span class="s2">.</span><span class="s1">keys</span><span class="s2">()</span>
+
+        <span class="s0">if </span><span class="s1">key_a</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">2</span><span class="s2">] == </span><span class="s1">system_features</span><span class="s2">:</span>
+            <span class="s1">key_host</span><span class="s2">, </span><span class="s1">key_generic </span><span class="s2">= </span><span class="s1">key_a</span><span class="s2">, </span><span class="s1">key_b</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">key_host</span><span class="s2">, </span><span class="s1">key_generic </span><span class="s2">= </span><span class="s1">key_b</span><span class="s2">, </span><span class="s1">key_a</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">key_host</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">1</span><span class="s2">], </span><span class="s1">ll</span><span class="s2">.</span><span class="s1">get_host_cpu_name</span><span class="s2">())</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">key_host</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">2</span><span class="s2">], </span><span class="s1">system_features</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">key_generic</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">1</span><span class="s2">], </span><span class="s1">ll</span><span class="s2">.</span><span class="s1">get_host_cpu_name</span><span class="s2">())</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">key_generic</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">2</span><span class="s2">], </span><span class="s1">my_cpu_features</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">TestMultiprocessCache</span><span class="s2">(</span><span class="s1">BaseCacheTest</span><span class="s2">):</span>
+
+    <span class="s3"># Nested multiprocessing.Pool raises AssertionError:</span>
+    <span class="s3"># &quot;daemonic processes are not allowed to have children&quot;</span>
+    <span class="s1">_numba_parallel_test_ </span><span class="s2">= </span><span class="s0">False</span>
+
+    <span class="s1">here </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">dirname</span><span class="s2">(</span><span class="s1">__file__</span><span class="s2">)</span>
+    <span class="s1">usecases_file </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">here</span><span class="s2">, </span><span class="s4">&quot;cache_usecases.py&quot;</span><span class="s2">)</span>
+    <span class="s1">modname </span><span class="s2">= </span><span class="s4">&quot;dispatcher_caching_test_fodder&quot;</span>
+
+    <span class="s0">def </span><span class="s1">test_multiprocessing</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Check caching works from multiple processes at once (#2028)</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s3"># Calling a pure Python caller of the JIT-compiled function is</span>
+        <span class="s3"># necessary to reproduce the issue.</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">simple_usecase_caller</span>
+        <span class="s1">n </span><span class="s2">= </span><span class="s5">3</span>
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s1">ctx </span><span class="s2">= </span><span class="s1">multiprocessing</span><span class="s2">.</span><span class="s1">get_context</span><span class="s2">(</span><span class="s4">'spawn'</span><span class="s2">)</span>
+        <span class="s0">except </span><span class="s1">AttributeError</span><span class="s2">:</span>
+            <span class="s1">ctx </span><span class="s2">= </span><span class="s1">multiprocessing</span>
+        <span class="s1">pool </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">Pool</span><span class="s2">(</span><span class="s1">n</span><span class="s2">)</span>
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s1">res </span><span class="s2">= </span><span class="s1">sum</span><span class="s2">(</span><span class="s1">pool</span><span class="s2">.</span><span class="s1">imap</span><span class="s2">(</span><span class="s1">f</span><span class="s2">, </span><span class="s1">range</span><span class="s2">(</span><span class="s1">n</span><span class="s2">)))</span>
+        <span class="s0">finally</span><span class="s2">:</span>
+            <span class="s1">pool</span><span class="s2">.</span><span class="s1">close</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">res</span><span class="s2">, </span><span class="s1">n </span><span class="s2">* (</span><span class="s1">n </span><span class="s2">- </span><span class="s5">1</span><span class="s2">) // </span><span class="s5">2</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">skip_if_typeguard</span>
+<span class="s0">class </span><span class="s1">TestCacheFileCollision</span><span class="s2">(</span><span class="s1">unittest</span><span class="s2">.</span><span class="s1">TestCase</span><span class="s2">):</span>
+    <span class="s1">_numba_parallel_test_ </span><span class="s2">= </span><span class="s0">False</span>
+
+    <span class="s1">here </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">dirname</span><span class="s2">(</span><span class="s1">__file__</span><span class="s2">)</span>
+    <span class="s1">usecases_file </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">here</span><span class="s2">, </span><span class="s4">&quot;cache_usecases.py&quot;</span><span class="s2">)</span>
+    <span class="s1">modname </span><span class="s2">= </span><span class="s4">&quot;caching_file_loc_fodder&quot;</span>
+    <span class="s1">source_text_1 </span><span class="s2">= </span><span class="s4">&quot;&quot;&quot; 
+from numba import njit 
+@njit(cache=True) 
+def bar(): 
+    return 123 
+&quot;&quot;&quot;</span>
+    <span class="s1">source_text_2 </span><span class="s2">= </span><span class="s4">&quot;&quot;&quot; 
+from numba import njit 
+@njit(cache=True) 
+def bar(): 
+    return 321 
+&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">setUp</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir </span><span class="s2">= </span><span class="s1">temp_directory</span><span class="s2">(</span><span class="s4">'test_cache_file_loc'</span><span class="s2">)</span>
+        <span class="s1">sys</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">insert</span><span class="s2">(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">modname </span><span class="s2">= </span><span class="s4">'module_name_that_is_unlikely'</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertNotIn</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">modname</span><span class="s2">, </span><span class="s1">sys</span><span class="s2">.</span><span class="s1">modules</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">modname_bar1 </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">modname</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">modname_bar2 </span><span class="s2">= </span><span class="s4">'.'</span><span class="s2">.</span><span class="s1">join</span><span class="s2">([</span><span class="s1">self</span><span class="s2">.</span><span class="s1">modname</span><span class="s2">, </span><span class="s4">'foo'</span><span class="s2">])</span>
+        <span class="s1">foomod </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">modname</span><span class="s2">)</span>
+        <span class="s1">os</span><span class="s2">.</span><span class="s1">mkdir</span><span class="s2">(</span><span class="s1">foomod</span><span class="s2">)</span>
+        <span class="s0">with </span><span class="s1">open</span><span class="s2">(</span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">foomod</span><span class="s2">, </span><span class="s4">'__init__.py'</span><span class="s2">), </span><span class="s4">'w'</span><span class="s2">) </span><span class="s0">as </span><span class="s1">fout</span><span class="s2">:</span>
+            <span class="s1">print</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">source_text_1</span><span class="s2">, </span><span class="s1">file</span><span class="s2">=</span><span class="s1">fout</span><span class="s2">)</span>
+        <span class="s0">with </span><span class="s1">open</span><span class="s2">(</span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">foomod</span><span class="s2">, </span><span class="s4">'foo.py'</span><span class="s2">), </span><span class="s4">'w'</span><span class="s2">) </span><span class="s0">as </span><span class="s1">fout</span><span class="s2">:</span>
+            <span class="s1">print</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">source_text_2</span><span class="s2">, </span><span class="s1">file</span><span class="s2">=</span><span class="s1">fout</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">tearDown</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">sys</span><span class="s2">.</span><span class="s1">modules</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">modname_bar1</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+        <span class="s1">sys</span><span class="s2">.</span><span class="s1">modules</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">modname_bar2</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+        <span class="s1">sys</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">remove</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">import_bar1</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">import_dynamic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">modname_bar1</span><span class="s2">).</span><span class="s1">bar</span>
+
+    <span class="s0">def </span><span class="s1">import_bar2</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">import_dynamic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">modname_bar2</span><span class="s2">).</span><span class="s1">bar</span>
+
+    <span class="s0">def </span><span class="s1">test_file_location</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">bar1 </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_bar1</span><span class="s2">()</span>
+        <span class="s1">bar2 </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_bar2</span><span class="s2">()</span>
+        <span class="s3"># Check that the cache file is named correctly</span>
+        <span class="s1">idxname1 </span><span class="s2">= </span><span class="s1">bar1</span><span class="s2">.</span><span class="s1">_cache</span><span class="s2">.</span><span class="s1">_cache_file</span><span class="s2">.</span><span class="s1">_index_name</span>
+        <span class="s1">idxname2 </span><span class="s2">= </span><span class="s1">bar2</span><span class="s2">.</span><span class="s1">_cache</span><span class="s2">.</span><span class="s1">_cache_file</span><span class="s2">.</span><span class="s1">_index_name</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertNotEqual</span><span class="s2">(</span><span class="s1">idxname1</span><span class="s2">, </span><span class="s1">idxname2</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">idxname1</span><span class="s2">.</span><span class="s1">startswith</span><span class="s2">(</span><span class="s4">&quot;__init__.bar-3.py&quot;</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">idxname2</span><span class="s2">.</span><span class="s1">startswith</span><span class="s2">(</span><span class="s4">&quot;foo.bar-3.py&quot;</span><span class="s2">))</span>
+
+    <span class="s2">@</span><span class="s1">unittest</span><span class="s2">.</span><span class="s1">skipUnless</span><span class="s2">(</span><span class="s1">hasattr</span><span class="s2">(</span><span class="s1">multiprocessing</span><span class="s2">, </span><span class="s4">'get_context'</span><span class="s2">),</span>
+                         <span class="s4">'Test requires multiprocessing.get_context'</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">test_no_collision</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">bar1 </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_bar1</span><span class="s2">()</span>
+        <span class="s1">bar2 </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_bar2</span><span class="s2">()</span>
+        <span class="s0">with </span><span class="s1">capture_cache_log</span><span class="s2">() </span><span class="s0">as </span><span class="s1">buf</span><span class="s2">:</span>
+            <span class="s1">res1 </span><span class="s2">= </span><span class="s1">bar1</span><span class="s2">()</span>
+        <span class="s1">cachelog </span><span class="s2">= </span><span class="s1">buf</span><span class="s2">.</span><span class="s1">getvalue</span><span class="s2">()</span>
+        <span class="s3"># bar1 should save new index and data</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">cachelog</span><span class="s2">.</span><span class="s1">count</span><span class="s2">(</span><span class="s4">'index saved'</span><span class="s2">), </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">cachelog</span><span class="s2">.</span><span class="s1">count</span><span class="s2">(</span><span class="s4">'data saved'</span><span class="s2">), </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">cachelog</span><span class="s2">.</span><span class="s1">count</span><span class="s2">(</span><span class="s4">'index loaded'</span><span class="s2">), </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">cachelog</span><span class="s2">.</span><span class="s1">count</span><span class="s2">(</span><span class="s4">'data loaded'</span><span class="s2">), </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s0">with </span><span class="s1">capture_cache_log</span><span class="s2">() </span><span class="s0">as </span><span class="s1">buf</span><span class="s2">:</span>
+            <span class="s1">res2 </span><span class="s2">= </span><span class="s1">bar2</span><span class="s2">()</span>
+        <span class="s1">cachelog </span><span class="s2">= </span><span class="s1">buf</span><span class="s2">.</span><span class="s1">getvalue</span><span class="s2">()</span>
+        <span class="s3"># bar2 should save new index and data</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">cachelog</span><span class="s2">.</span><span class="s1">count</span><span class="s2">(</span><span class="s4">'index saved'</span><span class="s2">), </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">cachelog</span><span class="s2">.</span><span class="s1">count</span><span class="s2">(</span><span class="s4">'data saved'</span><span class="s2">), </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">cachelog</span><span class="s2">.</span><span class="s1">count</span><span class="s2">(</span><span class="s4">'index loaded'</span><span class="s2">), </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">cachelog</span><span class="s2">.</span><span class="s1">count</span><span class="s2">(</span><span class="s4">'data loaded'</span><span class="s2">), </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertNotEqual</span><span class="s2">(</span><span class="s1">res1</span><span class="s2">, </span><span class="s1">res2</span><span class="s2">)</span>
+
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s3"># Make sure we can spawn new process without inheriting</span>
+            <span class="s3"># the parent context.</span>
+            <span class="s1">mp </span><span class="s2">= </span><span class="s1">multiprocessing</span><span class="s2">.</span><span class="s1">get_context</span><span class="s2">(</span><span class="s4">'spawn'</span><span class="s2">)</span>
+        <span class="s0">except </span><span class="s1">ValueError</span><span class="s2">:</span>
+            <span class="s1">print</span><span class="s2">(</span><span class="s4">&quot;missing spawn context&quot;</span><span class="s2">)</span>
+
+        <span class="s1">q </span><span class="s2">= </span><span class="s1">mp</span><span class="s2">.</span><span class="s1">Queue</span><span class="s2">()</span>
+        <span class="s3"># Start new process that calls `cache_file_collision_tester`</span>
+        <span class="s1">proc </span><span class="s2">= </span><span class="s1">mp</span><span class="s2">.</span><span class="s1">Process</span><span class="s2">(</span><span class="s1">target</span><span class="s2">=</span><span class="s1">cache_file_collision_tester</span><span class="s2">,</span>
+                          <span class="s1">args</span><span class="s2">=(</span><span class="s1">q</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir</span><span class="s2">,</span>
+                                <span class="s1">self</span><span class="s2">.</span><span class="s1">modname_bar1</span><span class="s2">,</span>
+                                <span class="s1">self</span><span class="s2">.</span><span class="s1">modname_bar2</span><span class="s2">))</span>
+        <span class="s1">proc</span><span class="s2">.</span><span class="s1">start</span><span class="s2">()</span>
+        <span class="s3"># Get results from the process</span>
+        <span class="s1">log1 </span><span class="s2">= </span><span class="s1">q</span><span class="s2">.</span><span class="s1">get</span><span class="s2">()</span>
+        <span class="s1">got1 </span><span class="s2">= </span><span class="s1">q</span><span class="s2">.</span><span class="s1">get</span><span class="s2">()</span>
+        <span class="s1">log2 </span><span class="s2">= </span><span class="s1">q</span><span class="s2">.</span><span class="s1">get</span><span class="s2">()</span>
+        <span class="s1">got2 </span><span class="s2">= </span><span class="s1">q</span><span class="s2">.</span><span class="s1">get</span><span class="s2">()</span>
+        <span class="s1">proc</span><span class="s2">.</span><span class="s1">join</span><span class="s2">()</span>
+
+        <span class="s3"># The remote execution result of bar1() and bar2() should match</span>
+        <span class="s3"># the one executed locally.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">got1</span><span class="s2">, </span><span class="s1">res1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">got2</span><span class="s2">, </span><span class="s1">res2</span><span class="s2">)</span>
+
+        <span class="s3"># The remote should have loaded bar1 from cache</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">log1</span><span class="s2">.</span><span class="s1">count</span><span class="s2">(</span><span class="s4">'index saved'</span><span class="s2">), </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">log1</span><span class="s2">.</span><span class="s1">count</span><span class="s2">(</span><span class="s4">'data saved'</span><span class="s2">), </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">log1</span><span class="s2">.</span><span class="s1">count</span><span class="s2">(</span><span class="s4">'index loaded'</span><span class="s2">), </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">log1</span><span class="s2">.</span><span class="s1">count</span><span class="s2">(</span><span class="s4">'data loaded'</span><span class="s2">), </span><span class="s5">1</span><span class="s2">)</span>
+
+        <span class="s3"># The remote should have loaded bar2 from cache</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">log2</span><span class="s2">.</span><span class="s1">count</span><span class="s2">(</span><span class="s4">'index saved'</span><span class="s2">), </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">log2</span><span class="s2">.</span><span class="s1">count</span><span class="s2">(</span><span class="s4">'data saved'</span><span class="s2">), </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">log2</span><span class="s2">.</span><span class="s1">count</span><span class="s2">(</span><span class="s4">'index loaded'</span><span class="s2">), </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">log2</span><span class="s2">.</span><span class="s1">count</span><span class="s2">(</span><span class="s4">'data loaded'</span><span class="s2">), </span><span class="s5">1</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">cache_file_collision_tester</span><span class="s2">(</span><span class="s1">q</span><span class="s2">, </span><span class="s1">tempdir</span><span class="s2">, </span><span class="s1">modname_bar1</span><span class="s2">, </span><span class="s1">modname_bar2</span><span class="s2">):</span>
+    <span class="s1">sys</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">insert</span><span class="s2">(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">tempdir</span><span class="s2">)</span>
+    <span class="s1">bar1 </span><span class="s2">= </span><span class="s1">import_dynamic</span><span class="s2">(</span><span class="s1">modname_bar1</span><span class="s2">).</span><span class="s1">bar</span>
+    <span class="s1">bar2 </span><span class="s2">= </span><span class="s1">import_dynamic</span><span class="s2">(</span><span class="s1">modname_bar2</span><span class="s2">).</span><span class="s1">bar</span>
+    <span class="s0">with </span><span class="s1">capture_cache_log</span><span class="s2">() </span><span class="s0">as </span><span class="s1">buf</span><span class="s2">:</span>
+        <span class="s1">r1 </span><span class="s2">= </span><span class="s1">bar1</span><span class="s2">()</span>
+    <span class="s1">q</span><span class="s2">.</span><span class="s1">put</span><span class="s2">(</span><span class="s1">buf</span><span class="s2">.</span><span class="s1">getvalue</span><span class="s2">())</span>
+    <span class="s1">q</span><span class="s2">.</span><span class="s1">put</span><span class="s2">(</span><span class="s1">r1</span><span class="s2">)</span>
+    <span class="s0">with </span><span class="s1">capture_cache_log</span><span class="s2">() </span><span class="s0">as </span><span class="s1">buf</span><span class="s2">:</span>
+        <span class="s1">r2 </span><span class="s2">= </span><span class="s1">bar2</span><span class="s2">()</span>
+    <span class="s1">q</span><span class="s2">.</span><span class="s1">put</span><span class="s2">(</span><span class="s1">buf</span><span class="s2">.</span><span class="s1">getvalue</span><span class="s2">())</span>
+    <span class="s1">q</span><span class="s2">.</span><span class="s1">put</span><span class="s2">(</span><span class="s1">r2</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">TestCacheMultipleFilesWithSignature</span><span class="s2">(</span><span class="s1">unittest</span><span class="s2">.</span><span class="s1">TestCase</span><span class="s2">):</span>
+    <span class="s3"># Regression test for https://github.com/numba/numba/issues/3658</span>
+
+    <span class="s1">_numba_parallel_test_ </span><span class="s2">= </span><span class="s0">False</span>
+
+    <span class="s1">source_text_file1 </span><span class="s2">= </span><span class="s4">&quot;&quot;&quot; 
+from file2 import function2 
+&quot;&quot;&quot;</span>
+    <span class="s1">source_text_file2 </span><span class="s2">= </span><span class="s4">&quot;&quot;&quot; 
+from numba import njit 
+ 
+@njit('float64(float64)', cache=True) 
+def function1(x): 
+    return x 
+ 
+@njit('float64(float64)', cache=True) 
+def function2(x): 
+    return x 
+&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">setUp</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir </span><span class="s2">= </span><span class="s1">temp_directory</span><span class="s2">(</span><span class="s4">'test_cache_file_loc'</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">file1 </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir</span><span class="s2">, </span><span class="s4">'file1.py'</span><span class="s2">)</span>
+        <span class="s0">with </span><span class="s1">open</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">file1</span><span class="s2">, </span><span class="s4">'w'</span><span class="s2">) </span><span class="s0">as </span><span class="s1">fout</span><span class="s2">:</span>
+            <span class="s1">print</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">source_text_file1</span><span class="s2">, </span><span class="s1">file</span><span class="s2">=</span><span class="s1">fout</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">file2 </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir</span><span class="s2">, </span><span class="s4">'file2.py'</span><span class="s2">)</span>
+        <span class="s0">with </span><span class="s1">open</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">file2</span><span class="s2">, </span><span class="s4">'w'</span><span class="s2">) </span><span class="s0">as </span><span class="s1">fout</span><span class="s2">:</span>
+            <span class="s1">print</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">source_text_file2</span><span class="s2">, </span><span class="s1">file</span><span class="s2">=</span><span class="s1">fout</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">tearDown</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">shutil</span><span class="s2">.</span><span class="s1">rmtree</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_caching_mutliple_files_with_signature</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Execute file1.py</span>
+        <span class="s1">popen </span><span class="s2">= </span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">Popen</span><span class="s2">([</span><span class="s1">sys</span><span class="s2">.</span><span class="s1">executable</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">file1</span><span class="s2">],</span>
+                                 <span class="s1">stdout</span><span class="s2">=</span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">PIPE</span><span class="s2">,</span>
+                                 <span class="s1">stderr</span><span class="s2">=</span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">PIPE</span><span class="s2">)</span>
+        <span class="s1">out</span><span class="s2">, </span><span class="s1">err </span><span class="s2">= </span><span class="s1">popen</span><span class="s2">.</span><span class="s1">communicate</span><span class="s2">()</span>
+        <span class="s1">msg </span><span class="s2">= </span><span class="s4">f&quot;stdout:</span><span class="s0">\n{</span><span class="s1">out</span><span class="s2">.</span><span class="s1">decode</span><span class="s2">()</span><span class="s0">}\n\n</span><span class="s4">stderr:</span><span class="s0">\n{</span><span class="s1">err</span><span class="s2">.</span><span class="s1">decode</span><span class="s2">()</span><span class="s0">}</span><span class="s4">&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">popen</span><span class="s2">.</span><span class="s1">returncode</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">msg</span><span class="s2">=</span><span class="s1">msg</span><span class="s2">)</span>
+
+        <span class="s3"># Execute file2.py</span>
+        <span class="s1">popen </span><span class="s2">= </span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">Popen</span><span class="s2">([</span><span class="s1">sys</span><span class="s2">.</span><span class="s1">executable</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">file2</span><span class="s2">],</span>
+                                 <span class="s1">stdout</span><span class="s2">=</span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">PIPE</span><span class="s2">,</span>
+                                 <span class="s1">stderr</span><span class="s2">=</span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">PIPE</span><span class="s2">)</span>
+        <span class="s1">out</span><span class="s2">, </span><span class="s1">err </span><span class="s2">= </span><span class="s1">popen</span><span class="s2">.</span><span class="s1">communicate</span><span class="s2">()</span>
+        <span class="s1">msg </span><span class="s2">= </span><span class="s4">f&quot;stdout:</span><span class="s0">\n{</span><span class="s1">out</span><span class="s2">.</span><span class="s1">decode</span><span class="s2">()</span><span class="s0">}\n\n</span><span class="s4">stderr:</span><span class="s0">\n{</span><span class="s1">err</span><span class="s2">.</span><span class="s1">decode</span><span class="s2">()</span><span class="s0">}</span><span class="s4">&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">popen</span><span class="s2">.</span><span class="s1">returncode</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">msg</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">TestCFuncCache</span><span class="s2">(</span><span class="s1">BaseCacheTest</span><span class="s2">):</span>
+
+    <span class="s1">here </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">dirname</span><span class="s2">(</span><span class="s1">__file__</span><span class="s2">)</span>
+    <span class="s1">usecases_file </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">here</span><span class="s2">, </span><span class="s4">&quot;cfunc_cache_usecases.py&quot;</span><span class="s2">)</span>
+    <span class="s1">modname </span><span class="s2">= </span><span class="s4">&quot;cfunc_caching_test_fodder&quot;</span>
+
+    <span class="s0">def </span><span class="s1">run_in_separate_process</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Cached functions can be run from a distinct process.</span>
+        <span class="s1">code </span><span class="s2">= </span><span class="s4">&quot;&quot;&quot;if 1: 
+            import sys 
+ 
+            sys.path.insert(0, %(tempdir)r) 
+            mod = __import__(%(modname)r) 
+            mod.self_test() 
+ 
+            f = mod.add_usecase 
+            assert f.cache_hits == 1 
+            f = mod.outer 
+            assert f.cache_hits == 1 
+            f = mod.div_usecase 
+            assert f.cache_hits == 1 
+            &quot;&quot;&quot; </span><span class="s2">% </span><span class="s1">dict</span><span class="s2">(</span><span class="s1">tempdir</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">tempdir</span><span class="s2">, </span><span class="s1">modname</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">modname</span><span class="s2">)</span>
+
+        <span class="s1">popen </span><span class="s2">= </span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">Popen</span><span class="s2">([</span><span class="s1">sys</span><span class="s2">.</span><span class="s1">executable</span><span class="s2">, </span><span class="s4">&quot;-c&quot;</span><span class="s2">, </span><span class="s1">code</span><span class="s2">],</span>
+                                 <span class="s1">stdout</span><span class="s2">=</span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">PIPE</span><span class="s2">, </span><span class="s1">stderr</span><span class="s2">=</span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">PIPE</span><span class="s2">)</span>
+        <span class="s1">out</span><span class="s2">, </span><span class="s1">err </span><span class="s2">= </span><span class="s1">popen</span><span class="s2">.</span><span class="s1">communicate</span><span class="s2">()</span>
+        <span class="s0">if </span><span class="s1">popen</span><span class="s2">.</span><span class="s1">returncode </span><span class="s2">!= </span><span class="s5">0</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">AssertionError</span><span class="s2">(</span><span class="s4">f&quot;process failed with code </span><span class="s0">{</span><span class="s1">popen</span><span class="s2">.</span><span class="s1">returncode</span><span class="s0">}</span><span class="s4">:&quot;</span>
+                                 <span class="s4">f&quot;stderr follows</span><span class="s0">\n{</span><span class="s1">err</span><span class="s2">.</span><span class="s1">decode</span><span class="s2">()</span><span class="s0">}\n</span><span class="s4">&quot;</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">check_module</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s1">mod</span><span class="s2">.</span><span class="s1">self_test</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">test_caching</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">6</span><span class="s2">)  </span><span class="s3"># 3 index, 3 data</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">add_usecase</span><span class="s2">.</span><span class="s1">cache_hits</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">outer</span><span class="s2">.</span><span class="s1">cache_hits</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">add_nocache_usecase</span><span class="s2">.</span><span class="s1">cache_hits</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">div_usecase</span><span class="s2">.</span><span class="s1">cache_hits</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_module</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">)</span>
+
+        <span class="s3"># Reload module to hit the cache</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">import_module</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_pycache</span><span class="s2">(</span><span class="s5">6</span><span class="s2">)  </span><span class="s3"># 3 index, 3 data</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">add_usecase</span><span class="s2">.</span><span class="s1">cache_hits</span><span class="s2">, </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">outer</span><span class="s2">.</span><span class="s1">cache_hits</span><span class="s2">, </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">add_nocache_usecase</span><span class="s2">.</span><span class="s1">cache_hits</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">div_usecase</span><span class="s2">.</span><span class="s1">cache_hits</span><span class="s2">, </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_module</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">run_in_separate_process</span><span class="s2">()</span>
+
+
+<span class="s0">if </span><span class="s1">__name__ </span><span class="s2">== </span><span class="s4">'__main__'</span><span class="s2">:</span>
+    <span class="s1">unittest</span><span class="s2">.</span><span class="s1">main</span><span class="s2">()</span>
+</pre>
+</body>
+</html>

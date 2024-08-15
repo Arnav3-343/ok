@@ -1,0 +1,431 @@
+<html>
+<head>
+<title>test_cfunc.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #2aacb8;}
+.s5 { color: #6aab73;}
+.s6 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_cfunc.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Tests for @cfunc and friends. 
+&quot;&quot;&quot;</span>
+
+
+<span class="s2">import </span><span class="s1">ctypes</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">subprocess</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">namedtuple</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">from </span><span class="s1">numba </span><span class="s2">import </span><span class="s1">cfunc</span><span class="s3">, </span><span class="s1">carray</span><span class="s3">, </span><span class="s1">farray</span><span class="s3">, </span><span class="s1">njit</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">types</span><span class="s3">, </span><span class="s1">typing</span><span class="s3">, </span><span class="s1">utils</span>
+<span class="s2">import </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">typing</span><span class="s3">.</span><span class="s1">cffi_utils </span><span class="s2">as </span><span class="s1">cffi_support</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">tests</span><span class="s3">.</span><span class="s1">support </span><span class="s2">import </span><span class="s3">(</span><span class="s1">TestCase</span><span class="s3">, </span><span class="s1">skip_unless_cffi</span><span class="s3">, </span><span class="s1">tag</span><span class="s3">,</span>
+                                 <span class="s1">captured_stderr</span><span class="s3">)</span>
+<span class="s2">import </span><span class="s1">unittest</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">np </span><span class="s2">import </span><span class="s1">numpy_support</span>
+
+
+<span class="s2">def </span><span class="s1">add_usecase</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">a </span><span class="s3">+ </span><span class="s1">b</span>
+
+<span class="s2">def </span><span class="s1">div_usecase</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+    <span class="s1">c </span><span class="s3">= </span><span class="s1">a </span><span class="s3">/ </span><span class="s1">b</span>
+    <span class="s2">return </span><span class="s1">c</span>
+
+<span class="s2">def </span><span class="s1">square_usecase</span><span class="s3">(</span><span class="s1">a</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">a </span><span class="s3">** </span><span class="s4">2</span>
+
+<span class="s1">add_sig </span><span class="s3">= </span><span class="s5">&quot;float64(float64, float64)&quot;</span>
+
+<span class="s1">div_sig </span><span class="s3">= </span><span class="s5">&quot;float64(int64, int64)&quot;</span>
+
+<span class="s1">square_sig </span><span class="s3">= </span><span class="s5">&quot;float64(float64)&quot;</span>
+
+<span class="s2">def </span><span class="s1">objmode_usecase</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+    <span class="s1">object</span><span class="s3">()</span>
+    <span class="s2">return </span><span class="s1">a </span><span class="s3">+ </span><span class="s1">b</span>
+
+<span class="s6"># Test functions for carray() and farray()</span>
+
+<span class="s1">CARRAY_USECASE_OUT_LEN </span><span class="s3">= </span><span class="s4">8</span>
+
+<span class="s2">def </span><span class="s1">make_cfarray_usecase</span><span class="s3">(</span><span class="s1">func</span><span class="s3">):</span>
+
+    <span class="s2">def </span><span class="s1">cfarray_usecase</span><span class="s3">(</span><span class="s1">in_ptr</span><span class="s3">, </span><span class="s1">out_ptr</span><span class="s3">, </span><span class="s1">m</span><span class="s3">, </span><span class="s1">n</span><span class="s3">):</span>
+        <span class="s6"># Tuple shape</span>
+        <span class="s1">in_ </span><span class="s3">= </span><span class="s1">func</span><span class="s3">(</span><span class="s1">in_ptr</span><span class="s3">, (</span><span class="s1">m</span><span class="s3">, </span><span class="s1">n</span><span class="s3">))</span>
+        <span class="s6"># Integer shape</span>
+        <span class="s1">out </span><span class="s3">= </span><span class="s1">func</span><span class="s3">(</span><span class="s1">out_ptr</span><span class="s3">, </span><span class="s1">CARRAY_USECASE_OUT_LEN</span><span class="s3">)</span>
+        <span class="s1">out</span><span class="s3">[</span><span class="s4">0</span><span class="s3">] = </span><span class="s1">in_</span><span class="s3">.</span><span class="s1">ndim</span>
+        <span class="s1">out</span><span class="s3">[</span><span class="s4">1</span><span class="s3">:</span><span class="s4">3</span><span class="s3">] = </span><span class="s1">in_</span><span class="s3">.</span><span class="s1">shape</span>
+        <span class="s1">out</span><span class="s3">[</span><span class="s4">3</span><span class="s3">:</span><span class="s4">5</span><span class="s3">] = </span><span class="s1">in_</span><span class="s3">.</span><span class="s1">strides</span>
+        <span class="s1">out</span><span class="s3">[</span><span class="s4">5</span><span class="s3">] = </span><span class="s1">in_</span><span class="s3">.</span><span class="s1">flags</span><span class="s3">.</span><span class="s1">c_contiguous</span>
+        <span class="s1">out</span><span class="s3">[</span><span class="s4">6</span><span class="s3">] = </span><span class="s1">in_</span><span class="s3">.</span><span class="s1">flags</span><span class="s3">.</span><span class="s1">f_contiguous</span>
+        <span class="s1">s </span><span class="s3">= </span><span class="s4">0</span>
+        <span class="s2">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">j </span><span class="s2">in </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ndindex</span><span class="s3">(</span><span class="s1">m</span><span class="s3">, </span><span class="s1">n</span><span class="s3">):</span>
+            <span class="s1">s </span><span class="s3">+= </span><span class="s1">in_</span><span class="s3">[</span><span class="s1">i</span><span class="s3">, </span><span class="s1">j</span><span class="s3">] * (</span><span class="s1">i </span><span class="s3">- </span><span class="s1">j</span><span class="s3">)</span>
+        <span class="s1">out</span><span class="s3">[</span><span class="s4">7</span><span class="s3">] = </span><span class="s1">s</span>
+
+    <span class="s2">return </span><span class="s1">cfarray_usecase</span>
+
+<span class="s1">carray_usecase </span><span class="s3">= </span><span class="s1">make_cfarray_usecase</span><span class="s3">(</span><span class="s1">carray</span><span class="s3">)</span>
+<span class="s1">farray_usecase </span><span class="s3">= </span><span class="s1">make_cfarray_usecase</span><span class="s3">(</span><span class="s1">farray</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">make_cfarray_dtype_usecase</span><span class="s3">(</span><span class="s1">func</span><span class="s3">):</span>
+    <span class="s6"># Same as make_cfarray_usecase(), but with explicit dtype.</span>
+
+    <span class="s2">def </span><span class="s1">cfarray_usecase</span><span class="s3">(</span><span class="s1">in_ptr</span><span class="s3">, </span><span class="s1">out_ptr</span><span class="s3">, </span><span class="s1">m</span><span class="s3">, </span><span class="s1">n</span><span class="s3">):</span>
+        <span class="s6"># Tuple shape</span>
+        <span class="s1">in_ </span><span class="s3">= </span><span class="s1">func</span><span class="s3">(</span><span class="s1">in_ptr</span><span class="s3">, (</span><span class="s1">m</span><span class="s3">, </span><span class="s1">n</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float32</span><span class="s3">)</span>
+        <span class="s6"># Integer shape</span>
+        <span class="s1">out </span><span class="s3">= </span><span class="s1">func</span><span class="s3">(</span><span class="s1">out_ptr</span><span class="s3">, </span><span class="s1">CARRAY_USECASE_OUT_LEN</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">float32</span><span class="s3">)</span>
+        <span class="s1">out</span><span class="s3">[</span><span class="s4">0</span><span class="s3">] = </span><span class="s1">in_</span><span class="s3">.</span><span class="s1">ndim</span>
+        <span class="s1">out</span><span class="s3">[</span><span class="s4">1</span><span class="s3">:</span><span class="s4">3</span><span class="s3">] = </span><span class="s1">in_</span><span class="s3">.</span><span class="s1">shape</span>
+        <span class="s1">out</span><span class="s3">[</span><span class="s4">3</span><span class="s3">:</span><span class="s4">5</span><span class="s3">] = </span><span class="s1">in_</span><span class="s3">.</span><span class="s1">strides</span>
+        <span class="s1">out</span><span class="s3">[</span><span class="s4">5</span><span class="s3">] = </span><span class="s1">in_</span><span class="s3">.</span><span class="s1">flags</span><span class="s3">.</span><span class="s1">c_contiguous</span>
+        <span class="s1">out</span><span class="s3">[</span><span class="s4">6</span><span class="s3">] = </span><span class="s1">in_</span><span class="s3">.</span><span class="s1">flags</span><span class="s3">.</span><span class="s1">f_contiguous</span>
+        <span class="s1">s </span><span class="s3">= </span><span class="s4">0</span>
+        <span class="s2">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">j </span><span class="s2">in </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ndindex</span><span class="s3">(</span><span class="s1">m</span><span class="s3">, </span><span class="s1">n</span><span class="s3">):</span>
+            <span class="s1">s </span><span class="s3">+= </span><span class="s1">in_</span><span class="s3">[</span><span class="s1">i</span><span class="s3">, </span><span class="s1">j</span><span class="s3">] * (</span><span class="s1">i </span><span class="s3">- </span><span class="s1">j</span><span class="s3">)</span>
+        <span class="s1">out</span><span class="s3">[</span><span class="s4">7</span><span class="s3">] = </span><span class="s1">s</span>
+
+    <span class="s2">return </span><span class="s1">cfarray_usecase</span>
+
+<span class="s1">carray_dtype_usecase </span><span class="s3">= </span><span class="s1">make_cfarray_dtype_usecase</span><span class="s3">(</span><span class="s1">carray</span><span class="s3">)</span>
+<span class="s1">farray_dtype_usecase </span><span class="s3">= </span><span class="s1">make_cfarray_dtype_usecase</span><span class="s3">(</span><span class="s1">farray</span><span class="s3">)</span>
+
+<span class="s1">carray_float32_usecase_sig </span><span class="s3">= </span><span class="s1">types</span><span class="s3">.</span><span class="s1">void</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">CPointer</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">float32</span><span class="s3">),</span>
+                                        <span class="s1">types</span><span class="s3">.</span><span class="s1">CPointer</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">float32</span><span class="s3">),</span>
+                                        <span class="s1">types</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">)</span>
+
+<span class="s1">carray_float64_usecase_sig </span><span class="s3">= </span><span class="s1">types</span><span class="s3">.</span><span class="s1">void</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">CPointer</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">),</span>
+                                        <span class="s1">types</span><span class="s3">.</span><span class="s1">CPointer</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">),</span>
+                                        <span class="s1">types</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">)</span>
+
+<span class="s1">carray_voidptr_usecase_sig </span><span class="s3">= </span><span class="s1">types</span><span class="s3">.</span><span class="s1">void</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">voidptr</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">voidptr</span><span class="s3">,</span>
+                                        <span class="s1">types</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestCFunc</span><span class="s3">(</span><span class="s1">TestCase</span><span class="s3">):</span>
+
+    <span class="s2">def </span><span class="s1">test_basic</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Basic usage and properties of a cfunc. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">f </span><span class="s3">= </span><span class="s1">cfunc</span><span class="s3">(</span><span class="s1">add_sig</span><span class="s3">)(</span><span class="s1">add_usecase</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">f</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">, </span><span class="s5">&quot;add_usecase&quot;</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">f</span><span class="s3">.</span><span class="s1">__qualname__</span><span class="s3">, </span><span class="s5">&quot;add_usecase&quot;</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIs</span><span class="s3">(</span><span class="s1">f</span><span class="s3">.</span><span class="s1">__wrapped__</span><span class="s3">, </span><span class="s1">add_usecase</span><span class="s3">)</span>
+
+        <span class="s1">symbol </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">native_name</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIsInstance</span><span class="s3">(</span><span class="s1">symbol</span><span class="s3">, </span><span class="s1">str</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIn</span><span class="s3">(</span><span class="s5">&quot;add_usecase&quot;</span><span class="s3">, </span><span class="s1">symbol</span><span class="s3">)</span>
+
+        <span class="s1">addr </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">address</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIsInstance</span><span class="s3">(</span><span class="s1">addr</span><span class="s3">, </span><span class="s1">int</span><span class="s3">)</span>
+
+        <span class="s1">ct </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">ctypes</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">cast</span><span class="s3">(</span><span class="s1">ct</span><span class="s3">, </span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">c_void_p</span><span class="s3">).</span><span class="s1">value</span><span class="s3">, </span><span class="s1">addr</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertPreciseEqual</span><span class="s3">(</span><span class="s1">ct</span><span class="s3">(</span><span class="s4">2.0</span><span class="s3">, </span><span class="s4">3.5</span><span class="s3">), </span><span class="s4">5.5</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">skip_unless_cffi</span>
+    <span class="s2">def </span><span class="s1">test_cffi</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">tests </span><span class="s2">import </span><span class="s1">cffi_usecases</span>
+        <span class="s1">ffi</span><span class="s3">, </span><span class="s1">lib </span><span class="s3">= </span><span class="s1">cffi_usecases</span><span class="s3">.</span><span class="s1">load_inline_module</span><span class="s3">()</span>
+
+        <span class="s1">f </span><span class="s3">= </span><span class="s1">cfunc</span><span class="s3">(</span><span class="s1">square_sig</span><span class="s3">)(</span><span class="s1">square_usecase</span><span class="s3">)</span>
+
+        <span class="s1">res </span><span class="s3">= </span><span class="s1">lib</span><span class="s3">.</span><span class="s1">_numba_test_funcptr</span><span class="s3">(</span><span class="s1">f</span><span class="s3">.</span><span class="s1">cffi</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertPreciseEqual</span><span class="s3">(</span><span class="s1">res</span><span class="s3">, </span><span class="s4">2.25</span><span class="s3">)  </span><span class="s6"># 1.5 ** 2</span>
+
+    <span class="s2">def </span><span class="s1">test_locals</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s6"># By forcing the intermediate result into an integer, we</span>
+        <span class="s6"># truncate the ultimate function result</span>
+        <span class="s1">f </span><span class="s3">= </span><span class="s1">cfunc</span><span class="s3">(</span><span class="s1">div_sig</span><span class="s3">, </span><span class="s1">locals</span><span class="s3">={</span><span class="s5">'c'</span><span class="s3">: </span><span class="s1">types</span><span class="s3">.</span><span class="s1">int64</span><span class="s3">})(</span><span class="s1">div_usecase</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertPreciseEqual</span><span class="s3">(</span><span class="s1">f</span><span class="s3">.</span><span class="s1">ctypes</span><span class="s3">(</span><span class="s4">8</span><span class="s3">, </span><span class="s4">3</span><span class="s3">), </span><span class="s4">2.0</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_errors</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">f </span><span class="s3">= </span><span class="s1">cfunc</span><span class="s3">(</span><span class="s1">div_sig</span><span class="s3">)(</span><span class="s1">div_usecase</span><span class="s3">)</span>
+
+        <span class="s2">with </span><span class="s1">captured_stderr</span><span class="s3">() </span><span class="s2">as </span><span class="s1">err</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assertPreciseEqual</span><span class="s3">(</span><span class="s1">f</span><span class="s3">.</span><span class="s1">ctypes</span><span class="s3">(</span><span class="s4">5</span><span class="s3">, </span><span class="s4">2</span><span class="s3">), </span><span class="s4">2.5</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">err</span><span class="s3">.</span><span class="s1">getvalue</span><span class="s3">(), </span><span class="s5">&quot;&quot;</span><span class="s3">)</span>
+
+        <span class="s2">with </span><span class="s1">captured_stderr</span><span class="s3">() </span><span class="s2">as </span><span class="s1">err</span><span class="s3">:</span>
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">ctypes</span><span class="s3">(</span><span class="s4">5</span><span class="s3">, </span><span class="s4">0</span><span class="s3">)</span>
+            <span class="s6"># This is just a side effect of Numba zero-initializing</span>
+            <span class="s6"># stack variables, and could change in the future.</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assertPreciseEqual</span><span class="s3">(</span><span class="s1">res</span><span class="s3">, </span><span class="s4">0.0</span><span class="s3">)</span>
+        <span class="s1">err </span><span class="s3">= </span><span class="s1">err</span><span class="s3">.</span><span class="s1">getvalue</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIn</span><span class="s3">(</span><span class="s5">&quot;ZeroDivisionError:&quot;</span><span class="s3">, </span><span class="s1">err</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIn</span><span class="s3">(</span><span class="s5">&quot;Exception ignored&quot;</span><span class="s3">, </span><span class="s1">err</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_llvm_ir</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">f </span><span class="s3">= </span><span class="s1">cfunc</span><span class="s3">(</span><span class="s1">add_sig</span><span class="s3">)(</span><span class="s1">add_usecase</span><span class="s3">)</span>
+        <span class="s1">ir </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">inspect_llvm</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIn</span><span class="s3">(</span><span class="s1">f</span><span class="s3">.</span><span class="s1">native_name</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIn</span><span class="s3">(</span><span class="s5">&quot;fadd double&quot;</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_object_mode</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Object mode is currently unsupported. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">assertRaises</span><span class="s3">(</span><span class="s1">NotImplementedError</span><span class="s3">):</span>
+            <span class="s1">cfunc</span><span class="s3">(</span><span class="s1">add_sig</span><span class="s3">, </span><span class="s1">forceobj</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)(</span><span class="s1">add_usecase</span><span class="s3">)</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">assertTypingError</span><span class="s3">() </span><span class="s2">as </span><span class="s1">raises</span><span class="s3">:</span>
+            <span class="s1">cfunc</span><span class="s3">(</span><span class="s1">add_sig</span><span class="s3">)(</span><span class="s1">objmode_usecase</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIn</span><span class="s3">(</span><span class="s5">&quot;Untyped global name 'object'&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">(</span><span class="s1">raises</span><span class="s3">.</span><span class="s1">exception</span><span class="s3">))</span>
+
+
+<span class="s2">class </span><span class="s1">TestCArray</span><span class="s3">(</span><span class="s1">TestCase</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Tests for carray() and farray(). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">run_carray_usecase</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">pointer_factory</span><span class="s3">, </span><span class="s1">func</span><span class="s3">):</span>
+        <span class="s1">a </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s4">10</span><span class="s3">, </span><span class="s4">16</span><span class="s3">).</span><span class="s1">reshape</span><span class="s3">((</span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">)).</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float32</span><span class="s3">)</span>
+        <span class="s1">out </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">CARRAY_USECASE_OUT_LEN</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float32</span><span class="s3">)</span>
+        <span class="s1">func</span><span class="s3">(</span><span class="s1">pointer_factory</span><span class="s3">(</span><span class="s1">a</span><span class="s3">), </span><span class="s1">pointer_factory</span><span class="s3">(</span><span class="s1">out</span><span class="s3">), *</span><span class="s1">a</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">out</span>
+
+    <span class="s2">def </span><span class="s1">check_carray_usecase</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">pointer_factory</span><span class="s3">, </span><span class="s1">pyfunc</span><span class="s3">, </span><span class="s1">cfunc</span><span class="s3">):</span>
+        <span class="s1">expected </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">run_carray_usecase</span><span class="s3">(</span><span class="s1">pointer_factory</span><span class="s3">, </span><span class="s1">pyfunc</span><span class="s3">)</span>
+        <span class="s1">got </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">run_carray_usecase</span><span class="s3">(</span><span class="s1">pointer_factory</span><span class="s3">, </span><span class="s1">cfunc</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertPreciseEqual</span><span class="s3">(</span><span class="s1">expected</span><span class="s3">, </span><span class="s1">got</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">make_voidptr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">arr</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">arr</span><span class="s3">.</span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">data_as</span><span class="s3">(</span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">c_void_p</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">make_float32_pointer</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">arr</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">arr</span><span class="s3">.</span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">data_as</span><span class="s3">(</span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">POINTER</span><span class="s3">(</span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">c_float</span><span class="s3">))</span>
+
+    <span class="s2">def </span><span class="s1">make_float64_pointer</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">arr</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">arr</span><span class="s3">.</span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">data_as</span><span class="s3">(</span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">POINTER</span><span class="s3">(</span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">c_double</span><span class="s3">))</span>
+
+    <span class="s2">def </span><span class="s1">check_carray_farray</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">func</span><span class="s3">, </span><span class="s1">order</span><span class="s3">):</span>
+        <span class="s2">def </span><span class="s1">eq</span><span class="s3">(</span><span class="s1">got</span><span class="s3">, </span><span class="s1">expected</span><span class="s3">):</span>
+            <span class="s6"># Same layout, dtype, shape, etc.</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assertPreciseEqual</span><span class="s3">(</span><span class="s1">got</span><span class="s3">, </span><span class="s1">expected</span><span class="s3">)</span>
+            <span class="s6"># Same underlying data</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">got</span><span class="s3">.</span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">data</span><span class="s3">, </span><span class="s1">expected</span><span class="s3">.</span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">data</span><span class="s3">)</span>
+
+        <span class="s1">base </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s4">6</span><span class="s3">).</span><span class="s1">reshape</span><span class="s3">((</span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">)).</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float32</span><span class="s3">).</span><span class="s1">copy</span><span class="s3">(</span><span class="s1">order</span><span class="s3">=</span><span class="s1">order</span><span class="s3">)</span>
+
+        <span class="s6"># With typed pointer and implied dtype</span>
+        <span class="s1">a </span><span class="s3">= </span><span class="s1">func</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">make_float32_pointer</span><span class="s3">(</span><span class="s1">base</span><span class="s3">), </span><span class="s1">base</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)</span>
+        <span class="s1">eq</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">base</span><span class="s3">)</span>
+        <span class="s6"># Integer shape</span>
+        <span class="s1">a </span><span class="s3">= </span><span class="s1">func</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">make_float32_pointer</span><span class="s3">(</span><span class="s1">base</span><span class="s3">), </span><span class="s1">base</span><span class="s3">.</span><span class="s1">size</span><span class="s3">)</span>
+        <span class="s1">eq</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">base</span><span class="s3">.</span><span class="s1">ravel</span><span class="s3">(</span><span class="s5">'K'</span><span class="s3">))</span>
+
+        <span class="s6"># With typed pointer and explicit dtype</span>
+        <span class="s1">a </span><span class="s3">= </span><span class="s1">func</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">make_float32_pointer</span><span class="s3">(</span><span class="s1">base</span><span class="s3">), </span><span class="s1">base</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">base</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">)</span>
+        <span class="s1">eq</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">base</span><span class="s3">)</span>
+        <span class="s1">a </span><span class="s3">= </span><span class="s1">func</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">make_float32_pointer</span><span class="s3">(</span><span class="s1">base</span><span class="s3">), </span><span class="s1">base</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">float32</span><span class="s3">)</span>
+        <span class="s1">eq</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">base</span><span class="s3">)</span>
+
+        <span class="s6"># With voidptr and explicit dtype</span>
+        <span class="s1">a </span><span class="s3">= </span><span class="s1">func</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">make_voidptr</span><span class="s3">(</span><span class="s1">base</span><span class="s3">), </span><span class="s1">base</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">base</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">)</span>
+        <span class="s1">eq</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">base</span><span class="s3">)</span>
+        <span class="s1">a </span><span class="s3">= </span><span class="s1">func</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">make_voidptr</span><span class="s3">(</span><span class="s1">base</span><span class="s3">), </span><span class="s1">base</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">int32</span><span class="s3">)</span>
+        <span class="s1">eq</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">base</span><span class="s3">.</span><span class="s1">view</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">int32</span><span class="s3">))</span>
+
+        <span class="s6"># voidptr without dtype</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">assertRaises</span><span class="s3">(</span><span class="s1">TypeError</span><span class="s3">):</span>
+            <span class="s1">func</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">make_voidptr</span><span class="s3">(</span><span class="s1">base</span><span class="s3">), </span><span class="s1">base</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)</span>
+        <span class="s6"># Invalid pointer type</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">assertRaises</span><span class="s3">(</span><span class="s1">TypeError</span><span class="s3">):</span>
+            <span class="s1">func</span><span class="s3">(</span><span class="s1">base</span><span class="s3">.</span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">data</span><span class="s3">, </span><span class="s1">base</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)</span>
+        <span class="s6"># Mismatching dtype</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">assertRaises</span><span class="s3">(</span><span class="s1">TypeError</span><span class="s3">) </span><span class="s2">as </span><span class="s1">raises</span><span class="s3">:</span>
+            <span class="s1">func</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">make_float32_pointer</span><span class="s3">(</span><span class="s1">base</span><span class="s3">), </span><span class="s1">base</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">int32</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIn</span><span class="s3">(</span><span class="s5">&quot;mismatching dtype 'int32' for pointer&quot;</span><span class="s3">,</span>
+                      <span class="s1">str</span><span class="s3">(</span><span class="s1">raises</span><span class="s3">.</span><span class="s1">exception</span><span class="s3">))</span>
+
+    <span class="s2">def </span><span class="s1">test_carray</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Test pure Python carray(). 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_carray_farray</span><span class="s3">(</span><span class="s1">carray</span><span class="s3">, </span><span class="s5">'C'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_farray</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Test pure Python farray(). 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_carray_farray</span><span class="s3">(</span><span class="s1">farray</span><span class="s3">, </span><span class="s5">'F'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">make_carray_sigs</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">formal_sig</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Generate a bunch of concrete signatures by varying the width 
+        and signedness of size arguments (see issue #1923). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">for </span><span class="s1">actual_size </span><span class="s2">in </span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">int32</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">intc</span><span class="s3">,</span>
+                            <span class="s1">types</span><span class="s3">.</span><span class="s1">uintp</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">uint32</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">uintc</span><span class="s3">):</span>
+            <span class="s1">args </span><span class="s3">= </span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">actual_size </span><span class="s2">if </span><span class="s1">a </span><span class="s3">== </span><span class="s1">types</span><span class="s3">.</span><span class="s1">intp </span><span class="s2">else </span><span class="s1">a</span>
+                         <span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">formal_sig</span><span class="s3">.</span><span class="s1">args</span><span class="s3">)</span>
+            <span class="s2">yield </span><span class="s1">formal_sig</span><span class="s3">.</span><span class="s1">return_type</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">check_numba_carray_farray</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">usecase</span><span class="s3">, </span><span class="s1">dtype_usecase</span><span class="s3">):</span>
+        <span class="s6"># With typed pointers and implicit dtype</span>
+        <span class="s1">pyfunc </span><span class="s3">= </span><span class="s1">usecase</span>
+        <span class="s2">for </span><span class="s1">sig </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">make_carray_sigs</span><span class="s3">(</span><span class="s1">carray_float32_usecase_sig</span><span class="s3">):</span>
+            <span class="s1">f </span><span class="s3">= </span><span class="s1">cfunc</span><span class="s3">(</span><span class="s1">sig</span><span class="s3">)(</span><span class="s1">pyfunc</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_carray_usecase</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">make_float32_pointer</span><span class="s3">, </span><span class="s1">pyfunc</span><span class="s3">, </span><span class="s1">f</span><span class="s3">.</span><span class="s1">ctypes</span><span class="s3">)</span>
+
+        <span class="s6"># With typed pointers and explicit (matching) dtype</span>
+        <span class="s1">pyfunc </span><span class="s3">= </span><span class="s1">dtype_usecase</span>
+        <span class="s2">for </span><span class="s1">sig </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">make_carray_sigs</span><span class="s3">(</span><span class="s1">carray_float32_usecase_sig</span><span class="s3">):</span>
+            <span class="s1">f </span><span class="s3">= </span><span class="s1">cfunc</span><span class="s3">(</span><span class="s1">sig</span><span class="s3">)(</span><span class="s1">pyfunc</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_carray_usecase</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">make_float32_pointer</span><span class="s3">, </span><span class="s1">pyfunc</span><span class="s3">, </span><span class="s1">f</span><span class="s3">.</span><span class="s1">ctypes</span><span class="s3">)</span>
+        <span class="s6"># With typed pointers and mismatching dtype</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">assertTypingError</span><span class="s3">() </span><span class="s2">as </span><span class="s1">raises</span><span class="s3">:</span>
+            <span class="s1">f </span><span class="s3">= </span><span class="s1">cfunc</span><span class="s3">(</span><span class="s1">carray_float64_usecase_sig</span><span class="s3">)(</span><span class="s1">pyfunc</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIn</span><span class="s3">(</span><span class="s5">&quot;mismatching dtype 'float32' for pointer type 'float64*'&quot;</span><span class="s3">,</span>
+                      <span class="s1">str</span><span class="s3">(</span><span class="s1">raises</span><span class="s3">.</span><span class="s1">exception</span><span class="s3">))</span>
+
+        <span class="s6"># With voidptr</span>
+        <span class="s1">pyfunc </span><span class="s3">= </span><span class="s1">dtype_usecase</span>
+        <span class="s2">for </span><span class="s1">sig </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">make_carray_sigs</span><span class="s3">(</span><span class="s1">carray_voidptr_usecase_sig</span><span class="s3">):</span>
+            <span class="s1">f </span><span class="s3">= </span><span class="s1">cfunc</span><span class="s3">(</span><span class="s1">sig</span><span class="s3">)(</span><span class="s1">pyfunc</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_carray_usecase</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">make_float32_pointer</span><span class="s3">, </span><span class="s1">pyfunc</span><span class="s3">, </span><span class="s1">f</span><span class="s3">.</span><span class="s1">ctypes</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_numba_carray</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Test Numba-compiled carray() against pure Python carray() 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_numba_carray_farray</span><span class="s3">(</span><span class="s1">carray_usecase</span><span class="s3">, </span><span class="s1">carray_dtype_usecase</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_numba_farray</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Test Numba-compiled farray() against pure Python farray() 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_numba_carray_farray</span><span class="s3">(</span><span class="s1">farray_usecase</span><span class="s3">, </span><span class="s1">farray_dtype_usecase</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">skip_unless_cffi</span>
+<span class="s2">class </span><span class="s1">TestCffiStruct</span><span class="s3">(</span><span class="s1">TestCase</span><span class="s3">):</span>
+    <span class="s1">c_source </span><span class="s3">= </span><span class="s5">&quot;&quot;&quot; 
+typedef struct _big_struct { 
+    int    i1; 
+    float  f2; 
+    double d3; 
+    float  af4[9]; 
+} big_struct; 
+ 
+typedef struct _error { 
+    int bits:4; 
+} error; 
+ 
+typedef double (*myfunc)(big_struct*, size_t); 
+&quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">get_ffi</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">src</span><span class="s3">=</span><span class="s1">c_source</span><span class="s3">):</span>
+        <span class="s2">from </span><span class="s1">cffi </span><span class="s2">import </span><span class="s1">FFI</span>
+
+        <span class="s1">ffi </span><span class="s3">= </span><span class="s1">FFI</span><span class="s3">()</span>
+        <span class="s1">ffi</span><span class="s3">.</span><span class="s1">cdef</span><span class="s3">(</span><span class="s1">src</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">ffi</span>
+
+    <span class="s2">def </span><span class="s1">test_type_parsing</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">ffi </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_ffi</span><span class="s3">()</span>
+        <span class="s6"># Check struct typedef</span>
+        <span class="s1">big_struct </span><span class="s3">= </span><span class="s1">ffi</span><span class="s3">.</span><span class="s1">typeof</span><span class="s3">(</span><span class="s5">'big_struct'</span><span class="s3">)</span>
+        <span class="s1">nbtype </span><span class="s3">= </span><span class="s1">cffi_support</span><span class="s3">.</span><span class="s1">map_type</span><span class="s3">(</span><span class="s1">big_struct</span><span class="s3">, </span><span class="s1">use_record_dtype</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIsInstance</span><span class="s3">(</span><span class="s1">nbtype</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">Record</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">nbtype</span><span class="s3">), </span><span class="s4">4</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">nbtype</span><span class="s3">.</span><span class="s1">typeof</span><span class="s3">(</span><span class="s5">'i1'</span><span class="s3">), </span><span class="s1">types</span><span class="s3">.</span><span class="s1">int32</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">nbtype</span><span class="s3">.</span><span class="s1">typeof</span><span class="s3">(</span><span class="s5">'f2'</span><span class="s3">), </span><span class="s1">types</span><span class="s3">.</span><span class="s1">float32</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">nbtype</span><span class="s3">.</span><span class="s1">typeof</span><span class="s3">(</span><span class="s5">'d3'</span><span class="s3">), </span><span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span>
+            <span class="s1">nbtype</span><span class="s3">.</span><span class="s1">typeof</span><span class="s3">(</span><span class="s5">'af4'</span><span class="s3">),</span>
+            <span class="s1">types</span><span class="s3">.</span><span class="s1">NestedArray</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">types</span><span class="s3">.</span><span class="s1">float32</span><span class="s3">, </span><span class="s1">shape</span><span class="s3">=(</span><span class="s4">9</span><span class="s3">,)),</span>
+        <span class="s3">)</span>
+
+        <span class="s6"># Check function typedef</span>
+        <span class="s1">myfunc </span><span class="s3">= </span><span class="s1">ffi</span><span class="s3">.</span><span class="s1">typeof</span><span class="s3">(</span><span class="s5">'myfunc'</span><span class="s3">)</span>
+        <span class="s1">sig </span><span class="s3">= </span><span class="s1">cffi_support</span><span class="s3">.</span><span class="s1">map_type</span><span class="s3">(</span><span class="s1">myfunc</span><span class="s3">, </span><span class="s1">use_record_dtype</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIsInstance</span><span class="s3">(</span><span class="s1">sig</span><span class="s3">, </span><span class="s1">typing</span><span class="s3">.</span><span class="s1">Signature</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">sig</span><span class="s3">.</span><span class="s1">args</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s1">types</span><span class="s3">.</span><span class="s1">CPointer</span><span class="s3">(</span><span class="s1">nbtype</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">sig</span><span class="s3">.</span><span class="s1">args</span><span class="s3">[</span><span class="s4">1</span><span class="s3">], </span><span class="s1">types</span><span class="s3">.</span><span class="s1">uintp</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">sig</span><span class="s3">.</span><span class="s1">return_type</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_cfunc_callback</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">ffi </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_ffi</span><span class="s3">()</span>
+        <span class="s1">big_struct </span><span class="s3">= </span><span class="s1">ffi</span><span class="s3">.</span><span class="s1">typeof</span><span class="s3">(</span><span class="s5">'big_struct'</span><span class="s3">)</span>
+        <span class="s1">nb_big_struct </span><span class="s3">= </span><span class="s1">cffi_support</span><span class="s3">.</span><span class="s1">map_type</span><span class="s3">(</span><span class="s1">big_struct</span><span class="s3">, </span><span class="s1">use_record_dtype</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+        <span class="s1">sig </span><span class="s3">= </span><span class="s1">cffi_support</span><span class="s3">.</span><span class="s1">map_type</span><span class="s3">(</span><span class="s1">ffi</span><span class="s3">.</span><span class="s1">typeof</span><span class="s3">(</span><span class="s5">'myfunc'</span><span class="s3">), </span><span class="s1">use_record_dtype</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">calc</span><span class="s3">(</span><span class="s1">base</span><span class="s3">):</span>
+            <span class="s1">tmp </span><span class="s3">= </span><span class="s4">0</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">base</span><span class="s3">.</span><span class="s1">size</span><span class="s3">):</span>
+                <span class="s1">elem </span><span class="s3">= </span><span class="s1">base</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+                <span class="s1">tmp </span><span class="s3">+= </span><span class="s1">elem</span><span class="s3">.</span><span class="s1">i1 </span><span class="s3">* </span><span class="s1">elem</span><span class="s3">.</span><span class="s1">f2 </span><span class="s3">/ </span><span class="s1">elem</span><span class="s3">.</span><span class="s1">d3</span>
+                <span class="s1">tmp </span><span class="s3">+= </span><span class="s1">base</span><span class="s3">[</span><span class="s1">i</span><span class="s3">].</span><span class="s1">af4</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">()</span>
+            <span class="s2">return </span><span class="s1">tmp</span>
+
+        <span class="s3">@</span><span class="s1">cfunc</span><span class="s3">(</span><span class="s1">sig</span><span class="s3">)</span>
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">(</span><span class="s1">ptr</span><span class="s3">, </span><span class="s1">n</span><span class="s3">):</span>
+            <span class="s1">base </span><span class="s3">= </span><span class="s1">carray</span><span class="s3">(</span><span class="s1">ptr</span><span class="s3">, </span><span class="s1">n</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">calc</span><span class="s3">(</span><span class="s1">base</span><span class="s3">)</span>
+
+        <span class="s6"># Make data</span>
+        <span class="s1">mydata </span><span class="s3">= </span><span class="s1">ffi</span><span class="s3">.</span><span class="s1">new</span><span class="s3">(</span><span class="s5">'big_struct[3]'</span><span class="s3">)</span>
+        <span class="s1">ptr </span><span class="s3">= </span><span class="s1">ffi</span><span class="s3">.</span><span class="s1">cast</span><span class="s3">(</span><span class="s5">'big_struct*'</span><span class="s3">, </span><span class="s1">mydata</span><span class="s3">)</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s4">3</span><span class="s3">):</span>
+            <span class="s1">ptr</span><span class="s3">[</span><span class="s1">i</span><span class="s3">].</span><span class="s1">i1 </span><span class="s3">= </span><span class="s1">i </span><span class="s3">* </span><span class="s4">123</span>
+            <span class="s1">ptr</span><span class="s3">[</span><span class="s1">i</span><span class="s3">].</span><span class="s1">f2 </span><span class="s3">= </span><span class="s1">i </span><span class="s3">* </span><span class="s4">213</span>
+            <span class="s1">ptr</span><span class="s3">[</span><span class="s1">i</span><span class="s3">].</span><span class="s1">d3 </span><span class="s3">= (</span><span class="s4">1 </span><span class="s3">+ </span><span class="s1">i</span><span class="s3">) * </span><span class="s4">213</span>
+            <span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s4">9</span><span class="s3">):</span>
+                <span class="s1">ptr</span><span class="s3">[</span><span class="s1">i</span><span class="s3">].</span><span class="s1">af4</span><span class="s3">[</span><span class="s1">j</span><span class="s3">] = </span><span class="s1">i </span><span class="s3">* </span><span class="s4">10 </span><span class="s3">+ </span><span class="s1">j</span>
+
+        <span class="s6"># Address of my data</span>
+        <span class="s1">addr </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">ffi</span><span class="s3">.</span><span class="s1">cast</span><span class="s3">(</span><span class="s5">'size_t'</span><span class="s3">, </span><span class="s1">ptr</span><span class="s3">))</span>
+        <span class="s1">got </span><span class="s3">= </span><span class="s1">foo</span><span class="s3">.</span><span class="s1">ctypes</span><span class="s3">(</span><span class="s1">addr</span><span class="s3">, </span><span class="s4">3</span><span class="s3">)</span>
+
+        <span class="s6"># Make numpy array from the cffi buffer</span>
+        <span class="s1">array </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">(</span>
+            <span class="s1">buffer</span><span class="s3">=</span><span class="s1">ffi</span><span class="s3">.</span><span class="s1">buffer</span><span class="s3">(</span><span class="s1">mydata</span><span class="s3">),</span>
+            <span class="s1">dtype</span><span class="s3">=</span><span class="s1">numpy_support</span><span class="s3">.</span><span class="s1">as_dtype</span><span class="s3">(</span><span class="s1">nb_big_struct</span><span class="s3">),</span>
+            <span class="s1">shape</span><span class="s3">=</span><span class="s4">3</span><span class="s3">,</span>
+            <span class="s3">)</span>
+        <span class="s1">expect </span><span class="s3">= </span><span class="s1">calc</span><span class="s3">(</span><span class="s1">array</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">got</span><span class="s3">, </span><span class="s1">expect</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_unsupport_bitsize</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">ffi </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_ffi</span><span class="s3">()</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">assertRaises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">) </span><span class="s2">as </span><span class="s1">raises</span><span class="s3">:</span>
+            <span class="s1">cffi_support</span><span class="s3">.</span><span class="s1">map_type</span><span class="s3">(</span>
+                <span class="s1">ffi</span><span class="s3">.</span><span class="s1">typeof</span><span class="s3">(</span><span class="s5">'error'</span><span class="s3">),</span>
+                <span class="s1">use_record_dtype</span><span class="s3">=</span><span class="s2">True</span><span class="s3">,</span>
+            <span class="s3">)</span>
+        <span class="s6"># When bitsize is provided, bitshift defaults to 0.</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span>
+            <span class="s5">&quot;field 'bits' has bitshift, this is not supported&quot;</span><span class="s3">,</span>
+            <span class="s1">str</span><span class="s3">(</span><span class="s1">raises</span><span class="s3">.</span><span class="s1">exception</span><span class="s3">)</span>
+        <span class="s3">)</span>
+
+
+<span class="s2">if </span><span class="s1">__name__ </span><span class="s3">== </span><span class="s5">&quot;__main__&quot;</span><span class="s3">:</span>
+    <span class="s1">unittest</span><span class="s3">.</span><span class="s1">main</span><span class="s3">()</span>
+</pre>
+</body>
+</html>

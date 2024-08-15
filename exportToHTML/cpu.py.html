@@ -1,0 +1,348 @@
+<html>
+<head>
+<title>cpu.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #7a7e85;}
+.s4 { color: #6aab73;}
+.s5 { color: #5f826b; font-style: italic;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+cpu.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">platform</span>
+
+<span class="s0">import </span><span class="s1">llvmlite</span><span class="s2">.</span><span class="s1">binding </span><span class="s0">as </span><span class="s1">ll</span>
+<span class="s0">from </span><span class="s1">llvmlite </span><span class="s0">import </span><span class="s1">ir</span>
+
+<span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">_dynfunc</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">callwrapper </span><span class="s0">import </span><span class="s1">PyCallWrapper</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">base </span><span class="s0">import </span><span class="s1">BaseContext</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s2">(</span><span class="s1">utils</span><span class="s2">, </span><span class="s1">types</span><span class="s2">, </span><span class="s1">config</span><span class="s2">, </span><span class="s1">cgutils</span><span class="s2">, </span><span class="s1">callconv</span><span class="s2">, </span><span class="s1">codegen</span><span class="s2">,</span>
+                        <span class="s1">externals</span><span class="s2">, </span><span class="s1">fastmathpass</span><span class="s2">, </span><span class="s1">intrinsics</span><span class="s2">)</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">options </span><span class="s0">import </span><span class="s1">TargetOptions</span><span class="s2">, </span><span class="s1">include_default_options</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">runtime </span><span class="s0">import </span><span class="s1">rtsys</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">compiler_lock </span><span class="s0">import </span><span class="s1">global_compiler_lock</span>
+<span class="s0">import </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">entrypoints</span>
+<span class="s3"># Re-export these options, they are used from the cpu module throughout the code</span>
+<span class="s3"># base.</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">cpu_options </span><span class="s0">import </span><span class="s2">(</span><span class="s1">ParallelOptions</span><span class="s2">, </span><span class="s3"># noqa F401</span>
+                                    <span class="s1">FastMathOptions</span><span class="s2">, </span><span class="s1">InlineOptions</span><span class="s2">) </span><span class="s3"># noqa F401</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">np </span><span class="s0">import </span><span class="s1">ufunc_db</span>
+
+<span class="s3"># Keep those structures in sync with _dynfunc.c.</span>
+
+
+<span class="s0">class </span><span class="s1">ClosureBody</span><span class="s2">(</span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">Structure</span><span class="s2">):</span>
+    <span class="s1">_fields </span><span class="s2">= [(</span><span class="s4">'env'</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">pyobject</span><span class="s2">)]</span>
+
+
+<span class="s0">class </span><span class="s1">EnvBody</span><span class="s2">(</span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">Structure</span><span class="s2">):</span>
+    <span class="s1">_fields </span><span class="s2">= [</span>
+        <span class="s2">(</span><span class="s4">'globals'</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">pyobject</span><span class="s2">),</span>
+        <span class="s2">(</span><span class="s4">'consts'</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">pyobject</span><span class="s2">),</span>
+    <span class="s2">]</span>
+
+
+<span class="s0">class </span><span class="s1">CPUContext</span><span class="s2">(</span><span class="s1">BaseContext</span><span class="s2">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Changes BaseContext calling convention 
+    &quot;&quot;&quot;</span>
+    <span class="s1">allow_dynamic_globals </span><span class="s2">= </span><span class="s0">True</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">typingctx</span><span class="s2">, </span><span class="s1">target</span><span class="s2">=</span><span class="s4">'cpu'</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">typingctx</span><span class="s2">, </span><span class="s1">target</span><span class="s2">)</span>
+
+    <span class="s3"># Overrides</span>
+    <span class="s0">def </span><span class="s1">create_module</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_internal_codegen</span><span class="s2">.</span><span class="s1">_create_empty_module</span><span class="s2">(</span><span class="s1">name</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">global_compiler_lock</span>
+    <span class="s0">def </span><span class="s1">init</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">is32bit </span><span class="s2">= (</span><span class="s1">utils</span><span class="s2">.</span><span class="s1">MACHINE_BITS </span><span class="s2">== </span><span class="s6">32</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_internal_codegen </span><span class="s2">= </span><span class="s1">codegen</span><span class="s2">.</span><span class="s1">JITCPUCodegen</span><span class="s2">(</span><span class="s4">&quot;numba.exec&quot;</span><span class="s2">)</span>
+
+        <span class="s3"># Add ARM ABI functions from libgcc_s</span>
+        <span class="s0">if </span><span class="s1">platform</span><span class="s2">.</span><span class="s1">machine</span><span class="s2">() == </span><span class="s4">'armv7l'</span><span class="s2">:</span>
+            <span class="s1">ll</span><span class="s2">.</span><span class="s1">load_library_permanently</span><span class="s2">(</span><span class="s4">'libgcc_s.so.1'</span><span class="s2">)</span>
+
+        <span class="s3"># Map external C functions.</span>
+        <span class="s1">externals</span><span class="s2">.</span><span class="s1">c_math_functions</span><span class="s2">.</span><span class="s1">install</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">load_additional_registries</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Only initialize the NRT once something is about to be compiled. The</span>
+        <span class="s3"># &quot;initialized&quot; state doesn't need to be threadsafe, there's a lock</span>
+        <span class="s3"># around the internal compilation and the rtsys.initialize call can be</span>
+        <span class="s3"># made multiple times, worse case init just gets called a bit more often</span>
+        <span class="s3"># than optimal.</span>
+        <span class="s1">rtsys</span><span class="s2">.</span><span class="s1">initialize</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)</span>
+
+        <span class="s3"># Add implementations that work via import</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cpython </span><span class="s0">import </span><span class="s2">(</span><span class="s1">builtins</span><span class="s2">, </span><span class="s1">charseq</span><span class="s2">, </span><span class="s1">enumimpl</span><span class="s2">, </span><span class="s3"># noqa F401</span>
+                                   <span class="s1">hashing</span><span class="s2">, </span><span class="s1">heapq</span><span class="s2">, </span><span class="s1">iterators</span><span class="s2">, </span><span class="s3"># noqa F401</span>
+                                   <span class="s1">listobj</span><span class="s2">, </span><span class="s1">numbers</span><span class="s2">, </span><span class="s1">rangeobj</span><span class="s2">, </span><span class="s3"># noqa F401</span>
+                                   <span class="s1">setobj</span><span class="s2">, </span><span class="s1">slicing</span><span class="s2">, </span><span class="s1">tupleobj</span><span class="s2">, </span><span class="s3"># noqa F401</span>
+                                   <span class="s1">unicode</span><span class="s2">,) </span><span class="s3"># noqa F401</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">optional</span><span class="s2">, </span><span class="s1">inline_closurecall </span><span class="s3"># noqa F401</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">misc </span><span class="s0">import </span><span class="s1">gdb_hook</span><span class="s2">, </span><span class="s1">literal </span><span class="s3"># noqa F401</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">np </span><span class="s0">import </span><span class="s1">linalg</span><span class="s2">, </span><span class="s1">arraymath</span><span class="s2">, </span><span class="s1">arrayobj </span><span class="s3"># noqa F401</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">np</span><span class="s2">.</span><span class="s1">random </span><span class="s0">import </span><span class="s1">generator_core</span><span class="s2">, </span><span class="s1">generator_methods </span><span class="s3"># noqa F401</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">np</span><span class="s2">.</span><span class="s1">polynomial </span><span class="s0">import </span><span class="s1">polynomial_core</span><span class="s2">, </span><span class="s1">polynomial_functions </span><span class="s3"># noqa F401</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">typed </span><span class="s0">import </span><span class="s1">typeddict</span><span class="s2">, </span><span class="s1">dictimpl </span><span class="s3"># noqa F401</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">typed </span><span class="s0">import </span><span class="s1">typedlist</span><span class="s2">, </span><span class="s1">listobject </span><span class="s3"># noqa F401</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">experimental </span><span class="s0">import </span><span class="s1">jitclass</span><span class="s2">, </span><span class="s1">function_type </span><span class="s3"># noqa F401</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">np </span><span class="s0">import </span><span class="s1">npdatetime </span><span class="s3"># noqa F401</span>
+
+        <span class="s3"># Add target specific implementations</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">np </span><span class="s0">import </span><span class="s1">npyimpl</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cpython </span><span class="s0">import </span><span class="s1">cmathimpl</span><span class="s2">, </span><span class="s1">mathimpl</span><span class="s2">, </span><span class="s1">printimpl</span><span class="s2">, </span><span class="s1">randomimpl</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">misc </span><span class="s0">import </span><span class="s1">cffiimpl</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">experimental</span><span class="s2">.</span><span class="s1">jitclass</span><span class="s2">.</span><span class="s1">base </span><span class="s0">import </span><span class="s1">ClassBuilder </span><span class="s0">as </span><span class="s1">\</span>
+            <span class="s1">jitclassimpl</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">cmathimpl</span><span class="s2">.</span><span class="s1">registry</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">cffiimpl</span><span class="s2">.</span><span class="s1">registry</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">mathimpl</span><span class="s2">.</span><span class="s1">registry</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">npyimpl</span><span class="s2">.</span><span class="s1">registry</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">printimpl</span><span class="s2">.</span><span class="s1">registry</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">randomimpl</span><span class="s2">.</span><span class="s1">registry</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">jitclassimpl</span><span class="s2">.</span><span class="s1">class_impl_registry</span><span class="s2">)</span>
+
+        <span class="s3"># load 3rd party extensions</span>
+        <span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">entrypoints</span><span class="s2">.</span><span class="s1">init_all</span><span class="s2">()</span>
+
+        <span class="s3"># fix for #8940</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">np</span><span class="s2">.</span><span class="s1">unsafe </span><span class="s0">import </span><span class="s1">ndarray </span><span class="s3"># noqa F401</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">target_data</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_internal_codegen</span><span class="s2">.</span><span class="s1">target_data</span>
+
+    <span class="s0">def </span><span class="s1">with_aot_codegen</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, **</span><span class="s1">aot_options</span><span class="s2">):</span>
+        <span class="s1">aot_codegen </span><span class="s2">= </span><span class="s1">codegen</span><span class="s2">.</span><span class="s1">AOTCPUCodegen</span><span class="s2">(</span><span class="s1">name</span><span class="s2">, **</span><span class="s1">aot_options</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">subtarget</span><span class="s2">(</span><span class="s1">_internal_codegen</span><span class="s2">=</span><span class="s1">aot_codegen</span><span class="s2">,</span>
+                              <span class="s1">aot_mode</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">codegen</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_internal_codegen</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">call_conv</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">callconv</span><span class="s2">.</span><span class="s1">CPUCallConv</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">get_env_body</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">envptr</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        From the given *envptr* (a pointer to a _dynfunc.Environment object), 
+        get a EnvBody allowing structured access to environment fields. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">body_ptr </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">pointer_add</span><span class="s2">(</span>
+            <span class="s1">builder</span><span class="s2">, </span><span class="s1">envptr</span><span class="s2">, </span><span class="s1">_dynfunc</span><span class="s2">.</span><span class="s1">_impl_info</span><span class="s2">[</span><span class="s4">'offsetof_env_body'</span><span class="s2">])</span>
+        <span class="s0">return </span><span class="s1">EnvBody</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">ref</span><span class="s2">=</span><span class="s1">body_ptr</span><span class="s2">, </span><span class="s1">cast_ref</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">get_env_manager</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">return_pyobject</span><span class="s2">=</span><span class="s0">False</span><span class="s2">):</span>
+        <span class="s1">envgv </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">declare_env_global</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">module</span><span class="s2">,</span>
+                                        <span class="s1">self</span><span class="s2">.</span><span class="s1">get_env_name</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">fndesc</span><span class="s2">))</span>
+        <span class="s1">envarg </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">envgv</span><span class="s2">)</span>
+        <span class="s1">pyapi </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_python_api</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">)</span>
+        <span class="s1">pyapi</span><span class="s2">.</span><span class="s1">emit_environment_sentry</span><span class="s2">(</span>
+            <span class="s1">envarg</span><span class="s2">,</span>
+            <span class="s1">return_pyobject</span><span class="s2">=</span><span class="s1">return_pyobject</span><span class="s2">,</span>
+            <span class="s1">debug_msg</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">fndesc</span><span class="s2">.</span><span class="s1">env_name</span><span class="s2">,</span>
+        <span class="s2">)</span>
+        <span class="s1">env_body </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_env_body</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">envarg</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">pyapi</span><span class="s2">.</span><span class="s1">get_env_manager</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">environment</span><span class="s2">, </span><span class="s1">env_body</span><span class="s2">, </span><span class="s1">envarg</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">get_generator_state</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">genptr</span><span class="s2">, </span><span class="s1">return_type</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        From the given *genptr* (a pointer to a _dynfunc.Generator object), 
+        get a pointer to its state area. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">pointer_add</span><span class="s2">(</span>
+            <span class="s1">builder</span><span class="s2">, </span><span class="s1">genptr</span><span class="s2">, </span><span class="s1">_dynfunc</span><span class="s2">.</span><span class="s1">_impl_info</span><span class="s2">[</span><span class="s4">'offsetof_generator_state'</span><span class="s2">],</span>
+            <span class="s1">return_type</span><span class="s2">=</span><span class="s1">return_type</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">build_list</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">list_type</span><span class="s2">, </span><span class="s1">items</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Build a list from the Numba *list_type* and its initial *items*. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cpython </span><span class="s0">import </span><span class="s1">listobj</span>
+        <span class="s0">return </span><span class="s1">listobj</span><span class="s2">.</span><span class="s1">build_list</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">list_type</span><span class="s2">, </span><span class="s1">items</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">build_set</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">set_type</span><span class="s2">, </span><span class="s1">items</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Build a set from the Numba *set_type* and its initial *items*. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cpython </span><span class="s0">import </span><span class="s1">setobj</span>
+        <span class="s0">return </span><span class="s1">setobj</span><span class="s2">.</span><span class="s1">build_set</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">set_type</span><span class="s2">, </span><span class="s1">items</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">build_map</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">dict_type</span><span class="s2">, </span><span class="s1">item_types</span><span class="s2">, </span><span class="s1">items</span><span class="s2">):</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">typed </span><span class="s0">import </span><span class="s1">dictobject</span>
+
+        <span class="s0">return </span><span class="s1">dictobject</span><span class="s2">.</span><span class="s1">build_map</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">dict_type</span><span class="s2">, </span><span class="s1">item_types</span><span class="s2">, </span><span class="s1">items</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">post_lowering</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">, </span><span class="s1">library</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">fastmath</span><span class="s2">:</span>
+            <span class="s1">fastmathpass</span><span class="s2">.</span><span class="s1">rewrite_module</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">fastmath</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">is32bit</span><span class="s2">:</span>
+            <span class="s3"># 32-bit machine needs to replace all 64-bit div/rem to avoid</span>
+            <span class="s3"># calls to compiler-rt</span>
+            <span class="s1">intrinsics</span><span class="s2">.</span><span class="s1">fix_divmod</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">)</span>
+
+        <span class="s1">library</span><span class="s2">.</span><span class="s1">add_linking_library</span><span class="s2">(</span><span class="s1">rtsys</span><span class="s2">.</span><span class="s1">library</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">create_cpython_wrapper</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">library</span><span class="s2">, </span><span class="s1">fndesc</span><span class="s2">, </span><span class="s1">env</span><span class="s2">, </span><span class="s1">call_helper</span><span class="s2">,</span>
+                               <span class="s1">release_gil</span><span class="s2">=</span><span class="s0">False</span><span class="s2">):</span>
+        <span class="s1">wrapper_module </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">create_module</span><span class="s2">(</span><span class="s4">&quot;wrapper&quot;</span><span class="s2">)</span>
+        <span class="s1">fnty </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">call_conv</span><span class="s2">.</span><span class="s1">get_function_type</span><span class="s2">(</span><span class="s1">fndesc</span><span class="s2">.</span><span class="s1">restype</span><span class="s2">, </span><span class="s1">fndesc</span><span class="s2">.</span><span class="s1">argtypes</span><span class="s2">)</span>
+        <span class="s1">wrapper_callee </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">wrapper_module</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">,</span>
+                                     <span class="s1">fndesc</span><span class="s2">.</span><span class="s1">llvm_func_name</span><span class="s2">)</span>
+        <span class="s1">builder </span><span class="s2">= </span><span class="s1">PyCallWrapper</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">wrapper_module</span><span class="s2">, </span><span class="s1">wrapper_callee</span><span class="s2">,</span>
+                                <span class="s1">fndesc</span><span class="s2">, </span><span class="s1">env</span><span class="s2">, </span><span class="s1">call_helper</span><span class="s2">=</span><span class="s1">call_helper</span><span class="s2">,</span>
+                                <span class="s1">release_gil</span><span class="s2">=</span><span class="s1">release_gil</span><span class="s2">)</span>
+        <span class="s1">builder</span><span class="s2">.</span><span class="s1">build</span><span class="s2">()</span>
+        <span class="s1">library</span><span class="s2">.</span><span class="s1">add_ir_module</span><span class="s2">(</span><span class="s1">wrapper_module</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">create_cfunc_wrapper</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">library</span><span class="s2">, </span><span class="s1">fndesc</span><span class="s2">, </span><span class="s1">env</span><span class="s2">, </span><span class="s1">call_helper</span><span class="s2">):</span>
+        <span class="s1">wrapper_module </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">create_module</span><span class="s2">(</span><span class="s4">&quot;cfunc_wrapper&quot;</span><span class="s2">)</span>
+        <span class="s1">fnty </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">call_conv</span><span class="s2">.</span><span class="s1">get_function_type</span><span class="s2">(</span><span class="s1">fndesc</span><span class="s2">.</span><span class="s1">restype</span><span class="s2">, </span><span class="s1">fndesc</span><span class="s2">.</span><span class="s1">argtypes</span><span class="s2">)</span>
+        <span class="s1">wrapper_callee </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">wrapper_module</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">,</span>
+                                     <span class="s1">fndesc</span><span class="s2">.</span><span class="s1">llvm_func_name</span><span class="s2">)</span>
+
+        <span class="s1">ll_argtypes </span><span class="s2">= [</span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_value_type</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">) </span><span class="s0">for </span><span class="s1">ty </span><span class="s0">in </span><span class="s1">fndesc</span><span class="s2">.</span><span class="s1">argtypes</span><span class="s2">]</span>
+        <span class="s1">ll_return_type </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_value_type</span><span class="s2">(</span><span class="s1">fndesc</span><span class="s2">.</span><span class="s1">restype</span><span class="s2">)</span>
+        <span class="s1">wrapty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ll_return_type</span><span class="s2">, </span><span class="s1">ll_argtypes</span><span class="s2">)</span>
+        <span class="s1">wrapfn </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">wrapper_module</span><span class="s2">, </span><span class="s1">wrapty</span><span class="s2">,</span>
+                             <span class="s1">fndesc</span><span class="s2">.</span><span class="s1">llvm_cfunc_wrapper_name</span><span class="s2">)</span>
+        <span class="s1">builder </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IRBuilder</span><span class="s2">(</span><span class="s1">wrapfn</span><span class="s2">.</span><span class="s1">append_basic_block</span><span class="s2">(</span><span class="s4">'entry'</span><span class="s2">))</span>
+
+        <span class="s1">status</span><span class="s2">, </span><span class="s1">out </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">call_conv</span><span class="s2">.</span><span class="s1">call_function</span><span class="s2">(</span>
+            <span class="s1">builder</span><span class="s2">, </span><span class="s1">wrapper_callee</span><span class="s2">, </span><span class="s1">fndesc</span><span class="s2">.</span><span class="s1">restype</span><span class="s2">, </span><span class="s1">fndesc</span><span class="s2">.</span><span class="s1">argtypes</span><span class="s2">,</span>
+            <span class="s1">wrapfn</span><span class="s2">.</span><span class="s1">args</span><span class="s2">, </span><span class="s1">attrs</span><span class="s2">=(</span><span class="s4">'noinline'</span><span class="s2">,))</span>
+
+        <span class="s0">with </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">if_then</span><span class="s2">(</span><span class="s1">status</span><span class="s2">.</span><span class="s1">is_error</span><span class="s2">, </span><span class="s1">likely</span><span class="s2">=</span><span class="s0">False</span><span class="s2">):</span>
+            <span class="s3"># If (and only if) an error occurred, acquire the GIL</span>
+            <span class="s3"># and use the interpreter to write out the exception.</span>
+            <span class="s1">pyapi </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_python_api</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">)</span>
+            <span class="s1">gil_state </span><span class="s2">= </span><span class="s1">pyapi</span><span class="s2">.</span><span class="s1">gil_ensure</span><span class="s2">()</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">call_conv</span><span class="s2">.</span><span class="s1">raise_error</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">, </span><span class="s1">status</span><span class="s2">)</span>
+            <span class="s1">cstr </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">insert_const_string</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">module</span><span class="s2">, </span><span class="s1">repr</span><span class="s2">(</span><span class="s1">self</span><span class="s2">))</span>
+            <span class="s1">strobj </span><span class="s2">= </span><span class="s1">pyapi</span><span class="s2">.</span><span class="s1">string_from_string</span><span class="s2">(</span><span class="s1">cstr</span><span class="s2">)</span>
+            <span class="s1">pyapi</span><span class="s2">.</span><span class="s1">err_write_unraisable</span><span class="s2">(</span><span class="s1">strobj</span><span class="s2">)</span>
+            <span class="s1">pyapi</span><span class="s2">.</span><span class="s1">decref</span><span class="s2">(</span><span class="s1">strobj</span><span class="s2">)</span>
+            <span class="s1">pyapi</span><span class="s2">.</span><span class="s1">gil_release</span><span class="s2">(</span><span class="s1">gil_state</span><span class="s2">)</span>
+
+        <span class="s1">builder</span><span class="s2">.</span><span class="s1">ret</span><span class="s2">(</span><span class="s1">out</span><span class="s2">)</span>
+        <span class="s1">library</span><span class="s2">.</span><span class="s1">add_ir_module</span><span class="s2">(</span><span class="s1">wrapper_module</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">get_executable</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">library</span><span class="s2">, </span><span class="s1">fndesc</span><span class="s2">, </span><span class="s1">env</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Returns 
+        ------- 
+        (cfunc, fnptr) 
+ 
+        - cfunc 
+            callable function (Can be None) 
+        - fnptr 
+            callable function address 
+        - env 
+            an execution environment (from _dynfunc) 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># Code generation</span>
+        <span class="s1">fnptr </span><span class="s2">= </span><span class="s1">library</span><span class="s2">.</span><span class="s1">get_pointer_to_function</span><span class="s2">(</span>
+            <span class="s1">fndesc</span><span class="s2">.</span><span class="s1">llvm_cpython_wrapper_name</span><span class="s2">)</span>
+
+        <span class="s3"># Note: we avoid reusing the original docstring to avoid encoding</span>
+        <span class="s3"># issues on Python 2, see issue #1908</span>
+        <span class="s1">doc </span><span class="s2">= </span><span class="s4">&quot;compiled wrapper for %r&quot; </span><span class="s2">% (</span><span class="s1">fndesc</span><span class="s2">.</span><span class="s1">qualname</span><span class="s2">,)</span>
+        <span class="s1">cfunc </span><span class="s2">= </span><span class="s1">_dynfunc</span><span class="s2">.</span><span class="s1">make_function</span><span class="s2">(</span><span class="s1">fndesc</span><span class="s2">.</span><span class="s1">lookup_module</span><span class="s2">(),</span>
+                                       <span class="s1">fndesc</span><span class="s2">.</span><span class="s1">qualname</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s4">'.'</span><span class="s2">)[-</span><span class="s6">1</span><span class="s2">],</span>
+                                       <span class="s1">doc</span><span class="s2">, </span><span class="s1">fnptr</span><span class="s2">, </span><span class="s1">env</span><span class="s2">,</span>
+                                       <span class="s3"># objects to keepalive with the function</span>
+                                       <span class="s2">(</span><span class="s1">library</span><span class="s2">,)</span>
+                                       <span class="s2">)</span>
+        <span class="s1">library</span><span class="s2">.</span><span class="s1">codegen</span><span class="s2">.</span><span class="s1">set_env</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_env_name</span><span class="s2">(</span><span class="s1">fndesc</span><span class="s2">), </span><span class="s1">env</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">cfunc</span>
+
+    <span class="s0">def </span><span class="s1">calc_array_sizeof</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ndim</span><span class="s2">):</span>
+        <span class="s5">''' 
+        Calculate the size of an array struct on the CPU target 
+        '''</span>
+        <span class="s1">aryty </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">, </span><span class="s1">ndim</span><span class="s2">, </span><span class="s4">'A'</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_abi_sizeof</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_value_type</span><span class="s2">(</span><span class="s1">aryty</span><span class="s2">))</span>
+
+    <span class="s3"># Overrides</span>
+    <span class="s0">def </span><span class="s1">get_ufunc_info</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ufunc_key</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">ufunc_db</span><span class="s2">.</span><span class="s1">get_ufunc_info</span><span class="s2">(</span><span class="s1">ufunc_key</span><span class="s2">)</span>
+
+
+<span class="s3"># ----------------------------------------------------------------------------</span>
+<span class="s3"># TargetOptions</span>
+
+<span class="s1">_options_mixin </span><span class="s2">= </span><span class="s1">include_default_options</span><span class="s2">(</span>
+    <span class="s4">&quot;nopython&quot;</span><span class="s2">,</span>
+    <span class="s4">&quot;forceobj&quot;</span><span class="s2">,</span>
+    <span class="s4">&quot;looplift&quot;</span><span class="s2">,</span>
+    <span class="s4">&quot;_nrt&quot;</span><span class="s2">,</span>
+    <span class="s4">&quot;debug&quot;</span><span class="s2">,</span>
+    <span class="s4">&quot;boundscheck&quot;</span><span class="s2">,</span>
+    <span class="s4">&quot;nogil&quot;</span><span class="s2">,</span>
+    <span class="s4">&quot;no_rewrites&quot;</span><span class="s2">,</span>
+    <span class="s4">&quot;no_cpython_wrapper&quot;</span><span class="s2">,</span>
+    <span class="s4">&quot;no_cfunc_wrapper&quot;</span><span class="s2">,</span>
+    <span class="s4">&quot;parallel&quot;</span><span class="s2">,</span>
+    <span class="s4">&quot;fastmath&quot;</span><span class="s2">,</span>
+    <span class="s4">&quot;error_model&quot;</span><span class="s2">,</span>
+    <span class="s4">&quot;inline&quot;</span><span class="s2">,</span>
+    <span class="s4">&quot;forceinline&quot;</span><span class="s2">,</span>
+    <span class="s4">&quot;_dbg_extend_lifetimes&quot;</span><span class="s2">,</span>
+    <span class="s4">&quot;_dbg_optnone&quot;</span><span class="s2">,</span>
+<span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">CPUTargetOptions</span><span class="s2">(</span><span class="s1">_options_mixin</span><span class="s2">, </span><span class="s1">TargetOptions</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">finalize</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">flags</span><span class="s2">, </span><span class="s1">options</span><span class="s2">):</span>
+        <span class="s0">if not </span><span class="s1">flags</span><span class="s2">.</span><span class="s1">is_set</span><span class="s2">(</span><span class="s4">&quot;enable_pyobject&quot;</span><span class="s2">):</span>
+            <span class="s1">flags</span><span class="s2">.</span><span class="s1">enable_pyobject </span><span class="s2">= </span><span class="s0">True</span>
+
+        <span class="s0">if not </span><span class="s1">flags</span><span class="s2">.</span><span class="s1">is_set</span><span class="s2">(</span><span class="s4">&quot;enable_looplift&quot;</span><span class="s2">):</span>
+            <span class="s1">flags</span><span class="s2">.</span><span class="s1">enable_looplift </span><span class="s2">= </span><span class="s0">True</span>
+
+        <span class="s1">flags</span><span class="s2">.</span><span class="s1">inherit_if_not_set</span><span class="s2">(</span><span class="s4">&quot;nrt&quot;</span><span class="s2">, </span><span class="s1">default</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+
+        <span class="s0">if not </span><span class="s1">flags</span><span class="s2">.</span><span class="s1">is_set</span><span class="s2">(</span><span class="s4">&quot;debuginfo&quot;</span><span class="s2">):</span>
+            <span class="s1">flags</span><span class="s2">.</span><span class="s1">debuginfo </span><span class="s2">= </span><span class="s1">config</span><span class="s2">.</span><span class="s1">DEBUGINFO_DEFAULT</span>
+
+        <span class="s0">if not </span><span class="s1">flags</span><span class="s2">.</span><span class="s1">is_set</span><span class="s2">(</span><span class="s4">&quot;dbg_extend_lifetimes&quot;</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s1">flags</span><span class="s2">.</span><span class="s1">debuginfo</span><span class="s2">:</span>
+                <span class="s3"># auto turn on extend-lifetimes if debuginfo is on and</span>
+                <span class="s3"># dbg_extend_lifetimes is not set</span>
+                <span class="s1">flags</span><span class="s2">.</span><span class="s1">dbg_extend_lifetimes </span><span class="s2">= </span><span class="s0">True</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s3"># set flag using env-var config</span>
+                <span class="s1">flags</span><span class="s2">.</span><span class="s1">dbg_extend_lifetimes </span><span class="s2">= </span><span class="s1">config</span><span class="s2">.</span><span class="s1">EXTEND_VARIABLE_LIFETIMES</span>
+
+        <span class="s0">if not </span><span class="s1">flags</span><span class="s2">.</span><span class="s1">is_set</span><span class="s2">(</span><span class="s4">&quot;boundscheck&quot;</span><span class="s2">):</span>
+            <span class="s1">flags</span><span class="s2">.</span><span class="s1">boundscheck </span><span class="s2">= </span><span class="s1">flags</span><span class="s2">.</span><span class="s1">debuginfo</span>
+
+        <span class="s1">flags</span><span class="s2">.</span><span class="s1">enable_pyobject_looplift </span><span class="s2">= </span><span class="s0">True</span>
+
+        <span class="s1">flags</span><span class="s2">.</span><span class="s1">inherit_if_not_set</span><span class="s2">(</span><span class="s4">&quot;fastmath&quot;</span><span class="s2">)</span>
+
+        <span class="s1">flags</span><span class="s2">.</span><span class="s1">inherit_if_not_set</span><span class="s2">(</span><span class="s4">&quot;error_model&quot;</span><span class="s2">, </span><span class="s1">default</span><span class="s2">=</span><span class="s4">&quot;python&quot;</span><span class="s2">)</span>
+
+        <span class="s1">flags</span><span class="s2">.</span><span class="s1">inherit_if_not_set</span><span class="s2">(</span><span class="s4">&quot;forceinline&quot;</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">flags</span><span class="s2">.</span><span class="s1">forceinline</span><span class="s2">:</span>
+            <span class="s3"># forceinline turns off optnone, just like clang.</span>
+            <span class="s1">flags</span><span class="s2">.</span><span class="s1">optnone </span><span class="s2">= </span><span class="s0">False</span>
+</pre>
+</body>
+</html>

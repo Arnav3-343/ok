@@ -1,0 +1,336 @@
+<html>
+<head>
+<title>test_ipc.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #7a7e85;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_ipc.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">multiprocessing </span><span class="s0">as </span><span class="s1">mp</span>
+<span class="s0">import </span><span class="s1">itertools</span>
+<span class="s0">import </span><span class="s1">traceback</span>
+<span class="s0">import </span><span class="s1">pickle</span>
+
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+
+<span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">cuda</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">cudadrv </span><span class="s0">import </span><span class="s1">driver</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">testing </span><span class="s0">import </span><span class="s2">(</span><span class="s1">skip_on_arm</span><span class="s2">, </span><span class="s1">skip_on_cudasim</span><span class="s2">,</span>
+                                <span class="s1">skip_under_cuda_memcheck</span><span class="s2">,</span>
+                                <span class="s1">ContextResettingTestCase</span><span class="s2">, </span><span class="s1">ForeignArray</span><span class="s2">)</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">tests</span><span class="s2">.</span><span class="s1">support </span><span class="s0">import </span><span class="s1">linux_only</span><span class="s2">, </span><span class="s1">windows_only</span>
+<span class="s0">import </span><span class="s1">unittest</span>
+
+
+<span class="s0">def </span><span class="s1">core_ipc_handle_test</span><span class="s2">(</span><span class="s1">the_work</span><span class="s2">, </span><span class="s1">result_queue</span><span class="s2">):</span>
+    <span class="s0">try</span><span class="s2">:</span>
+        <span class="s1">arr </span><span class="s2">= </span><span class="s1">the_work</span><span class="s2">()</span>
+    <span class="s3"># Catch anything going wrong in the worker function</span>
+    <span class="s0">except</span><span class="s2">:  </span><span class="s3"># noqa: E722</span>
+        <span class="s3"># FAILED. propagate the exception as a string</span>
+        <span class="s1">succ </span><span class="s2">= </span><span class="s0">False</span>
+        <span class="s1">out </span><span class="s2">= </span><span class="s1">traceback</span><span class="s2">.</span><span class="s1">format_exc</span><span class="s2">()</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s3"># OK. send the ndarray back</span>
+        <span class="s1">succ </span><span class="s2">= </span><span class="s0">True</span>
+        <span class="s1">out </span><span class="s2">= </span><span class="s1">arr</span>
+    <span class="s1">result_queue</span><span class="s2">.</span><span class="s1">put</span><span class="s2">((</span><span class="s1">succ</span><span class="s2">, </span><span class="s1">out</span><span class="s2">))</span>
+
+
+<span class="s0">def </span><span class="s1">base_ipc_handle_test</span><span class="s2">(</span><span class="s1">handle</span><span class="s2">, </span><span class="s1">size</span><span class="s2">, </span><span class="s1">result_queue</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">the_work</span><span class="s2">():</span>
+        <span class="s1">dtype </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">)</span>
+        <span class="s0">with </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">open_ipc_array</span><span class="s2">(</span><span class="s1">handle</span><span class="s2">, </span><span class="s1">shape</span><span class="s2">=</span><span class="s1">size </span><span class="s2">// </span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">itemsize</span><span class="s2">,</span>
+                                 <span class="s1">dtype</span><span class="s2">=</span><span class="s1">dtype</span><span class="s2">) </span><span class="s0">as </span><span class="s1">darr</span><span class="s2">:</span>
+            <span class="s3"># copy the data to host</span>
+            <span class="s0">return </span><span class="s1">darr</span><span class="s2">.</span><span class="s1">copy_to_host</span><span class="s2">()</span>
+
+    <span class="s1">core_ipc_handle_test</span><span class="s2">(</span><span class="s1">the_work</span><span class="s2">, </span><span class="s1">result_queue</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">serialize_ipc_handle_test</span><span class="s2">(</span><span class="s1">handle</span><span class="s2">, </span><span class="s1">result_queue</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">the_work</span><span class="s2">():</span>
+        <span class="s1">dtype </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">)</span>
+        <span class="s1">darr </span><span class="s2">= </span><span class="s1">handle</span><span class="s2">.</span><span class="s1">open_array</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">current_context</span><span class="s2">(),</span>
+                                 <span class="s1">shape</span><span class="s2">=</span><span class="s1">handle</span><span class="s2">.</span><span class="s1">size </span><span class="s2">// </span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">itemsize</span><span class="s2">,</span>
+                                 <span class="s1">dtype</span><span class="s2">=</span><span class="s1">dtype</span><span class="s2">)</span>
+        <span class="s3"># copy the data to host</span>
+        <span class="s1">arr </span><span class="s2">= </span><span class="s1">darr</span><span class="s2">.</span><span class="s1">copy_to_host</span><span class="s2">()</span>
+        <span class="s1">handle</span><span class="s2">.</span><span class="s1">close</span><span class="s2">()</span>
+        <span class="s0">return </span><span class="s1">arr</span>
+
+    <span class="s1">core_ipc_handle_test</span><span class="s2">(</span><span class="s1">the_work</span><span class="s2">, </span><span class="s1">result_queue</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">ipc_array_test</span><span class="s2">(</span><span class="s1">ipcarr</span><span class="s2">, </span><span class="s1">result_queue</span><span class="s2">):</span>
+    <span class="s0">try</span><span class="s2">:</span>
+        <span class="s0">with </span><span class="s1">ipcarr </span><span class="s0">as </span><span class="s1">darr</span><span class="s2">:</span>
+            <span class="s1">arr </span><span class="s2">= </span><span class="s1">darr</span><span class="s2">.</span><span class="s1">copy_to_host</span><span class="s2">()</span>
+            <span class="s0">try</span><span class="s2">:</span>
+                <span class="s3"># should fail to reopen</span>
+                <span class="s0">with </span><span class="s1">ipcarr</span><span class="s2">:</span>
+                    <span class="s0">pass</span>
+            <span class="s0">except </span><span class="s1">ValueError </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+                <span class="s0">if </span><span class="s1">str</span><span class="s2">(</span><span class="s1">e</span><span class="s2">) != </span><span class="s4">'IpcHandle is already opened'</span><span class="s2">:</span>
+                    <span class="s0">raise </span><span class="s1">AssertionError</span><span class="s2">(</span><span class="s4">'invalid exception message'</span><span class="s2">)</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s0">raise </span><span class="s1">AssertionError</span><span class="s2">(</span><span class="s4">'did not raise on reopen'</span><span class="s2">)</span>
+    <span class="s3"># Catch any exception so we can propagate it</span>
+    <span class="s0">except</span><span class="s2">:  </span><span class="s3"># noqa: E722</span>
+        <span class="s3"># FAILED. propagate the exception as a string</span>
+        <span class="s1">succ </span><span class="s2">= </span><span class="s0">False</span>
+        <span class="s1">out </span><span class="s2">= </span><span class="s1">traceback</span><span class="s2">.</span><span class="s1">format_exc</span><span class="s2">()</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s3"># OK. send the ndarray back</span>
+        <span class="s1">succ </span><span class="s2">= </span><span class="s0">True</span>
+        <span class="s1">out </span><span class="s2">= </span><span class="s1">arr</span>
+    <span class="s1">result_queue</span><span class="s2">.</span><span class="s1">put</span><span class="s2">((</span><span class="s1">succ</span><span class="s2">, </span><span class="s1">out</span><span class="s2">))</span>
+
+
+<span class="s2">@</span><span class="s1">linux_only</span>
+<span class="s2">@</span><span class="s1">skip_under_cuda_memcheck</span><span class="s2">(</span><span class="s4">'Hangs cuda-memcheck'</span><span class="s2">)</span>
+<span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s4">'Ipc not available in CUDASIM'</span><span class="s2">)</span>
+<span class="s2">@</span><span class="s1">skip_on_arm</span><span class="s2">(</span><span class="s4">'CUDA IPC not supported on ARM in Numba'</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">TestIpcMemory</span><span class="s2">(</span><span class="s1">ContextResettingTestCase</span><span class="s2">):</span>
+
+    <span class="s0">def </span><span class="s1">test_ipc_handle</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># prepare data for IPC</span>
+        <span class="s1">arr </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s5">10</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">)</span>
+        <span class="s1">devarr </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">arr</span><span class="s2">)</span>
+
+        <span class="s3"># create IPC handle</span>
+        <span class="s1">ctx </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">current_context</span><span class="s2">()</span>
+        <span class="s1">ipch </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">get_ipc_handle</span><span class="s2">(</span><span class="s1">devarr</span><span class="s2">.</span><span class="s1">gpu_data</span><span class="s2">)</span>
+
+        <span class="s3"># manually prepare for serialization as bytes</span>
+        <span class="s0">if </span><span class="s1">driver</span><span class="s2">.</span><span class="s1">USE_NV_BINDING</span><span class="s2">:</span>
+            <span class="s1">handle_bytes </span><span class="s2">= </span><span class="s1">ipch</span><span class="s2">.</span><span class="s1">handle</span><span class="s2">.</span><span class="s1">reserved</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">handle_bytes </span><span class="s2">= </span><span class="s1">bytes</span><span class="s2">(</span><span class="s1">ipch</span><span class="s2">.</span><span class="s1">handle</span><span class="s2">)</span>
+        <span class="s1">size </span><span class="s2">= </span><span class="s1">ipch</span><span class="s2">.</span><span class="s1">size</span>
+
+        <span class="s3"># spawn new process for testing</span>
+        <span class="s1">ctx </span><span class="s2">= </span><span class="s1">mp</span><span class="s2">.</span><span class="s1">get_context</span><span class="s2">(</span><span class="s4">'spawn'</span><span class="s2">)</span>
+        <span class="s1">result_queue </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">Queue</span><span class="s2">()</span>
+        <span class="s1">args </span><span class="s2">= (</span><span class="s1">handle_bytes</span><span class="s2">, </span><span class="s1">size</span><span class="s2">, </span><span class="s1">result_queue</span><span class="s2">)</span>
+        <span class="s1">proc </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">Process</span><span class="s2">(</span><span class="s1">target</span><span class="s2">=</span><span class="s1">base_ipc_handle_test</span><span class="s2">, </span><span class="s1">args</span><span class="s2">=</span><span class="s1">args</span><span class="s2">)</span>
+        <span class="s1">proc</span><span class="s2">.</span><span class="s1">start</span><span class="s2">()</span>
+        <span class="s1">succ</span><span class="s2">, </span><span class="s1">out </span><span class="s2">= </span><span class="s1">result_queue</span><span class="s2">.</span><span class="s1">get</span><span class="s2">()</span>
+        <span class="s0">if not </span><span class="s1">succ</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">fail</span><span class="s2">(</span><span class="s1">out</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_equal</span><span class="s2">(</span><span class="s1">arr</span><span class="s2">, </span><span class="s1">out</span><span class="s2">)</span>
+        <span class="s1">proc</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s5">3</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">variants</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Test with no slicing and various different slices</span>
+        <span class="s1">indices </span><span class="s2">= (</span><span class="s0">None</span><span class="s2">, </span><span class="s1">slice</span><span class="s2">(</span><span class="s5">3</span><span class="s2">, </span><span class="s0">None</span><span class="s2">), </span><span class="s1">slice</span><span class="s2">(</span><span class="s5">3</span><span class="s2">, </span><span class="s5">8</span><span class="s2">), </span><span class="s1">slice</span><span class="s2">(</span><span class="s0">None</span><span class="s2">, </span><span class="s5">8</span><span class="s2">))</span>
+        <span class="s3"># Test with a Numba DeviceNDArray, or an array from elsewhere through</span>
+        <span class="s3"># the CUDA Array Interface</span>
+        <span class="s1">foreigns </span><span class="s2">= (</span><span class="s0">False</span><span class="s2">, </span><span class="s0">True</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">itertools</span><span class="s2">.</span><span class="s1">product</span><span class="s2">(</span><span class="s1">indices</span><span class="s2">, </span><span class="s1">foreigns</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">check_ipc_handle_serialization</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">index_arg</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">foreign</span><span class="s2">=</span><span class="s0">False</span><span class="s2">):</span>
+        <span class="s3"># prepare data for IPC</span>
+        <span class="s1">arr </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s5">10</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">)</span>
+        <span class="s1">devarr </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">arr</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">index_arg </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s1">devarr </span><span class="s2">= </span><span class="s1">devarr</span><span class="s2">[</span><span class="s1">index_arg</span><span class="s2">]</span>
+        <span class="s0">if </span><span class="s1">foreign</span><span class="s2">:</span>
+            <span class="s1">devarr </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">as_cuda_array</span><span class="s2">(</span><span class="s1">ForeignArray</span><span class="s2">(</span><span class="s1">devarr</span><span class="s2">))</span>
+        <span class="s1">expect </span><span class="s2">= </span><span class="s1">devarr</span><span class="s2">.</span><span class="s1">copy_to_host</span><span class="s2">()</span>
+
+        <span class="s3"># create IPC handle</span>
+        <span class="s1">ctx </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">current_context</span><span class="s2">()</span>
+        <span class="s1">ipch </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">get_ipc_handle</span><span class="s2">(</span><span class="s1">devarr</span><span class="s2">.</span><span class="s1">gpu_data</span><span class="s2">)</span>
+
+        <span class="s3"># pickle</span>
+        <span class="s1">buf </span><span class="s2">= </span><span class="s1">pickle</span><span class="s2">.</span><span class="s1">dumps</span><span class="s2">(</span><span class="s1">ipch</span><span class="s2">)</span>
+        <span class="s1">ipch_recon </span><span class="s2">= </span><span class="s1">pickle</span><span class="s2">.</span><span class="s1">loads</span><span class="s2">(</span><span class="s1">buf</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIs</span><span class="s2">(</span><span class="s1">ipch_recon</span><span class="s2">.</span><span class="s1">base</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">ipch_recon</span><span class="s2">.</span><span class="s1">size</span><span class="s2">, </span><span class="s1">ipch</span><span class="s2">.</span><span class="s1">size</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">driver</span><span class="s2">.</span><span class="s1">USE_NV_BINDING</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">ipch_recon</span><span class="s2">.</span><span class="s1">handle</span><span class="s2">.</span><span class="s1">reserved</span><span class="s2">, </span><span class="s1">ipch</span><span class="s2">.</span><span class="s1">handle</span><span class="s2">.</span><span class="s1">reserved</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">ipch_recon</span><span class="s2">.</span><span class="s1">handle</span><span class="s2">), </span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">ipch</span><span class="s2">.</span><span class="s1">handle</span><span class="s2">))</span>
+
+        <span class="s3"># spawn new process for testing</span>
+        <span class="s1">ctx </span><span class="s2">= </span><span class="s1">mp</span><span class="s2">.</span><span class="s1">get_context</span><span class="s2">(</span><span class="s4">'spawn'</span><span class="s2">)</span>
+        <span class="s1">result_queue </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">Queue</span><span class="s2">()</span>
+        <span class="s1">args </span><span class="s2">= (</span><span class="s1">ipch</span><span class="s2">, </span><span class="s1">result_queue</span><span class="s2">)</span>
+        <span class="s1">proc </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">Process</span><span class="s2">(</span><span class="s1">target</span><span class="s2">=</span><span class="s1">serialize_ipc_handle_test</span><span class="s2">, </span><span class="s1">args</span><span class="s2">=</span><span class="s1">args</span><span class="s2">)</span>
+        <span class="s1">proc</span><span class="s2">.</span><span class="s1">start</span><span class="s2">()</span>
+        <span class="s1">succ</span><span class="s2">, </span><span class="s1">out </span><span class="s2">= </span><span class="s1">result_queue</span><span class="s2">.</span><span class="s1">get</span><span class="s2">()</span>
+        <span class="s0">if not </span><span class="s1">succ</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">fail</span><span class="s2">(</span><span class="s1">out</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_equal</span><span class="s2">(</span><span class="s1">expect</span><span class="s2">, </span><span class="s1">out</span><span class="s2">)</span>
+        <span class="s1">proc</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s5">3</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_ipc_handle_serialization</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">for </span><span class="s1">index</span><span class="s2">, </span><span class="s1">foreign</span><span class="s2">, </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">variants</span><span class="s2">():</span>
+            <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">subTest</span><span class="s2">(</span><span class="s1">index</span><span class="s2">=</span><span class="s1">index</span><span class="s2">, </span><span class="s1">foreign</span><span class="s2">=</span><span class="s1">foreign</span><span class="s2">):</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">check_ipc_handle_serialization</span><span class="s2">(</span><span class="s1">index</span><span class="s2">, </span><span class="s1">foreign</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">check_ipc_array</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">index_arg</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">foreign</span><span class="s2">=</span><span class="s0">False</span><span class="s2">):</span>
+        <span class="s3"># prepare data for IPC</span>
+        <span class="s1">arr </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s5">10</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">)</span>
+        <span class="s1">devarr </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">arr</span><span class="s2">)</span>
+        <span class="s3"># Slice</span>
+        <span class="s0">if </span><span class="s1">index_arg </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s1">devarr </span><span class="s2">= </span><span class="s1">devarr</span><span class="s2">[</span><span class="s1">index_arg</span><span class="s2">]</span>
+        <span class="s0">if </span><span class="s1">foreign</span><span class="s2">:</span>
+            <span class="s1">devarr </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">as_cuda_array</span><span class="s2">(</span><span class="s1">ForeignArray</span><span class="s2">(</span><span class="s1">devarr</span><span class="s2">))</span>
+        <span class="s1">expect </span><span class="s2">= </span><span class="s1">devarr</span><span class="s2">.</span><span class="s1">copy_to_host</span><span class="s2">()</span>
+        <span class="s1">ipch </span><span class="s2">= </span><span class="s1">devarr</span><span class="s2">.</span><span class="s1">get_ipc_handle</span><span class="s2">()</span>
+
+        <span class="s3"># spawn new process for testing</span>
+        <span class="s1">ctx </span><span class="s2">= </span><span class="s1">mp</span><span class="s2">.</span><span class="s1">get_context</span><span class="s2">(</span><span class="s4">'spawn'</span><span class="s2">)</span>
+        <span class="s1">result_queue </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">Queue</span><span class="s2">()</span>
+        <span class="s1">args </span><span class="s2">= (</span><span class="s1">ipch</span><span class="s2">, </span><span class="s1">result_queue</span><span class="s2">)</span>
+        <span class="s1">proc </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">Process</span><span class="s2">(</span><span class="s1">target</span><span class="s2">=</span><span class="s1">ipc_array_test</span><span class="s2">, </span><span class="s1">args</span><span class="s2">=</span><span class="s1">args</span><span class="s2">)</span>
+        <span class="s1">proc</span><span class="s2">.</span><span class="s1">start</span><span class="s2">()</span>
+        <span class="s1">succ</span><span class="s2">, </span><span class="s1">out </span><span class="s2">= </span><span class="s1">result_queue</span><span class="s2">.</span><span class="s1">get</span><span class="s2">()</span>
+        <span class="s0">if not </span><span class="s1">succ</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">fail</span><span class="s2">(</span><span class="s1">out</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_equal</span><span class="s2">(</span><span class="s1">expect</span><span class="s2">, </span><span class="s1">out</span><span class="s2">)</span>
+        <span class="s1">proc</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s5">3</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_ipc_array</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">for </span><span class="s1">index</span><span class="s2">, </span><span class="s1">foreign</span><span class="s2">, </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">variants</span><span class="s2">():</span>
+            <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">subTest</span><span class="s2">(</span><span class="s1">index</span><span class="s2">=</span><span class="s1">index</span><span class="s2">, </span><span class="s1">foreign</span><span class="s2">=</span><span class="s1">foreign</span><span class="s2">):</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">check_ipc_array</span><span class="s2">(</span><span class="s1">index</span><span class="s2">, </span><span class="s1">foreign</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">staged_ipc_handle_test</span><span class="s2">(</span><span class="s1">handle</span><span class="s2">, </span><span class="s1">device_num</span><span class="s2">, </span><span class="s1">result_queue</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">the_work</span><span class="s2">():</span>
+        <span class="s0">with </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">gpus</span><span class="s2">[</span><span class="s1">device_num</span><span class="s2">]:</span>
+            <span class="s1">this_ctx </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">devices</span><span class="s2">.</span><span class="s1">get_context</span><span class="s2">()</span>
+            <span class="s1">deviceptr </span><span class="s2">= </span><span class="s1">handle</span><span class="s2">.</span><span class="s1">open_staged</span><span class="s2">(</span><span class="s1">this_ctx</span><span class="s2">)</span>
+            <span class="s1">arrsize </span><span class="s2">= </span><span class="s1">handle</span><span class="s2">.</span><span class="s1">size </span><span class="s2">// </span><span class="s1">np</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">).</span><span class="s1">itemsize</span>
+            <span class="s1">hostarray </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s1">arrsize</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">)</span>
+            <span class="s1">cuda</span><span class="s2">.</span><span class="s1">driver</span><span class="s2">.</span><span class="s1">device_to_host</span><span class="s2">(</span>
+                <span class="s1">hostarray</span><span class="s2">, </span><span class="s1">deviceptr</span><span class="s2">, </span><span class="s1">size</span><span class="s2">=</span><span class="s1">handle</span><span class="s2">.</span><span class="s1">size</span><span class="s2">,</span>
+            <span class="s2">)</span>
+            <span class="s1">handle</span><span class="s2">.</span><span class="s1">close</span><span class="s2">()</span>
+        <span class="s0">return </span><span class="s1">hostarray</span>
+
+    <span class="s1">core_ipc_handle_test</span><span class="s2">(</span><span class="s1">the_work</span><span class="s2">, </span><span class="s1">result_queue</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">staged_ipc_array_test</span><span class="s2">(</span><span class="s1">ipcarr</span><span class="s2">, </span><span class="s1">device_num</span><span class="s2">, </span><span class="s1">result_queue</span><span class="s2">):</span>
+    <span class="s0">try</span><span class="s2">:</span>
+        <span class="s0">with </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">gpus</span><span class="s2">[</span><span class="s1">device_num</span><span class="s2">]:</span>
+            <span class="s0">with </span><span class="s1">ipcarr </span><span class="s0">as </span><span class="s1">darr</span><span class="s2">:</span>
+                <span class="s1">arr </span><span class="s2">= </span><span class="s1">darr</span><span class="s2">.</span><span class="s1">copy_to_host</span><span class="s2">()</span>
+                <span class="s0">try</span><span class="s2">:</span>
+                    <span class="s3"># should fail to reopen</span>
+                    <span class="s0">with </span><span class="s1">ipcarr</span><span class="s2">:</span>
+                        <span class="s0">pass</span>
+                <span class="s0">except </span><span class="s1">ValueError </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+                    <span class="s0">if </span><span class="s1">str</span><span class="s2">(</span><span class="s1">e</span><span class="s2">) != </span><span class="s4">'IpcHandle is already opened'</span><span class="s2">:</span>
+                        <span class="s0">raise </span><span class="s1">AssertionError</span><span class="s2">(</span><span class="s4">'invalid exception message'</span><span class="s2">)</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s0">raise </span><span class="s1">AssertionError</span><span class="s2">(</span><span class="s4">'did not raise on reopen'</span><span class="s2">)</span>
+    <span class="s3"># Catch any exception so we can propagate it</span>
+    <span class="s0">except</span><span class="s2">:  </span><span class="s3"># noqa: E722</span>
+        <span class="s3"># FAILED. propagate the exception as a string</span>
+        <span class="s1">succ </span><span class="s2">= </span><span class="s0">False</span>
+        <span class="s1">out </span><span class="s2">= </span><span class="s1">traceback</span><span class="s2">.</span><span class="s1">format_exc</span><span class="s2">()</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s3"># OK. send the ndarray back</span>
+        <span class="s1">succ </span><span class="s2">= </span><span class="s0">True</span>
+        <span class="s1">out </span><span class="s2">= </span><span class="s1">arr</span>
+    <span class="s1">result_queue</span><span class="s2">.</span><span class="s1">put</span><span class="s2">((</span><span class="s1">succ</span><span class="s2">, </span><span class="s1">out</span><span class="s2">))</span>
+
+
+<span class="s2">@</span><span class="s1">linux_only</span>
+<span class="s2">@</span><span class="s1">skip_under_cuda_memcheck</span><span class="s2">(</span><span class="s4">'Hangs cuda-memcheck'</span><span class="s2">)</span>
+<span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s4">'Ipc not available in CUDASIM'</span><span class="s2">)</span>
+<span class="s2">@</span><span class="s1">skip_on_arm</span><span class="s2">(</span><span class="s4">'CUDA IPC not supported on ARM in Numba'</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">TestIpcStaged</span><span class="s2">(</span><span class="s1">ContextResettingTestCase</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">test_staged</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># prepare data for IPC</span>
+        <span class="s1">arr </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s5">10</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">)</span>
+        <span class="s1">devarr </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">arr</span><span class="s2">)</span>
+
+        <span class="s3"># spawn new process for testing</span>
+        <span class="s1">mpctx </span><span class="s2">= </span><span class="s1">mp</span><span class="s2">.</span><span class="s1">get_context</span><span class="s2">(</span><span class="s4">'spawn'</span><span class="s2">)</span>
+        <span class="s1">result_queue </span><span class="s2">= </span><span class="s1">mpctx</span><span class="s2">.</span><span class="s1">Queue</span><span class="s2">()</span>
+
+        <span class="s3"># create IPC handle</span>
+        <span class="s1">ctx </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">current_context</span><span class="s2">()</span>
+        <span class="s1">ipch </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">get_ipc_handle</span><span class="s2">(</span><span class="s1">devarr</span><span class="s2">.</span><span class="s1">gpu_data</span><span class="s2">)</span>
+        <span class="s3"># pickle</span>
+        <span class="s1">buf </span><span class="s2">= </span><span class="s1">pickle</span><span class="s2">.</span><span class="s1">dumps</span><span class="s2">(</span><span class="s1">ipch</span><span class="s2">)</span>
+        <span class="s1">ipch_recon </span><span class="s2">= </span><span class="s1">pickle</span><span class="s2">.</span><span class="s1">loads</span><span class="s2">(</span><span class="s1">buf</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIs</span><span class="s2">(</span><span class="s1">ipch_recon</span><span class="s2">.</span><span class="s1">base</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">driver</span><span class="s2">.</span><span class="s1">USE_NV_BINDING</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">ipch_recon</span><span class="s2">.</span><span class="s1">handle</span><span class="s2">.</span><span class="s1">reserved</span><span class="s2">, </span><span class="s1">ipch</span><span class="s2">.</span><span class="s1">handle</span><span class="s2">.</span><span class="s1">reserved</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">ipch_recon</span><span class="s2">.</span><span class="s1">handle</span><span class="s2">), </span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">ipch</span><span class="s2">.</span><span class="s1">handle</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">ipch_recon</span><span class="s2">.</span><span class="s1">size</span><span class="s2">, </span><span class="s1">ipch</span><span class="s2">.</span><span class="s1">size</span><span class="s2">)</span>
+
+        <span class="s3"># Test on every CUDA devices</span>
+        <span class="s0">for </span><span class="s1">device_num </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">gpus</span><span class="s2">)):</span>
+            <span class="s1">args </span><span class="s2">= (</span><span class="s1">ipch</span><span class="s2">, </span><span class="s1">device_num</span><span class="s2">, </span><span class="s1">result_queue</span><span class="s2">)</span>
+            <span class="s1">proc </span><span class="s2">= </span><span class="s1">mpctx</span><span class="s2">.</span><span class="s1">Process</span><span class="s2">(</span><span class="s1">target</span><span class="s2">=</span><span class="s1">staged_ipc_handle_test</span><span class="s2">, </span><span class="s1">args</span><span class="s2">=</span><span class="s1">args</span><span class="s2">)</span>
+            <span class="s1">proc</span><span class="s2">.</span><span class="s1">start</span><span class="s2">()</span>
+            <span class="s1">succ</span><span class="s2">, </span><span class="s1">out </span><span class="s2">= </span><span class="s1">result_queue</span><span class="s2">.</span><span class="s1">get</span><span class="s2">()</span>
+            <span class="s1">proc</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s5">3</span><span class="s2">)</span>
+            <span class="s0">if not </span><span class="s1">succ</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">fail</span><span class="s2">(</span><span class="s1">out</span><span class="s2">)</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_equal</span><span class="s2">(</span><span class="s1">arr</span><span class="s2">, </span><span class="s1">out</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_ipc_array</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">for </span><span class="s1">device_num </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">gpus</span><span class="s2">)):</span>
+            <span class="s3"># prepare data for IPC</span>
+            <span class="s1">arr </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">random</span><span class="s2">.</span><span class="s1">random</span><span class="s2">(</span><span class="s5">10</span><span class="s2">)</span>
+            <span class="s1">devarr </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">arr</span><span class="s2">)</span>
+            <span class="s1">ipch </span><span class="s2">= </span><span class="s1">devarr</span><span class="s2">.</span><span class="s1">get_ipc_handle</span><span class="s2">()</span>
+
+            <span class="s3"># spawn new process for testing</span>
+            <span class="s1">ctx </span><span class="s2">= </span><span class="s1">mp</span><span class="s2">.</span><span class="s1">get_context</span><span class="s2">(</span><span class="s4">'spawn'</span><span class="s2">)</span>
+            <span class="s1">result_queue </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">Queue</span><span class="s2">()</span>
+            <span class="s1">args </span><span class="s2">= (</span><span class="s1">ipch</span><span class="s2">, </span><span class="s1">device_num</span><span class="s2">, </span><span class="s1">result_queue</span><span class="s2">)</span>
+            <span class="s1">proc </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">Process</span><span class="s2">(</span><span class="s1">target</span><span class="s2">=</span><span class="s1">staged_ipc_array_test</span><span class="s2">, </span><span class="s1">args</span><span class="s2">=</span><span class="s1">args</span><span class="s2">)</span>
+            <span class="s1">proc</span><span class="s2">.</span><span class="s1">start</span><span class="s2">()</span>
+            <span class="s1">succ</span><span class="s2">, </span><span class="s1">out </span><span class="s2">= </span><span class="s1">result_queue</span><span class="s2">.</span><span class="s1">get</span><span class="s2">()</span>
+            <span class="s1">proc</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s5">3</span><span class="s2">)</span>
+            <span class="s0">if not </span><span class="s1">succ</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">fail</span><span class="s2">(</span><span class="s1">out</span><span class="s2">)</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_equal</span><span class="s2">(</span><span class="s1">arr</span><span class="s2">, </span><span class="s1">out</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">windows_only</span>
+<span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s4">'Ipc not available in CUDASIM'</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">TestIpcNotSupported</span><span class="s2">(</span><span class="s1">ContextResettingTestCase</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">test_unsupported</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">arr </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s5">10</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">)</span>
+        <span class="s1">devarr </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">arr</span><span class="s2">)</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaises</span><span class="s2">(</span><span class="s1">OSError</span><span class="s2">) </span><span class="s0">as </span><span class="s1">raises</span><span class="s2">:</span>
+            <span class="s1">devarr</span><span class="s2">.</span><span class="s1">get_ipc_handle</span><span class="s2">()</span>
+        <span class="s1">errmsg </span><span class="s2">= </span><span class="s1">str</span><span class="s2">(</span><span class="s1">raises</span><span class="s2">.</span><span class="s1">exception</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s4">'OS does not support CUDA IPC'</span><span class="s2">, </span><span class="s1">errmsg</span><span class="s2">)</span>
+
+
+<span class="s0">if </span><span class="s1">__name__ </span><span class="s2">== </span><span class="s4">'__main__'</span><span class="s2">:</span>
+    <span class="s1">unittest</span><span class="s2">.</span><span class="s1">main</span><span class="s2">()</span>
+</pre>
+</body>
+</html>

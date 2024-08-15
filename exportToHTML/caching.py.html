@@ -1,0 +1,755 @@
+<html>
+<head>
+<title>caching.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #7a7e85;}
+.s5 { color: #2aacb8;}
+.s6 { color: #6aab73;}
+.s7 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+caching.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Caching mechanism for compiled functions. 
+&quot;&quot;&quot;</span>
+
+
+<span class="s2">from </span><span class="s1">abc </span><span class="s2">import </span><span class="s1">ABCMeta</span><span class="s3">, </span><span class="s1">abstractmethod</span><span class="s3">, </span><span class="s1">abstractproperty</span>
+<span class="s2">import </span><span class="s1">contextlib</span>
+<span class="s2">import </span><span class="s1">errno</span>
+<span class="s2">import </span><span class="s1">hashlib</span>
+<span class="s2">import </span><span class="s1">inspect</span>
+<span class="s2">import </span><span class="s1">itertools</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">pickle</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">import </span><span class="s1">tempfile</span>
+<span class="s2">import </span><span class="s1">uuid</span>
+<span class="s2">import </span><span class="s1">warnings</span>
+
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">misc</span><span class="s3">.</span><span class="s1">appdirs </span><span class="s2">import </span><span class="s1">AppDirs</span>
+
+<span class="s2">import </span><span class="s1">numba</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">errors </span><span class="s2">import </span><span class="s1">NumbaWarning</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">base </span><span class="s2">import </span><span class="s1">BaseContext</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">codegen </span><span class="s2">import </span><span class="s1">CodeLibrary</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">compiler </span><span class="s2">import </span><span class="s1">CompileResult</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">config</span><span class="s3">, </span><span class="s1">compiler</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">serialize </span><span class="s2">import </span><span class="s1">dumps</span>
+
+
+<span class="s2">def </span><span class="s1">_cache_log</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">, *</span><span class="s1">args</span><span class="s3">):</span>
+    <span class="s2">if </span><span class="s1">config</span><span class="s3">.</span><span class="s1">DEBUG_CACHE</span><span class="s3">:</span>
+        <span class="s1">msg </span><span class="s3">= </span><span class="s1">msg </span><span class="s3">% </span><span class="s1">args</span>
+        <span class="s1">print</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">_Cache</span><span class="s3">(</span><span class="s1">metaclass</span><span class="s3">=</span><span class="s1">ABCMeta</span><span class="s3">):</span>
+
+    <span class="s3">@</span><span class="s1">abstractproperty</span>
+    <span class="s2">def </span><span class="s1">cache_path</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        The base filesystem path of this cache (for example its root folder). 
+        &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">load_overload</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">sig</span><span class="s3">, </span><span class="s1">target_context</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Load an overload for the given signature using the target context. 
+        The saved object must be returned if successful, None if not found 
+        in the cache. 
+        &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">save_overload</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">sig</span><span class="s3">, </span><span class="s1">data</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Save the overload for the given signature. 
+        &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">enable</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Enable the cache. 
+        &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">disable</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Disable the cache. 
+        &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">flush</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Flush the cache. 
+        &quot;&quot;&quot;</span>
+
+
+<span class="s2">class </span><span class="s1">NullCache</span><span class="s3">(</span><span class="s1">_Cache</span><span class="s3">):</span>
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">cache_path</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return None</span>
+
+    <span class="s2">def </span><span class="s1">load_overload</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">sig</span><span class="s3">, </span><span class="s1">target_context</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">save_overload</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">sig</span><span class="s3">, </span><span class="s1">cres</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">enable</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">disable</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">flush</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+
+<span class="s2">class </span><span class="s1">_CacheLocator</span><span class="s3">(</span><span class="s1">metaclass</span><span class="s3">=</span><span class="s1">ABCMeta</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A filesystem locator for caching a given function. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">ensure_cache_path</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">path </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_cache_path</span><span class="s3">()</span>
+        <span class="s1">os</span><span class="s3">.</span><span class="s1">makedirs</span><span class="s3">(</span><span class="s1">path</span><span class="s3">, </span><span class="s1">exist_ok</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+        <span class="s4"># Ensure the directory is writable by trying to write a temporary file</span>
+        <span class="s1">tempfile</span><span class="s3">.</span><span class="s1">TemporaryFile</span><span class="s3">(</span><span class="s1">dir</span><span class="s3">=</span><span class="s1">path</span><span class="s3">).</span><span class="s1">close</span><span class="s3">()</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">get_cache_path</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the directory the function is cached in. 
+        &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">get_source_stamp</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Get a timestamp representing the source code's freshness. 
+        Can return any picklable Python object. 
+        &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">get_disambiguator</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Get a string disambiguator for this locator's function. 
+        It should allow disambiguating different but similarly-named functions. 
+        &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">from_function</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">py_func</span><span class="s3">, </span><span class="s1">py_file</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Create a locator instance for the given function located in the 
+        given file. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">get_suitable_cache_subpath</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">py_file</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Given the Python file path, compute a suitable path inside the 
+        cache directory. 
+ 
+        This will reduce a file path that is too long, which can be a problem 
+        on some operating system (i.e. Windows 7). 
+        &quot;&quot;&quot;</span>
+        <span class="s1">path </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">abspath</span><span class="s3">(</span><span class="s1">py_file</span><span class="s3">)</span>
+        <span class="s1">subpath </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">dirname</span><span class="s3">(</span><span class="s1">path</span><span class="s3">)</span>
+        <span class="s1">parentdir </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">split</span><span class="s3">(</span><span class="s1">subpath</span><span class="s3">)[-</span><span class="s5">1</span><span class="s3">]</span>
+        <span class="s4"># Use SHA1 to reduce path length.</span>
+        <span class="s4"># Note: windows doesn't like long path.</span>
+        <span class="s1">hashed </span><span class="s3">= </span><span class="s1">hashlib</span><span class="s3">.</span><span class="s1">sha1</span><span class="s3">(</span><span class="s1">subpath</span><span class="s3">.</span><span class="s1">encode</span><span class="s3">()).</span><span class="s1">hexdigest</span><span class="s3">()</span>
+        <span class="s4"># Retain parent directory name for easier debugging</span>
+        <span class="s2">return </span><span class="s6">'_'</span><span class="s3">.</span><span class="s1">join</span><span class="s3">([</span><span class="s1">parentdir</span><span class="s3">, </span><span class="s1">hashed</span><span class="s3">])</span>
+
+
+<span class="s2">class </span><span class="s1">_SourceFileBackedLocatorMixin</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A cache locator mixin for functions which are backed by a well-known 
+    Python source file. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">get_source_stamp</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">sys</span><span class="s3">, </span><span class="s6">'frozen'</span><span class="s3">, </span><span class="s2">False</span><span class="s3">):</span>
+            <span class="s1">st </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">stat</span><span class="s3">(</span><span class="s1">sys</span><span class="s3">.</span><span class="s1">executable</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">st </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">stat</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_py_file</span><span class="s3">)</span>
+        <span class="s4"># We use both timestamp and size as some filesystems only have second</span>
+        <span class="s4"># granularity.</span>
+        <span class="s2">return </span><span class="s1">st</span><span class="s3">.</span><span class="s1">st_mtime</span><span class="s3">, </span><span class="s1">st</span><span class="s3">.</span><span class="s1">st_size</span>
+
+    <span class="s2">def </span><span class="s1">get_disambiguator</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">str</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lineno</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">from_function</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">py_func</span><span class="s3">, </span><span class="s1">py_file</span><span class="s3">):</span>
+        <span class="s2">if not </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">exists</span><span class="s3">(</span><span class="s1">py_file</span><span class="s3">):</span>
+            <span class="s4"># Perhaps a placeholder (e.g. &quot;&lt;ipython-XXX&gt;&quot;)</span>
+            <span class="s2">return</span>
+        <span class="s1">self </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">(</span><span class="s1">py_func</span><span class="s3">, </span><span class="s1">py_file</span><span class="s3">)</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">ensure_cache_path</span><span class="s3">()</span>
+        <span class="s2">except </span><span class="s1">OSError</span><span class="s3">:</span>
+            <span class="s4"># Cannot ensure the cache directory exists or is writable</span>
+            <span class="s2">return</span>
+        <span class="s2">return </span><span class="s1">self</span>
+
+
+<span class="s2">class </span><span class="s1">_UserProvidedCacheLocator</span><span class="s3">(</span><span class="s1">_SourceFileBackedLocatorMixin</span><span class="s3">, </span><span class="s1">_CacheLocator</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A locator that always point to the user provided directory in 
+    `numba.config.CACHE_DIR` 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">py_func</span><span class="s3">, </span><span class="s1">py_file</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_py_file </span><span class="s3">= </span><span class="s1">py_file</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_lineno </span><span class="s3">= </span><span class="s1">py_func</span><span class="s3">.</span><span class="s1">__code__</span><span class="s3">.</span><span class="s1">co_firstlineno</span>
+        <span class="s1">cache_subpath </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_suitable_cache_subpath</span><span class="s3">(</span><span class="s1">py_file</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_path </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">config</span><span class="s3">.</span><span class="s1">CACHE_DIR</span><span class="s3">, </span><span class="s1">cache_subpath</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">get_cache_path</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_path</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">from_function</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">py_func</span><span class="s3">, </span><span class="s1">py_file</span><span class="s3">):</span>
+        <span class="s2">if not </span><span class="s1">config</span><span class="s3">.</span><span class="s1">CACHE_DIR</span><span class="s3">:</span>
+            <span class="s2">return</span>
+        <span class="s1">parent </span><span class="s3">= </span><span class="s1">super</span><span class="s3">(</span><span class="s1">_UserProvidedCacheLocator</span><span class="s3">, </span><span class="s1">cls</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">parent</span><span class="s3">.</span><span class="s1">from_function</span><span class="s3">(</span><span class="s1">py_func</span><span class="s3">, </span><span class="s1">py_file</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">_InTreeCacheLocator</span><span class="s3">(</span><span class="s1">_SourceFileBackedLocatorMixin</span><span class="s3">, </span><span class="s1">_CacheLocator</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A locator for functions backed by a regular Python module with a 
+    writable __pycache__ directory. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">py_func</span><span class="s3">, </span><span class="s1">py_file</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_py_file </span><span class="s3">= </span><span class="s1">py_file</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_lineno </span><span class="s3">= </span><span class="s1">py_func</span><span class="s3">.</span><span class="s1">__code__</span><span class="s3">.</span><span class="s1">co_firstlineno</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_path </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">dirname</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_py_file</span><span class="s3">), </span><span class="s6">'__pycache__'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">get_cache_path</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_path</span>
+
+
+<span class="s2">class </span><span class="s1">_UserWideCacheLocator</span><span class="s3">(</span><span class="s1">_SourceFileBackedLocatorMixin</span><span class="s3">, </span><span class="s1">_CacheLocator</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A locator for functions backed by a regular Python module or a 
+    frozen executable, cached into a user-wide cache directory. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">py_func</span><span class="s3">, </span><span class="s1">py_file</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_py_file </span><span class="s3">= </span><span class="s1">py_file</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_lineno </span><span class="s3">= </span><span class="s1">py_func</span><span class="s3">.</span><span class="s1">__code__</span><span class="s3">.</span><span class="s1">co_firstlineno</span>
+        <span class="s1">appdirs </span><span class="s3">= </span><span class="s1">AppDirs</span><span class="s3">(</span><span class="s1">appname</span><span class="s3">=</span><span class="s6">&quot;numba&quot;</span><span class="s3">, </span><span class="s1">appauthor</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)</span>
+        <span class="s1">cache_dir </span><span class="s3">= </span><span class="s1">appdirs</span><span class="s3">.</span><span class="s1">user_cache_dir</span>
+        <span class="s1">cache_subpath </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_suitable_cache_subpath</span><span class="s3">(</span><span class="s1">py_file</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_path </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">cache_dir</span><span class="s3">, </span><span class="s1">cache_subpath</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">get_cache_path</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_path</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">from_function</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">py_func</span><span class="s3">, </span><span class="s1">py_file</span><span class="s3">):</span>
+        <span class="s2">if not </span><span class="s3">(</span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">exists</span><span class="s3">(</span><span class="s1">py_file</span><span class="s3">) </span><span class="s2">or </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">sys</span><span class="s3">, </span><span class="s6">'frozen'</span><span class="s3">, </span><span class="s2">False</span><span class="s3">)):</span>
+            <span class="s4"># Perhaps a placeholder (e.g. &quot;&lt;ipython-XXX&gt;&quot;)</span>
+            <span class="s4"># stop function exit if frozen, since it uses a temp placeholder</span>
+            <span class="s2">return</span>
+        <span class="s1">self </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">(</span><span class="s1">py_func</span><span class="s3">, </span><span class="s1">py_file</span><span class="s3">)</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">ensure_cache_path</span><span class="s3">()</span>
+        <span class="s2">except </span><span class="s1">OSError</span><span class="s3">:</span>
+            <span class="s4"># Cannot ensure the cache directory exists or is writable</span>
+            <span class="s2">return</span>
+        <span class="s2">return </span><span class="s1">self</span>
+
+
+<span class="s2">class </span><span class="s1">_IPythonCacheLocator</span><span class="s3">(</span><span class="s1">_CacheLocator</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A locator for functions entered at the IPython prompt (notebook or other). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">py_func</span><span class="s3">, </span><span class="s1">py_file</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_py_file </span><span class="s3">= </span><span class="s1">py_file</span>
+        <span class="s4"># Note IPython enhances the linecache module to be able to</span>
+        <span class="s4"># inspect source code of functions defined on the interactive prompt.</span>
+        <span class="s1">source </span><span class="s3">= </span><span class="s1">inspect</span><span class="s3">.</span><span class="s1">getsource</span><span class="s3">(</span><span class="s1">py_func</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">source</span><span class="s3">, </span><span class="s1">bytes</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_bytes_source </span><span class="s3">= </span><span class="s1">source</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_bytes_source </span><span class="s3">= </span><span class="s1">source</span><span class="s3">.</span><span class="s1">encode</span><span class="s3">(</span><span class="s6">'utf-8'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">get_cache_path</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s4"># We could also use jupyter_core.paths.jupyter_runtime_dir()</span>
+        <span class="s4"># In both cases this is a user-wide directory, so we need to</span>
+        <span class="s4"># be careful when disambiguating if we don't want too many</span>
+        <span class="s4"># conflicts (see below).</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">from </span><span class="s1">IPython</span><span class="s3">.</span><span class="s1">paths </span><span class="s2">import </span><span class="s1">get_ipython_cache_dir</span>
+        <span class="s2">except </span><span class="s1">ImportError</span><span class="s3">:</span>
+            <span class="s4"># older IPython version</span>
+            <span class="s2">from </span><span class="s1">IPython</span><span class="s3">.</span><span class="s1">utils</span><span class="s3">.</span><span class="s1">path </span><span class="s2">import </span><span class="s1">get_ipython_cache_dir</span>
+        <span class="s2">return </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">get_ipython_cache_dir</span><span class="s3">(), </span><span class="s6">'numba_cache'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">get_source_stamp</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">hashlib</span><span class="s3">.</span><span class="s1">sha256</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_bytes_source</span><span class="s3">).</span><span class="s1">hexdigest</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">get_disambiguator</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s4"># Heuristic: we don't want too many variants being saved, but</span>
+        <span class="s4"># we don't want similar named functions (e.g. &quot;f&quot;) to compete</span>
+        <span class="s4"># for the cache, so we hash the first two lines of the function</span>
+        <span class="s4"># source (usually this will be the @jit decorator + the function</span>
+        <span class="s4"># signature).</span>
+        <span class="s1">firstlines </span><span class="s3">= </span><span class="s7">b''</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_bytes_source</span><span class="s3">.</span><span class="s1">splitlines</span><span class="s3">(</span><span class="s2">True</span><span class="s3">)[:</span><span class="s5">2</span><span class="s3">])</span>
+        <span class="s2">return </span><span class="s1">hashlib</span><span class="s3">.</span><span class="s1">sha256</span><span class="s3">(</span><span class="s1">firstlines</span><span class="s3">).</span><span class="s1">hexdigest</span><span class="s3">()[:</span><span class="s5">10</span><span class="s3">]</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">from_function</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">py_func</span><span class="s3">, </span><span class="s1">py_file</span><span class="s3">):</span>
+        <span class="s2">if not </span><span class="s3">(</span>
+            <span class="s1">py_file</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s6">&quot;&lt;ipython-&quot;</span><span class="s3">)</span>
+            <span class="s2">or </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">basename</span><span class="s3">(</span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">dirname</span><span class="s3">(</span><span class="s1">py_file</span><span class="s3">)).</span><span class="s1">startswith</span><span class="s3">(</span><span class="s6">&quot;ipykernel_&quot;</span><span class="s3">)</span>
+        <span class="s3">):</span>
+            <span class="s2">return</span>
+        <span class="s1">self </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">(</span><span class="s1">py_func</span><span class="s3">, </span><span class="s1">py_file</span><span class="s3">)</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">ensure_cache_path</span><span class="s3">()</span>
+        <span class="s2">except </span><span class="s1">OSError</span><span class="s3">:</span>
+            <span class="s4"># Cannot ensure the cache directory exists</span>
+            <span class="s2">return</span>
+        <span class="s2">return </span><span class="s1">self</span>
+
+
+<span class="s2">class </span><span class="s1">CacheImpl</span><span class="s3">(</span><span class="s1">metaclass</span><span class="s3">=</span><span class="s1">ABCMeta</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Provides the core machinery for caching. 
+    - implement how to serialize and deserialize the data in the cache. 
+    - control the filename of the cache. 
+    - provide the cache locator 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_locator_classes </span><span class="s3">= [</span><span class="s1">_UserProvidedCacheLocator</span><span class="s3">,</span>
+                        <span class="s1">_InTreeCacheLocator</span><span class="s3">,</span>
+                        <span class="s1">_UserWideCacheLocator</span><span class="s3">,</span>
+                        <span class="s1">_IPythonCacheLocator</span><span class="s3">]</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">py_func</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_lineno </span><span class="s3">= </span><span class="s1">py_func</span><span class="s3">.</span><span class="s1">__code__</span><span class="s3">.</span><span class="s1">co_firstlineno</span>
+        <span class="s4"># Get qualname</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">qualname </span><span class="s3">= </span><span class="s1">py_func</span><span class="s3">.</span><span class="s1">__qualname__</span>
+        <span class="s2">except </span><span class="s1">AttributeError</span><span class="s3">:</span>
+            <span class="s1">qualname </span><span class="s3">= </span><span class="s1">py_func</span><span class="s3">.</span><span class="s1">__name__</span>
+        <span class="s4"># Find a locator</span>
+        <span class="s1">source_path </span><span class="s3">= </span><span class="s1">inspect</span><span class="s3">.</span><span class="s1">getfile</span><span class="s3">(</span><span class="s1">py_func</span><span class="s3">)</span>
+        <span class="s2">for </span><span class="s1">cls </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_locator_classes</span><span class="s3">:</span>
+            <span class="s1">locator </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">from_function</span><span class="s3">(</span><span class="s1">py_func</span><span class="s3">, </span><span class="s1">source_path</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">locator </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s2">break</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s6">&quot;cannot cache function %r: no locator available &quot;</span>
+                               <span class="s6">&quot;for file %r&quot; </span><span class="s3">% (</span><span class="s1">qualname</span><span class="s3">, </span><span class="s1">source_path</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_locator </span><span class="s3">= </span><span class="s1">locator</span>
+        <span class="s4"># Use filename base name as module name to avoid conflict between</span>
+        <span class="s4"># foo/__init__.py and foo/foo.py</span>
+        <span class="s1">filename </span><span class="s3">= </span><span class="s1">inspect</span><span class="s3">.</span><span class="s1">getfile</span><span class="s3">(</span><span class="s1">py_func</span><span class="s3">)</span>
+        <span class="s1">modname </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">splitext</span><span class="s3">(</span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">basename</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">))[</span><span class="s5">0</span><span class="s3">]</span>
+        <span class="s1">fullname </span><span class="s3">= </span><span class="s6">&quot;%s.%s&quot; </span><span class="s3">% (</span><span class="s1">modname</span><span class="s3">, </span><span class="s1">qualname</span><span class="s3">)</span>
+        <span class="s1">abiflags </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">sys</span><span class="s3">, </span><span class="s6">'abiflags'</span><span class="s3">, </span><span class="s6">''</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_filename_base </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_filename_base</span><span class="s3">(</span><span class="s1">fullname</span><span class="s3">, </span><span class="s1">abiflags</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">get_filename_base</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">fullname</span><span class="s3">, </span><span class="s1">abiflags</span><span class="s3">):</span>
+        <span class="s4"># '&lt;' and '&gt;' can appear in the qualname (e.g. '&lt;locals&gt;') but</span>
+        <span class="s4"># are forbidden in Windows filenames</span>
+        <span class="s1">fixed_fullname </span><span class="s3">= </span><span class="s1">fullname</span><span class="s3">.</span><span class="s1">replace</span><span class="s3">(</span><span class="s6">'&lt;'</span><span class="s3">, </span><span class="s6">''</span><span class="s3">).</span><span class="s1">replace</span><span class="s3">(</span><span class="s6">'&gt;'</span><span class="s3">, </span><span class="s6">''</span><span class="s3">)</span>
+        <span class="s1">fmt </span><span class="s3">= </span><span class="s6">'%s-%s.py%d%d%s'</span>
+        <span class="s2">return </span><span class="s1">fmt </span><span class="s3">% (</span><span class="s1">fixed_fullname</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">locator</span><span class="s3">.</span><span class="s1">get_disambiguator</span><span class="s3">(),</span>
+                      <span class="s1">sys</span><span class="s3">.</span><span class="s1">version_info</span><span class="s3">[</span><span class="s5">0</span><span class="s3">], </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">version_info</span><span class="s3">[</span><span class="s5">1</span><span class="s3">], </span><span class="s1">abiflags</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">filename_base</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_filename_base</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">locator</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_locator</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">reduce</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">data</span><span class="s3">):</span>
+        <span class="s0">&quot;Returns the serialized form the data&quot;</span>
+        <span class="s2">pass</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">rebuild</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">target_context</span><span class="s3">, </span><span class="s1">reduced_data</span><span class="s3">):</span>
+        <span class="s0">&quot;Returns the de-serialized form of the *reduced_data*&quot;</span>
+        <span class="s2">pass</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">check_cachable</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">data</span><span class="s3">):</span>
+        <span class="s0">&quot;Returns True if the given data is cachable; otherwise, returns False.&quot;</span>
+        <span class="s2">pass</span>
+
+
+<span class="s2">class </span><span class="s1">CompileResultCacheImpl</span><span class="s3">(</span><span class="s1">CacheImpl</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Implements the logic to cache CompileResult objects. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">reduce</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">cres</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns a serialized CompileResult 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">cres</span><span class="s3">.</span><span class="s1">_reduce</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">rebuild</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">target_context</span><span class="s3">, </span><span class="s1">payload</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the unserialized CompileResult 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">compiler</span><span class="s3">.</span><span class="s1">CompileResult</span><span class="s3">.</span><span class="s1">_rebuild</span><span class="s3">(</span><span class="s1">target_context</span><span class="s3">, *</span><span class="s1">payload</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">check_cachable</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">cres</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Check cachability of the given compile result. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">cannot_cache </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">any</span><span class="s3">(</span><span class="s2">not </span><span class="s1">x</span><span class="s3">.</span><span class="s1">can_cache </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">cres</span><span class="s3">.</span><span class="s1">lifted</span><span class="s3">):</span>
+            <span class="s1">cannot_cache </span><span class="s3">= </span><span class="s6">&quot;as it uses lifted code&quot;</span>
+        <span class="s2">elif </span><span class="s1">cres</span><span class="s3">.</span><span class="s1">library</span><span class="s3">.</span><span class="s1">has_dynamic_globals</span><span class="s3">:</span>
+            <span class="s1">cannot_cache </span><span class="s3">= (</span><span class="s6">&quot;as it uses dynamic globals &quot;</span>
+                            <span class="s6">&quot;(such as ctypes pointers and large global arrays)&quot;</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">cannot_cache</span><span class="s3">:</span>
+            <span class="s1">msg </span><span class="s3">= (</span><span class="s6">'Cannot cache compiled function &quot;%s&quot; %s'</span>
+                   <span class="s3">% (</span><span class="s1">cres</span><span class="s3">.</span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">qualname</span><span class="s3">.</span><span class="s1">split</span><span class="s3">(</span><span class="s6">'.'</span><span class="s3">)[-</span><span class="s5">1</span><span class="s3">], </span><span class="s1">cannot_cache</span><span class="s3">))</span>
+            <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn_explicit</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">, </span><span class="s1">NumbaWarning</span><span class="s3">,</span>
+                                   <span class="s1">self</span><span class="s3">.</span><span class="s1">_locator</span><span class="s3">.</span><span class="s1">_py_file</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lineno</span><span class="s3">)</span>
+            <span class="s2">return False</span>
+        <span class="s2">return True</span>
+
+
+<span class="s2">class </span><span class="s1">CodeLibraryCacheImpl</span><span class="s3">(</span><span class="s1">CacheImpl</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Implements the logic to cache CodeLibrary objects. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_filename_prefix </span><span class="s3">= </span><span class="s2">None  </span><span class="s4"># must be overridden</span>
+
+    <span class="s2">def </span><span class="s1">reduce</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">codelib</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns a serialized CodeLibrary 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">codelib</span><span class="s3">.</span><span class="s1">serialize_using_object_code</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">rebuild</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">target_context</span><span class="s3">, </span><span class="s1">payload</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the unserialized CodeLibrary 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">target_context</span><span class="s3">.</span><span class="s1">codegen</span><span class="s3">().</span><span class="s1">unserialize_library</span><span class="s3">(</span><span class="s1">payload</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">check_cachable</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">codelib</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Check cachability of the given CodeLibrary. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return not </span><span class="s1">codelib</span><span class="s3">.</span><span class="s1">has_dynamic_globals</span>
+
+    <span class="s2">def </span><span class="s1">get_filename_base</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">fullname</span><span class="s3">, </span><span class="s1">abiflags</span><span class="s3">):</span>
+        <span class="s1">parent </span><span class="s3">= </span><span class="s1">super</span><span class="s3">(</span><span class="s1">CodeLibraryCacheImpl</span><span class="s3">, </span><span class="s1">self</span><span class="s3">)</span>
+        <span class="s1">res </span><span class="s3">= </span><span class="s1">parent</span><span class="s3">.</span><span class="s1">get_filename_base</span><span class="s3">(</span><span class="s1">fullname</span><span class="s3">, </span><span class="s1">abiflags</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s6">'-'</span><span class="s3">.</span><span class="s1">join</span><span class="s3">([</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_filename_prefix</span><span class="s3">, </span><span class="s1">res</span><span class="s3">])</span>
+
+
+<span class="s2">class </span><span class="s1">IndexDataCacheFile</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Implements the logic for the index file and data file used by a cache. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">cache_path</span><span class="s3">, </span><span class="s1">filename_base</span><span class="s3">, </span><span class="s1">source_stamp</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_path </span><span class="s3">= </span><span class="s1">cache_path</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_index_name </span><span class="s3">= </span><span class="s6">'%s.nbi' </span><span class="s3">% (</span><span class="s1">filename_base</span><span class="s3">,)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_index_path </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_path</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_index_name</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_data_name_pattern </span><span class="s3">= </span><span class="s6">'%s.{number:d}.nbc' </span><span class="s3">% (</span><span class="s1">filename_base</span><span class="s3">,)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_source_stamp </span><span class="s3">= </span><span class="s1">source_stamp</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_version </span><span class="s3">= </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">__version__</span>
+
+    <span class="s2">def </span><span class="s1">flush</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_save_index</span><span class="s3">({})</span>
+
+    <span class="s2">def </span><span class="s1">save</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">data</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Save a new cache entry with *key* and *data*. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">overloads </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_load_index</span><span class="s3">()</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s4"># If key already exists, we will overwrite the file</span>
+            <span class="s1">data_name </span><span class="s3">= </span><span class="s1">overloads</span><span class="s3">[</span><span class="s1">key</span><span class="s3">]</span>
+        <span class="s2">except </span><span class="s1">KeyError</span><span class="s3">:</span>
+            <span class="s4"># Find an available name for the data file</span>
+            <span class="s1">existing </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">overloads</span><span class="s3">.</span><span class="s1">values</span><span class="s3">())</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">itertools</span><span class="s3">.</span><span class="s1">count</span><span class="s3">(</span><span class="s5">1</span><span class="s3">):</span>
+                <span class="s1">data_name </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_data_name</span><span class="s3">(</span><span class="s1">i</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">data_name </span><span class="s2">not in </span><span class="s1">existing</span><span class="s3">:</span>
+                    <span class="s2">break</span>
+            <span class="s1">overloads</span><span class="s3">[</span><span class="s1">key</span><span class="s3">] = </span><span class="s1">data_name</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_save_index</span><span class="s3">(</span><span class="s1">overloads</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_save_data</span><span class="s3">(</span><span class="s1">data_name</span><span class="s3">, </span><span class="s1">data</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">load</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">key</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Load a cache entry with *key*. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">overloads </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_load_index</span><span class="s3">()</span>
+        <span class="s1">data_name </span><span class="s3">= </span><span class="s1">overloads</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">key</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">data_name </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">return</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_load_data</span><span class="s3">(</span><span class="s1">data_name</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">OSError</span><span class="s3">:</span>
+            <span class="s4"># File could have been removed while the index still refers it.</span>
+            <span class="s2">return</span>
+
+    <span class="s2">def </span><span class="s1">_load_index</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Load the cache index and return it as a dictionary (possibly 
+        empty if cache is empty or obsolete). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_index_path</span><span class="s3">, </span><span class="s6">&quot;rb&quot;</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+                <span class="s1">version </span><span class="s3">= </span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">f</span><span class="s3">)</span>
+                <span class="s1">data </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">read</span><span class="s3">()</span>
+        <span class="s2">except </span><span class="s1">FileNotFoundError</span><span class="s3">:</span>
+            <span class="s4"># Index doesn't exist yet?</span>
+            <span class="s2">return </span><span class="s3">{}</span>
+        <span class="s2">if </span><span class="s1">version </span><span class="s3">!= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_version</span><span class="s3">:</span>
+            <span class="s4"># This is another version.  Avoid trying to unpickling the</span>
+            <span class="s4"># rest of the stream, as that may fail.</span>
+            <span class="s2">return </span><span class="s3">{}</span>
+        <span class="s1">stamp</span><span class="s3">, </span><span class="s1">overloads </span><span class="s3">= </span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">loads</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s1">_cache_log</span><span class="s3">(</span><span class="s6">&quot;[cache] index loaded from %r&quot;</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_index_path</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">stamp </span><span class="s3">!= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_source_stamp</span><span class="s3">:</span>
+            <span class="s4"># Cache is not fresh.  Stale data files will be eventually</span>
+            <span class="s4"># overwritten, since they are numbered in incrementing order.</span>
+            <span class="s2">return </span><span class="s3">{}</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">overloads</span>
+
+    <span class="s2">def </span><span class="s1">_save_index</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">overloads</span><span class="s3">):</span>
+        <span class="s1">data </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_source_stamp</span><span class="s3">, </span><span class="s1">overloads</span>
+        <span class="s1">data </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_dump</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_open_for_write</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_index_path</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+            <span class="s1">pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_version</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">protocol</span><span class="s3">=-</span><span class="s5">1</span><span class="s3">)</span>
+            <span class="s1">f</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s1">_cache_log</span><span class="s3">(</span><span class="s6">&quot;[cache] index saved to %r&quot;</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_index_path</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_load_data</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">):</span>
+        <span class="s1">path </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_data_path</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">path</span><span class="s3">, </span><span class="s6">&quot;rb&quot;</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+            <span class="s1">data </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">read</span><span class="s3">()</span>
+        <span class="s1">tup </span><span class="s3">= </span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">loads</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s1">_cache_log</span><span class="s3">(</span><span class="s6">&quot;[cache] data loaded from %r&quot;</span><span class="s3">, </span><span class="s1">path</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">tup</span>
+
+    <span class="s2">def </span><span class="s1">_save_data</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">data</span><span class="s3">):</span>
+        <span class="s1">data </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_dump</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s1">path </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_data_path</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_open_for_write</span><span class="s3">(</span><span class="s1">path</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+            <span class="s1">f</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s1">_cache_log</span><span class="s3">(</span><span class="s6">&quot;[cache] data saved to %r&quot;</span><span class="s3">, </span><span class="s1">path</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_data_name</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">number</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_data_name_pattern</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">number</span><span class="s3">=</span><span class="s1">number</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_data_path</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_path</span><span class="s3">, </span><span class="s1">name</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_dump</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">dumps</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">contextlib</span><span class="s3">.</span><span class="s1">contextmanager</span>
+    <span class="s2">def </span><span class="s1">_open_for_write</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">filepath</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Open *filepath* for writing in a race condition-free way (hopefully). 
+        uuid4 is used to try and avoid name collisions on a shared filesystem. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">uid </span><span class="s3">= </span><span class="s1">uuid</span><span class="s3">.</span><span class="s1">uuid4</span><span class="s3">().</span><span class="s1">hex</span><span class="s3">[:</span><span class="s5">16</span><span class="s3">]  </span><span class="s4"># avoid long paths</span>
+        <span class="s1">tmpname </span><span class="s3">= </span><span class="s6">'%s.tmp.%s' </span><span class="s3">% (</span><span class="s1">filepath</span><span class="s3">, </span><span class="s1">uid</span><span class="s3">)</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">tmpname</span><span class="s3">, </span><span class="s6">&quot;wb&quot;</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+                <span class="s2">yield </span><span class="s1">f</span>
+            <span class="s1">os</span><span class="s3">.</span><span class="s1">replace</span><span class="s3">(</span><span class="s1">tmpname</span><span class="s3">, </span><span class="s1">filepath</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+            <span class="s4"># In case of error, remove dangling tmp file</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s1">os</span><span class="s3">.</span><span class="s1">unlink</span><span class="s3">(</span><span class="s1">tmpname</span><span class="s3">)</span>
+            <span class="s2">except </span><span class="s1">OSError</span><span class="s3">:</span>
+                <span class="s2">pass</span>
+            <span class="s2">raise</span>
+
+
+<span class="s2">class </span><span class="s1">Cache</span><span class="s3">(</span><span class="s1">_Cache</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A per-function compilation cache.  The cache saves data in separate 
+    data files and maintains information in an index file. 
+ 
+    There is one index file per function and Python version 
+    (&quot;function_name-&lt;lineno&gt;.pyXY.nbi&quot;) which contains a mapping of 
+    signatures and architectures to data files. 
+    It is prefixed by a versioning key and a timestamp of the Python source 
+    file containing the function. 
+ 
+    There is one data file (&quot;function_name-&lt;lineno&gt;.pyXY.&lt;number&gt;.nbc&quot;) 
+    per function, function signature, target architecture and Python version. 
+ 
+    Separate index and data files per Python version avoid pickle 
+    compatibility problems. 
+ 
+    Note: 
+    This contains the driver logic only.  The core logic is provided 
+    by a subclass of ``CacheImpl`` specified as *_impl_class* in the subclass. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s4"># The following class variables must be overridden by subclass.</span>
+    <span class="s1">_impl_class </span><span class="s3">= </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">py_func</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_name </span><span class="s3">= </span><span class="s1">repr</span><span class="s3">(</span><span class="s1">py_func</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_py_func </span><span class="s3">= </span><span class="s1">py_func</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_impl </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_impl_class</span><span class="s3">(</span><span class="s1">py_func</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_path </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_impl</span><span class="s3">.</span><span class="s1">locator</span><span class="s3">.</span><span class="s1">get_cache_path</span><span class="s3">()</span>
+        <span class="s4"># This may be a bit strict but avoids us maintaining a magic number</span>
+        <span class="s1">source_stamp </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_impl</span><span class="s3">.</span><span class="s1">locator</span><span class="s3">.</span><span class="s1">get_source_stamp</span><span class="s3">()</span>
+        <span class="s1">filename_base </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_impl</span><span class="s3">.</span><span class="s1">filename_base</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_file </span><span class="s3">= </span><span class="s1">IndexDataCacheFile</span><span class="s3">(</span><span class="s1">cache_path</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_path</span><span class="s3">,</span>
+                                              <span class="s1">filename_base</span><span class="s3">=</span><span class="s1">filename_base</span><span class="s3">,</span>
+                                              <span class="s1">source_stamp</span><span class="s3">=</span><span class="s1">source_stamp</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">enable</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s6">&quot;&lt;%s py_func=%r&gt;&quot; </span><span class="s3">% (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_name</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">cache_path</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_path</span>
+
+    <span class="s2">def </span><span class="s1">enable</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_enabled </span><span class="s3">= </span><span class="s2">True</span>
+
+    <span class="s2">def </span><span class="s1">disable</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_enabled </span><span class="s3">= </span><span class="s2">False</span>
+
+    <span class="s2">def </span><span class="s1">flush</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_file</span><span class="s3">.</span><span class="s1">flush</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">load_overload</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">sig</span><span class="s3">, </span><span class="s1">target_context</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Load and recreate the cached object for the given signature, 
+        using the *target_context*. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># Refresh the context to ensure it is initialized</span>
+        <span class="s1">target_context</span><span class="s3">.</span><span class="s1">refresh</span><span class="s3">()</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_guard_against_spurious_io_errors</span><span class="s3">():</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_load_overload</span><span class="s3">(</span><span class="s1">sig</span><span class="s3">, </span><span class="s1">target_context</span><span class="s3">)</span>
+        <span class="s4"># None returned if the `with` block swallows an exception</span>
+
+    <span class="s2">def </span><span class="s1">_load_overload</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">sig</span><span class="s3">, </span><span class="s1">target_context</span><span class="s3">):</span>
+        <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_enabled</span><span class="s3">:</span>
+            <span class="s2">return</span>
+        <span class="s1">key </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_index_key</span><span class="s3">(</span><span class="s1">sig</span><span class="s3">, </span><span class="s1">target_context</span><span class="s3">.</span><span class="s1">codegen</span><span class="s3">())</span>
+        <span class="s1">data </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_file</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">key</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">data </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">data </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_impl</span><span class="s3">.</span><span class="s1">rebuild</span><span class="s3">(</span><span class="s1">target_context</span><span class="s3">, </span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">data</span>
+
+    <span class="s2">def </span><span class="s1">save_overload</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">sig</span><span class="s3">, </span><span class="s1">data</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Save the data for the given signature in the cache. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_guard_against_spurious_io_errors</span><span class="s3">():</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_save_overload</span><span class="s3">(</span><span class="s1">sig</span><span class="s3">, </span><span class="s1">data</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_save_overload</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">sig</span><span class="s3">, </span><span class="s1">data</span><span class="s3">):</span>
+        <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_enabled</span><span class="s3">:</span>
+            <span class="s2">return</span>
+        <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_impl</span><span class="s3">.</span><span class="s1">check_cachable</span><span class="s3">(</span><span class="s1">data</span><span class="s3">):</span>
+            <span class="s2">return</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_impl</span><span class="s3">.</span><span class="s1">locator</span><span class="s3">.</span><span class="s1">ensure_cache_path</span><span class="s3">()</span>
+        <span class="s1">key </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_index_key</span><span class="s3">(</span><span class="s1">sig</span><span class="s3">, </span><span class="s1">data</span><span class="s3">.</span><span class="s1">codegen</span><span class="s3">)</span>
+        <span class="s1">data </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_impl</span><span class="s3">.</span><span class="s1">reduce</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_file</span><span class="s3">.</span><span class="s1">save</span><span class="s3">(</span><span class="s1">key</span><span class="s3">, </span><span class="s1">data</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">contextlib</span><span class="s3">.</span><span class="s1">contextmanager</span>
+    <span class="s2">def </span><span class="s1">_guard_against_spurious_io_errors</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">os</span><span class="s3">.</span><span class="s1">name </span><span class="s3">== </span><span class="s6">'nt'</span><span class="s3">:</span>
+            <span class="s4"># Guard against permission errors due to accessing the file</span>
+            <span class="s4"># from several processes (see #2028)</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s2">yield</span>
+            <span class="s2">except </span><span class="s1">OSError </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">e</span><span class="s3">.</span><span class="s1">errno </span><span class="s3">!= </span><span class="s1">errno</span><span class="s3">.</span><span class="s1">EACCES</span><span class="s3">:</span>
+                    <span class="s2">raise</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s4"># No such conditions under non-Windows OSes</span>
+            <span class="s2">yield</span>
+
+    <span class="s2">def </span><span class="s1">_index_key</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">sig</span><span class="s3">, </span><span class="s1">codegen</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Compute index key for the given signature and codegen. 
+        It includes a description of the OS, target architecture and hashes of 
+        the bytecode for the function and, if the function has a __closure__, 
+        a hash of the cell_contents. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">codebytes </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_py_func</span><span class="s3">.</span><span class="s1">__code__</span><span class="s3">.</span><span class="s1">co_code</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_py_func</span><span class="s3">.</span><span class="s1">__closure__ </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">cvars </span><span class="s3">= </span><span class="s1">tuple</span><span class="s3">([</span><span class="s1">x</span><span class="s3">.</span><span class="s1">cell_contents </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_py_func</span><span class="s3">.</span><span class="s1">__closure__</span><span class="s3">])</span>
+            <span class="s4"># Note: cloudpickle serializes a function differently depending</span>
+            <span class="s4">#       on how the process is launched; e.g. multiprocessing.Process</span>
+            <span class="s1">cvarbytes </span><span class="s3">= </span><span class="s1">dumps</span><span class="s3">(</span><span class="s1">cvars</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">cvarbytes </span><span class="s3">= </span><span class="s7">b''</span>
+
+        <span class="s1">hasher </span><span class="s3">= </span><span class="s2">lambda </span><span class="s1">x</span><span class="s3">: </span><span class="s1">hashlib</span><span class="s3">.</span><span class="s1">sha256</span><span class="s3">(</span><span class="s1">x</span><span class="s3">).</span><span class="s1">hexdigest</span><span class="s3">()</span>
+        <span class="s2">return </span><span class="s3">(</span><span class="s1">sig</span><span class="s3">, </span><span class="s1">codegen</span><span class="s3">.</span><span class="s1">magic_tuple</span><span class="s3">(), (</span><span class="s1">hasher</span><span class="s3">(</span><span class="s1">codebytes</span><span class="s3">),</span>
+                                             <span class="s1">hasher</span><span class="s3">(</span><span class="s1">cvarbytes</span><span class="s3">),))</span>
+
+
+<span class="s2">class </span><span class="s1">FunctionCache</span><span class="s3">(</span><span class="s1">Cache</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Implements Cache that saves and loads CompileResult objects. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_impl_class </span><span class="s3">= </span><span class="s1">CompileResultCacheImpl</span>
+
+
+<span class="s4"># Remember used cache filename prefixes.</span>
+<span class="s1">_lib_cache_prefixes </span><span class="s3">= </span><span class="s1">set</span><span class="s3">([</span><span class="s6">''</span><span class="s3">])</span>
+
+
+<span class="s2">def </span><span class="s1">make_library_cache</span><span class="s3">(</span><span class="s1">prefix</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Create a Cache class for additional compilation features to cache their 
+    result for reuse.  The cache is saved in filename pattern like 
+    in ``FunctionCache`` but with additional *prefix* as specified. 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># avoid cache prefix reuse</span>
+    <span class="s2">assert </span><span class="s1">prefix </span><span class="s2">not in </span><span class="s1">_lib_cache_prefixes</span>
+    <span class="s1">_lib_cache_prefixes</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">prefix</span><span class="s3">)</span>
+
+    <span class="s2">class </span><span class="s1">CustomCodeLibraryCacheImpl</span><span class="s3">(</span><span class="s1">CodeLibraryCacheImpl</span><span class="s3">):</span>
+        <span class="s1">_filename_prefix </span><span class="s3">= </span><span class="s1">prefix</span>
+
+    <span class="s2">class </span><span class="s1">LibraryCache</span><span class="s3">(</span><span class="s1">Cache</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Implements Cache that saves and loads CodeLibrary objects for additional 
+        feature for the specified python function. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">_impl_class </span><span class="s3">= </span><span class="s1">CustomCodeLibraryCacheImpl</span>
+
+    <span class="s2">return </span><span class="s1">LibraryCache</span>
+
+</pre>
+</body>
+</html>

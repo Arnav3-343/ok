@@ -1,0 +1,486 @@
+<html>
+<head>
+<title>compiler_machinery.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #7a7e85;}
+.s4 { color: #5f826b; font-style: italic;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+compiler_machinery.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">timeit</span>
+<span class="s0">from </span><span class="s1">abc </span><span class="s0">import </span><span class="s1">abstractmethod</span><span class="s2">, </span><span class="s1">ABCMeta</span>
+<span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">namedtuple</span><span class="s2">, </span><span class="s1">OrderedDict</span>
+<span class="s0">import </span><span class="s1">inspect</span>
+<span class="s0">from </span><span class="s1">pprint </span><span class="s0">import </span><span class="s1">pformat</span>
+
+
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">compiler_lock </span><span class="s0">import </span><span class="s1">global_compiler_lock</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">errors</span><span class="s2">, </span><span class="s1">config</span><span class="s2">, </span><span class="s1">transforms</span><span class="s2">, </span><span class="s1">utils</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">tracing </span><span class="s0">import </span><span class="s1">event</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">postproc </span><span class="s0">import </span><span class="s1">PostProcessor</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">ir_utils </span><span class="s0">import </span><span class="s1">enforce_no_dels</span><span class="s2">, </span><span class="s1">legalize_single_scope</span>
+<span class="s0">import </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">event </span><span class="s0">as </span><span class="s1">ev</span>
+
+<span class="s3"># terminal color markup</span>
+<span class="s1">_termcolor </span><span class="s2">= </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">termcolor</span><span class="s2">()</span>
+
+
+<span class="s0">class </span><span class="s1">SimpleTimer</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    A simple context managed timer 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__enter__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">ts </span><span class="s2">= </span><span class="s1">timeit</span><span class="s2">.</span><span class="s1">default_timer</span><span class="s2">()</span>
+        <span class="s0">return </span><span class="s1">self</span>
+
+    <span class="s0">def </span><span class="s1">__exit__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">exc</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">elapsed </span><span class="s2">= </span><span class="s1">timeit</span><span class="s2">.</span><span class="s1">default_timer</span><span class="s2">() - </span><span class="s1">self</span><span class="s2">.</span><span class="s1">ts</span>
+
+
+<span class="s0">class </span><span class="s1">CompilerPass</span><span class="s2">(</span><span class="s1">metaclass</span><span class="s2">=</span><span class="s1">ABCMeta</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; The base class for all compiler passes. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">@</span><span class="s1">abstractmethod</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_analysis </span><span class="s2">= </span><span class="s0">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_pass_id </span><span class="s2">= </span><span class="s0">None</span>
+
+    <span class="s2">@</span><span class="s1">classmethod</span>
+    <span class="s0">def </span><span class="s1">name</span><span class="s2">(</span><span class="s1">cls</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Returns the name of the pass 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">cls</span><span class="s2">.</span><span class="s1">_name</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">pass_id</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        The ID of the pass 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_pass_id</span>
+
+    <span class="s2">@</span><span class="s1">pass_id</span><span class="s2">.</span><span class="s1">setter</span>
+    <span class="s0">def </span><span class="s1">pass_id</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Sets the ID of the pass 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_pass_id </span><span class="s2">= </span><span class="s1">val</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">analysis</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Analysis data for the pass 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_analysis</span>
+
+    <span class="s2">@</span><span class="s1">analysis</span><span class="s2">.</span><span class="s1">setter</span>
+    <span class="s0">def </span><span class="s1">analysis</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Set the analysis data for the pass 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_analysis </span><span class="s2">= </span><span class="s1">val</span>
+
+    <span class="s0">def </span><span class="s1">run_initialization</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Runs the initialization sequence for the pass, will run before 
+        `run_pass`. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return False</span>
+
+    <span class="s2">@</span><span class="s1">abstractmethod</span>
+    <span class="s0">def </span><span class="s1">run_pass</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Runs the pass itself. Must return True/False depending on whether 
+        statement level modification took place. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">pass</span>
+
+    <span class="s0">def </span><span class="s1">run_finalizer</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Runs the initialization sequence for the pass, will run before 
+        `run_pass`. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return False</span>
+
+    <span class="s0">def </span><span class="s1">get_analysis_usage</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">AU</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; Override to set analysis usage 
+        &quot;&quot;&quot;</span>
+        <span class="s0">pass</span>
+
+    <span class="s0">def </span><span class="s1">get_analysis</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">pass_name</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Gets the analysis from a given pass 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_analysis</span><span class="s2">[</span><span class="s1">pass_name</span><span class="s2">]</span>
+
+
+<span class="s0">class </span><span class="s1">SSACompliantMixin</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; Mixin to indicate a pass is SSA form compliant. Nothing is asserted 
+    about this condition at present. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">pass</span>
+
+
+<span class="s0">class </span><span class="s1">FunctionPass</span><span class="s2">(</span><span class="s1">CompilerPass</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; Base class for function passes 
+    &quot;&quot;&quot;</span>
+    <span class="s0">pass</span>
+
+
+<span class="s0">class </span><span class="s1">AnalysisPass</span><span class="s2">(</span><span class="s1">CompilerPass</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; Base class for analysis passes (no modification made to state) 
+    &quot;&quot;&quot;</span>
+    <span class="s0">pass</span>
+
+
+<span class="s0">class </span><span class="s1">LoweringPass</span><span class="s2">(</span><span class="s1">CompilerPass</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; Base class for lowering passes 
+    &quot;&quot;&quot;</span>
+    <span class="s0">pass</span>
+
+
+<span class="s0">class </span><span class="s1">AnalysisUsage</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot;This looks and behaves like LLVM's AnalysisUsage because its like that. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_required </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_preserved </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">get_required_set</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_required</span>
+
+    <span class="s0">def </span><span class="s1">get_preserved_set</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_preserved</span>
+
+    <span class="s0">def </span><span class="s1">add_required</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">pss</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_required</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">pss</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">add_preserved</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">pss</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_preserved</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">pss</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s5">&quot;required: %s</span><span class="s0">\n</span><span class="s5">&quot; </span><span class="s2">% </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_required</span>
+
+
+<span class="s1">_DEBUG </span><span class="s2">= </span><span class="s0">False</span>
+
+
+<span class="s0">def </span><span class="s1">debug_print</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+    <span class="s0">if </span><span class="s1">_DEBUG</span><span class="s2">:</span>
+        <span class="s1">print</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">)</span>
+
+
+<span class="s1">pass_timings </span><span class="s2">= </span><span class="s1">namedtuple</span><span class="s2">(</span><span class="s5">'pass_timings'</span><span class="s2">, </span><span class="s5">'init run finalize'</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">PassManager</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    The PassManager is a named instance of a particular compilation pipeline 
+    &quot;&quot;&quot;</span>
+    <span class="s3"># TODO: Eventually enable this, it enforces self consistency after each pass</span>
+    <span class="s1">_ENFORCING </span><span class="s2">= </span><span class="s0">False</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">pipeline_name</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Create a new pipeline with name &quot;pipeline_name&quot; 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">passes </span><span class="s2">= []</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">exec_times </span><span class="s2">= </span><span class="s1">OrderedDict</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_finalized </span><span class="s2">= </span><span class="s0">False</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_analysis </span><span class="s2">= </span><span class="s0">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_print_after </span><span class="s2">= </span><span class="s0">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">pipeline_name </span><span class="s2">= </span><span class="s1">pipeline_name</span>
+
+    <span class="s0">def </span><span class="s1">_validate_pass</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">pass_cls</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s2">(</span><span class="s0">not </span><span class="s2">(</span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">pass_cls</span><span class="s2">, </span><span class="s1">str</span><span class="s2">) </span><span class="s0">or</span>
+                 <span class="s2">(</span><span class="s1">inspect</span><span class="s2">.</span><span class="s1">isclass</span><span class="s2">(</span><span class="s1">pass_cls</span><span class="s2">) </span><span class="s0">and</span>
+                  <span class="s1">issubclass</span><span class="s2">(</span><span class="s1">pass_cls</span><span class="s2">, </span><span class="s1">CompilerPass</span><span class="s2">)))):</span>
+            <span class="s1">msg </span><span class="s2">= (</span><span class="s5">&quot;Pass must be referenced by name or be a subclass of a &quot;</span>
+                   <span class="s5">&quot;CompilerPass. Have %s&quot; </span><span class="s2">% </span><span class="s1">pass_cls</span><span class="s2">)</span>
+            <span class="s0">raise </span><span class="s1">TypeError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">pass_cls</span><span class="s2">, </span><span class="s1">str</span><span class="s2">):</span>
+            <span class="s1">pass_cls </span><span class="s2">= </span><span class="s1">_pass_registry</span><span class="s2">.</span><span class="s1">find_by_name</span><span class="s2">(</span><span class="s1">pass_cls</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s0">if not </span><span class="s1">_pass_registry</span><span class="s2">.</span><span class="s1">is_registered</span><span class="s2">(</span><span class="s1">pass_cls</span><span class="s2">):</span>
+                <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s5">&quot;Pass %s is not registered&quot; </span><span class="s2">% </span><span class="s1">pass_cls</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">add_pass</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">pss</span><span class="s2">, </span><span class="s1">description</span><span class="s2">=</span><span class="s5">&quot;&quot;</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Append a pass to the PassManager's compilation pipeline 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_validate_pass</span><span class="s2">(</span><span class="s1">pss</span><span class="s2">)</span>
+        <span class="s1">func_desc_tuple </span><span class="s2">= (</span><span class="s1">pss</span><span class="s2">, </span><span class="s1">description</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">passes</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">func_desc_tuple</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_finalized </span><span class="s2">= </span><span class="s0">False</span>
+
+    <span class="s0">def </span><span class="s1">add_pass_after</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">pass_cls</span><span class="s2">, </span><span class="s1">location</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Add a pass `pass_cls` to the PassManager's compilation pipeline after 
+        the pass `location`. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">assert </span><span class="s1">self</span><span class="s2">.</span><span class="s1">passes</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_validate_pass</span><span class="s2">(</span><span class="s1">pass_cls</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_validate_pass</span><span class="s2">(</span><span class="s1">location</span><span class="s2">)</span>
+        <span class="s0">for </span><span class="s1">idx</span><span class="s2">, (</span><span class="s1">x</span><span class="s2">, </span><span class="s1">_</span><span class="s2">) </span><span class="s0">in </span><span class="s1">enumerate</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">passes</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s1">x </span><span class="s2">== </span><span class="s1">location</span><span class="s2">:</span>
+                <span class="s0">break</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s5">&quot;Could not find pass %s&quot; </span><span class="s2">% </span><span class="s1">location</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">passes</span><span class="s2">.</span><span class="s1">insert</span><span class="s2">(</span><span class="s1">idx </span><span class="s2">+ </span><span class="s6">1</span><span class="s2">, (</span><span class="s1">pass_cls</span><span class="s2">, </span><span class="s1">str</span><span class="s2">(</span><span class="s1">pass_cls</span><span class="s2">)))</span>
+        <span class="s3"># if a pass has been added, it's not finalized</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_finalized </span><span class="s2">= </span><span class="s0">False</span>
+
+    <span class="s0">def </span><span class="s1">_debug_init</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># determine after which passes IR dumps should take place</span>
+        <span class="s0">def </span><span class="s1">parse</span><span class="s2">(</span><span class="s1">conf_item</span><span class="s2">):</span>
+            <span class="s1">print_passes </span><span class="s2">= []</span>
+            <span class="s0">if </span><span class="s1">conf_item </span><span class="s2">!= </span><span class="s5">&quot;none&quot;</span><span class="s2">:</span>
+                <span class="s0">if </span><span class="s1">conf_item </span><span class="s2">== </span><span class="s5">&quot;all&quot;</span><span class="s2">:</span>
+                    <span class="s1">print_passes </span><span class="s2">= [</span><span class="s1">x</span><span class="s2">.</span><span class="s1">name</span><span class="s2">() </span><span class="s0">for </span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">_</span><span class="s2">) </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">passes</span><span class="s2">]</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s3"># we don't validate whether the named passes exist in this</span>
+                    <span class="s3"># pipeline the compiler may be used reentrantly and</span>
+                    <span class="s3"># different pipelines may contain different passes</span>
+                    <span class="s1">splitted </span><span class="s2">= </span><span class="s1">conf_item</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s5">','</span><span class="s2">)</span>
+                    <span class="s1">print_passes </span><span class="s2">= [</span><span class="s1">x</span><span class="s2">.</span><span class="s1">strip</span><span class="s2">() </span><span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s1">splitted</span><span class="s2">]</span>
+            <span class="s0">return </span><span class="s1">print_passes</span>
+        <span class="s1">ret </span><span class="s2">= (</span><span class="s1">parse</span><span class="s2">(</span><span class="s1">config</span><span class="s2">.</span><span class="s1">DEBUG_PRINT_AFTER</span><span class="s2">),</span>
+               <span class="s1">parse</span><span class="s2">(</span><span class="s1">config</span><span class="s2">.</span><span class="s1">DEBUG_PRINT_BEFORE</span><span class="s2">),</span>
+               <span class="s1">parse</span><span class="s2">(</span><span class="s1">config</span><span class="s2">.</span><span class="s1">DEBUG_PRINT_WRAP</span><span class="s2">),)</span>
+        <span class="s0">return </span><span class="s1">ret</span>
+
+    <span class="s0">def </span><span class="s1">finalize</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Finalize the PassManager, after which no more passes may be added 
+        without re-finalization. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_analysis </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">dependency_analysis</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_print_after</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_print_before</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_print_wrap </span><span class="s2">= </span><span class="s1">\</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_debug_init</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_finalized </span><span class="s2">= </span><span class="s0">True</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">finalized</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_finalized</span>
+
+    <span class="s0">def </span><span class="s1">_patch_error</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">desc</span><span class="s2">, </span><span class="s1">exc</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Patches the error to show the stage that it arose in. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">newmsg </span><span class="s2">= </span><span class="s5">&quot;{desc}</span><span class="s0">\n</span><span class="s5">{exc}&quot;</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">desc</span><span class="s2">=</span><span class="s1">desc</span><span class="s2">, </span><span class="s1">exc</span><span class="s2">=</span><span class="s1">exc</span><span class="s2">)</span>
+        <span class="s1">exc</span><span class="s2">.</span><span class="s1">args </span><span class="s2">= (</span><span class="s1">newmsg</span><span class="s2">,)</span>
+        <span class="s0">return </span><span class="s1">exc</span>
+
+    <span class="s2">@</span><span class="s1">global_compiler_lock  </span><span class="s3"># this need a lock, likely calls LLVM</span>
+    <span class="s0">def </span><span class="s1">_runPass</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">index</span><span class="s2">, </span><span class="s1">pss</span><span class="s2">, </span><span class="s1">internal_state</span><span class="s2">):</span>
+        <span class="s1">mutated </span><span class="s2">= </span><span class="s0">False</span>
+
+        <span class="s0">def </span><span class="s1">check</span><span class="s2">(</span><span class="s1">func</span><span class="s2">, </span><span class="s1">compiler_state</span><span class="s2">):</span>
+            <span class="s1">mangled </span><span class="s2">= </span><span class="s1">func</span><span class="s2">(</span><span class="s1">compiler_state</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">mangled </span><span class="s0">not in </span><span class="s2">(</span><span class="s0">True</span><span class="s2">, </span><span class="s0">False</span><span class="s2">):</span>
+                <span class="s1">msg </span><span class="s2">= (</span><span class="s5">&quot;CompilerPass implementations should return True/False. &quot;</span>
+                       <span class="s5">&quot;CompilerPass with name '%s' did not.&quot;</span><span class="s2">)</span>
+                <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s1">msg </span><span class="s2">% </span><span class="s1">pss</span><span class="s2">.</span><span class="s1">name</span><span class="s2">())</span>
+            <span class="s0">return </span><span class="s1">mangled</span>
+
+        <span class="s0">def </span><span class="s1">debug_print</span><span class="s2">(</span><span class="s1">pass_name</span><span class="s2">, </span><span class="s1">print_condition</span><span class="s2">, </span><span class="s1">printable_condition</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s1">pass_name </span><span class="s0">in </span><span class="s1">print_condition</span><span class="s2">:</span>
+                <span class="s1">fid </span><span class="s2">= </span><span class="s1">internal_state</span><span class="s2">.</span><span class="s1">func_id</span>
+                <span class="s1">args </span><span class="s2">= (</span><span class="s1">fid</span><span class="s2">.</span><span class="s1">modname</span><span class="s2">, </span><span class="s1">fid</span><span class="s2">.</span><span class="s1">func_qualname</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">pipeline_name</span><span class="s2">,</span>
+                        <span class="s1">printable_condition</span><span class="s2">, </span><span class="s1">pass_name</span><span class="s2">)</span>
+                <span class="s1">print</span><span class="s2">((</span><span class="s5">&quot;%s.%s: %s: %s %s&quot; </span><span class="s2">% </span><span class="s1">args</span><span class="s2">).</span><span class="s1">center</span><span class="s2">(</span><span class="s6">120</span><span class="s2">, </span><span class="s5">'-'</span><span class="s2">))</span>
+                <span class="s0">if </span><span class="s1">internal_state</span><span class="s2">.</span><span class="s1">func_ir </span><span class="s0">is not None</span><span class="s2">:</span>
+                    <span class="s1">internal_state</span><span class="s2">.</span><span class="s1">func_ir</span><span class="s2">.</span><span class="s1">dump</span><span class="s2">()</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s1">print</span><span class="s2">(</span><span class="s5">&quot;func_ir is None&quot;</span><span class="s2">)</span>
+
+        <span class="s3"># debug print before this pass?</span>
+        <span class="s1">debug_print</span><span class="s2">(</span><span class="s1">pss</span><span class="s2">.</span><span class="s1">name</span><span class="s2">(), </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_print_before </span><span class="s2">+ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_print_wrap</span><span class="s2">, </span><span class="s5">&quot;BEFORE&quot;</span><span class="s2">)</span>
+
+        <span class="s3"># wire in the analysis info so it's accessible</span>
+        <span class="s1">pss</span><span class="s2">.</span><span class="s1">analysis </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_analysis</span>
+
+        <span class="s1">qualname </span><span class="s2">= </span><span class="s1">internal_state</span><span class="s2">.</span><span class="s1">func_id</span><span class="s2">.</span><span class="s1">func_qualname</span>
+
+        <span class="s1">ev_details </span><span class="s2">= </span><span class="s1">dict</span><span class="s2">(</span>
+            <span class="s1">name</span><span class="s2">=</span><span class="s5">f&quot;</span><span class="s0">{</span><span class="s1">pss</span><span class="s2">.</span><span class="s1">name</span><span class="s2">()</span><span class="s0">} </span><span class="s5">[</span><span class="s0">{</span><span class="s1">qualname</span><span class="s0">}</span><span class="s5">]&quot;</span><span class="s2">,</span>
+            <span class="s1">qualname</span><span class="s2">=</span><span class="s1">qualname</span><span class="s2">,</span>
+            <span class="s1">module</span><span class="s2">=</span><span class="s1">internal_state</span><span class="s2">.</span><span class="s1">func_id</span><span class="s2">.</span><span class="s1">modname</span><span class="s2">,</span>
+            <span class="s1">flags</span><span class="s2">=</span><span class="s1">pformat</span><span class="s2">(</span><span class="s1">internal_state</span><span class="s2">.</span><span class="s1">flags</span><span class="s2">.</span><span class="s1">values</span><span class="s2">()),</span>
+            <span class="s1">args</span><span class="s2">=</span><span class="s1">str</span><span class="s2">(</span><span class="s1">internal_state</span><span class="s2">.</span><span class="s1">args</span><span class="s2">),</span>
+            <span class="s1">return_type</span><span class="s2">=</span><span class="s1">str</span><span class="s2">(</span><span class="s1">internal_state</span><span class="s2">.</span><span class="s1">return_type</span><span class="s2">),</span>
+        <span class="s2">)</span>
+        <span class="s0">with </span><span class="s1">ev</span><span class="s2">.</span><span class="s1">trigger_event</span><span class="s2">(</span><span class="s5">&quot;numba:run_pass&quot;</span><span class="s2">, </span><span class="s1">data</span><span class="s2">=</span><span class="s1">ev_details</span><span class="s2">):</span>
+            <span class="s0">with </span><span class="s1">SimpleTimer</span><span class="s2">() </span><span class="s0">as </span><span class="s1">init_time</span><span class="s2">:</span>
+                <span class="s1">mutated </span><span class="s2">|= </span><span class="s1">check</span><span class="s2">(</span><span class="s1">pss</span><span class="s2">.</span><span class="s1">run_initialization</span><span class="s2">, </span><span class="s1">internal_state</span><span class="s2">)</span>
+            <span class="s0">with </span><span class="s1">SimpleTimer</span><span class="s2">() </span><span class="s0">as </span><span class="s1">pass_time</span><span class="s2">:</span>
+                <span class="s1">mutated </span><span class="s2">|= </span><span class="s1">check</span><span class="s2">(</span><span class="s1">pss</span><span class="s2">.</span><span class="s1">run_pass</span><span class="s2">, </span><span class="s1">internal_state</span><span class="s2">)</span>
+            <span class="s0">with </span><span class="s1">SimpleTimer</span><span class="s2">() </span><span class="s0">as </span><span class="s1">finalize_time</span><span class="s2">:</span>
+                <span class="s1">mutated </span><span class="s2">|= </span><span class="s1">check</span><span class="s2">(</span><span class="s1">pss</span><span class="s2">.</span><span class="s1">run_finalizer</span><span class="s2">, </span><span class="s1">internal_state</span><span class="s2">)</span>
+
+        <span class="s3"># Check that if the pass is an instance of a FunctionPass that it hasn't</span>
+        <span class="s3"># emitted ir.Dels.</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">pss</span><span class="s2">, </span><span class="s1">FunctionPass</span><span class="s2">):</span>
+            <span class="s1">enforce_no_dels</span><span class="s2">(</span><span class="s1">internal_state</span><span class="s2">.</span><span class="s1">func_ir</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ENFORCING</span><span class="s2">:</span>
+            <span class="s3"># TODO: Add in self consistency enforcement for</span>
+            <span class="s3"># `func_ir._definitions` etc</span>
+            <span class="s0">if </span><span class="s1">_pass_registry</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">pss</span><span class="s2">.</span><span class="s1">__class__</span><span class="s2">).</span><span class="s1">mutates_CFG</span><span class="s2">:</span>
+                <span class="s0">if </span><span class="s1">mutated</span><span class="s2">:  </span><span class="s3"># block level changes, rebuild all</span>
+                    <span class="s1">PostProcessor</span><span class="s2">(</span><span class="s1">internal_state</span><span class="s2">.</span><span class="s1">func_ir</span><span class="s2">).</span><span class="s1">run</span><span class="s2">()</span>
+                <span class="s0">else</span><span class="s2">:  </span><span class="s3"># CFG level changes rebuild CFG</span>
+                    <span class="s1">internal_state</span><span class="s2">.</span><span class="s1">func_ir</span><span class="s2">.</span><span class="s1">blocks </span><span class="s2">= </span><span class="s1">transforms</span><span class="s2">.</span><span class="s1">canonicalize_cfg</span><span class="s2">(</span>
+                        <span class="s1">internal_state</span><span class="s2">.</span><span class="s1">func_ir</span><span class="s2">.</span><span class="s1">blocks</span><span class="s2">)</span>
+            <span class="s3"># Check the func_ir has exactly one Scope instance</span>
+            <span class="s0">if not </span><span class="s1">legalize_single_scope</span><span class="s2">(</span><span class="s1">internal_state</span><span class="s2">.</span><span class="s1">func_ir</span><span class="s2">.</span><span class="s1">blocks</span><span class="s2">):</span>
+                <span class="s0">raise </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">CompilerError</span><span class="s2">(</span>
+                    <span class="s5">f&quot;multiple scope in func_ir detected in </span><span class="s0">{</span><span class="s1">pss</span><span class="s0">}</span><span class="s5">&quot;</span><span class="s2">,</span>
+                <span class="s2">)</span>
+        <span class="s3"># inject runtimes</span>
+        <span class="s1">pt </span><span class="s2">= </span><span class="s1">pass_timings</span><span class="s2">(</span><span class="s1">init_time</span><span class="s2">.</span><span class="s1">elapsed</span><span class="s2">, </span><span class="s1">pass_time</span><span class="s2">.</span><span class="s1">elapsed</span><span class="s2">,</span>
+                          <span class="s1">finalize_time</span><span class="s2">.</span><span class="s1">elapsed</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">exec_times</span><span class="s2">[</span><span class="s5">&quot;%s_%s&quot; </span><span class="s2">% (</span><span class="s1">index</span><span class="s2">, </span><span class="s1">pss</span><span class="s2">.</span><span class="s1">name</span><span class="s2">())] = </span><span class="s1">pt</span>
+
+        <span class="s3"># debug print after this pass?</span>
+        <span class="s1">debug_print</span><span class="s2">(</span><span class="s1">pss</span><span class="s2">.</span><span class="s1">name</span><span class="s2">(), </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_print_after </span><span class="s2">+ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_print_wrap</span><span class="s2">, </span><span class="s5">&quot;AFTER&quot;</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">run</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">state</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Run the defined pipelines on the state. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">compiler </span><span class="s0">import </span><span class="s1">_EarlyPipelineCompletion</span>
+        <span class="s0">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">finalized</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">RuntimeError</span><span class="s2">(</span><span class="s5">&quot;Cannot run non-finalised pipeline&quot;</span><span class="s2">)</span>
+
+        <span class="s3"># walk the passes and run them</span>
+        <span class="s0">for </span><span class="s1">idx</span><span class="s2">, (</span><span class="s1">pss</span><span class="s2">, </span><span class="s1">pass_desc</span><span class="s2">) </span><span class="s0">in </span><span class="s1">enumerate</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">passes</span><span class="s2">):</span>
+            <span class="s0">try</span><span class="s2">:</span>
+                <span class="s1">event</span><span class="s2">(</span><span class="s5">&quot;-- %s&quot; </span><span class="s2">% </span><span class="s1">pass_desc</span><span class="s2">)</span>
+                <span class="s1">pass_inst </span><span class="s2">= </span><span class="s1">_pass_registry</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">pss</span><span class="s2">).</span><span class="s1">pass_inst</span>
+                <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">pass_inst</span><span class="s2">, </span><span class="s1">CompilerPass</span><span class="s2">):</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">_runPass</span><span class="s2">(</span><span class="s1">idx</span><span class="s2">, </span><span class="s1">pass_inst</span><span class="s2">, </span><span class="s1">state</span><span class="s2">)</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s0">raise </span><span class="s1">BaseException</span><span class="s2">(</span><span class="s5">&quot;Legacy pass in use&quot;</span><span class="s2">)</span>
+            <span class="s0">except </span><span class="s1">_EarlyPipelineCompletion </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+                <span class="s0">raise </span><span class="s1">e</span>
+            <span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+                <span class="s0">if </span><span class="s2">(</span><span class="s1">utils</span><span class="s2">.</span><span class="s1">use_new_style_errors</span><span class="s2">() </span><span class="s0">and not</span>
+                        <span class="s1">isinstance</span><span class="s2">(</span><span class="s1">e</span><span class="s2">, </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">NumbaError</span><span class="s2">)):</span>
+                    <span class="s0">raise </span><span class="s1">e</span>
+                <span class="s1">msg </span><span class="s2">= </span><span class="s5">&quot;Failed in %s mode pipeline (step: %s)&quot; </span><span class="s2">% </span><span class="s1">\</span>
+                    <span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">pipeline_name</span><span class="s2">, </span><span class="s1">pass_desc</span><span class="s2">)</span>
+                <span class="s1">patched_exception </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_patch_error</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">, </span><span class="s1">e</span><span class="s2">)</span>
+                <span class="s0">raise </span><span class="s1">patched_exception</span>
+
+    <span class="s0">def </span><span class="s1">dependency_analysis</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Computes dependency analysis 
+        &quot;&quot;&quot;</span>
+        <span class="s1">deps </span><span class="s2">= </span><span class="s1">dict</span><span class="s2">()</span>
+        <span class="s0">for </span><span class="s2">(</span><span class="s1">pss</span><span class="s2">, </span><span class="s1">_</span><span class="s2">) </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">passes</span><span class="s2">:</span>
+            <span class="s1">x </span><span class="s2">= </span><span class="s1">_pass_registry</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">pss</span><span class="s2">).</span><span class="s1">pass_inst</span>
+            <span class="s1">au </span><span class="s2">= </span><span class="s1">AnalysisUsage</span><span class="s2">()</span>
+            <span class="s1">x</span><span class="s2">.</span><span class="s1">get_analysis_usage</span><span class="s2">(</span><span class="s1">au</span><span class="s2">)</span>
+            <span class="s1">deps</span><span class="s2">[</span><span class="s1">type</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)] = </span><span class="s1">au</span>
+
+        <span class="s1">requires_map </span><span class="s2">= </span><span class="s1">dict</span><span class="s2">()</span>
+        <span class="s0">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">deps</span><span class="s2">.</span><span class="s1">items</span><span class="s2">():</span>
+            <span class="s1">requires_map</span><span class="s2">[</span><span class="s1">k</span><span class="s2">] = </span><span class="s1">v</span><span class="s2">.</span><span class="s1">get_required_set</span><span class="s2">()</span>
+
+        <span class="s0">def </span><span class="s1">resolve_requires</span><span class="s2">(</span><span class="s1">key</span><span class="s2">, </span><span class="s1">rmap</span><span class="s2">):</span>
+            <span class="s0">def </span><span class="s1">walk</span><span class="s2">(</span><span class="s1">lkey</span><span class="s2">, </span><span class="s1">rmap</span><span class="s2">):</span>
+                <span class="s1">dep_set </span><span class="s2">= </span><span class="s1">rmap</span><span class="s2">[</span><span class="s1">lkey</span><span class="s2">] </span><span class="s0">if </span><span class="s1">lkey </span><span class="s0">in </span><span class="s1">rmap </span><span class="s0">else </span><span class="s1">set</span><span class="s2">()</span>
+                <span class="s0">if </span><span class="s1">dep_set</span><span class="s2">:</span>
+                    <span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s1">dep_set</span><span class="s2">:</span>
+                        <span class="s1">dep_set </span><span class="s2">|= (</span><span class="s1">walk</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">rmap</span><span class="s2">))</span>
+                    <span class="s0">return </span><span class="s1">dep_set</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s0">return </span><span class="s1">set</span><span class="s2">()</span>
+            <span class="s1">ret </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+            <span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">key</span><span class="s2">:</span>
+                <span class="s1">ret </span><span class="s2">|= </span><span class="s1">walk</span><span class="s2">(</span><span class="s1">k</span><span class="s2">, </span><span class="s1">rmap</span><span class="s2">)</span>
+            <span class="s0">return </span><span class="s1">ret</span>
+
+        <span class="s1">dep_chain </span><span class="s2">= </span><span class="s1">dict</span><span class="s2">()</span>
+        <span class="s0">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">requires_map</span><span class="s2">.</span><span class="s1">items</span><span class="s2">():</span>
+            <span class="s1">dep_chain</span><span class="s2">[</span><span class="s1">k</span><span class="s2">] = </span><span class="s1">set</span><span class="s2">(</span><span class="s1">v</span><span class="s2">) | (</span><span class="s1">resolve_requires</span><span class="s2">(</span><span class="s1">v</span><span class="s2">, </span><span class="s1">requires_map</span><span class="s2">))</span>
+
+        <span class="s0">return </span><span class="s1">dep_chain</span>
+
+
+<span class="s1">pass_info </span><span class="s2">= </span><span class="s1">namedtuple</span><span class="s2">(</span><span class="s5">'pass_info'</span><span class="s2">, </span><span class="s5">'pass_inst mutates_CFG analysis_only'</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">PassRegistry</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Pass registry singleton class. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_id </span><span class="s2">= </span><span class="s6">0</span>
+
+    <span class="s1">_registry </span><span class="s2">= </span><span class="s1">dict</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">register</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mutates_CFG</span><span class="s2">, </span><span class="s1">analysis_only</span><span class="s2">):</span>
+        <span class="s0">def </span><span class="s1">make_festive</span><span class="s2">(</span><span class="s1">pass_class</span><span class="s2">):</span>
+            <span class="s0">assert not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">is_registered</span><span class="s2">(</span><span class="s1">pass_class</span><span class="s2">)</span>
+            <span class="s0">assert not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_does_pass_name_alias</span><span class="s2">(</span><span class="s1">pass_class</span><span class="s2">.</span><span class="s1">name</span><span class="s2">())</span>
+            <span class="s1">pass_class</span><span class="s2">.</span><span class="s1">pass_id </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_id</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_id </span><span class="s2">+= </span><span class="s6">1</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_registry</span><span class="s2">[</span><span class="s1">pass_class</span><span class="s2">] = </span><span class="s1">pass_info</span><span class="s2">(</span><span class="s1">pass_class</span><span class="s2">(), </span><span class="s1">mutates_CFG</span><span class="s2">,</span>
+                                                   <span class="s1">analysis_only</span><span class="s2">)</span>
+            <span class="s0">return </span><span class="s1">pass_class</span>
+        <span class="s0">return </span><span class="s1">make_festive</span>
+
+    <span class="s0">def </span><span class="s1">is_registered</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">clazz</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">clazz </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_registry</span><span class="s2">.</span><span class="s1">keys</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">get</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">clazz</span><span class="s2">):</span>
+        <span class="s0">assert </span><span class="s1">self</span><span class="s2">.</span><span class="s1">is_registered</span><span class="s2">(</span><span class="s1">clazz</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_registry</span><span class="s2">[</span><span class="s1">clazz</span><span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">_does_pass_name_alias</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">check</span><span class="s2">):</span>
+        <span class="s0">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_registry</span><span class="s2">.</span><span class="s1">items</span><span class="s2">():</span>
+            <span class="s0">if </span><span class="s1">v</span><span class="s2">.</span><span class="s1">pass_inst</span><span class="s2">.</span><span class="s1">name </span><span class="s2">== </span><span class="s1">check</span><span class="s2">:</span>
+                <span class="s0">return True</span>
+        <span class="s0">return False</span>
+
+    <span class="s0">def </span><span class="s1">find_by_name</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">class_name</span><span class="s2">):</span>
+        <span class="s0">assert </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">class_name</span><span class="s2">, </span><span class="s1">str</span><span class="s2">)</span>
+        <span class="s0">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_registry</span><span class="s2">.</span><span class="s1">items</span><span class="s2">():</span>
+            <span class="s0">if </span><span class="s1">v</span><span class="s2">.</span><span class="s1">pass_inst</span><span class="s2">.</span><span class="s1">name </span><span class="s2">== </span><span class="s1">class_name</span><span class="s2">:</span>
+                <span class="s0">return </span><span class="s1">v</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s5">&quot;No pass with name %s is registered&quot; </span><span class="s2">% </span><span class="s1">class_name</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">dump</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_registry</span><span class="s2">.</span><span class="s1">items</span><span class="s2">():</span>
+            <span class="s1">print</span><span class="s2">(</span><span class="s5">&quot;%s: %s&quot; </span><span class="s2">% (</span><span class="s1">k</span><span class="s2">, </span><span class="s1">v</span><span class="s2">))</span>
+
+
+<span class="s1">_pass_registry </span><span class="s2">= </span><span class="s1">PassRegistry</span><span class="s2">()</span>
+<span class="s0">del </span><span class="s1">PassRegistry</span>
+
+
+<span class="s5">&quot;&quot;&quot; 
+register_pass is used to register a compiler pass class for use with PassManager 
+instances. 
+&quot;&quot;&quot;</span>
+<span class="s1">register_pass </span><span class="s2">= </span><span class="s1">_pass_registry</span><span class="s2">.</span><span class="s1">register</span>
+</pre>
+</body>
+</html>

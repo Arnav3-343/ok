@@ -1,0 +1,169 @@
+<html>
+<head>
+<title>object_mode_passes.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #5f826b; font-style: italic;}
+.s5 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+object_mode_passes.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s2">(</span><span class="s1">types</span><span class="s2">, </span><span class="s1">typing</span><span class="s2">, </span><span class="s1">funcdesc</span><span class="s2">, </span><span class="s1">config</span><span class="s2">, </span><span class="s1">pylowering</span><span class="s2">, </span><span class="s1">transforms</span><span class="s2">,</span>
+                        <span class="s1">errors</span><span class="s2">)</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">compiler_machinery </span><span class="s0">import </span><span class="s2">(</span><span class="s1">FunctionPass</span><span class="s2">, </span><span class="s1">LoweringPass</span><span class="s2">,</span>
+                                           <span class="s1">register_pass</span><span class="s2">)</span>
+<span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">defaultdict</span>
+<span class="s0">import </span><span class="s1">warnings</span>
+
+
+<span class="s2">@</span><span class="s1">register_pass</span><span class="s2">(</span><span class="s1">mutates_CFG</span><span class="s2">=</span><span class="s0">True</span><span class="s2">, </span><span class="s1">analysis_only</span><span class="s2">=</span><span class="s0">False</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">ObjectModeFrontEnd</span><span class="s2">(</span><span class="s1">FunctionPass</span><span class="s2">):</span>
+    <span class="s1">_name </span><span class="s2">= </span><span class="s3">&quot;object_mode_front_end&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">FunctionPass</span><span class="s2">.</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">_frontend_looplift</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">state</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Loop lifting analysis and transformation 
+        &quot;&quot;&quot;</span>
+        <span class="s1">loop_flags </span><span class="s2">= </span><span class="s1">state</span><span class="s2">.</span><span class="s1">flags</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">()</span>
+        <span class="s1">outer_flags </span><span class="s2">= </span><span class="s1">state</span><span class="s2">.</span><span class="s1">flags</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">()</span>
+        <span class="s5"># Do not recursively loop lift</span>
+        <span class="s1">outer_flags</span><span class="s2">.</span><span class="s1">enable_looplift </span><span class="s2">= </span><span class="s0">False</span>
+        <span class="s1">loop_flags</span><span class="s2">.</span><span class="s1">enable_looplift </span><span class="s2">= </span><span class="s0">False</span>
+        <span class="s0">if not </span><span class="s1">state</span><span class="s2">.</span><span class="s1">flags</span><span class="s2">.</span><span class="s1">enable_pyobject_looplift</span><span class="s2">:</span>
+            <span class="s1">loop_flags</span><span class="s2">.</span><span class="s1">enable_pyobject </span><span class="s2">= </span><span class="s0">False</span>
+        <span class="s1">loop_flags</span><span class="s2">.</span><span class="s1">enable_ssa </span><span class="s2">= </span><span class="s0">False</span>
+
+        <span class="s1">main</span><span class="s2">, </span><span class="s1">loops </span><span class="s2">= </span><span class="s1">transforms</span><span class="s2">.</span><span class="s1">loop_lifting</span><span class="s2">(</span><span class="s1">state</span><span class="s2">.</span><span class="s1">func_ir</span><span class="s2">,</span>
+                                              <span class="s1">typingctx</span><span class="s2">=</span><span class="s1">state</span><span class="s2">.</span><span class="s1">typingctx</span><span class="s2">,</span>
+                                              <span class="s1">targetctx</span><span class="s2">=</span><span class="s1">state</span><span class="s2">.</span><span class="s1">targetctx</span><span class="s2">,</span>
+                                              <span class="s1">locals</span><span class="s2">=</span><span class="s1">state</span><span class="s2">.</span><span class="s1">locals</span><span class="s2">,</span>
+                                              <span class="s1">flags</span><span class="s2">=</span><span class="s1">loop_flags</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">loops</span><span class="s2">:</span>
+            <span class="s5"># Some loops were extracted</span>
+            <span class="s0">if </span><span class="s1">config</span><span class="s2">.</span><span class="s1">DEBUG_FRONTEND </span><span class="s0">or </span><span class="s1">config</span><span class="s2">.</span><span class="s1">DEBUG</span><span class="s2">:</span>
+                <span class="s0">for </span><span class="s1">loop </span><span class="s0">in </span><span class="s1">loops</span><span class="s2">:</span>
+                    <span class="s1">print</span><span class="s2">(</span><span class="s3">&quot;Lifting loop&quot;</span><span class="s2">, </span><span class="s1">loop</span><span class="s2">.</span><span class="s1">get_source_location</span><span class="s2">())</span>
+            <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">compiler </span><span class="s0">import </span><span class="s1">compile_ir</span>
+            <span class="s1">cres </span><span class="s2">= </span><span class="s1">compile_ir</span><span class="s2">(</span><span class="s1">state</span><span class="s2">.</span><span class="s1">typingctx</span><span class="s2">, </span><span class="s1">state</span><span class="s2">.</span><span class="s1">targetctx</span><span class="s2">, </span><span class="s1">main</span><span class="s2">,</span>
+                              <span class="s1">state</span><span class="s2">.</span><span class="s1">args</span><span class="s2">, </span><span class="s1">state</span><span class="s2">.</span><span class="s1">return_type</span><span class="s2">,</span>
+                              <span class="s1">outer_flags</span><span class="s2">, </span><span class="s1">state</span><span class="s2">.</span><span class="s1">locals</span><span class="s2">,</span>
+                              <span class="s1">lifted</span><span class="s2">=</span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">loops</span><span class="s2">), </span><span class="s1">lifted_from</span><span class="s2">=</span><span class="s0">None</span><span class="s2">,</span>
+                              <span class="s1">is_lifted_loop</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+            <span class="s0">return </span><span class="s1">cres</span>
+
+    <span class="s0">def </span><span class="s1">run_pass</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">state</span><span class="s2">):</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">compiler </span><span class="s0">import </span><span class="s1">_EarlyPipelineCompletion</span>
+        <span class="s5"># NOTE: That so much stuff, including going back into the compiler, is</span>
+        <span class="s5"># captured in a single pass is not ideal.</span>
+        <span class="s0">if </span><span class="s1">state</span><span class="s2">.</span><span class="s1">flags</span><span class="s2">.</span><span class="s1">enable_looplift</span><span class="s2">:</span>
+            <span class="s0">assert not </span><span class="s1">state</span><span class="s2">.</span><span class="s1">lifted</span>
+            <span class="s1">cres </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_frontend_looplift</span><span class="s2">(</span><span class="s1">state</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">cres </span><span class="s0">is not None</span><span class="s2">:</span>
+                <span class="s0">raise </span><span class="s1">_EarlyPipelineCompletion</span><span class="s2">(</span><span class="s1">cres</span><span class="s2">)</span>
+
+        <span class="s5"># Fallback typing: everything is a python object</span>
+        <span class="s1">state</span><span class="s2">.</span><span class="s1">typemap </span><span class="s2">= </span><span class="s1">defaultdict</span><span class="s2">(</span><span class="s0">lambda</span><span class="s2">: </span><span class="s1">types</span><span class="s2">.</span><span class="s1">pyobject</span><span class="s2">)</span>
+        <span class="s1">state</span><span class="s2">.</span><span class="s1">calltypes </span><span class="s2">= </span><span class="s1">defaultdict</span><span class="s2">(</span><span class="s0">lambda</span><span class="s2">: </span><span class="s1">types</span><span class="s2">.</span><span class="s1">pyobject</span><span class="s2">)</span>
+        <span class="s1">state</span><span class="s2">.</span><span class="s1">return_type </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">pyobject</span>
+        <span class="s0">return True</span>
+
+
+<span class="s2">@</span><span class="s1">register_pass</span><span class="s2">(</span><span class="s1">mutates_CFG</span><span class="s2">=</span><span class="s0">True</span><span class="s2">, </span><span class="s1">analysis_only</span><span class="s2">=</span><span class="s0">False</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">ObjectModeBackEnd</span><span class="s2">(</span><span class="s1">LoweringPass</span><span class="s2">):</span>
+
+    <span class="s1">_name </span><span class="s2">= </span><span class="s3">&quot;object_mode_back_end&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">LoweringPass</span><span class="s2">.</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">_py_lowering_stage</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">targetctx</span><span class="s2">, </span><span class="s1">library</span><span class="s2">, </span><span class="s1">interp</span><span class="s2">, </span><span class="s1">flags</span><span class="s2">):</span>
+        <span class="s1">fndesc </span><span class="s2">= </span><span class="s1">funcdesc</span><span class="s2">.</span><span class="s1">PythonFunctionDescriptor</span><span class="s2">.</span><span class="s1">from_object_mode_function</span><span class="s2">(</span>
+            <span class="s1">interp</span>
+        <span class="s2">)</span>
+        <span class="s0">with </span><span class="s1">targetctx</span><span class="s2">.</span><span class="s1">push_code_library</span><span class="s2">(</span><span class="s1">library</span><span class="s2">):</span>
+            <span class="s1">lower </span><span class="s2">= </span><span class="s1">pylowering</span><span class="s2">.</span><span class="s1">PyLower</span><span class="s2">(</span><span class="s1">targetctx</span><span class="s2">, </span><span class="s1">library</span><span class="s2">, </span><span class="s1">fndesc</span><span class="s2">, </span><span class="s1">interp</span><span class="s2">)</span>
+            <span class="s1">lower</span><span class="s2">.</span><span class="s1">lower</span><span class="s2">()</span>
+            <span class="s0">if not </span><span class="s1">flags</span><span class="s2">.</span><span class="s1">no_cpython_wrapper</span><span class="s2">:</span>
+                <span class="s1">lower</span><span class="s2">.</span><span class="s1">create_cpython_wrapper</span><span class="s2">()</span>
+            <span class="s1">env </span><span class="s2">= </span><span class="s1">lower</span><span class="s2">.</span><span class="s1">env</span>
+            <span class="s1">call_helper </span><span class="s2">= </span><span class="s1">lower</span><span class="s2">.</span><span class="s1">call_helper</span>
+            <span class="s0">del </span><span class="s1">lower</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">compiler </span><span class="s0">import </span><span class="s1">_LowerResult  </span><span class="s5"># TODO: move this</span>
+        <span class="s0">if </span><span class="s1">flags</span><span class="s2">.</span><span class="s1">no_compile</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">_LowerResult</span><span class="s2">(</span><span class="s1">fndesc</span><span class="s2">, </span><span class="s1">call_helper</span><span class="s2">, </span><span class="s1">cfunc</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">env</span><span class="s2">=</span><span class="s1">env</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s5"># Prepare for execution</span>
+            <span class="s1">cfunc </span><span class="s2">= </span><span class="s1">targetctx</span><span class="s2">.</span><span class="s1">get_executable</span><span class="s2">(</span><span class="s1">library</span><span class="s2">, </span><span class="s1">fndesc</span><span class="s2">, </span><span class="s1">env</span><span class="s2">)</span>
+            <span class="s0">return </span><span class="s1">_LowerResult</span><span class="s2">(</span><span class="s1">fndesc</span><span class="s2">, </span><span class="s1">call_helper</span><span class="s2">, </span><span class="s1">cfunc</span><span class="s2">=</span><span class="s1">cfunc</span><span class="s2">, </span><span class="s1">env</span><span class="s2">=</span><span class="s1">env</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">run_pass</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">state</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Lowering for object mode 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0">if </span><span class="s1">state</span><span class="s2">.</span><span class="s1">library </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s1">codegen </span><span class="s2">= </span><span class="s1">state</span><span class="s2">.</span><span class="s1">targetctx</span><span class="s2">.</span><span class="s1">codegen</span><span class="s2">()</span>
+            <span class="s1">state</span><span class="s2">.</span><span class="s1">library </span><span class="s2">= </span><span class="s1">codegen</span><span class="s2">.</span><span class="s1">create_library</span><span class="s2">(</span><span class="s1">state</span><span class="s2">.</span><span class="s1">func_id</span><span class="s2">.</span><span class="s1">func_qualname</span><span class="s2">)</span>
+            <span class="s5"># Enable object caching upfront, so that the library can</span>
+            <span class="s5"># be later serialized.</span>
+            <span class="s1">state</span><span class="s2">.</span><span class="s1">library</span><span class="s2">.</span><span class="s1">enable_object_caching</span><span class="s2">()</span>
+
+        <span class="s0">def </span><span class="s1">backend_object_mode</span><span class="s2">():</span>
+            <span class="s4">&quot;&quot;&quot; 
+            Object mode compilation 
+            &quot;&quot;&quot;</span>
+            <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">state</span><span class="s2">.</span><span class="s1">args</span><span class="s2">) != </span><span class="s1">state</span><span class="s2">.</span><span class="s1">nargs</span><span class="s2">:</span>
+                <span class="s5"># append missing</span>
+                <span class="s5"># BUG?: What's going on with nargs here?</span>
+                <span class="s5"># check state.nargs vs self.nargs on original code</span>
+                <span class="s1">state</span><span class="s2">.</span><span class="s1">args </span><span class="s2">= (</span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">state</span><span class="s2">.</span><span class="s1">args</span><span class="s2">) + (</span><span class="s1">types</span><span class="s2">.</span><span class="s1">pyobject</span><span class="s2">,) *</span>
+                              <span class="s2">(</span><span class="s1">state</span><span class="s2">.</span><span class="s1">nargs </span><span class="s2">- </span><span class="s1">len</span><span class="s2">(</span><span class="s1">state</span><span class="s2">.</span><span class="s1">args</span><span class="s2">)))</span>
+
+            <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_py_lowering_stage</span><span class="s2">(</span><span class="s1">state</span><span class="s2">.</span><span class="s1">targetctx</span><span class="s2">,</span>
+                                           <span class="s1">state</span><span class="s2">.</span><span class="s1">library</span><span class="s2">,</span>
+                                           <span class="s1">state</span><span class="s2">.</span><span class="s1">func_ir</span><span class="s2">,</span>
+                                           <span class="s1">state</span><span class="s2">.</span><span class="s1">flags</span><span class="s2">)</span>
+
+        <span class="s1">lowered </span><span class="s2">= </span><span class="s1">backend_object_mode</span><span class="s2">()</span>
+        <span class="s1">signature </span><span class="s2">= </span><span class="s1">typing</span><span class="s2">.</span><span class="s1">signature</span><span class="s2">(</span><span class="s1">state</span><span class="s2">.</span><span class="s1">return_type</span><span class="s2">, *</span><span class="s1">state</span><span class="s2">.</span><span class="s1">args</span><span class="s2">)</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">compiler </span><span class="s0">import </span><span class="s1">compile_result</span>
+        <span class="s1">state</span><span class="s2">.</span><span class="s1">cr </span><span class="s2">= </span><span class="s1">compile_result</span><span class="s2">(</span>
+            <span class="s1">typing_context</span><span class="s2">=</span><span class="s1">state</span><span class="s2">.</span><span class="s1">typingctx</span><span class="s2">,</span>
+            <span class="s1">target_context</span><span class="s2">=</span><span class="s1">state</span><span class="s2">.</span><span class="s1">targetctx</span><span class="s2">,</span>
+            <span class="s1">entry_point</span><span class="s2">=</span><span class="s1">lowered</span><span class="s2">.</span><span class="s1">cfunc</span><span class="s2">,</span>
+            <span class="s1">typing_error</span><span class="s2">=</span><span class="s1">state</span><span class="s2">.</span><span class="s1">status</span><span class="s2">.</span><span class="s1">fail_reason</span><span class="s2">,</span>
+            <span class="s1">type_annotation</span><span class="s2">=</span><span class="s1">state</span><span class="s2">.</span><span class="s1">type_annotation</span><span class="s2">,</span>
+            <span class="s1">library</span><span class="s2">=</span><span class="s1">state</span><span class="s2">.</span><span class="s1">library</span><span class="s2">,</span>
+            <span class="s1">call_helper</span><span class="s2">=</span><span class="s1">lowered</span><span class="s2">.</span><span class="s1">call_helper</span><span class="s2">,</span>
+            <span class="s1">signature</span><span class="s2">=</span><span class="s1">signature</span><span class="s2">,</span>
+            <span class="s1">objectmode</span><span class="s2">=</span><span class="s0">True</span><span class="s2">,</span>
+            <span class="s1">lifted</span><span class="s2">=</span><span class="s1">state</span><span class="s2">.</span><span class="s1">lifted</span><span class="s2">,</span>
+            <span class="s1">fndesc</span><span class="s2">=</span><span class="s1">lowered</span><span class="s2">.</span><span class="s1">fndesc</span><span class="s2">,</span>
+            <span class="s1">environment</span><span class="s2">=</span><span class="s1">lowered</span><span class="s2">.</span><span class="s1">env</span><span class="s2">,</span>
+            <span class="s1">metadata</span><span class="s2">=</span><span class="s1">state</span><span class="s2">.</span><span class="s1">metadata</span><span class="s2">,</span>
+            <span class="s1">reload_init</span><span class="s2">=</span><span class="s1">state</span><span class="s2">.</span><span class="s1">reload_init</span><span class="s2">,</span>
+        <span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">state</span><span class="s2">.</span><span class="s1">flags</span><span class="s2">.</span><span class="s1">release_gil</span><span class="s2">:</span>
+            <span class="s1">warn_msg </span><span class="s2">= (</span><span class="s3">&quot;Code running in object mode won't allow parallel&quot;</span>
+                        <span class="s3">&quot; execution despite nogil=True.&quot;</span><span class="s2">)</span>
+            <span class="s1">warnings</span><span class="s2">.</span><span class="s1">warn_explicit</span><span class="s2">(</span><span class="s1">warn_msg</span><span class="s2">, </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">NumbaWarning</span><span class="s2">,</span>
+                                   <span class="s1">state</span><span class="s2">.</span><span class="s1">func_id</span><span class="s2">.</span><span class="s1">filename</span><span class="s2">,</span>
+                                   <span class="s1">state</span><span class="s2">.</span><span class="s1">func_id</span><span class="s2">.</span><span class="s1">firstlineno</span><span class="s2">)</span>
+
+        <span class="s0">return True</span>
+</pre>
+</body>
+</html>

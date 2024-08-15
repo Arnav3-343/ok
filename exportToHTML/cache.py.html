@@ -1,0 +1,285 @@
+<html>
+<head>
+<title>cache.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+cache.py</font>
+</center></td></tr></table>
+<pre><span class="s0">''' 
+Cache manager 
+============= 
+ 
+The cache manager can be used to store python objects attached to a unique 
+key. The cache can be controlled in two ways: with a object limit or a 
+timeout. 
+ 
+For example, we can create a new cache with a limit of 10 objects and a 
+timeout of 5 seconds:: 
+ 
+    # register a new Cache 
+    Cache.register('mycache', limit=10, timeout=5) 
+ 
+    # create an object + id 
+    key = 'objectid' 
+    instance = Label(text=text) 
+    Cache.append('mycache', key, instance) 
+ 
+    # retrieve the cached object 
+    instance = Cache.get('mycache', key) 
+ 
+If the instance is NULL, the cache may have trashed it because you've 
+not used the label for 5 seconds and you've reach the limit. 
+'''</span>
+
+<span class="s2">from </span><span class="s1">os </span><span class="s2">import </span><span class="s1">environ</span>
+<span class="s2">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">logger </span><span class="s2">import </span><span class="s1">Logger</span>
+<span class="s2">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">clock </span><span class="s2">import </span><span class="s1">Clock</span>
+
+<span class="s1">__all__ </span><span class="s3">= (</span><span class="s4">'Cache'</span><span class="s3">, )</span>
+
+
+<span class="s2">class </span><span class="s1">Cache</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s0">'''See module documentation for more information. 
+    '''</span>
+
+    <span class="s1">_categories </span><span class="s3">= {}</span>
+    <span class="s1">_objects </span><span class="s3">= {}</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s2">def </span><span class="s1">register</span><span class="s3">(</span><span class="s1">category</span><span class="s3">, </span><span class="s1">limit</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">timeout</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">'''Register a new category in the cache with the specified limit. 
+ 
+        :Parameters: 
+            `category`: str 
+                Identifier of the category. 
+            `limit`: int (optional) 
+                Maximum number of objects allowed in the cache. 
+                If None, no limit is applied. 
+            `timeout`: double (optional) 
+                Time after which to delete the object if it has not been used. 
+                If None, no timeout is applied. 
+        '''</span>
+        <span class="s1">Cache</span><span class="s3">.</span><span class="s1">_categories</span><span class="s3">[</span><span class="s1">category</span><span class="s3">] = {</span>
+            <span class="s4">'limit'</span><span class="s3">: </span><span class="s1">limit</span><span class="s3">,</span>
+            <span class="s4">'timeout'</span><span class="s3">: </span><span class="s1">timeout</span><span class="s3">}</span>
+        <span class="s1">Cache</span><span class="s3">.</span><span class="s1">_objects</span><span class="s3">[</span><span class="s1">category</span><span class="s3">] = {}</span>
+        <span class="s1">Logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span>
+            <span class="s4">'Cache: register &lt;%s&gt; with limit=%s, timeout=%s' </span><span class="s3">%</span>
+            <span class="s3">(</span><span class="s1">category</span><span class="s3">, </span><span class="s1">str</span><span class="s3">(</span><span class="s1">limit</span><span class="s3">), </span><span class="s1">str</span><span class="s3">(</span><span class="s1">timeout</span><span class="s3">)))</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s2">def </span><span class="s1">append</span><span class="s3">(</span><span class="s1">category</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">, </span><span class="s1">timeout</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">'''Add a new object to the cache. 
+ 
+        :Parameters: 
+            `category`: str 
+                Identifier of the category. 
+            `key`: str 
+                Unique identifier of the object to store. 
+            `obj`: object 
+                Object to store in cache. 
+            `timeout`: double (optional) 
+                Time after which to delete the object if it has not been used. 
+                If None, no timeout is applied. 
+ 
+        :raises: 
+            `ValueError`: If `None` is used as `key`. 
+ 
+        .. versionchanged:: 2.0.0 
+            Raises `ValueError` if `None` is used as `key`. 
+ 
+        '''</span>
+        <span class="s5"># check whether obj should not be cached first</span>
+        <span class="s2">if </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s4">'_nocache'</span><span class="s3">, </span><span class="s2">False</span><span class="s3">):</span>
+            <span class="s2">return</span>
+        <span class="s2">if </span><span class="s1">key </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s5"># This check is added because of the case when key is None and</span>
+            <span class="s5"># one of purge methods gets called. Then loop in purge method will</span>
+            <span class="s5"># call Cache.remove with key None which then clears entire</span>
+            <span class="s5"># category from Cache making next iteration of loop to raise a</span>
+            <span class="s5"># KeyError because next key will not exist.</span>
+            <span class="s5"># See: https://github.com/kivy/kivy/pull/6950</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">'&quot;None&quot; cannot be used as key in Cache'</span><span class="s3">)</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">cat </span><span class="s3">= </span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_categories</span><span class="s3">[</span><span class="s1">category</span><span class="s3">]</span>
+        <span class="s2">except </span><span class="s1">KeyError</span><span class="s3">:</span>
+            <span class="s1">Logger</span><span class="s3">.</span><span class="s1">warning</span><span class="s3">(</span><span class="s4">'Cache: category &lt;%s&gt; does not exist' </span><span class="s3">% </span><span class="s1">category</span><span class="s3">)</span>
+            <span class="s2">return</span>
+
+        <span class="s1">timeout </span><span class="s3">= </span><span class="s1">timeout </span><span class="s2">or </span><span class="s1">cat</span><span class="s3">[</span><span class="s4">'timeout'</span><span class="s3">]</span>
+
+        <span class="s1">limit </span><span class="s3">= </span><span class="s1">cat</span><span class="s3">[</span><span class="s4">'limit'</span><span class="s3">]</span>
+
+        <span class="s2">if </span><span class="s1">limit </span><span class="s2">is not None and </span><span class="s1">len</span><span class="s3">(</span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_objects</span><span class="s3">[</span><span class="s1">category</span><span class="s3">]) &gt;= </span><span class="s1">limit</span><span class="s3">:</span>
+            <span class="s1">Cache</span><span class="s3">.</span><span class="s1">_purge_oldest</span><span class="s3">(</span><span class="s1">category</span><span class="s3">)</span>
+
+        <span class="s1">Cache</span><span class="s3">.</span><span class="s1">_objects</span><span class="s3">[</span><span class="s1">category</span><span class="s3">][</span><span class="s1">key</span><span class="s3">] = {</span>
+            <span class="s4">'object'</span><span class="s3">: </span><span class="s1">obj</span><span class="s3">,</span>
+            <span class="s4">'timeout'</span><span class="s3">: </span><span class="s1">timeout</span><span class="s3">,</span>
+            <span class="s4">'lastaccess'</span><span class="s3">: </span><span class="s1">Clock</span><span class="s3">.</span><span class="s1">get_time</span><span class="s3">(),</span>
+            <span class="s4">'timestamp'</span><span class="s3">: </span><span class="s1">Clock</span><span class="s3">.</span><span class="s1">get_time</span><span class="s3">()}</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s2">def </span><span class="s1">get</span><span class="s3">(</span><span class="s1">category</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">default</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">'''Get a object from the cache. 
+ 
+        :Parameters: 
+            `category`: str 
+                Identifier of the category. 
+            `key`: str 
+                Unique identifier of the object in the store. 
+            `default`: anything, defaults to None 
+                Default value to be returned if the key is not found. 
+        '''</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">Cache</span><span class="s3">.</span><span class="s1">_objects</span><span class="s3">[</span><span class="s1">category</span><span class="s3">][</span><span class="s1">key</span><span class="s3">][</span><span class="s4">'lastaccess'</span><span class="s3">] = </span><span class="s1">Clock</span><span class="s3">.</span><span class="s1">get_time</span><span class="s3">()</span>
+            <span class="s2">return </span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_objects</span><span class="s3">[</span><span class="s1">category</span><span class="s3">][</span><span class="s1">key</span><span class="s3">][</span><span class="s4">'object'</span><span class="s3">]</span>
+        <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">default</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s2">def </span><span class="s1">get_timestamp</span><span class="s3">(</span><span class="s1">category</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">default</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">'''Get the object timestamp in the cache. 
+ 
+        :Parameters: 
+            `category`: str 
+                Identifier of the category. 
+            `key`: str 
+                Unique identifier of the object in the store. 
+            `default`: anything, defaults to None 
+                Default value to be returned if the key is not found. 
+        '''</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_objects</span><span class="s3">[</span><span class="s1">category</span><span class="s3">][</span><span class="s1">key</span><span class="s3">][</span><span class="s4">'timestamp'</span><span class="s3">]</span>
+        <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">default</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s2">def </span><span class="s1">get_lastaccess</span><span class="s3">(</span><span class="s1">category</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">default</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">'''Get the objects last access time in the cache. 
+ 
+        :Parameters: 
+            `category`: str 
+                Identifier of the category. 
+            `key`: str 
+                Unique identifier of the object in the store. 
+            `default`: anything, defaults to None 
+                Default value to be returned if the key is not found. 
+        '''</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_objects</span><span class="s3">[</span><span class="s1">category</span><span class="s3">][</span><span class="s1">key</span><span class="s3">][</span><span class="s4">'lastaccess'</span><span class="s3">]</span>
+        <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">default</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s2">def </span><span class="s1">remove</span><span class="s3">(</span><span class="s1">category</span><span class="s3">, </span><span class="s1">key</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">'''Purge the cache. 
+ 
+        :Parameters: 
+            `category`: str 
+                Identifier of the category. 
+            `key`: str (optional) 
+                Unique identifier of the object in the store. If this 
+                argument is not supplied, the entire category will be purged. 
+        '''</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">key </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s2">del </span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_objects</span><span class="s3">[</span><span class="s1">category</span><span class="s3">][</span><span class="s1">key</span><span class="s3">]</span>
+                <span class="s1">Logger</span><span class="s3">.</span><span class="s1">trace</span><span class="s3">(</span><span class="s4">'Cache: Removed %s:%s from cache' </span><span class="s3">%</span>
+                             <span class="s3">(</span><span class="s1">category</span><span class="s3">, </span><span class="s1">key</span><span class="s3">))</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">Cache</span><span class="s3">.</span><span class="s1">_objects</span><span class="s3">[</span><span class="s1">category</span><span class="s3">] = {}</span>
+                <span class="s1">Logger</span><span class="s3">.</span><span class="s1">trace</span><span class="s3">(</span><span class="s4">'Cache: Flushed category %s from cache' </span><span class="s3">%</span>
+                             <span class="s1">category</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+            <span class="s2">pass</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s2">def </span><span class="s1">_purge_oldest</span><span class="s3">(</span><span class="s1">category</span><span class="s3">, </span><span class="s1">maxpurge</span><span class="s3">=</span><span class="s6">1</span><span class="s3">):</span>
+        <span class="s1">Logger</span><span class="s3">.</span><span class="s1">trace</span><span class="s3">(</span><span class="s4">'Cache: Remove oldest in %s' </span><span class="s3">% </span><span class="s1">category</span><span class="s3">)</span>
+        <span class="s2">import </span><span class="s1">heapq</span>
+        <span class="s1">time </span><span class="s3">= </span><span class="s1">Clock</span><span class="s3">.</span><span class="s1">get_time</span><span class="s3">()</span>
+        <span class="s1">heap_list </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">key </span><span class="s2">in </span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_objects</span><span class="s3">[</span><span class="s1">category</span><span class="s3">]:</span>
+            <span class="s1">obj </span><span class="s3">= </span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_objects</span><span class="s3">[</span><span class="s1">category</span><span class="s3">][</span><span class="s1">key</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">obj</span><span class="s3">[</span><span class="s4">'lastaccess'</span><span class="s3">] == </span><span class="s1">obj</span><span class="s3">[</span><span class="s4">'timestamp'</span><span class="s3">] == </span><span class="s1">time</span><span class="s3">:</span>
+                <span class="s2">continue</span>
+            <span class="s1">heapq</span><span class="s3">.</span><span class="s1">heappush</span><span class="s3">(</span><span class="s1">heap_list</span><span class="s3">, (</span><span class="s1">obj</span><span class="s3">[</span><span class="s4">'lastaccess'</span><span class="s3">], </span><span class="s1">key</span><span class="s3">))</span>
+            <span class="s1">Logger</span><span class="s3">.</span><span class="s1">trace</span><span class="s3">(</span><span class="s4">'Cache: &lt;&lt;&lt; %f' </span><span class="s3">% </span><span class="s1">obj</span><span class="s3">[</span><span class="s4">'lastaccess'</span><span class="s3">])</span>
+        <span class="s1">n </span><span class="s3">= </span><span class="s6">0</span>
+        <span class="s2">while </span><span class="s1">n </span><span class="s3">&lt;= </span><span class="s1">maxpurge</span><span class="s3">:</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s1">n </span><span class="s3">+= </span><span class="s6">1</span>
+                <span class="s1">lastaccess</span><span class="s3">, </span><span class="s1">key </span><span class="s3">= </span><span class="s1">heapq</span><span class="s3">.</span><span class="s1">heappop</span><span class="s3">(</span><span class="s1">heap_list</span><span class="s3">)</span>
+                <span class="s1">Logger</span><span class="s3">.</span><span class="s1">trace</span><span class="s3">(</span><span class="s4">'Cache: %d =&gt; %s %f %f' </span><span class="s3">%</span>
+                             <span class="s3">(</span><span class="s1">n</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">lastaccess</span><span class="s3">, </span><span class="s1">Clock</span><span class="s3">.</span><span class="s1">get_time</span><span class="s3">()))</span>
+            <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+                <span class="s2">return</span>
+            <span class="s1">Cache</span><span class="s3">.</span><span class="s1">remove</span><span class="s3">(</span><span class="s1">category</span><span class="s3">, </span><span class="s1">key</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s2">def </span><span class="s1">_purge_by_timeout</span><span class="s3">(</span><span class="s1">dt</span><span class="s3">):</span>
+        <span class="s1">curtime </span><span class="s3">= </span><span class="s1">Clock</span><span class="s3">.</span><span class="s1">get_time</span><span class="s3">()</span>
+
+        <span class="s2">for </span><span class="s1">category </span><span class="s2">in </span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_objects</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">category </span><span class="s2">not in </span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_categories</span><span class="s3">:</span>
+                <span class="s2">continue</span>
+            <span class="s1">timeout </span><span class="s3">= </span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_categories</span><span class="s3">[</span><span class="s1">category</span><span class="s3">][</span><span class="s4">'timeout'</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">timeout </span><span class="s2">is not None and </span><span class="s1">dt </span><span class="s3">&gt; </span><span class="s1">timeout</span><span class="s3">:</span>
+                <span class="s5"># XXX got a lag ! that may be because the frame take lot of</span>
+                <span class="s5"># time to draw. and the timeout is not adapted to the current</span>
+                <span class="s5"># framerate. So, increase the timeout by two.</span>
+                <span class="s5"># ie: if the timeout is 1 sec, and framerate go to 0.7, newly</span>
+                <span class="s5"># object added will be automatically trashed.</span>
+                <span class="s1">timeout </span><span class="s3">*= </span><span class="s6">2</span>
+                <span class="s1">Cache</span><span class="s3">.</span><span class="s1">_categories</span><span class="s3">[</span><span class="s1">category</span><span class="s3">][</span><span class="s4">'timeout'</span><span class="s3">] = </span><span class="s1">timeout</span>
+                <span class="s2">continue</span>
+
+            <span class="s2">for </span><span class="s1">key </span><span class="s2">in </span><span class="s1">list</span><span class="s3">(</span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_objects</span><span class="s3">[</span><span class="s1">category</span><span class="s3">].</span><span class="s1">keys</span><span class="s3">()):</span>
+                <span class="s1">lastaccess </span><span class="s3">= </span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_objects</span><span class="s3">[</span><span class="s1">category</span><span class="s3">][</span><span class="s1">key</span><span class="s3">][</span><span class="s4">'lastaccess'</span><span class="s3">]</span>
+                <span class="s1">objtimeout </span><span class="s3">= </span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_objects</span><span class="s3">[</span><span class="s1">category</span><span class="s3">][</span><span class="s1">key</span><span class="s3">][</span><span class="s4">'timeout'</span><span class="s3">]</span>
+
+                <span class="s5"># take the object timeout if available</span>
+                <span class="s2">if </span><span class="s1">objtimeout </span><span class="s2">is not None</span><span class="s3">:</span>
+                    <span class="s1">timeout </span><span class="s3">= </span><span class="s1">objtimeout</span>
+
+                <span class="s5"># no timeout, cancel</span>
+                <span class="s2">if </span><span class="s1">timeout </span><span class="s2">is None</span><span class="s3">:</span>
+                    <span class="s2">continue</span>
+
+                <span class="s2">if </span><span class="s1">curtime </span><span class="s3">- </span><span class="s1">lastaccess </span><span class="s3">&gt; </span><span class="s1">timeout</span><span class="s3">:</span>
+                    <span class="s1">Logger</span><span class="s3">.</span><span class="s1">trace</span><span class="s3">(</span><span class="s4">'Cache: Removed %s:%s from cache due to '</span>
+                                 <span class="s4">'timeout' </span><span class="s3">% (</span><span class="s1">category</span><span class="s3">, </span><span class="s1">key</span><span class="s3">))</span>
+                    <span class="s1">Cache</span><span class="s3">.</span><span class="s1">remove</span><span class="s3">(</span><span class="s1">category</span><span class="s3">, </span><span class="s1">key</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s2">def </span><span class="s1">print_usage</span><span class="s3">():</span>
+        <span class="s0">'''Print the cache usage to the console.'''</span>
+        <span class="s1">print</span><span class="s3">(</span><span class="s4">'Cache usage :'</span><span class="s3">)</span>
+        <span class="s2">for </span><span class="s1">category </span><span class="s2">in </span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_categories</span><span class="s3">:</span>
+            <span class="s1">print</span><span class="s3">(</span><span class="s4">' * %s : %d / %s, timeout=%s' </span><span class="s3">% (</span>
+                <span class="s1">category</span><span class="s3">.</span><span class="s1">capitalize</span><span class="s3">(),</span>
+                <span class="s1">len</span><span class="s3">(</span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_objects</span><span class="s3">[</span><span class="s1">category</span><span class="s3">]),</span>
+                <span class="s1">str</span><span class="s3">(</span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_categories</span><span class="s3">[</span><span class="s1">category</span><span class="s3">][</span><span class="s4">'limit'</span><span class="s3">]),</span>
+                <span class="s1">str</span><span class="s3">(</span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_categories</span><span class="s3">[</span><span class="s1">category</span><span class="s3">][</span><span class="s4">'timeout'</span><span class="s3">])))</span>
+
+
+<span class="s2">if </span><span class="s4">'KIVY_DOC_INCLUDE' </span><span class="s2">not in </span><span class="s1">environ</span><span class="s3">:</span>
+    <span class="s5"># install the schedule clock for purging</span>
+    <span class="s1">Clock</span><span class="s3">.</span><span class="s1">schedule_interval</span><span class="s3">(</span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">_purge_by_timeout</span><span class="s3">, </span><span class="s6">1</span><span class="s3">)</span>
+</pre>
+</body>
+</html>

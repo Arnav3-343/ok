@@ -1,0 +1,473 @@
+<html>
+<head>
+<title>video_ffpyplayer.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #cf8e6d;}
+.s5 { color: #2aacb8;}
+.s6 { color: #7a7e85;}
+.s7 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+video_ffpyplayer.py</font>
+</center></td></tr></table>
+<pre><span class="s0">''' 
+FFmpeg based video abstraction 
+============================== 
+ 
+To use, you need to install ffpyplayer and have a compiled ffmpeg shared 
+library. 
+ 
+    https://github.com/matham/ffpyplayer 
+ 
+The docs there describe how to set this up. But briefly, first you need to 
+compile ffmpeg using the shared flags while disabling the static flags (you'll 
+probably have to set the fPIC flag, e.g. CFLAGS=-fPIC). Here are some 
+instructions: https://trac.ffmpeg.org/wiki/CompilationGuide. For Windows, you 
+can download compiled GPL binaries from http://ffmpeg.zeranoe.com/builds/. 
+Similarly, you should download SDL2. 
+ 
+Now, you should have ffmpeg and sdl directories. In each, you should have an 
+'include', 'bin' and 'lib' directory, where e.g. for Windows, 'lib' contains 
+the .dll.a files, while 'bin' contains the actual dlls. The 'include' directory 
+holds the headers. The 'bin' directory is only needed if the shared libraries 
+are not already in the path. In the environment, define FFMPEG_ROOT and 
+SDL_ROOT, each pointing to the ffmpeg and SDL directories respectively. (If 
+you're using SDL2, the 'include' directory will contain an 'SDL2' directory, 
+which then holds the headers). 
+ 
+Once defined, download the ffpyplayer git repo and run 
+ 
+    python setup.py build_ext --inplace 
+ 
+Finally, before running you need to ensure that ffpyplayer is in python's path. 
+ 
+..Note:: 
+ 
+    When kivy exits by closing the window while the video is playing, 
+    it appears that the __del__method of VideoFFPy 
+    is not called. Because of this, the VideoFFPy object is not 
+    properly deleted when kivy exits. The consequence is that because 
+    MediaPlayer creates internal threads which do not have their daemon 
+    flag set, when the main threads exists, it'll hang and wait for the other 
+    MediaPlayer threads to exit. But since __del__ is not called to delete the 
+    MediaPlayer object, those threads will remain alive, hanging kivy. What 
+    this means is that you have to be sure to delete the MediaPlayer object 
+    before kivy exits by setting it to None. 
+'''</span>
+
+<span class="s1">__all__ </span><span class="s2">= (</span><span class="s3">'VideoFFPy'</span><span class="s2">, )</span>
+
+<span class="s4">try</span><span class="s2">:</span>
+    <span class="s4">import </span><span class="s1">ffpyplayer</span>
+    <span class="s4">from </span><span class="s1">ffpyplayer</span><span class="s2">.</span><span class="s1">player </span><span class="s4">import </span><span class="s1">MediaPlayer</span>
+    <span class="s4">from </span><span class="s1">ffpyplayer</span><span class="s2">.</span><span class="s1">tools </span><span class="s4">import </span><span class="s1">set_log_callback</span><span class="s2">, </span><span class="s1">get_log_callback</span>
+<span class="s4">except</span><span class="s2">:</span>
+    <span class="s4">raise</span>
+
+
+<span class="s4">from </span><span class="s1">threading </span><span class="s4">import </span><span class="s1">Thread</span>
+<span class="s4">from </span><span class="s1">queue </span><span class="s4">import </span><span class="s1">Queue</span><span class="s2">, </span><span class="s1">Empty</span><span class="s2">, </span><span class="s1">Full</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">clock </span><span class="s4">import </span><span class="s1">Clock</span><span class="s2">, </span><span class="s1">mainthread</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">logger </span><span class="s4">import </span><span class="s1">Logger</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">video </span><span class="s4">import </span><span class="s1">VideoBase</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">graphics </span><span class="s4">import </span><span class="s1">Rectangle</span><span class="s2">, </span><span class="s1">BindTexture</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">graphics</span><span class="s2">.</span><span class="s1">texture </span><span class="s4">import </span><span class="s1">Texture</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">graphics</span><span class="s2">.</span><span class="s1">fbo </span><span class="s4">import </span><span class="s1">Fbo</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">weakmethod </span><span class="s4">import </span><span class="s1">WeakMethod</span>
+<span class="s4">import </span><span class="s1">time</span>
+
+<span class="s1">Logger</span><span class="s2">.</span><span class="s1">info</span><span class="s2">(</span><span class="s3">'VideoFFPy: Using ffpyplayer {}'</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">ffpyplayer</span><span class="s2">.</span><span class="s1">version</span><span class="s2">))</span>
+
+
+<span class="s1">logger_func </span><span class="s2">= {</span><span class="s3">'quiet'</span><span class="s2">: </span><span class="s1">Logger</span><span class="s2">.</span><span class="s1">critical</span><span class="s2">, </span><span class="s3">'panic'</span><span class="s2">: </span><span class="s1">Logger</span><span class="s2">.</span><span class="s1">critical</span><span class="s2">,</span>
+               <span class="s3">'fatal'</span><span class="s2">: </span><span class="s1">Logger</span><span class="s2">.</span><span class="s1">critical</span><span class="s2">, </span><span class="s3">'error'</span><span class="s2">: </span><span class="s1">Logger</span><span class="s2">.</span><span class="s1">error</span><span class="s2">,</span>
+               <span class="s3">'warning'</span><span class="s2">: </span><span class="s1">Logger</span><span class="s2">.</span><span class="s1">warning</span><span class="s2">, </span><span class="s3">'info'</span><span class="s2">: </span><span class="s1">Logger</span><span class="s2">.</span><span class="s1">info</span><span class="s2">,</span>
+               <span class="s3">'verbose'</span><span class="s2">: </span><span class="s1">Logger</span><span class="s2">.</span><span class="s1">debug</span><span class="s2">, </span><span class="s3">'debug'</span><span class="s2">: </span><span class="s1">Logger</span><span class="s2">.</span><span class="s1">debug</span><span class="s2">}</span>
+
+
+<span class="s4">def </span><span class="s1">_log_callback</span><span class="s2">(</span><span class="s1">message</span><span class="s2">, </span><span class="s1">level</span><span class="s2">):</span>
+    <span class="s1">message </span><span class="s2">= </span><span class="s1">message</span><span class="s2">.</span><span class="s1">strip</span><span class="s2">()</span>
+    <span class="s4">if </span><span class="s1">message</span><span class="s2">:</span>
+        <span class="s1">logger_func</span><span class="s2">[</span><span class="s1">level</span><span class="s2">](</span><span class="s3">'ffpyplayer: {}'</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">message</span><span class="s2">))</span>
+
+
+<span class="s4">if not </span><span class="s1">get_log_callback</span><span class="s2">():</span>
+    <span class="s1">set_log_callback</span><span class="s2">(</span><span class="s1">_log_callback</span><span class="s2">)</span>
+
+
+<span class="s4">class </span><span class="s1">VideoFFPy</span><span class="s2">(</span><span class="s1">VideoBase</span><span class="s2">):</span>
+
+    <span class="s1">YUV_RGB_FS </span><span class="s2">= </span><span class="s3">&quot;&quot;&quot; 
+    $HEADER$ 
+    uniform sampler2D tex_y; 
+    uniform sampler2D tex_u; 
+    uniform sampler2D tex_v; 
+ 
+    void main(void) { 
+        float y = texture2D(tex_y, tex_coord0).r; 
+        float u = texture2D(tex_u, tex_coord0).r - 0.5; 
+        float v = texture2D(tex_v, tex_coord0).r - 0.5; 
+        float r = y +             1.402 * v; 
+        float g = y - 0.344 * u - 0.714 * v; 
+        float b = y + 1.772 * u; 
+        gl_FragColor = vec4(r, g, b, 1.0); 
+    } 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_trigger </span><span class="s2">= </span><span class="s4">None</span>
+
+    <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_thread </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_next_frame </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_seek_queue </span><span class="s2">= []</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer_need_quit </span><span class="s2">= </span><span class="s4">False</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_wakeup_queue </span><span class="s2">= </span><span class="s1">Queue</span><span class="s2">(</span><span class="s1">maxsize</span><span class="s2">=</span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_trigger </span><span class="s2">= </span><span class="s1">Clock</span><span class="s2">.</span><span class="s1">create_trigger</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_redraw</span><span class="s2">)</span>
+
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">VideoFFPy</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">(**</span><span class="s1">kwargs</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s4">def </span><span class="s1">_is_stream</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s6"># This is only used when building ff_opts, to prevent starting</span>
+        <span class="s6"># player paused and can probably be removed as soon as the 'eof'</span>
+        <span class="s6"># receiving issue is solved.</span>
+        <span class="s6"># See https://github.com/matham/ffpyplayer/issues/142</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">filename</span><span class="s2">.</span><span class="s1">startswith</span><span class="s2">(</span><span class="s3">'rtsp://'</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">__del__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">unload</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">_wakeup_thread</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">try</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_wakeup_queue</span><span class="s2">.</span><span class="s1">put</span><span class="s2">(</span><span class="s4">None</span><span class="s2">, </span><span class="s4">False</span><span class="s2">)</span>
+        <span class="s4">except </span><span class="s1">Full</span><span class="s2">:</span>
+            <span class="s4">pass</span>
+
+    <span class="s4">def </span><span class="s1">_wait_for_wakeup</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">timeout</span><span class="s2">):</span>
+        <span class="s4">try</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_wakeup_queue</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s4">True</span><span class="s2">, </span><span class="s1">timeout</span><span class="s2">)</span>
+        <span class="s4">except </span><span class="s1">Empty</span><span class="s2">:</span>
+            <span class="s4">pass</span>
+
+    <span class="s4">def </span><span class="s1">_player_callback</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">selector</span><span class="s2">, </span><span class="s1">value</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer </span><span class="s4">is None</span><span class="s2">:</span>
+            <span class="s4">return</span>
+        <span class="s4">if </span><span class="s1">selector </span><span class="s2">== </span><span class="s3">'quit'</span><span class="s2">:</span>
+            <span class="s4">def </span><span class="s1">close</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">):</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">unload</span><span class="s2">()</span>
+            <span class="s1">Clock</span><span class="s2">.</span><span class="s1">schedule_once</span><span class="s2">(</span><span class="s1">close</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">_get_position</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer </span><span class="s4">is not None</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span><span class="s2">.</span><span class="s1">get_pts</span><span class="s2">()</span>
+        <span class="s4">return </span><span class="s5">0</span>
+
+    <span class="s4">def </span><span class="s1">_set_position</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">pos</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">seek</span><span class="s2">(</span><span class="s1">pos</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">_set_volume</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">volume</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_volume </span><span class="s2">= </span><span class="s1">volume</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer </span><span class="s4">is not None</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span><span class="s2">.</span><span class="s1">set_volume</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_volume</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">_get_duration</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer </span><span class="s4">is None</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s5">0</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span><span class="s2">.</span><span class="s1">get_metadata</span><span class="s2">()[</span><span class="s3">'duration'</span><span class="s2">]</span>
+
+    <span class="s2">@</span><span class="s1">mainthread</span>
+    <span class="s4">def </span><span class="s1">_do_eos</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">eos </span><span class="s2">== </span><span class="s3">'pause'</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">pause</span><span class="s2">()</span>
+        <span class="s4">elif </span><span class="s1">self</span><span class="s2">.</span><span class="s1">eos </span><span class="s2">== </span><span class="s3">'stop'</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">stop</span><span class="s2">()</span>
+        <span class="s4">elif </span><span class="s1">self</span><span class="s2">.</span><span class="s1">eos </span><span class="s2">== </span><span class="s3">'loop'</span><span class="s2">:</span>
+            <span class="s6"># this causes a seek to zero</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">position </span><span class="s2">= </span><span class="s5">0</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_eos'</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">mainthread</span>
+    <span class="s4">def </span><span class="s1">_finish_setup</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s6"># once setup is done, we make sure player state matches what user</span>
+        <span class="s6"># could have requested while player was being setup and it was in limbo</span>
+        <span class="s6"># also, thread starts player in internal paused mode, so this unpauses</span>
+        <span class="s6"># it if user didn't request pause meanwhile</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer </span><span class="s4">is not None</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span><span class="s2">.</span><span class="s1">set_volume</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_volume</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span><span class="s2">.</span><span class="s1">set_pause</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s2">== </span><span class="s3">'paused'</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_wakeup_thread</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">_redraw</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">):</span>
+        <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span><span class="s2">:</span>
+            <span class="s4">return</span>
+        <span class="s1">next_frame </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_next_frame</span>
+        <span class="s4">if not </span><span class="s1">next_frame</span><span class="s2">:</span>
+            <span class="s4">return</span>
+
+        <span class="s1">img</span><span class="s2">, </span><span class="s1">pts </span><span class="s2">= </span><span class="s1">next_frame</span>
+        <span class="s4">if </span><span class="s1">img</span><span class="s2">.</span><span class="s1">get_size</span><span class="s2">() != </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_size </span><span class="s4">or </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_texture </span><span class="s4">is None</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_size </span><span class="s2">= </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h </span><span class="s2">= </span><span class="s1">img</span><span class="s2">.</span><span class="s1">get_size</span><span class="s2">()</span>
+
+            <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_out_fmt </span><span class="s2">== </span><span class="s3">'yuv420p'</span><span class="s2">:</span>
+                <span class="s1">w2 </span><span class="s2">= </span><span class="s1">int</span><span class="s2">(</span><span class="s1">w </span><span class="s2">/ </span><span class="s5">2</span><span class="s2">)</span>
+                <span class="s1">h2 </span><span class="s2">= </span><span class="s1">int</span><span class="s2">(</span><span class="s1">h </span><span class="s2">/ </span><span class="s5">2</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_tex_y </span><span class="s2">= </span><span class="s1">Texture</span><span class="s2">.</span><span class="s1">create</span><span class="s2">(</span>
+                    <span class="s1">size</span><span class="s2">=(</span><span class="s1">w</span><span class="s2">, </span><span class="s1">h</span><span class="s2">), </span><span class="s1">colorfmt</span><span class="s2">=</span><span class="s3">'luminance'</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_tex_u </span><span class="s2">= </span><span class="s1">Texture</span><span class="s2">.</span><span class="s1">create</span><span class="s2">(</span>
+                    <span class="s1">size</span><span class="s2">=(</span><span class="s1">w2</span><span class="s2">, </span><span class="s1">h2</span><span class="s2">), </span><span class="s1">colorfmt</span><span class="s2">=</span><span class="s3">'luminance'</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_tex_v </span><span class="s2">= </span><span class="s1">Texture</span><span class="s2">.</span><span class="s1">create</span><span class="s2">(</span>
+                    <span class="s1">size</span><span class="s2">=(</span><span class="s1">w2</span><span class="s2">, </span><span class="s1">h2</span><span class="s2">), </span><span class="s1">colorfmt</span><span class="s2">=</span><span class="s3">'luminance'</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_fbo </span><span class="s2">= </span><span class="s1">fbo </span><span class="s2">= </span><span class="s1">Fbo</span><span class="s2">(</span><span class="s1">size</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_size</span><span class="s2">)</span>
+                <span class="s4">with </span><span class="s1">fbo</span><span class="s2">:</span>
+                    <span class="s1">BindTexture</span><span class="s2">(</span><span class="s1">texture</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_tex_u</span><span class="s2">, </span><span class="s1">index</span><span class="s2">=</span><span class="s5">1</span><span class="s2">)</span>
+                    <span class="s1">BindTexture</span><span class="s2">(</span><span class="s1">texture</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_tex_v</span><span class="s2">, </span><span class="s1">index</span><span class="s2">=</span><span class="s5">2</span><span class="s2">)</span>
+                    <span class="s1">Rectangle</span><span class="s2">(</span><span class="s1">size</span><span class="s2">=</span><span class="s1">fbo</span><span class="s2">.</span><span class="s1">size</span><span class="s2">, </span><span class="s1">texture</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_tex_y</span><span class="s2">)</span>
+                <span class="s1">fbo</span><span class="s2">.</span><span class="s1">shader</span><span class="s2">.</span><span class="s1">fs </span><span class="s2">= </span><span class="s1">VideoFFPy</span><span class="s2">.</span><span class="s1">YUV_RGB_FS</span>
+                <span class="s1">fbo</span><span class="s2">[</span><span class="s3">'tex_y'</span><span class="s2">] = </span><span class="s5">0</span>
+                <span class="s1">fbo</span><span class="s2">[</span><span class="s3">'tex_u'</span><span class="s2">] = </span><span class="s5">1</span>
+                <span class="s1">fbo</span><span class="s2">[</span><span class="s3">'tex_v'</span><span class="s2">] = </span><span class="s5">2</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_texture </span><span class="s2">= </span><span class="s1">fbo</span><span class="s2">.</span><span class="s1">texture</span>
+            <span class="s4">else</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_texture </span><span class="s2">= </span><span class="s1">Texture</span><span class="s2">.</span><span class="s1">create</span><span class="s2">(</span><span class="s1">size</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_size</span><span class="s2">,</span>
+                                               <span class="s1">colorfmt</span><span class="s2">=</span><span class="s3">'rgba'</span><span class="s2">)</span>
+
+            <span class="s6"># XXX FIXME</span>
+            <span class="s6"># self.texture.add_reload_observer(self.reload_buffer)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_texture</span><span class="s2">.</span><span class="s1">flip_vertical</span><span class="s2">()</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_load'</span><span class="s2">)</span>
+
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_texture</span><span class="s2">:</span>
+            <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_out_fmt </span><span class="s2">== </span><span class="s3">'yuv420p'</span><span class="s2">:</span>
+                <span class="s1">dy</span><span class="s2">, </span><span class="s1">du</span><span class="s2">, </span><span class="s1">dv</span><span class="s2">, </span><span class="s1">_ </span><span class="s2">= </span><span class="s1">img</span><span class="s2">.</span><span class="s1">to_memoryview</span><span class="s2">()</span>
+                <span class="s4">if </span><span class="s1">dy </span><span class="s4">and </span><span class="s1">du </span><span class="s4">and </span><span class="s1">dv</span><span class="s2">:</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">_tex_y</span><span class="s2">.</span><span class="s1">blit_buffer</span><span class="s2">(</span><span class="s1">dy</span><span class="s2">, </span><span class="s1">colorfmt</span><span class="s2">=</span><span class="s3">'luminance'</span><span class="s2">)</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">_tex_u</span><span class="s2">.</span><span class="s1">blit_buffer</span><span class="s2">(</span><span class="s1">du</span><span class="s2">, </span><span class="s1">colorfmt</span><span class="s2">=</span><span class="s3">'luminance'</span><span class="s2">)</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">_tex_v</span><span class="s2">.</span><span class="s1">blit_buffer</span><span class="s2">(</span><span class="s1">dv</span><span class="s2">, </span><span class="s1">colorfmt</span><span class="s2">=</span><span class="s3">'luminance'</span><span class="s2">)</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">_fbo</span><span class="s2">.</span><span class="s1">ask_update</span><span class="s2">()</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">_fbo</span><span class="s2">.</span><span class="s1">draw</span><span class="s2">()</span>
+            <span class="s4">else</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_texture</span><span class="s2">.</span><span class="s1">blit_buffer</span><span class="s2">(</span>
+                    <span class="s1">img</span><span class="s2">.</span><span class="s1">to_memoryview</span><span class="s2">()[</span><span class="s5">0</span><span class="s2">], </span><span class="s1">colorfmt</span><span class="s2">=</span><span class="s3">'rgba'</span><span class="s2">)</span>
+
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_frame'</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">_next_frame_run</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ffplayer</span><span class="s2">):</span>
+        <span class="s1">sleep </span><span class="s2">= </span><span class="s1">time</span><span class="s2">.</span><span class="s1">sleep</span>
+        <span class="s1">trigger </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_trigger</span>
+        <span class="s1">did_dispatch_eof </span><span class="s2">= </span><span class="s4">False</span>
+        <span class="s1">wait_for_wakeup </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_wait_for_wakeup</span>
+        <span class="s1">seek_queue </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_seek_queue</span>
+        <span class="s6"># video starts in internal paused state</span>
+
+        <span class="s6"># fast path, if the source video is yuv420p, we'll use a glsl shader</span>
+        <span class="s6"># for buffer conversion to rgba</span>
+        <span class="s6"># wait until we get frame metadata</span>
+        <span class="s4">while not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer_need_quit</span><span class="s2">:</span>
+            <span class="s1">src_pix_fmt </span><span class="s2">= </span><span class="s1">ffplayer</span><span class="s2">.</span><span class="s1">get_metadata</span><span class="s2">().</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'src_pix_fmt'</span><span class="s2">)</span>
+            <span class="s4">if not </span><span class="s1">src_pix_fmt</span><span class="s2">:</span>
+                <span class="s1">wait_for_wakeup</span><span class="s2">(</span><span class="s5">0.005</span><span class="s2">)</span>
+                <span class="s4">continue</span>
+
+            <span class="s6"># ffpyplayer reports src_pix_fmt as bytes. this may or may not</span>
+            <span class="s6"># change in future, so we check for both bytes and str</span>
+            <span class="s4">if </span><span class="s1">src_pix_fmt </span><span class="s4">in </span><span class="s2">(</span><span class="s7">b'yuv420p'</span><span class="s2">, </span><span class="s3">'yuv420p'</span><span class="s2">):</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_out_fmt </span><span class="s2">= </span><span class="s3">'yuv420p'</span>
+                <span class="s1">ffplayer</span><span class="s2">.</span><span class="s1">set_output_pix_fmt</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_out_fmt</span><span class="s2">)</span>
+            <span class="s4">break</span>
+
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer_need_quit</span><span class="s2">:</span>
+            <span class="s1">ffplayer</span><span class="s2">.</span><span class="s1">close_player</span><span class="s2">()</span>
+            <span class="s4">return</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer </span><span class="s2">= </span><span class="s1">ffplayer</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_finish_setup</span><span class="s2">()</span>
+        <span class="s6"># now, we'll be in internal paused state and loop will wait until</span>
+        <span class="s6"># mainthread unpauses us when finishing setup</span>
+
+        <span class="s4">while not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer_need_quit</span><span class="s2">:</span>
+            <span class="s1">seek_happened </span><span class="s2">= </span><span class="s4">False</span>
+            <span class="s4">if </span><span class="s1">seek_queue</span><span class="s2">:</span>
+                <span class="s1">vals </span><span class="s2">= </span><span class="s1">seek_queue</span><span class="s2">[:]</span>
+                <span class="s4">del </span><span class="s1">seek_queue</span><span class="s2">[:</span><span class="s1">len</span><span class="s2">(</span><span class="s1">vals</span><span class="s2">)]</span>
+                <span class="s1">percent</span><span class="s2">, </span><span class="s1">precise </span><span class="s2">= </span><span class="s1">vals</span><span class="s2">[-</span><span class="s5">1</span><span class="s2">]</span>
+                <span class="s1">ffplayer</span><span class="s2">.</span><span class="s1">seek</span><span class="s2">(</span>
+                    <span class="s1">percent </span><span class="s2">* </span><span class="s1">ffplayer</span><span class="s2">.</span><span class="s1">get_metadata</span><span class="s2">()[</span><span class="s3">'duration'</span><span class="s2">],</span>
+                    <span class="s1">relative</span><span class="s2">=</span><span class="s4">False</span><span class="s2">,</span>
+                    <span class="s1">accurate</span><span class="s2">=</span><span class="s1">precise</span>
+                <span class="s2">)</span>
+                <span class="s1">seek_happened </span><span class="s2">= </span><span class="s4">True</span>
+                <span class="s1">did_dispatch_eof </span><span class="s2">= </span><span class="s4">False</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_next_frame </span><span class="s2">= </span><span class="s4">None</span>
+
+            <span class="s6"># Get next frame if paused:</span>
+            <span class="s4">if </span><span class="s1">seek_happened </span><span class="s4">and </span><span class="s1">ffplayer</span><span class="s2">.</span><span class="s1">get_pause</span><span class="s2">():</span>
+                <span class="s1">ffplayer</span><span class="s2">.</span><span class="s1">set_volume</span><span class="s2">(</span><span class="s5">0.0</span><span class="s2">)  </span><span class="s6"># Try to do it silently.</span>
+                <span class="s1">ffplayer</span><span class="s2">.</span><span class="s1">set_pause</span><span class="s2">(</span><span class="s4">False</span><span class="s2">)</span>
+                <span class="s4">try</span><span class="s2">:</span>
+                    <span class="s6"># We don't know concrete number of frames to skip,</span>
+                    <span class="s6"># this number worked fine on couple of tested videos:</span>
+                    <span class="s1">to_skip </span><span class="s2">= </span><span class="s5">6</span>
+                    <span class="s4">while True</span><span class="s2">:</span>
+                        <span class="s1">frame</span><span class="s2">, </span><span class="s1">val </span><span class="s2">= </span><span class="s1">ffplayer</span><span class="s2">.</span><span class="s1">get_frame</span><span class="s2">(</span><span class="s1">show</span><span class="s2">=</span><span class="s4">False</span><span class="s2">)</span>
+                        <span class="s6"># Exit loop on invalid val:</span>
+                        <span class="s4">if </span><span class="s1">val </span><span class="s4">in </span><span class="s2">(</span><span class="s3">'paused'</span><span class="s2">, </span><span class="s3">'eof'</span><span class="s2">):</span>
+                            <span class="s4">break</span>
+                        <span class="s6"># Exit loop on seek_queue updated:</span>
+                        <span class="s4">if </span><span class="s1">seek_queue</span><span class="s2">:</span>
+                            <span class="s4">break</span>
+                        <span class="s6"># Wait for next frame:</span>
+                        <span class="s4">if </span><span class="s1">frame </span><span class="s4">is None</span><span class="s2">:</span>
+                            <span class="s1">sleep</span><span class="s2">(</span><span class="s5">0.005</span><span class="s2">)</span>
+                            <span class="s4">continue</span>
+                        <span class="s6"># Wait until we skipped enough frames:</span>
+                        <span class="s1">to_skip </span><span class="s2">-= </span><span class="s5">1</span>
+                        <span class="s4">if </span><span class="s1">to_skip </span><span class="s2">== </span><span class="s5">0</span><span class="s2">:</span>
+                            <span class="s4">break</span>
+                    <span class="s6"># Assuming last frame is actual, just get it:</span>
+                    <span class="s1">frame</span><span class="s2">, </span><span class="s1">val </span><span class="s2">= </span><span class="s1">ffplayer</span><span class="s2">.</span><span class="s1">get_frame</span><span class="s2">(</span><span class="s1">force_refresh</span><span class="s2">=</span><span class="s4">True</span><span class="s2">)</span>
+                <span class="s4">finally</span><span class="s2">:</span>
+                    <span class="s1">ffplayer</span><span class="s2">.</span><span class="s1">set_pause</span><span class="s2">(</span><span class="s1">bool</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s2">== </span><span class="s3">'paused'</span><span class="s2">))</span>
+                    <span class="s6"># todo: this is not safe because user could have updated</span>
+                    <span class="s6"># volume between us reading it and setting it</span>
+                    <span class="s1">ffplayer</span><span class="s2">.</span><span class="s1">set_volume</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_volume</span><span class="s2">)</span>
+            <span class="s6"># Get next frame regular:</span>
+            <span class="s4">else</span><span class="s2">:</span>
+                <span class="s1">frame</span><span class="s2">, </span><span class="s1">val </span><span class="s2">= </span><span class="s1">ffplayer</span><span class="s2">.</span><span class="s1">get_frame</span><span class="s2">()</span>
+
+            <span class="s4">if </span><span class="s1">val </span><span class="s2">== </span><span class="s3">'eof'</span><span class="s2">:</span>
+                <span class="s4">if not </span><span class="s1">did_dispatch_eof</span><span class="s2">:</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">_do_eos</span><span class="s2">()</span>
+                    <span class="s1">did_dispatch_eof </span><span class="s2">= </span><span class="s4">True</span>
+                <span class="s1">wait_for_wakeup</span><span class="s2">(</span><span class="s4">None</span><span class="s2">)</span>
+            <span class="s4">elif </span><span class="s1">val </span><span class="s2">== </span><span class="s3">'paused'</span><span class="s2">:</span>
+                <span class="s1">did_dispatch_eof </span><span class="s2">= </span><span class="s4">False</span>
+                <span class="s1">wait_for_wakeup</span><span class="s2">(</span><span class="s4">None</span><span class="s2">)</span>
+            <span class="s4">else</span><span class="s2">:</span>
+                <span class="s1">did_dispatch_eof </span><span class="s2">= </span><span class="s4">False</span>
+                <span class="s4">if </span><span class="s1">frame</span><span class="s2">:</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">_next_frame </span><span class="s2">= </span><span class="s1">frame</span>
+                    <span class="s1">trigger</span><span class="s2">()</span>
+                <span class="s4">else</span><span class="s2">:</span>
+                    <span class="s1">val </span><span class="s2">= </span><span class="s1">val </span><span class="s4">if </span><span class="s1">val </span><span class="s4">else </span><span class="s2">(</span><span class="s5">1 </span><span class="s2">/ </span><span class="s5">30.</span><span class="s2">)</span>
+                <span class="s1">wait_for_wakeup</span><span class="s2">(</span><span class="s1">val</span><span class="s2">)</span>
+
+        <span class="s1">ffplayer</span><span class="s2">.</span><span class="s1">close_player</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">seek</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">percent</span><span class="s2">, </span><span class="s1">precise</span><span class="s2">=</span><span class="s4">True</span><span class="s2">):</span>
+        <span class="s6"># still save seek while thread is setting up</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_seek_queue</span><span class="s2">.</span><span class="s1">append</span><span class="s2">((</span><span class="s1">percent</span><span class="s2">, </span><span class="s1">precise</span><span class="s2">,))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_wakeup_thread</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">stop</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">unload</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">pause</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s6"># if state hasn't been set (empty), there's no player. If it's</span>
+        <span class="s6"># paused, nothing to do so just handle playing</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s2">== </span><span class="s3">'playing'</span><span class="s2">:</span>
+            <span class="s6"># we could be in limbo while player is setting up so check. Player</span>
+            <span class="s6"># will pause when finishing setting up</span>
+            <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer </span><span class="s4">is not None</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span><span class="s2">.</span><span class="s1">set_pause</span><span class="s2">(</span><span class="s4">True</span><span class="s2">)</span>
+            <span class="s6"># even in limbo, indicate to start in paused state</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s2">= </span><span class="s3">'paused'</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_wakeup_thread</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">play</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s6"># _state starts empty and is empty again after unloading</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span><span class="s2">:</span>
+            <span class="s6"># player is already setup, just handle unpausing</span>
+            <span class="s4">assert </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s4">in </span><span class="s2">(</span><span class="s3">'paused'</span><span class="s2">, </span><span class="s3">'playing'</span><span class="s2">)</span>
+            <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s2">== </span><span class="s3">'paused'</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span><span class="s2">.</span><span class="s1">set_pause</span><span class="s2">(</span><span class="s4">False</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s2">= </span><span class="s3">'playing'</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_wakeup_thread</span><span class="s2">()</span>
+            <span class="s4">return</span>
+
+        <span class="s6"># we're now either in limbo state waiting for thread to setup,</span>
+        <span class="s6"># or no thread has been started</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s2">== </span><span class="s3">'playing'</span><span class="s2">:</span>
+            <span class="s6"># in limbo, just wait for thread to setup player</span>
+            <span class="s4">return</span>
+        <span class="s4">elif </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s2">== </span><span class="s3">'paused'</span><span class="s2">:</span>
+            <span class="s6"># in limbo, still unpause for when player becomes ready</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s2">= </span><span class="s3">'playing'</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_wakeup_thread</span><span class="s2">()</span>
+            <span class="s4">return</span>
+
+        <span class="s6"># load first unloads</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">load</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_out_fmt </span><span class="s2">= </span><span class="s3">'rgba'</span>
+        <span class="s6"># if no stream, it starts internally paused, but unpauses itself</span>
+        <span class="s6"># if stream and we start paused, we sometimes receive eof after a</span>
+        <span class="s6"># few frames, depending on the stream producer.</span>
+        <span class="s6"># XXX: This probably needs to be figured out in ffpyplayer, using</span>
+        <span class="s6">#      ffplay directly works.</span>
+        <span class="s1">ff_opts </span><span class="s2">= {</span>
+            <span class="s3">'paused'</span><span class="s2">: </span><span class="s4">not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_is_stream</span><span class="s2">,</span>
+            <span class="s3">'out_fmt'</span><span class="s2">: </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_out_fmt</span><span class="s2">,</span>
+            <span class="s3">'sn'</span><span class="s2">: </span><span class="s4">True</span><span class="s2">,</span>
+            <span class="s3">'volume'</span><span class="s2">: </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_volume</span><span class="s2">,</span>
+        <span class="s2">}</span>
+        <span class="s1">ffplayer </span><span class="s2">= </span><span class="s1">MediaPlayer</span><span class="s2">(</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_filename</span><span class="s2">, </span><span class="s1">callback</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_player_callback</span><span class="s2">,</span>
+            <span class="s1">thread_lib</span><span class="s2">=</span><span class="s3">'SDL'</span><span class="s2">,</span>
+            <span class="s1">loglevel</span><span class="s2">=</span><span class="s3">'info'</span><span class="s2">, </span><span class="s1">ff_opts</span><span class="s2">=</span><span class="s1">ff_opts</span>
+        <span class="s2">)</span>
+
+        <span class="s6"># Disabled as an attempt to fix kivy issue #6210</span>
+        <span class="s6"># self._ffplayer.set_volume(self._volume)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_thread </span><span class="s2">= </span><span class="s1">Thread</span><span class="s2">(</span>
+            <span class="s1">target</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_next_frame_run</span><span class="s2">,</span>
+            <span class="s1">name</span><span class="s2">=</span><span class="s3">'Next frame'</span><span class="s2">,</span>
+            <span class="s1">args</span><span class="s2">=(</span><span class="s1">ffplayer</span><span class="s2">, )</span>
+        <span class="s2">)</span>
+        <span class="s6"># todo: remove</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_thread</span><span class="s2">.</span><span class="s1">daemon </span><span class="s2">= </span><span class="s4">True</span>
+
+        <span class="s6"># start in playing mode, but _ffplayer isn't set until ready. We're</span>
+        <span class="s6"># now in a limbo state</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s2">= </span><span class="s3">'playing'</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_thread</span><span class="s2">.</span><span class="s1">start</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">load</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">unload</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">unload</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s6"># no need to call self._trigger.cancel() because _ffplayer is set</span>
+        <span class="s6"># to None below, and it's not safe to call clock stuff from __del__</span>
+
+        <span class="s6"># if thread is still alive, set it to exit and wake it</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_wakeup_thread</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer_need_quit </span><span class="s2">= </span><span class="s4">True</span>
+        <span class="s6"># wait until it exits</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_thread</span><span class="s2">:</span>
+            <span class="s6"># TODO: use callback, don't block here</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_thread</span><span class="s2">.</span><span class="s1">join</span><span class="s2">()</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_thread </span><span class="s2">= </span><span class="s4">None</span>
+
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_next_frame </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_size </span><span class="s2">= (</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s2">= </span><span class="s3">''</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_seek_queue </span><span class="s2">= []</span>
+
+        <span class="s6"># reset for next load since thread is dead for sure</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer_need_quit </span><span class="s2">= </span><span class="s4">False</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_wakeup_queue </span><span class="s2">= </span><span class="s1">Queue</span><span class="s2">(</span><span class="s1">maxsize</span><span class="s2">=</span><span class="s5">1</span><span class="s2">)</span>
+</pre>
+</body>
+</html>

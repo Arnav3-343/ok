@@ -1,0 +1,928 @@
+<html>
+<head>
+<title>transforms.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+transforms.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Implement transformation on Numba IR 
+&quot;&quot;&quot;</span>
+
+
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">namedtuple</span><span class="s3">, </span><span class="s1">defaultdict</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">operator</span>
+
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">analysis </span><span class="s2">import </span><span class="s1">compute_cfg_from_blocks</span><span class="s3">, </span><span class="s1">find_top_level_loops</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">errors</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">, </span><span class="s1">ir_utils</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">analysis </span><span class="s2">import </span><span class="s1">compute_use_defs</span><span class="s3">, </span><span class="s1">compute_cfg_from_blocks</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">utils </span><span class="s2">import </span><span class="s1">PYVERSION</span>
+
+
+<span class="s1">_logger </span><span class="s3">= </span><span class="s1">logging</span><span class="s3">.</span><span class="s1">getLogger</span><span class="s3">(</span><span class="s1">__name__</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_extract_loop_lifting_candidates</span><span class="s3">(</span><span class="s1">cfg</span><span class="s3">, </span><span class="s1">blocks</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Returns a list of loops that are candidate for loop lifting 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># check well-formed-ness of the loop</span>
+    <span class="s2">def </span><span class="s1">same_exit_point</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">):</span>
+        <span class="s0">&quot;all exits must point to the same location&quot;</span>
+        <span class="s1">outedges </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+        <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">loop</span><span class="s3">.</span><span class="s1">exits</span><span class="s3">:</span>
+            <span class="s1">succs </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">x </span><span class="s2">for </span><span class="s1">x</span><span class="s3">, </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">successors</span><span class="s3">(</span><span class="s1">k</span><span class="s3">))</span>
+            <span class="s2">if not </span><span class="s1">succs</span><span class="s3">:</span>
+                <span class="s4"># If the exit point has no successor, it contains an return</span>
+                <span class="s4"># statement, which is not handled by the looplifting code.</span>
+                <span class="s4"># Thus, this loop is not a candidate.</span>
+                <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;return-statement in loop.&quot;</span><span class="s3">)</span>
+                <span class="s2">return False</span>
+            <span class="s1">outedges </span><span class="s3">|= </span><span class="s1">succs</span>
+        <span class="s1">ok </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">outedges</span><span class="s3">) == </span><span class="s6">1</span>
+        <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;same_exit_point=%s (%s)&quot;</span><span class="s3">, </span><span class="s1">ok</span><span class="s3">, </span><span class="s1">outedges</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">ok</span>
+
+    <span class="s2">def </span><span class="s1">one_entry</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">):</span>
+        <span class="s0">&quot;there is one entry&quot;</span>
+        <span class="s1">ok </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">.</span><span class="s1">entries</span><span class="s3">) == </span><span class="s6">1</span>
+        <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;one_entry=%s&quot;</span><span class="s3">, </span><span class="s1">ok</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">ok</span>
+
+    <span class="s2">def </span><span class="s1">cannot_yield</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">):</span>
+        <span class="s0">&quot;cannot have yield inside the loop&quot;</span>
+        <span class="s1">insiders </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">.</span><span class="s1">body</span><span class="s3">) | </span><span class="s1">set</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">.</span><span class="s1">entries</span><span class="s3">) | </span><span class="s1">set</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">.</span><span class="s1">exits</span><span class="s3">)</span>
+        <span class="s2">for </span><span class="s1">blk </span><span class="s2">in </span><span class="s1">map</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">__getitem__</span><span class="s3">, </span><span class="s1">insiders</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">inst </span><span class="s2">in </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">body</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Assign</span><span class="s3">):</span>
+                    <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">value</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Yield</span><span class="s3">):</span>
+                        <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;has yield&quot;</span><span class="s3">)</span>
+                        <span class="s2">return False</span>
+        <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;no yield&quot;</span><span class="s3">)</span>
+        <span class="s2">return True</span>
+
+    <span class="s1">_logger</span><span class="s3">.</span><span class="s1">info</span><span class="s3">(</span><span class="s5">'finding looplift candidates'</span><span class="s3">)</span>
+    <span class="s4"># the check for cfg.entry_point in the loop.entries is to prevent a bad</span>
+    <span class="s4"># rewrite where a prelude for a lifted loop would get written into block -1</span>
+    <span class="s4"># if a loop entry were in block 0</span>
+    <span class="s1">candidates </span><span class="s3">= []</span>
+    <span class="s2">for </span><span class="s1">loop </span><span class="s2">in </span><span class="s1">find_top_level_loops</span><span class="s3">(</span><span class="s1">cfg</span><span class="s3">):</span>
+        <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;top-level loop: %s&quot;</span><span class="s3">, </span><span class="s1">loop</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s3">(</span><span class="s1">same_exit_point</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">) </span><span class="s2">and </span><span class="s1">one_entry</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">) </span><span class="s2">and </span><span class="s1">cannot_yield</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">) </span><span class="s2">and</span>
+            <span class="s1">cfg</span><span class="s3">.</span><span class="s1">entry_point</span><span class="s3">() </span><span class="s2">not in </span><span class="s1">loop</span><span class="s3">.</span><span class="s1">entries</span><span class="s3">):</span>
+            <span class="s1">candidates</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">)</span>
+            <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;add candidate: %s&quot;</span><span class="s3">, </span><span class="s1">loop</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">candidates</span>
+
+
+<span class="s2">def </span><span class="s1">find_region_inout_vars</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">livemap</span><span class="s3">, </span><span class="s1">callfrom</span><span class="s3">, </span><span class="s1">returnto</span><span class="s3">, </span><span class="s1">body_block_ids</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Find input and output variables to a block region. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">inputs </span><span class="s3">= </span><span class="s1">livemap</span><span class="s3">[</span><span class="s1">callfrom</span><span class="s3">]</span>
+    <span class="s1">outputs </span><span class="s3">= </span><span class="s1">livemap</span><span class="s3">[</span><span class="s1">returnto</span><span class="s3">]</span>
+
+    <span class="s4"># ensure live variables are actually used in the blocks, else remove,</span>
+    <span class="s4"># saves having to create something valid to run through postproc</span>
+    <span class="s4"># to achieve similar</span>
+    <span class="s1">loopblocks </span><span class="s3">= {}</span>
+    <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">body_block_ids</span><span class="s3">:</span>
+        <span class="s1">loopblocks</span><span class="s3">[</span><span class="s1">k</span><span class="s3">] = </span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">k</span><span class="s3">]</span>
+
+    <span class="s1">used_vars </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+    <span class="s1">def_vars </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+    <span class="s1">defs </span><span class="s3">= </span><span class="s1">compute_use_defs</span><span class="s3">(</span><span class="s1">loopblocks</span><span class="s3">)</span>
+    <span class="s2">for </span><span class="s1">vs </span><span class="s2">in </span><span class="s1">defs</span><span class="s3">.</span><span class="s1">usemap</span><span class="s3">.</span><span class="s1">values</span><span class="s3">():</span>
+        <span class="s1">used_vars </span><span class="s3">|= </span><span class="s1">vs</span>
+    <span class="s2">for </span><span class="s1">vs </span><span class="s2">in </span><span class="s1">defs</span><span class="s3">.</span><span class="s1">defmap</span><span class="s3">.</span><span class="s1">values</span><span class="s3">():</span>
+        <span class="s1">def_vars </span><span class="s3">|= </span><span class="s1">vs</span>
+    <span class="s1">used_or_defined </span><span class="s3">= </span><span class="s1">used_vars </span><span class="s3">| </span><span class="s1">def_vars</span>
+
+    <span class="s4"># note: sorted for stable ordering</span>
+    <span class="s1">inputs </span><span class="s3">= </span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">set</span><span class="s3">(</span><span class="s1">inputs</span><span class="s3">) &amp; </span><span class="s1">used_or_defined</span><span class="s3">)</span>
+    <span class="s1">outputs </span><span class="s3">= </span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">set</span><span class="s3">(</span><span class="s1">outputs</span><span class="s3">) &amp; </span><span class="s1">used_or_defined </span><span class="s3">&amp; </span><span class="s1">def_vars</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">inputs</span><span class="s3">, </span><span class="s1">outputs</span>
+
+
+<span class="s1">_loop_lift_info </span><span class="s3">= </span><span class="s1">namedtuple</span><span class="s3">(</span><span class="s5">'loop_lift_info'</span><span class="s3">,</span>
+                             <span class="s5">'loop,inputs,outputs,callfrom,returnto'</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_loop_lift_get_candidate_infos</span><span class="s3">(</span><span class="s1">cfg</span><span class="s3">, </span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">livemap</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Returns information on looplifting candidates. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">loops </span><span class="s3">= </span><span class="s1">_extract_loop_lifting_candidates</span><span class="s3">(</span><span class="s1">cfg</span><span class="s3">, </span><span class="s1">blocks</span><span class="s3">)</span>
+    <span class="s1">loopinfos </span><span class="s3">= []</span>
+    <span class="s2">for </span><span class="s1">loop </span><span class="s2">in </span><span class="s1">loops</span><span class="s3">:</span>
+
+        <span class="s3">[</span><span class="s1">callfrom</span><span class="s3">] = </span><span class="s1">loop</span><span class="s3">.</span><span class="s1">entries   </span><span class="s4"># requirement checked earlier</span>
+        <span class="s1">an_exit </span><span class="s3">= </span><span class="s1">next</span><span class="s3">(</span><span class="s1">iter</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">.</span><span class="s1">exits</span><span class="s3">))  </span><span class="s4"># anyone of the exit block</span>
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">.</span><span class="s1">exits</span><span class="s3">) &gt; </span><span class="s6">1</span><span class="s3">:</span>
+            <span class="s4"># has multiple exits</span>
+            <span class="s3">[(</span><span class="s1">returnto</span><span class="s3">, </span><span class="s1">_</span><span class="s3">)] = </span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">successors</span><span class="s3">(</span><span class="s1">an_exit</span><span class="s3">)  </span><span class="s4"># requirement checked earlier</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s4"># does not have multiple exits</span>
+            <span class="s1">returnto </span><span class="s3">= </span><span class="s1">an_exit</span>
+
+        <span class="s1">local_block_ids </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">.</span><span class="s1">body</span><span class="s3">) | </span><span class="s1">set</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">.</span><span class="s1">entries</span><span class="s3">) | </span><span class="s1">set</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">.</span><span class="s1">exits</span><span class="s3">)</span>
+        <span class="s1">inputs</span><span class="s3">, </span><span class="s1">outputs </span><span class="s3">= </span><span class="s1">find_region_inout_vars</span><span class="s3">(</span>
+            <span class="s1">blocks</span><span class="s3">=</span><span class="s1">blocks</span><span class="s3">,</span>
+            <span class="s1">livemap</span><span class="s3">=</span><span class="s1">livemap</span><span class="s3">,</span>
+            <span class="s1">callfrom</span><span class="s3">=</span><span class="s1">callfrom</span><span class="s3">,</span>
+            <span class="s1">returnto</span><span class="s3">=</span><span class="s1">returnto</span><span class="s3">,</span>
+            <span class="s1">body_block_ids</span><span class="s3">=</span><span class="s1">local_block_ids</span><span class="s3">,</span>
+        <span class="s3">)</span>
+
+        <span class="s1">lli </span><span class="s3">= </span><span class="s1">_loop_lift_info</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">=</span><span class="s1">loop</span><span class="s3">, </span><span class="s1">inputs</span><span class="s3">=</span><span class="s1">inputs</span><span class="s3">, </span><span class="s1">outputs</span><span class="s3">=</span><span class="s1">outputs</span><span class="s3">,</span>
+                              <span class="s1">callfrom</span><span class="s3">=</span><span class="s1">callfrom</span><span class="s3">, </span><span class="s1">returnto</span><span class="s3">=</span><span class="s1">returnto</span><span class="s3">)</span>
+        <span class="s1">loopinfos</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">lli</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">loopinfos</span>
+
+
+<span class="s2">def </span><span class="s1">_loop_lift_modify_call_block</span><span class="s3">(</span><span class="s1">liftedloop</span><span class="s3">, </span><span class="s1">block</span><span class="s3">, </span><span class="s1">inputs</span><span class="s3">, </span><span class="s1">outputs</span><span class="s3">, </span><span class="s1">returnto</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Transform calling block from top-level function to call the lifted loop. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">scope </span><span class="s3">= </span><span class="s1">block</span><span class="s3">.</span><span class="s1">scope</span>
+    <span class="s1">loc </span><span class="s3">= </span><span class="s1">block</span><span class="s3">.</span><span class="s1">loc</span>
+    <span class="s1">blk </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Block</span><span class="s3">(</span><span class="s1">scope</span><span class="s3">=</span><span class="s1">scope</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">)</span>
+
+    <span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">fill_block_with_call</span><span class="s3">(</span>
+        <span class="s1">newblock</span><span class="s3">=</span><span class="s1">blk</span><span class="s3">,</span>
+        <span class="s1">callee</span><span class="s3">=</span><span class="s1">liftedloop</span><span class="s3">,</span>
+        <span class="s1">label_next</span><span class="s3">=</span><span class="s1">returnto</span><span class="s3">,</span>
+        <span class="s1">inputs</span><span class="s3">=</span><span class="s1">inputs</span><span class="s3">,</span>
+        <span class="s1">outputs</span><span class="s3">=</span><span class="s1">outputs</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">blk</span>
+
+
+<span class="s2">def </span><span class="s1">_loop_lift_prepare_loop_func</span><span class="s3">(</span><span class="s1">loopinfo</span><span class="s3">, </span><span class="s1">blocks</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Inplace transform loop blocks for use as lifted loop. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">entry_block </span><span class="s3">= </span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">loopinfo</span><span class="s3">.</span><span class="s1">callfrom</span><span class="s3">]</span>
+    <span class="s1">scope </span><span class="s3">= </span><span class="s1">entry_block</span><span class="s3">.</span><span class="s1">scope</span>
+    <span class="s1">loc </span><span class="s3">= </span><span class="s1">entry_block</span><span class="s3">.</span><span class="s1">loc</span>
+
+    <span class="s4"># Lowering assumes the first block to be the one with the smallest offset</span>
+    <span class="s1">firstblk </span><span class="s3">= </span><span class="s1">min</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">) - </span><span class="s6">1</span>
+    <span class="s1">blocks</span><span class="s3">[</span><span class="s1">firstblk</span><span class="s3">] = </span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">fill_callee_prologue</span><span class="s3">(</span>
+        <span class="s1">block</span><span class="s3">=</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Block</span><span class="s3">(</span><span class="s1">scope</span><span class="s3">=</span><span class="s1">scope</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">),</span>
+        <span class="s1">inputs</span><span class="s3">=</span><span class="s1">loopinfo</span><span class="s3">.</span><span class="s1">inputs</span><span class="s3">,</span>
+        <span class="s1">label_next</span><span class="s3">=</span><span class="s1">loopinfo</span><span class="s3">.</span><span class="s1">callfrom</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">blocks</span><span class="s3">[</span><span class="s1">loopinfo</span><span class="s3">.</span><span class="s1">returnto</span><span class="s3">] = </span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">fill_callee_epilogue</span><span class="s3">(</span>
+        <span class="s1">block</span><span class="s3">=</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Block</span><span class="s3">(</span><span class="s1">scope</span><span class="s3">=</span><span class="s1">scope</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">),</span>
+        <span class="s1">outputs</span><span class="s3">=</span><span class="s1">loopinfo</span><span class="s3">.</span><span class="s1">outputs</span><span class="s3">,</span>
+    <span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_loop_lift_modify_blocks</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">loopinfo</span><span class="s3">, </span><span class="s1">blocks</span><span class="s3">,</span>
+                             <span class="s1">typingctx</span><span class="s3">, </span><span class="s1">targetctx</span><span class="s3">, </span><span class="s1">flags</span><span class="s3">, </span><span class="s1">locals</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Modify the block inplace to call to the lifted-loop. 
+    Returns a dictionary of blocks of the lifted-loop. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">dispatcher </span><span class="s2">import </span><span class="s1">LiftedLoop</span>
+
+    <span class="s4"># Copy loop blocks</span>
+    <span class="s1">loop </span><span class="s3">= </span><span class="s1">loopinfo</span><span class="s3">.</span><span class="s1">loop</span>
+
+    <span class="s1">loopblockkeys </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">.</span><span class="s1">body</span><span class="s3">) | </span><span class="s1">set</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">.</span><span class="s1">entries</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">.</span><span class="s1">exits</span><span class="s3">) &gt; </span><span class="s6">1</span><span class="s3">:</span>
+        <span class="s4"># has multiple exits</span>
+        <span class="s1">loopblockkeys </span><span class="s3">|= </span><span class="s1">loop</span><span class="s3">.</span><span class="s1">exits</span>
+    <span class="s1">loopblocks </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">((</span><span class="s1">k</span><span class="s3">, </span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">k</span><span class="s3">].</span><span class="s1">copy</span><span class="s3">()) </span><span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">loopblockkeys</span><span class="s3">)</span>
+    <span class="s4"># Modify the loop blocks</span>
+    <span class="s1">_loop_lift_prepare_loop_func</span><span class="s3">(</span><span class="s1">loopinfo</span><span class="s3">, </span><span class="s1">loopblocks</span><span class="s3">)</span>
+
+    <span class="s4"># Create a new IR for the lifted loop</span>
+    <span class="s1">lifted_ir </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">derive</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">=</span><span class="s1">loopblocks</span><span class="s3">,</span>
+                               <span class="s1">arg_names</span><span class="s3">=</span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">loopinfo</span><span class="s3">.</span><span class="s1">inputs</span><span class="s3">),</span>
+                               <span class="s1">arg_count</span><span class="s3">=</span><span class="s1">len</span><span class="s3">(</span><span class="s1">loopinfo</span><span class="s3">.</span><span class="s1">inputs</span><span class="s3">),</span>
+                               <span class="s1">force_non_generator</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+    <span class="s1">liftedloop </span><span class="s3">= </span><span class="s1">LiftedLoop</span><span class="s3">(</span><span class="s1">lifted_ir</span><span class="s3">,</span>
+                            <span class="s1">typingctx</span><span class="s3">, </span><span class="s1">targetctx</span><span class="s3">, </span><span class="s1">flags</span><span class="s3">, </span><span class="s1">locals</span><span class="s3">)</span>
+
+    <span class="s4"># modify for calling into liftedloop</span>
+    <span class="s1">callblock </span><span class="s3">= </span><span class="s1">_loop_lift_modify_call_block</span><span class="s3">(</span><span class="s1">liftedloop</span><span class="s3">, </span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">loopinfo</span><span class="s3">.</span><span class="s1">callfrom</span><span class="s3">],</span>
+                                             <span class="s1">loopinfo</span><span class="s3">.</span><span class="s1">inputs</span><span class="s3">, </span><span class="s1">loopinfo</span><span class="s3">.</span><span class="s1">outputs</span><span class="s3">,</span>
+                                             <span class="s1">loopinfo</span><span class="s3">.</span><span class="s1">returnto</span><span class="s3">)</span>
+    <span class="s4"># remove blocks</span>
+    <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">loopblockkeys</span><span class="s3">:</span>
+        <span class="s2">del </span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">k</span><span class="s3">]</span>
+    <span class="s4"># update main interpreter callsite into the liftedloop</span>
+    <span class="s1">blocks</span><span class="s3">[</span><span class="s1">loopinfo</span><span class="s3">.</span><span class="s1">callfrom</span><span class="s3">] = </span><span class="s1">callblock</span>
+    <span class="s2">return </span><span class="s1">liftedloop</span>
+
+
+<span class="s2">def </span><span class="s1">_has_multiple_loop_exits</span><span class="s3">(</span><span class="s1">cfg</span><span class="s3">, </span><span class="s1">lpinfo</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Returns True if there is more than one exit in the loop. 
+ 
+    NOTE: &quot;common exits&quot; refers to the situation where a loop exit has another 
+    loop exit as its successor. In that case, we do not need to alter it. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">lpinfo</span><span class="s3">.</span><span class="s1">exits</span><span class="s3">) &lt;= </span><span class="s6">1</span><span class="s3">:</span>
+        <span class="s2">return False</span>
+    <span class="s1">exits </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">lpinfo</span><span class="s3">.</span><span class="s1">exits</span><span class="s3">)</span>
+    <span class="s1">pdom </span><span class="s3">= </span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">post_dominators</span><span class="s3">()</span>
+
+    <span class="s4"># Eliminate blocks that have other blocks as post-dominators.</span>
+    <span class="s1">processed </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+    <span class="s1">remain </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">exits</span><span class="s3">) </span><span class="s4"># create a copy to work on</span>
+    <span class="s2">while </span><span class="s1">remain</span><span class="s3">:</span>
+        <span class="s1">node </span><span class="s3">= </span><span class="s1">remain</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">()</span>
+        <span class="s1">processed</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">node</span><span class="s3">)</span>
+        <span class="s1">exits </span><span class="s3">-= </span><span class="s1">pdom</span><span class="s3">[</span><span class="s1">node</span><span class="s3">] - {</span><span class="s1">node</span><span class="s3">}</span>
+        <span class="s1">remain </span><span class="s3">= </span><span class="s1">exits </span><span class="s3">- </span><span class="s1">processed</span>
+
+    <span class="s2">return </span><span class="s1">len</span><span class="s3">(</span><span class="s1">exits</span><span class="s3">) &gt; </span><span class="s6">1</span>
+
+
+<span class="s2">def </span><span class="s1">_pre_looplift_transform</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Canonicalize loops for looplifting. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">postproc </span><span class="s2">import </span><span class="s1">PostProcessor</span>
+
+    <span class="s1">cfg </span><span class="s3">= </span><span class="s1">compute_cfg_from_blocks</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">)</span>
+    <span class="s4"># For every loop that has multiple exits, combine the exits into one.</span>
+    <span class="s2">for </span><span class="s1">loop_info </span><span class="s2">in </span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">loops</span><span class="s3">().</span><span class="s1">values</span><span class="s3">():</span>
+        <span class="s2">if </span><span class="s1">_has_multiple_loop_exits</span><span class="s3">(</span><span class="s1">cfg</span><span class="s3">, </span><span class="s1">loop_info</span><span class="s3">):</span>
+            <span class="s1">func_ir</span><span class="s3">, </span><span class="s1">_common_key </span><span class="s3">= </span><span class="s1">_fix_multi_exit_blocks</span><span class="s3">(</span>
+                <span class="s1">func_ir</span><span class="s3">, </span><span class="s1">loop_info</span><span class="s3">.</span><span class="s1">exits</span>
+            <span class="s3">)</span>
+    <span class="s4"># Reset and reprocess the func_ir</span>
+    <span class="s1">func_ir</span><span class="s3">.</span><span class="s1">_reset_analysis_variables</span><span class="s3">()</span>
+    <span class="s1">PostProcessor</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">).</span><span class="s1">run</span><span class="s3">()</span>
+    <span class="s2">return </span><span class="s1">func_ir</span>
+
+
+<span class="s2">def </span><span class="s1">loop_lifting</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">typingctx</span><span class="s3">, </span><span class="s1">targetctx</span><span class="s3">, </span><span class="s1">flags</span><span class="s3">, </span><span class="s1">locals</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Loop lifting transformation. 
+ 
+    Given a interpreter `func_ir` returns a 2 tuple of 
+    `(toplevel_interp, [loop0_interp, loop1_interp, ....])` 
+    &quot;&quot;&quot;</span>
+    <span class="s1">func_ir </span><span class="s3">= </span><span class="s1">_pre_looplift_transform</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">)</span>
+    <span class="s1">blocks </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+    <span class="s1">cfg </span><span class="s3">= </span><span class="s1">compute_cfg_from_blocks</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">)</span>
+    <span class="s1">loopinfos </span><span class="s3">= </span><span class="s1">_loop_lift_get_candidate_infos</span><span class="s3">(</span><span class="s1">cfg</span><span class="s3">, </span><span class="s1">blocks</span><span class="s3">,</span>
+                                               <span class="s1">func_ir</span><span class="s3">.</span><span class="s1">variable_lifetime</span><span class="s3">.</span><span class="s1">livemap</span><span class="s3">)</span>
+    <span class="s1">loops </span><span class="s3">= []</span>
+    <span class="s2">if </span><span class="s1">loopinfos</span><span class="s3">:</span>
+        <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">'loop lifting this IR with %d candidates:</span><span class="s2">\n</span><span class="s5">%s'</span><span class="s3">,</span>
+                      <span class="s1">len</span><span class="s3">(</span><span class="s1">loopinfos</span><span class="s3">), </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">dump_to_string</span><span class="s3">())</span>
+    <span class="s2">for </span><span class="s1">loopinfo </span><span class="s2">in </span><span class="s1">loopinfos</span><span class="s3">:</span>
+        <span class="s1">lifted </span><span class="s3">= </span><span class="s1">_loop_lift_modify_blocks</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">loopinfo</span><span class="s3">, </span><span class="s1">blocks</span><span class="s3">,</span>
+                                          <span class="s1">typingctx</span><span class="s3">, </span><span class="s1">targetctx</span><span class="s3">, </span><span class="s1">flags</span><span class="s3">, </span><span class="s1">locals</span><span class="s3">)</span>
+        <span class="s1">loops</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">lifted</span><span class="s3">)</span>
+
+    <span class="s4"># Make main IR</span>
+    <span class="s1">main </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">derive</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">=</span><span class="s1">blocks</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">main</span><span class="s3">, </span><span class="s1">loops</span>
+
+
+<span class="s2">def </span><span class="s1">canonicalize_cfg_single_backedge</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Rewrite loops that have multiple backedges. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">cfg </span><span class="s3">= </span><span class="s1">compute_cfg_from_blocks</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">)</span>
+    <span class="s1">newblocks </span><span class="s3">= </span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">new_block_id</span><span class="s3">():</span>
+        <span class="s2">return </span><span class="s1">max</span><span class="s3">(</span><span class="s1">newblocks</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">()) + </span><span class="s6">1</span>
+
+    <span class="s2">def </span><span class="s1">has_multiple_backedges</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">):</span>
+        <span class="s1">count </span><span class="s3">= </span><span class="s6">0</span>
+        <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">loop</span><span class="s3">.</span><span class="s1">body</span><span class="s3">:</span>
+            <span class="s1">blk </span><span class="s3">= </span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">k</span><span class="s3">]</span>
+            <span class="s1">edges </span><span class="s3">= </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">terminator</span><span class="s3">.</span><span class="s1">get_targets</span><span class="s3">()</span>
+            <span class="s4"># is a backedge?</span>
+            <span class="s2">if </span><span class="s1">loop</span><span class="s3">.</span><span class="s1">header </span><span class="s2">in </span><span class="s1">edges</span><span class="s3">:</span>
+                <span class="s1">count </span><span class="s3">+= </span><span class="s6">1</span>
+                <span class="s2">if </span><span class="s1">count </span><span class="s3">&gt; </span><span class="s6">1</span><span class="s3">:</span>
+                    <span class="s4"># early exit</span>
+                    <span class="s2">return True</span>
+        <span class="s2">return False</span>
+
+    <span class="s2">def </span><span class="s1">yield_loops_with_multiple_backedges</span><span class="s3">():</span>
+        <span class="s2">for </span><span class="s1">lp </span><span class="s2">in </span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">loops</span><span class="s3">().</span><span class="s1">values</span><span class="s3">():</span>
+            <span class="s2">if </span><span class="s1">has_multiple_backedges</span><span class="s3">(</span><span class="s1">lp</span><span class="s3">):</span>
+                <span class="s2">yield </span><span class="s1">lp</span>
+
+    <span class="s2">def </span><span class="s1">replace_target</span><span class="s3">(</span><span class="s1">term</span><span class="s3">, </span><span class="s1">src</span><span class="s3">, </span><span class="s1">dst</span><span class="s3">):</span>
+        <span class="s2">def </span><span class="s1">replace</span><span class="s3">(</span><span class="s1">target</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s3">(</span><span class="s1">dst </span><span class="s2">if </span><span class="s1">target </span><span class="s3">== </span><span class="s1">src </span><span class="s2">else </span><span class="s1">target</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">term</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Branch</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Branch</span><span class="s3">(</span><span class="s1">cond</span><span class="s3">=</span><span class="s1">term</span><span class="s3">.</span><span class="s1">cond</span><span class="s3">,</span>
+                             <span class="s1">truebr</span><span class="s3">=</span><span class="s1">replace</span><span class="s3">(</span><span class="s1">term</span><span class="s3">.</span><span class="s1">truebr</span><span class="s3">),</span>
+                             <span class="s1">falsebr</span><span class="s3">=</span><span class="s1">replace</span><span class="s3">(</span><span class="s1">term</span><span class="s3">.</span><span class="s1">falsebr</span><span class="s3">),</span>
+                             <span class="s1">loc</span><span class="s3">=</span><span class="s1">term</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">term</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Jump</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Jump</span><span class="s3">(</span><span class="s1">target</span><span class="s3">=</span><span class="s1">replace</span><span class="s3">(</span><span class="s1">term</span><span class="s3">.</span><span class="s1">target</span><span class="s3">), </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">term</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">assert not </span><span class="s1">term</span><span class="s3">.</span><span class="s1">get_targets</span><span class="s3">()</span>
+            <span class="s2">return </span><span class="s1">term</span>
+
+    <span class="s2">def </span><span class="s1">rewrite_single_backedge</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Add new tail block that gathers all the backedges 
+        &quot;&quot;&quot;</span>
+        <span class="s1">header </span><span class="s3">= </span><span class="s1">loop</span><span class="s3">.</span><span class="s1">header</span>
+        <span class="s1">tailkey </span><span class="s3">= </span><span class="s1">new_block_id</span><span class="s3">()</span>
+        <span class="s2">for </span><span class="s1">blkkey </span><span class="s2">in </span><span class="s1">loop</span><span class="s3">.</span><span class="s1">body</span><span class="s3">:</span>
+            <span class="s1">blk </span><span class="s3">= </span><span class="s1">newblocks</span><span class="s3">[</span><span class="s1">blkkey</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">header </span><span class="s2">in </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">terminator</span><span class="s3">.</span><span class="s1">get_targets</span><span class="s3">():</span>
+                <span class="s1">newblk </span><span class="s3">= </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+                <span class="s4"># rewrite backedge into jumps to new tail block</span>
+                <span class="s1">newblk</span><span class="s3">.</span><span class="s1">body</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">] = </span><span class="s1">replace_target</span><span class="s3">(</span><span class="s1">blk</span><span class="s3">.</span><span class="s1">terminator</span><span class="s3">, </span><span class="s1">header</span><span class="s3">,</span>
+                                                 <span class="s1">tailkey</span><span class="s3">)</span>
+                <span class="s1">newblocks</span><span class="s3">[</span><span class="s1">blkkey</span><span class="s3">] = </span><span class="s1">newblk</span>
+        <span class="s4"># create new tail block</span>
+        <span class="s1">entryblk </span><span class="s3">= </span><span class="s1">newblocks</span><span class="s3">[</span><span class="s1">header</span><span class="s3">]</span>
+        <span class="s1">tailblk </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Block</span><span class="s3">(</span><span class="s1">scope</span><span class="s3">=</span><span class="s1">entryblk</span><span class="s3">.</span><span class="s1">scope</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">entryblk</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">)</span>
+        <span class="s4"># add backedge</span>
+        <span class="s1">tailblk</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Jump</span><span class="s3">(</span><span class="s1">target</span><span class="s3">=</span><span class="s1">header</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">tailblk</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">))</span>
+        <span class="s1">newblocks</span><span class="s3">[</span><span class="s1">tailkey</span><span class="s3">] = </span><span class="s1">tailblk</span>
+
+    <span class="s2">for </span><span class="s1">loop </span><span class="s2">in </span><span class="s1">yield_loops_with_multiple_backedges</span><span class="s3">():</span>
+        <span class="s1">rewrite_single_backedge</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">newblocks</span>
+
+
+<span class="s2">def </span><span class="s1">canonicalize_cfg</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Rewrite the given blocks to canonicalize the CFG. 
+    Returns a new dictionary of blocks. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">canonicalize_cfg_single_backedge</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">with_lifting</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">typingctx</span><span class="s3">, </span><span class="s1">targetctx</span><span class="s3">, </span><span class="s1">flags</span><span class="s3">, </span><span class="s1">locals</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;With-lifting transformation 
+ 
+    Rewrite the IR to extract all withs. 
+    Only the top-level withs are extracted. 
+    Returns the (the_new_ir, the_lifted_with_ir) 
+    &quot;&quot;&quot;</span>
+    <span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">postproc</span>
+
+    <span class="s2">def </span><span class="s1">dispatcher_factory</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">objectmode</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">):</span>
+        <span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">dispatcher </span><span class="s2">import </span><span class="s1">LiftedWith</span><span class="s3">, </span><span class="s1">ObjModeLiftedWith</span>
+
+        <span class="s1">myflags </span><span class="s3">= </span><span class="s1">flags</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">objectmode</span><span class="s3">:</span>
+            <span class="s4"># Lifted with-block cannot looplift</span>
+            <span class="s1">myflags</span><span class="s3">.</span><span class="s1">enable_looplift </span><span class="s3">= </span><span class="s2">False</span>
+            <span class="s4"># Lifted with-block uses object mode</span>
+            <span class="s1">myflags</span><span class="s3">.</span><span class="s1">enable_pyobject </span><span class="s3">= </span><span class="s2">True</span>
+            <span class="s1">myflags</span><span class="s3">.</span><span class="s1">force_pyobject </span><span class="s3">= </span><span class="s2">True</span>
+            <span class="s1">myflags</span><span class="s3">.</span><span class="s1">no_cpython_wrapper </span><span class="s3">= </span><span class="s2">False</span>
+            <span class="s1">cls </span><span class="s3">= </span><span class="s1">ObjModeLiftedWith</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">cls </span><span class="s3">= </span><span class="s1">LiftedWith</span>
+        <span class="s2">return </span><span class="s1">cls</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">typingctx</span><span class="s3">, </span><span class="s1">targetctx</span><span class="s3">, </span><span class="s1">myflags</span><span class="s3">, </span><span class="s1">locals</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">)</span>
+
+    <span class="s4"># find where with-contexts regions are</span>
+    <span class="s1">withs</span><span class="s3">, </span><span class="s1">func_ir </span><span class="s3">= </span><span class="s1">find_setupwiths</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">)</span>
+
+    <span class="s2">if not </span><span class="s1">withs</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">func_ir</span><span class="s3">, []</span>
+
+    <span class="s1">postproc</span><span class="s3">.</span><span class="s1">PostProcessor</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">).</span><span class="s1">run</span><span class="s3">()  </span><span class="s4"># ensure we have variable lifetime</span>
+    <span class="s2">assert </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">variable_lifetime</span>
+    <span class="s1">vlt </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">variable_lifetime</span>
+    <span class="s1">blocks </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+    <span class="s1">cfg </span><span class="s3">= </span><span class="s1">vlt</span><span class="s3">.</span><span class="s1">cfg</span>
+    <span class="s4"># For each with-regions, mutate them according to</span>
+    <span class="s4"># the kind of contextmanager</span>
+    <span class="s1">sub_irs </span><span class="s3">= []</span>
+    <span class="s2">for </span><span class="s3">(</span><span class="s1">blk_start</span><span class="s3">, </span><span class="s1">blk_end</span><span class="s3">) </span><span class="s2">in </span><span class="s1">withs</span><span class="s3">:</span>
+        <span class="s1">body_blocks </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">node </span><span class="s2">in </span><span class="s1">_cfg_nodes_in_region</span><span class="s3">(</span><span class="s1">cfg</span><span class="s3">, </span><span class="s1">blk_start</span><span class="s3">, </span><span class="s1">blk_end</span><span class="s3">):</span>
+            <span class="s1">body_blocks</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">node</span><span class="s3">)</span>
+        <span class="s1">_legalize_with_head</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">blk_start</span><span class="s3">])</span>
+        <span class="s4"># Find the contextmanager</span>
+        <span class="s1">cmkind</span><span class="s3">, </span><span class="s1">extra </span><span class="s3">= </span><span class="s1">_get_with_contextmanager</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">blk_start</span><span class="s3">)</span>
+        <span class="s4"># Mutate the body and get new IR</span>
+        <span class="s1">sub </span><span class="s3">= </span><span class="s1">cmkind</span><span class="s3">.</span><span class="s1">mutate_with_body</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">blk_start</span><span class="s3">, </span><span class="s1">blk_end</span><span class="s3">,</span>
+                                      <span class="s1">body_blocks</span><span class="s3">, </span><span class="s1">dispatcher_factory</span><span class="s3">,</span>
+                                      <span class="s1">extra</span><span class="s3">)</span>
+        <span class="s1">sub_irs</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">sub</span><span class="s3">)</span>
+    <span class="s2">if not </span><span class="s1">sub_irs</span><span class="s3">:</span>
+        <span class="s4"># Unchanged</span>
+        <span class="s1">new_ir </span><span class="s3">= </span><span class="s1">func_ir</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">new_ir </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">derive</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">new_ir</span><span class="s3">, </span><span class="s1">sub_irs</span>
+
+
+<span class="s2">def </span><span class="s1">_get_with_contextmanager</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">blk_start</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Get the global object used for the context manager 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_illegal_cm_msg </span><span class="s3">= </span><span class="s5">&quot;Illegal use of context-manager.&quot;</span>
+
+    <span class="s2">def </span><span class="s1">get_var_dfn</span><span class="s3">(</span><span class="s1">var</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Get the definition given a variable&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">get_definition</span><span class="s3">(</span><span class="s1">var</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">get_ctxmgr_obj</span><span class="s3">(</span><span class="s1">var_ref</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Return the context-manager object and extra info. 
+ 
+        The extra contains the arguments if the context-manager is used 
+        as a call. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># If the contextmanager used as a Call</span>
+        <span class="s1">dfn </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">get_definition</span><span class="s3">(</span><span class="s1">var_ref</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">dfn</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Expr</span><span class="s3">) </span><span class="s2">and </span><span class="s1">dfn</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'call'</span><span class="s3">:</span>
+            <span class="s1">args </span><span class="s3">= [</span><span class="s1">get_var_dfn</span><span class="s3">(</span><span class="s1">x</span><span class="s3">) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">dfn</span><span class="s3">.</span><span class="s1">args</span><span class="s3">]</span>
+            <span class="s1">kws </span><span class="s3">= {</span><span class="s1">k</span><span class="s3">: </span><span class="s1">get_var_dfn</span><span class="s3">(</span><span class="s1">v</span><span class="s3">) </span><span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">dfn</span><span class="s3">.</span><span class="s1">kws</span><span class="s3">}</span>
+            <span class="s1">extra </span><span class="s3">= {</span><span class="s5">'args'</span><span class="s3">: </span><span class="s1">args</span><span class="s3">, </span><span class="s5">'kwargs'</span><span class="s3">: </span><span class="s1">kws</span><span class="s3">}</span>
+            <span class="s1">var_ref </span><span class="s3">= </span><span class="s1">dfn</span><span class="s3">.</span><span class="s1">func</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">extra </span><span class="s3">= </span><span class="s2">None</span>
+
+        <span class="s1">ctxobj </span><span class="s3">= </span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">guard</span><span class="s3">(</span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">find_outer_value</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">var_ref</span><span class="s3">)</span>
+
+        <span class="s4"># check the contextmanager object</span>
+        <span class="s2">if </span><span class="s1">ctxobj </span><span class="s2">is </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">UNDEFINED</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">errors</span><span class="s3">.</span><span class="s1">CompilerError</span><span class="s3">(</span>
+                <span class="s5">&quot;Undefined variable used as context manager&quot;</span><span class="s3">,</span>
+                <span class="s1">loc</span><span class="s3">=</span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">blk_start</span><span class="s3">].</span><span class="s1">loc</span><span class="s3">,</span>
+                <span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">ctxobj </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">errors</span><span class="s3">.</span><span class="s1">CompilerError</span><span class="s3">(</span><span class="s1">_illegal_cm_msg</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">dfn</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">)</span>
+
+        <span class="s2">return </span><span class="s1">ctxobj</span><span class="s3">, </span><span class="s1">extra</span>
+
+    <span class="s4"># Scan the start of the with-region for the contextmanager</span>
+    <span class="s2">for </span><span class="s1">stmt </span><span class="s2">in </span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">blk_start</span><span class="s3">].</span><span class="s1">body</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">EnterWith</span><span class="s3">):</span>
+            <span class="s1">var_ref </span><span class="s3">= </span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">contextmanager</span>
+            <span class="s1">ctxobj</span><span class="s3">, </span><span class="s1">extra </span><span class="s3">= </span><span class="s1">get_ctxmgr_obj</span><span class="s3">(</span><span class="s1">var_ref</span><span class="s3">)</span>
+            <span class="s2">if not </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">ctxobj</span><span class="s3">, </span><span class="s5">'mutate_with_body'</span><span class="s3">):</span>
+                <span class="s2">raise </span><span class="s1">errors</span><span class="s3">.</span><span class="s1">CompilerError</span><span class="s3">(</span>
+                    <span class="s5">&quot;Unsupported context manager in use&quot;</span><span class="s3">,</span>
+                    <span class="s1">loc</span><span class="s3">=</span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">blk_start</span><span class="s3">].</span><span class="s1">loc</span><span class="s3">,</span>
+                    <span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">ctxobj</span><span class="s3">, </span><span class="s1">extra</span>
+    <span class="s4"># No contextmanager found?</span>
+    <span class="s2">raise </span><span class="s1">errors</span><span class="s3">.</span><span class="s1">CompilerError</span><span class="s3">(</span>
+        <span class="s5">&quot;malformed with-context usage&quot;</span><span class="s3">,</span>
+        <span class="s1">loc</span><span class="s3">=</span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">blk_start</span><span class="s3">].</span><span class="s1">loc</span><span class="s3">,</span>
+        <span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_legalize_with_head</span><span class="s3">(</span><span class="s1">blk</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Given *blk*, the head block of the with-context, check that it doesn't 
+    do anything else. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">counters </span><span class="s3">= </span><span class="s1">defaultdict</span><span class="s3">(</span><span class="s1">int</span><span class="s3">)</span>
+    <span class="s2">for </span><span class="s1">stmt </span><span class="s2">in </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">body</span><span class="s3">:</span>
+        <span class="s1">counters</span><span class="s3">[</span><span class="s1">type</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">)] += </span><span class="s6">1</span>
+    <span class="s2">if </span><span class="s1">counters</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">EnterWith</span><span class="s3">) != </span><span class="s6">1</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">errors</span><span class="s3">.</span><span class="s1">CompilerError</span><span class="s3">(</span>
+            <span class="s5">&quot;with's head-block must have exactly 1 ENTER_WITH&quot;</span><span class="s3">,</span>
+            <span class="s1">loc</span><span class="s3">=</span><span class="s1">blk</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">,</span>
+            <span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">counters</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Jump</span><span class="s3">, </span><span class="s6">0</span><span class="s3">) != </span><span class="s6">1</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">errors</span><span class="s3">.</span><span class="s1">CompilerError</span><span class="s3">(</span>
+            <span class="s5">&quot;with's head-block must have exactly 1 JUMP&quot;</span><span class="s3">,</span>
+            <span class="s1">loc</span><span class="s3">=</span><span class="s1">blk</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">,</span>
+            <span class="s3">)</span>
+    <span class="s4"># Can have any number of del</span>
+    <span class="s1">counters</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Del</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+    <span class="s4"># There MUST NOT be any other statements</span>
+    <span class="s2">if </span><span class="s1">counters</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">errors</span><span class="s3">.</span><span class="s1">CompilerError</span><span class="s3">(</span>
+            <span class="s5">&quot;illegal statements in with's head-block&quot;</span><span class="s3">,</span>
+            <span class="s1">loc</span><span class="s3">=</span><span class="s1">blk</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">,</span>
+            <span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_cfg_nodes_in_region</span><span class="s3">(</span><span class="s1">cfg</span><span class="s3">, </span><span class="s1">region_begin</span><span class="s3">, </span><span class="s1">region_end</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Find the set of CFG nodes that are in the given region 
+    &quot;&quot;&quot;</span>
+    <span class="s1">region_nodes </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+    <span class="s1">stack </span><span class="s3">= [</span><span class="s1">region_begin</span><span class="s3">]</span>
+    <span class="s2">while </span><span class="s1">stack</span><span class="s3">:</span>
+        <span class="s1">tos </span><span class="s3">= </span><span class="s1">stack</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">()</span>
+        <span class="s1">succlist </span><span class="s3">= </span><span class="s1">list</span><span class="s3">(</span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">successors</span><span class="s3">(</span><span class="s1">tos</span><span class="s3">))</span>
+        <span class="s4"># a single block function will have a empty successor list</span>
+        <span class="s2">if </span><span class="s1">succlist</span><span class="s3">:</span>
+            <span class="s1">succs</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">= </span><span class="s1">zip</span><span class="s3">(*</span><span class="s1">succlist</span><span class="s3">)</span>
+            <span class="s1">nodes </span><span class="s3">= </span><span class="s1">set</span><span class="s3">([</span><span class="s1">node </span><span class="s2">for </span><span class="s1">node </span><span class="s2">in </span><span class="s1">succs</span>
+                        <span class="s2">if </span><span class="s1">node </span><span class="s2">not in </span><span class="s1">region_nodes </span><span class="s2">and</span>
+                        <span class="s1">node </span><span class="s3">!= </span><span class="s1">region_end</span><span class="s3">])</span>
+            <span class="s1">stack</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">(</span><span class="s1">nodes</span><span class="s3">)</span>
+            <span class="s1">region_nodes </span><span class="s3">|= </span><span class="s1">nodes</span>
+
+    <span class="s2">return </span><span class="s1">region_nodes</span>
+
+
+<span class="s2">def </span><span class="s1">find_setupwiths</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Find all top-level with. 
+ 
+    Returns a list of ranges for the with-regions. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">find_ranges</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">):</span>
+
+        <span class="s1">cfg </span><span class="s3">= </span><span class="s1">compute_cfg_from_blocks</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">)</span>
+        <span class="s1">sus_setups</span><span class="s3">, </span><span class="s1">sus_pops </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(), </span><span class="s1">set</span><span class="s3">()</span>
+        <span class="s4"># traverse the cfg and collect all suspected SETUP_WITH and POP_BLOCK</span>
+        <span class="s4"># statements so that we can iterate over them</span>
+        <span class="s2">for </span><span class="s1">label</span><span class="s3">, </span><span class="s1">block </span><span class="s2">in </span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+            <span class="s2">for </span><span class="s1">stmt </span><span class="s2">in </span><span class="s1">block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">is_setup_with</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">):</span>
+                    <span class="s1">sus_setups</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">label</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">is_pop_block</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">):</span>
+                    <span class="s1">sus_pops</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">label</span><span class="s3">)</span>
+
+        <span class="s4"># now that we do have the statements, iterate through them in reverse</span>
+        <span class="s4"># topo order and from each start looking for pop_blocks</span>
+        <span class="s1">setup_with_to_pop_blocks_map </span><span class="s3">= </span><span class="s1">defaultdict</span><span class="s3">(</span><span class="s1">set</span><span class="s3">)</span>
+        <span class="s2">for </span><span class="s1">setup_block </span><span class="s2">in </span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">topo_sort</span><span class="s3">(</span><span class="s1">sus_setups</span><span class="s3">, </span><span class="s1">reverse</span><span class="s3">=</span><span class="s2">True</span><span class="s3">):</span>
+            <span class="s4"># begin pop_block, search</span>
+            <span class="s1">to_visit</span><span class="s3">, </span><span class="s1">seen </span><span class="s3">= [], []</span>
+            <span class="s1">to_visit</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">setup_block</span><span class="s3">)</span>
+            <span class="s2">while </span><span class="s1">to_visit</span><span class="s3">:</span>
+                <span class="s4"># get whatever is next and record that we have seen it</span>
+                <span class="s1">block </span><span class="s3">= </span><span class="s1">to_visit</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">()</span>
+                <span class="s1">seen</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">block</span><span class="s3">)</span>
+                <span class="s4"># go through the body of the block, looking for statements</span>
+                <span class="s2">for </span><span class="s1">stmt </span><span class="s2">in </span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">block</span><span class="s3">].</span><span class="s1">body</span><span class="s3">:</span>
+                    <span class="s4"># raise detected before pop_block</span>
+                    <span class="s2">if </span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">is_raise</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">):</span>
+                            <span class="s2">raise </span><span class="s1">errors</span><span class="s3">.</span><span class="s1">CompilerError</span><span class="s3">(</span>
+                                <span class="s5">'unsupported control flow due to raise '</span>
+                                <span class="s5">'statements inside with block'</span>
+                                <span class="s3">)</span>
+                    <span class="s4"># if a pop_block, process it</span>
+                    <span class="s2">if </span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">is_pop_block</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">) </span><span class="s2">and </span><span class="s1">block </span><span class="s2">in </span><span class="s1">sus_pops</span><span class="s3">:</span>
+                        <span class="s4"># record the jump target of this block belonging to this setup</span>
+                        <span class="s1">setup_with_to_pop_blocks_map</span><span class="s3">[</span><span class="s1">setup_block</span><span class="s3">].</span><span class="s1">add</span><span class="s3">(</span><span class="s1">block</span><span class="s3">)</span>
+                        <span class="s4"># remove the block from blocks to be matched</span>
+                        <span class="s1">sus_pops</span><span class="s3">.</span><span class="s1">remove</span><span class="s3">(</span><span class="s1">block</span><span class="s3">)</span>
+                        <span class="s4"># stop looking, we have reached the frontier</span>
+                        <span class="s2">break</span>
+                    <span class="s4"># if we are still here, by the block terminator,</span>
+                    <span class="s4"># add all its targets to the to_visit stack, unless we</span>
+                    <span class="s4"># have seen them already</span>
+                    <span class="s2">if </span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">is_terminator</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">):</span>
+                        <span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">get_targets</span><span class="s3">():</span>
+                            <span class="s2">if </span><span class="s1">t </span><span class="s2">not in </span><span class="s1">seen</span><span class="s3">:</span>
+                                <span class="s1">to_visit</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">t</span><span class="s3">)</span>
+
+        <span class="s2">return </span><span class="s1">setup_with_to_pop_blocks_map</span>
+
+    <span class="s1">blocks </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span>
+    <span class="s4"># initial find, will return a dictionary, mapping indices of blocks</span>
+    <span class="s4"># containing SETUP_WITH statements to a set of indices of blocks containing</span>
+    <span class="s4"># POP_BLOCK statements</span>
+    <span class="s1">with_ranges_dict </span><span class="s3">= </span><span class="s1">find_ranges</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">)</span>
+    <span class="s4"># rewrite the CFG in case there are multiple POP_BLOCK statements for one</span>
+    <span class="s4"># with</span>
+    <span class="s1">func_ir </span><span class="s3">= </span><span class="s1">consolidate_multi_exit_withs</span><span class="s3">(</span><span class="s1">with_ranges_dict</span><span class="s3">, </span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">)</span>
+    <span class="s4"># here we need to turn the withs back into a list of tuples so that the</span>
+    <span class="s4"># rest of the code can cope</span>
+    <span class="s1">with_ranges_tuple </span><span class="s3">= [(</span><span class="s1">s</span><span class="s3">, </span><span class="s1">list</span><span class="s3">(</span><span class="s1">p</span><span class="s3">)[</span><span class="s6">0</span><span class="s3">])</span>
+             <span class="s2">for </span><span class="s3">(</span><span class="s1">s</span><span class="s3">, </span><span class="s1">p</span><span class="s3">) </span><span class="s2">in </span><span class="s1">with_ranges_dict</span><span class="s3">.</span><span class="s1">items</span><span class="s3">()]</span>
+
+    <span class="s4"># check for POP_BLOCKS with multiple outgoing edges and reject</span>
+    <span class="s2">for </span><span class="s3">(</span><span class="s1">_</span><span class="s3">, </span><span class="s1">p</span><span class="s3">) </span><span class="s2">in </span><span class="s1">with_ranges_tuple</span><span class="s3">:</span>
+        <span class="s1">targets </span><span class="s3">= </span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">p</span><span class="s3">].</span><span class="s1">terminator</span><span class="s3">.</span><span class="s1">get_targets</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">targets</span><span class="s3">) != </span><span class="s6">1</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">errors</span><span class="s3">.</span><span class="s1">CompilerError</span><span class="s3">(</span>
+                <span class="s5">&quot;unsupported control flow: with-context contains branches &quot;</span>
+                <span class="s5">&quot;(i.e. break/return/raise) that can leave the block &quot;</span>
+            <span class="s3">)</span>
+    <span class="s4"># now we check for returns inside with and reject them</span>
+    <span class="s2">for </span><span class="s3">(</span><span class="s1">_</span><span class="s3">, </span><span class="s1">p</span><span class="s3">) </span><span class="s2">in </span><span class="s1">with_ranges_tuple</span><span class="s3">:</span>
+        <span class="s1">target_block </span><span class="s3">= </span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">p</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">is_return</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">[</span>
+                <span class="s1">target_block</span><span class="s3">.</span><span class="s1">terminator</span><span class="s3">.</span><span class="s1">get_targets</span><span class="s3">()[</span><span class="s6">0</span><span class="s3">]].</span><span class="s1">terminator</span><span class="s3">):</span>
+            <span class="s1">_rewrite_return</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">p</span><span class="s3">)</span>
+
+    <span class="s4"># now we need to rewrite the tuple such that we have SETUP_WITH matching the</span>
+    <span class="s4"># successor of the block that contains the POP_BLOCK.</span>
+    <span class="s1">with_ranges_tuple </span><span class="s3">= [(</span><span class="s1">s</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">p</span><span class="s3">].</span><span class="s1">terminator</span><span class="s3">.</span><span class="s1">get_targets</span><span class="s3">()[</span><span class="s6">0</span><span class="s3">])</span>
+                         <span class="s2">for </span><span class="s3">(</span><span class="s1">s</span><span class="s3">, </span><span class="s1">p</span><span class="s3">) </span><span class="s2">in </span><span class="s1">with_ranges_tuple</span><span class="s3">]</span>
+
+    <span class="s4"># finally we check for nested with statements and reject them</span>
+    <span class="s1">with_ranges_tuple </span><span class="s3">= </span><span class="s1">_eliminate_nested_withs</span><span class="s3">(</span><span class="s1">with_ranges_tuple</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">with_ranges_tuple</span><span class="s3">, </span><span class="s1">func_ir</span>
+
+
+<span class="s2">def </span><span class="s1">_rewrite_return</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">target_block_label</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Rewrite a return block inside a with statement. 
+ 
+    Arguments 
+    --------- 
+ 
+    func_ir: Function IR 
+      the CFG to transform 
+    target_block_label: int 
+      the block index/label of the block containing the POP_BLOCK statement 
+ 
+ 
+    This implements a CFG transformation to insert a block between two other 
+    blocks. 
+ 
+    The input situation is: 
+ 
+    ┌───────────────┐ 
+    │   top         │ 
+    │   POP_BLOCK   │ 
+    │   bottom      │ 
+    └───────┬───────┘ 
+            │ 
+    ┌───────▼───────┐ 
+    │               │ 
+    │    RETURN     │ 
+    │               │ 
+    └───────────────┘ 
+ 
+    If such a pattern is detected in IR, it means there is a `return` statement 
+    within a `with` context. The basic idea is to rewrite the CFG as follows: 
+ 
+    ┌───────────────┐ 
+    │   top         │ 
+    │   POP_BLOCK   │ 
+    │               │ 
+    └───────┬───────┘ 
+            │ 
+    ┌───────▼───────┐ 
+    │               │ 
+    │     bottom    │ 
+    │               │ 
+    └───────┬───────┘ 
+            │ 
+    ┌───────▼───────┐ 
+    │               │ 
+    │    RETURN     │ 
+    │               │ 
+    └───────────────┘ 
+ 
+    We split the block that contains the `POP_BLOCK` statement into two blocks. 
+    Everything from the beginning of the block up to and including the 
+    `POP_BLOCK` statement is considered the 'top' and everything below is 
+    considered 'bottom'. Finally the jump statements are re-wired to make sure 
+    the CFG remains valid. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># the block itself from the index</span>
+    <span class="s1">target_block </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">target_block_label</span><span class="s3">]</span>
+    <span class="s4"># get the index of the block containing the return</span>
+    <span class="s1">target_block_successor_label </span><span class="s3">= </span><span class="s1">target_block</span><span class="s3">.</span><span class="s1">terminator</span><span class="s3">.</span><span class="s1">get_targets</span><span class="s3">()[</span><span class="s6">0</span><span class="s3">]</span>
+    <span class="s4"># the return block</span>
+    <span class="s1">target_block_successor </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">target_block_successor_label</span><span class="s3">]</span>
+
+    <span class="s4"># create the new return block with an appropriate label</span>
+    <span class="s1">max_label </span><span class="s3">= </span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">find_max_label</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">)</span>
+    <span class="s1">new_label </span><span class="s3">= </span><span class="s1">max_label </span><span class="s3">+ </span><span class="s6">1</span>
+    <span class="s4"># create the new return block</span>
+    <span class="s1">new_block_loc </span><span class="s3">= </span><span class="s1">target_block_successor</span><span class="s3">.</span><span class="s1">loc</span>
+    <span class="s1">new_block_scope </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Scope</span><span class="s3">(</span><span class="s2">None</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">new_block_loc</span><span class="s3">)</span>
+    <span class="s1">new_block </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Block</span><span class="s3">(</span><span class="s1">new_block_scope</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">new_block_loc</span><span class="s3">)</span>
+
+    <span class="s4"># Split the block containing the POP_BLOCK into top and bottom</span>
+    <span class="s4"># Block must be of the form:</span>
+    <span class="s4"># -----------------</span>
+    <span class="s4"># &lt;some stmts&gt;</span>
+    <span class="s4"># POP_BLOCK</span>
+    <span class="s4"># &lt;some more stmts&gt;</span>
+    <span class="s4"># JUMP</span>
+    <span class="s4"># -----------------</span>
+    <span class="s1">top_body</span><span class="s3">, </span><span class="s1">bottom_body </span><span class="s3">= [], []</span>
+    <span class="s1">pop_blocks </span><span class="s3">= [*</span><span class="s1">target_block</span><span class="s3">.</span><span class="s1">find_insts</span><span class="s3">(</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">PopBlock</span><span class="s3">)]</span>
+    <span class="s2">assert </span><span class="s1">len</span><span class="s3">(</span><span class="s1">pop_blocks</span><span class="s3">) == </span><span class="s6">1</span>
+    <span class="s2">assert </span><span class="s1">len</span><span class="s3">([*</span><span class="s1">target_block</span><span class="s3">.</span><span class="s1">find_insts</span><span class="s3">(</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Jump</span><span class="s3">)]) == </span><span class="s6">1</span>
+    <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">target_block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">], </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Jump</span><span class="s3">)</span>
+    <span class="s1">pb_marker </span><span class="s3">= </span><span class="s1">pop_blocks</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+    <span class="s1">pb_is </span><span class="s3">= </span><span class="s1">target_block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">.</span><span class="s1">index</span><span class="s3">(</span><span class="s1">pb_marker</span><span class="s3">)</span>
+    <span class="s1">top_body</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">(</span><span class="s1">target_block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">[:</span><span class="s1">pb_is</span><span class="s3">])</span>
+    <span class="s1">top_body</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Jump</span><span class="s3">(</span><span class="s1">target_block_successor_label</span><span class="s3">, </span><span class="s1">target_block</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">))</span>
+    <span class="s1">bottom_body</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">(</span><span class="s1">target_block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">[</span><span class="s1">pb_is</span><span class="s3">:-</span><span class="s6">1</span><span class="s3">])</span>
+    <span class="s1">bottom_body</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Jump</span><span class="s3">(</span><span class="s1">new_label</span><span class="s3">, </span><span class="s1">target_block</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">))</span>
+
+    <span class="s4"># get the contents of the return block</span>
+    <span class="s1">return_body </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">target_block_successor_label</span><span class="s3">].</span><span class="s1">body</span>
+    <span class="s4"># finally, re-assign all blocks</span>
+    <span class="s1">new_block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">(</span><span class="s1">return_body</span><span class="s3">)</span>
+    <span class="s1">target_block_successor</span><span class="s3">.</span><span class="s1">body</span><span class="s3">.</span><span class="s1">clear</span><span class="s3">()</span>
+    <span class="s1">target_block_successor</span><span class="s3">.</span><span class="s1">body</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">(</span><span class="s1">bottom_body</span><span class="s3">)</span>
+    <span class="s1">target_block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">.</span><span class="s1">clear</span><span class="s3">()</span>
+    <span class="s1">target_block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">(</span><span class="s1">top_body</span><span class="s3">)</span>
+
+    <span class="s4"># finally, append the new return block and rebuild the IR properties</span>
+    <span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">new_label</span><span class="s3">] = </span><span class="s1">new_block</span>
+    <span class="s1">func_ir</span><span class="s3">.</span><span class="s1">_definitions </span><span class="s3">= </span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">build_definitions</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">func_ir</span>
+
+
+<span class="s2">def </span><span class="s1">_eliminate_nested_withs</span><span class="s3">(</span><span class="s1">with_ranges</span><span class="s3">):</span>
+    <span class="s1">known_ranges </span><span class="s3">= []</span>
+    <span class="s2">def </span><span class="s1">within_known_range</span><span class="s3">(</span><span class="s1">start</span><span class="s3">, </span><span class="s1">end</span><span class="s3">, </span><span class="s1">known_ranges</span><span class="s3">):</span>
+        <span class="s2">for </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b </span><span class="s2">in </span><span class="s1">known_ranges</span><span class="s3">:</span>
+            <span class="s4"># FIXME: this should be a comparison in topological order, right</span>
+            <span class="s4"># now we are comparing the integers of the blocks, stuff probably</span>
+            <span class="s4"># works by accident.</span>
+            <span class="s2">if </span><span class="s1">start </span><span class="s3">&gt; </span><span class="s1">a </span><span class="s2">and </span><span class="s1">end </span><span class="s3">&lt; </span><span class="s1">b</span><span class="s3">:</span>
+                <span class="s2">return True</span>
+        <span class="s2">return False</span>
+
+    <span class="s2">for </span><span class="s1">s</span><span class="s3">, </span><span class="s1">e </span><span class="s2">in </span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">with_ranges</span><span class="s3">):</span>
+        <span class="s2">if not </span><span class="s1">within_known_range</span><span class="s3">(</span><span class="s1">s</span><span class="s3">, </span><span class="s1">e</span><span class="s3">, </span><span class="s1">known_ranges</span><span class="s3">):</span>
+            <span class="s1">known_ranges</span><span class="s3">.</span><span class="s1">append</span><span class="s3">((</span><span class="s1">s</span><span class="s3">, </span><span class="s1">e</span><span class="s3">))</span>
+
+    <span class="s2">return </span><span class="s1">known_ranges</span>
+
+<span class="s2">def </span><span class="s1">consolidate_multi_exit_withs</span><span class="s3">(</span><span class="s1">withs</span><span class="s3">: </span><span class="s1">dict</span><span class="s3">, </span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Modify the FunctionIR to merge the exit blocks of with constructs. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">withs</span><span class="s3">:</span>
+        <span class="s1">vs </span><span class="s3">: </span><span class="s1">set </span><span class="s3">= </span><span class="s1">withs</span><span class="s3">[</span><span class="s1">k</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">vs</span><span class="s3">) &gt; </span><span class="s6">1</span><span class="s3">:</span>
+            <span class="s1">func_ir</span><span class="s3">, </span><span class="s1">common </span><span class="s3">= </span><span class="s1">_fix_multi_exit_blocks</span><span class="s3">(</span>
+                <span class="s1">func_ir</span><span class="s3">, </span><span class="s1">vs</span><span class="s3">, </span><span class="s1">split_condition</span><span class="s3">=</span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">is_pop_block</span><span class="s3">,</span>
+            <span class="s3">)</span>
+            <span class="s1">withs</span><span class="s3">[</span><span class="s1">k</span><span class="s3">] = {</span><span class="s1">common</span><span class="s3">}</span>
+    <span class="s2">return </span><span class="s1">func_ir</span>
+
+
+<span class="s2">def </span><span class="s1">_fix_multi_exit_blocks</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">exit_nodes</span><span class="s3">, *, </span><span class="s1">split_condition</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Modify the FunctionIR to create a single common exit node given the 
+    original exit nodes. 
+ 
+    Parameters 
+    ---------- 
+    func_ir : 
+        The FunctionIR. Mutated inplace. 
+    exit_nodes : 
+        The original exit nodes. A sequence of block keys. 
+    split_condition : callable or None 
+        If not None, it is a callable with the signature 
+        `split_condition(statement)` that determines if the `statement` is the 
+        splitting point (e.g. `POP_BLOCK`) in an exit node. 
+        If it's None, the exit node is not split. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s4"># Convert the following:</span>
+    <span class="s4">#</span>
+    <span class="s4">#     |           |</span>
+    <span class="s4"># +-------+   +-------+</span>
+    <span class="s4"># | exit0 |   | exit1 |</span>
+    <span class="s4"># +-------+   +-------+</span>
+    <span class="s4">#     |           |</span>
+    <span class="s4"># +-------+   +-------+</span>
+    <span class="s4"># | after0|   | after1|</span>
+    <span class="s4"># +-------+   +-------+</span>
+    <span class="s4">#     |           |</span>
+    <span class="s4">#</span>
+    <span class="s4"># To roughly:</span>
+    <span class="s4">#</span>
+    <span class="s4">#     |           |</span>
+    <span class="s4"># +-------+   +-------+</span>
+    <span class="s4"># | exit0 |   | exit1 |</span>
+    <span class="s4"># +-------+   +-------+</span>
+    <span class="s4">#     |           |</span>
+    <span class="s4">#     +-----+-----+</span>
+    <span class="s4">#           |</span>
+    <span class="s4">#      +---------+</span>
+    <span class="s4">#      | common  |</span>
+    <span class="s4">#      +---------+</span>
+    <span class="s4">#           |</span>
+    <span class="s4">#       +-------+</span>
+    <span class="s4">#       | post  |</span>
+    <span class="s4">#       +-------+</span>
+    <span class="s4">#           |</span>
+    <span class="s4">#     +-----+-----+</span>
+    <span class="s4">#     |           |</span>
+    <span class="s4"># +-------+   +-------+</span>
+    <span class="s4"># | after0|   | after1|</span>
+    <span class="s4"># +-------+   +-------+</span>
+
+    <span class="s1">blocks </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span>
+    <span class="s4"># Getting the scope</span>
+    <span class="s1">any_blk </span><span class="s3">= </span><span class="s1">min</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">values</span><span class="s3">())</span>
+    <span class="s1">scope </span><span class="s3">= </span><span class="s1">any_blk</span><span class="s3">.</span><span class="s1">scope</span>
+    <span class="s4"># Getting the maximum block label</span>
+    <span class="s1">max_label </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">) + </span><span class="s6">1</span>
+    <span class="s4"># Define the new common block for the new exit.</span>
+    <span class="s1">common_block </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Block</span><span class="s3">(</span><span class="s1">any_blk</span><span class="s3">.</span><span class="s1">scope</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">unknown_loc</span><span class="s3">)</span>
+    <span class="s1">common_label </span><span class="s3">= </span><span class="s1">max_label</span>
+    <span class="s1">max_label </span><span class="s3">+= </span><span class="s6">1</span>
+    <span class="s1">blocks</span><span class="s3">[</span><span class="s1">common_label</span><span class="s3">] = </span><span class="s1">common_block</span>
+    <span class="s4"># Define the new block after the exit.</span>
+    <span class="s1">post_block </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Block</span><span class="s3">(</span><span class="s1">any_blk</span><span class="s3">.</span><span class="s1">scope</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">unknown_loc</span><span class="s3">)</span>
+    <span class="s1">post_label </span><span class="s3">= </span><span class="s1">max_label</span>
+    <span class="s1">max_label </span><span class="s3">+= </span><span class="s6">1</span>
+    <span class="s1">blocks</span><span class="s3">[</span><span class="s1">post_label</span><span class="s3">] = </span><span class="s1">post_block</span>
+
+    <span class="s4"># Adjust each exit node</span>
+    <span class="s1">remainings </span><span class="s3">= []</span>
+    <span class="s2">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">k </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">exit_nodes</span><span class="s3">):</span>
+        <span class="s1">blk </span><span class="s3">= </span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">k</span><span class="s3">]</span>
+
+        <span class="s4"># split the block if needed</span>
+        <span class="s2">if </span><span class="s1">split_condition </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">pt</span><span class="s3">, </span><span class="s1">stmt </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">blk</span><span class="s3">.</span><span class="s1">body</span><span class="s3">):</span>
+                <span class="s2">if </span><span class="s1">split_condition</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">):</span>
+                    <span class="s2">break</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s4"># no splitting</span>
+            <span class="s1">pt </span><span class="s3">= -</span><span class="s6">1</span>
+
+        <span class="s1">before </span><span class="s3">= </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">body</span><span class="s3">[:</span><span class="s1">pt</span><span class="s3">]</span>
+        <span class="s1">after </span><span class="s3">= </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">body</span><span class="s3">[</span><span class="s1">pt</span><span class="s3">:]</span>
+        <span class="s1">remainings</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">after</span><span class="s3">)</span>
+
+        <span class="s4"># Add control-point variable to mark which exit block this is.</span>
+        <span class="s1">blk</span><span class="s3">.</span><span class="s1">body </span><span class="s3">= </span><span class="s1">before</span>
+        <span class="s1">loc </span><span class="s3">= </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">loc</span>
+        <span class="s1">blk</span><span class="s3">.</span><span class="s1">body</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span>
+            <span class="s1">ir</span><span class="s3">.</span><span class="s1">Assign</span><span class="s3">(</span><span class="s1">value</span><span class="s3">=</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Const</span><span class="s3">(</span><span class="s1">i</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">),</span>
+                      <span class="s1">target</span><span class="s3">=</span><span class="s1">scope</span><span class="s3">.</span><span class="s1">get_or_define</span><span class="s3">(</span><span class="s5">&quot;$cp&quot;</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">),</span>
+                      <span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">)</span>
+        <span class="s3">)</span>
+        <span class="s4"># Replace terminator with a jump to the common block</span>
+        <span class="s2">assert not </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">is_terminated</span>
+        <span class="s1">blk</span><span class="s3">.</span><span class="s1">body</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Jump</span><span class="s3">(</span><span class="s1">common_label</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">unknown_loc</span><span class="s3">))</span>
+
+    <span class="s2">if </span><span class="s1">split_condition </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s4"># Move the splitting statement to the common block</span>
+        <span class="s1">common_block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">remainings</span><span class="s3">[</span><span class="s6">0</span><span class="s3">][</span><span class="s6">0</span><span class="s3">])</span>
+    <span class="s2">assert not </span><span class="s1">common_block</span><span class="s3">.</span><span class="s1">is_terminated</span>
+    <span class="s4"># Append jump from common block to post block</span>
+    <span class="s1">common_block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Jump</span><span class="s3">(</span><span class="s1">post_label</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">))</span>
+
+    <span class="s4"># Make if-else tree to jump to target</span>
+    <span class="s1">remain_blocks </span><span class="s3">= []</span>
+    <span class="s2">for </span><span class="s1">remain </span><span class="s2">in </span><span class="s1">remainings</span><span class="s3">:</span>
+        <span class="s1">remain_blocks</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">max_label</span><span class="s3">)</span>
+        <span class="s1">max_label </span><span class="s3">+= </span><span class="s6">1</span>
+
+    <span class="s1">switch_block </span><span class="s3">= </span><span class="s1">post_block</span>
+    <span class="s1">loc </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">unknown_loc</span>
+    <span class="s2">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">remain </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">remainings</span><span class="s3">):</span>
+        <span class="s1">match_expr </span><span class="s3">= </span><span class="s1">scope</span><span class="s3">.</span><span class="s1">redefine</span><span class="s3">(</span><span class="s5">&quot;$cp_check&quot;</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">)</span>
+        <span class="s1">match_rhs </span><span class="s3">= </span><span class="s1">scope</span><span class="s3">.</span><span class="s1">redefine</span><span class="s3">(</span><span class="s5">&quot;$cp_rhs&quot;</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">)</span>
+
+        <span class="s4"># Do comparison to match control-point variable to the exit block</span>
+        <span class="s1">switch_block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span>
+            <span class="s1">ir</span><span class="s3">.</span><span class="s1">Assign</span><span class="s3">(</span>
+                <span class="s1">value</span><span class="s3">=</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Const</span><span class="s3">(</span><span class="s1">i</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">),</span>
+                <span class="s1">target</span><span class="s3">=</span><span class="s1">match_rhs</span><span class="s3">,</span>
+                <span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span>
+            <span class="s3">),</span>
+        <span class="s3">)</span>
+
+        <span class="s4"># Add assignment for the comparison</span>
+        <span class="s1">switch_block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span>
+            <span class="s1">ir</span><span class="s3">.</span><span class="s1">Assign</span><span class="s3">(</span>
+                <span class="s1">value</span><span class="s3">=</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Expr</span><span class="s3">.</span><span class="s1">binop</span><span class="s3">(</span>
+                    <span class="s1">fn</span><span class="s3">=</span><span class="s1">operator</span><span class="s3">.</span><span class="s1">eq</span><span class="s3">, </span><span class="s1">lhs</span><span class="s3">=</span><span class="s1">scope</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s5">&quot;$cp&quot;</span><span class="s3">), </span><span class="s1">rhs</span><span class="s3">=</span><span class="s1">match_rhs</span><span class="s3">,</span>
+                    <span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">,</span>
+                <span class="s3">),</span>
+                <span class="s1">target</span><span class="s3">=</span><span class="s1">match_expr</span><span class="s3">,</span>
+                <span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span>
+            <span class="s3">),</span>
+        <span class="s3">)</span>
+
+        <span class="s4"># Insert jump to the next case</span>
+        <span class="s3">[</span><span class="s1">jump_target</span><span class="s3">] = </span><span class="s1">remain</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">].</span><span class="s1">get_targets</span><span class="s3">()</span>
+        <span class="s1">switch_block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span>
+            <span class="s1">ir</span><span class="s3">.</span><span class="s1">Branch</span><span class="s3">(</span><span class="s1">match_expr</span><span class="s3">, </span><span class="s1">jump_target</span><span class="s3">, </span><span class="s1">remain_blocks</span><span class="s3">[</span><span class="s1">i</span><span class="s3">], </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">),</span>
+        <span class="s3">)</span>
+        <span class="s1">switch_block </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Block</span><span class="s3">(</span><span class="s1">scope</span><span class="s3">=</span><span class="s1">scope</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">)</span>
+        <span class="s1">blocks</span><span class="s3">[</span><span class="s1">remain_blocks</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]] = </span><span class="s1">switch_block</span>
+
+    <span class="s4"># Add the final jump</span>
+    <span class="s1">switch_block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Jump</span><span class="s3">(</span><span class="s1">jump_target</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">))</span>
+
+    <span class="s2">return </span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">common_label</span>
+</pre>
+</body>
+</html>

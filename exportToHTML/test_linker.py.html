@@ -1,0 +1,340 @@
+<html>
+<head>
+<title>test_linker.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #2aacb8;}
+.s4 { color: #6aab73;}
+.s5 { color: #5f826b; font-style: italic;}
+.s6 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_linker.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">import </span><span class="s1">warnings</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">testing </span><span class="s0">import </span><span class="s1">unittest</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">testing </span><span class="s0">import </span><span class="s2">(</span><span class="s1">skip_on_cudasim</span><span class="s2">, </span><span class="s1">skip_if_cuda_includes_missing</span><span class="s2">)</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">testing </span><span class="s0">import </span><span class="s1">CUDATestCase</span><span class="s2">, </span><span class="s1">test_data_dir</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">cudadrv</span><span class="s2">.</span><span class="s1">driver </span><span class="s0">import </span><span class="s2">(</span><span class="s1">CudaAPIError</span><span class="s2">, </span><span class="s1">Linker</span><span class="s2">,</span>
+                                       <span class="s1">LinkerError</span><span class="s2">)</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">cudadrv</span><span class="s2">.</span><span class="s1">error </span><span class="s0">import </span><span class="s1">NvrtcError</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda </span><span class="s0">import </span><span class="s1">require_context</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">tests</span><span class="s2">.</span><span class="s1">support </span><span class="s0">import </span><span class="s1">ignore_internal_warnings</span>
+<span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">cuda</span><span class="s2">, </span><span class="s1">void</span><span class="s2">, </span><span class="s1">float64</span><span class="s2">, </span><span class="s1">int64</span><span class="s2">, </span><span class="s1">int32</span><span class="s2">, </span><span class="s1">typeof</span><span class="s2">, </span><span class="s1">float32</span>
+
+
+<span class="s1">CONST1D </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s3">10</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">simple_const_mem</span><span class="s2">(</span><span class="s1">A</span><span class="s2">):</span>
+    <span class="s1">C </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">const</span><span class="s2">.</span><span class="s1">array_like</span><span class="s2">(</span><span class="s1">CONST1D</span><span class="s2">)</span>
+    <span class="s1">i </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">grid</span><span class="s2">(</span><span class="s3">1</span><span class="s2">)</span>
+
+    <span class="s1">A</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] = </span><span class="s1">C</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] + </span><span class="s3">1.0</span>
+
+
+<span class="s0">def </span><span class="s1">func_with_lots_of_registers</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">c</span><span class="s2">, </span><span class="s1">d</span><span class="s2">, </span><span class="s1">e</span><span class="s2">, </span><span class="s1">f</span><span class="s2">):</span>
+    <span class="s1">a1 </span><span class="s2">= </span><span class="s3">1.0</span>
+    <span class="s1">a2 </span><span class="s2">= </span><span class="s3">1.0</span>
+    <span class="s1">a3 </span><span class="s2">= </span><span class="s3">1.0</span>
+    <span class="s1">a4 </span><span class="s2">= </span><span class="s3">1.0</span>
+    <span class="s1">a5 </span><span class="s2">= </span><span class="s3">1.0</span>
+    <span class="s1">b1 </span><span class="s2">= </span><span class="s3">1.0</span>
+    <span class="s1">b2 </span><span class="s2">= </span><span class="s3">1.0</span>
+    <span class="s1">b3 </span><span class="s2">= </span><span class="s3">1.0</span>
+    <span class="s1">b4 </span><span class="s2">= </span><span class="s3">1.0</span>
+    <span class="s1">b5 </span><span class="s2">= </span><span class="s3">1.0</span>
+    <span class="s1">c1 </span><span class="s2">= </span><span class="s3">1.0</span>
+    <span class="s1">c2 </span><span class="s2">= </span><span class="s3">1.0</span>
+    <span class="s1">c3 </span><span class="s2">= </span><span class="s3">1.0</span>
+    <span class="s1">c4 </span><span class="s2">= </span><span class="s3">1.0</span>
+    <span class="s1">c5 </span><span class="s2">= </span><span class="s3">1.0</span>
+    <span class="s1">d1 </span><span class="s2">= </span><span class="s3">10</span>
+    <span class="s1">d2 </span><span class="s2">= </span><span class="s3">10</span>
+    <span class="s1">d3 </span><span class="s2">= </span><span class="s3">10</span>
+    <span class="s1">d4 </span><span class="s2">= </span><span class="s3">10</span>
+    <span class="s1">d5 </span><span class="s2">= </span><span class="s3">10</span>
+    <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">a</span><span class="s2">):</span>
+        <span class="s1">a1 </span><span class="s2">+= </span><span class="s1">b</span>
+        <span class="s1">a2 </span><span class="s2">+= </span><span class="s1">c</span>
+        <span class="s1">a3 </span><span class="s2">+= </span><span class="s1">d</span>
+        <span class="s1">a4 </span><span class="s2">+= </span><span class="s1">e</span>
+        <span class="s1">a5 </span><span class="s2">+= </span><span class="s1">f</span>
+        <span class="s1">b1 </span><span class="s2">*= </span><span class="s1">b</span>
+        <span class="s1">b2 </span><span class="s2">*= </span><span class="s1">c</span>
+        <span class="s1">b3 </span><span class="s2">*= </span><span class="s1">d</span>
+        <span class="s1">b4 </span><span class="s2">*= </span><span class="s1">e</span>
+        <span class="s1">b5 </span><span class="s2">*= </span><span class="s1">f</span>
+        <span class="s1">c1 </span><span class="s2">/= </span><span class="s1">b</span>
+        <span class="s1">c2 </span><span class="s2">/= </span><span class="s1">c</span>
+        <span class="s1">c3 </span><span class="s2">/= </span><span class="s1">d</span>
+        <span class="s1">c4 </span><span class="s2">/= </span><span class="s1">e</span>
+        <span class="s1">c5 </span><span class="s2">/= </span><span class="s1">f</span>
+        <span class="s1">d1 </span><span class="s2">&lt;&lt;= </span><span class="s1">b</span>
+        <span class="s1">d2 </span><span class="s2">&lt;&lt;= </span><span class="s1">c</span>
+        <span class="s1">d3 </span><span class="s2">&lt;&lt;= </span><span class="s1">d</span>
+        <span class="s1">d4 </span><span class="s2">&lt;&lt;= </span><span class="s1">e</span>
+        <span class="s1">d5 </span><span class="s2">&lt;&lt;= </span><span class="s1">f</span>
+    <span class="s1">x</span><span class="s2">[</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">grid</span><span class="s2">(</span><span class="s3">1</span><span class="s2">)] = </span><span class="s1">a1 </span><span class="s2">+ </span><span class="s1">a2 </span><span class="s2">+ </span><span class="s1">a3 </span><span class="s2">+ </span><span class="s1">a4 </span><span class="s2">+ </span><span class="s1">a5</span>
+    <span class="s1">x</span><span class="s2">[</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">grid</span><span class="s2">(</span><span class="s3">1</span><span class="s2">)] += </span><span class="s1">b1 </span><span class="s2">+ </span><span class="s1">b2 </span><span class="s2">+ </span><span class="s1">b3 </span><span class="s2">+ </span><span class="s1">b4 </span><span class="s2">+ </span><span class="s1">b5</span>
+    <span class="s1">x</span><span class="s2">[</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">grid</span><span class="s2">(</span><span class="s3">1</span><span class="s2">)] += </span><span class="s1">c1 </span><span class="s2">+ </span><span class="s1">c2 </span><span class="s2">+ </span><span class="s1">c3 </span><span class="s2">+ </span><span class="s1">c4 </span><span class="s2">+ </span><span class="s1">c5</span>
+    <span class="s1">x</span><span class="s2">[</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">grid</span><span class="s2">(</span><span class="s3">1</span><span class="s2">)] += </span><span class="s1">d1 </span><span class="s2">+ </span><span class="s1">d2 </span><span class="s2">+ </span><span class="s1">d3 </span><span class="s2">+ </span><span class="s1">d4 </span><span class="s2">+ </span><span class="s1">d5</span>
+
+
+<span class="s0">def </span><span class="s1">simple_smem</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">, </span><span class="s1">dty</span><span class="s2">):</span>
+    <span class="s1">sm </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">shared</span><span class="s2">.</span><span class="s1">array</span><span class="s2">(</span><span class="s3">100</span><span class="s2">, </span><span class="s1">dty</span><span class="s2">)</span>
+    <span class="s1">i </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">grid</span><span class="s2">(</span><span class="s3">1</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">i </span><span class="s2">== </span><span class="s3">0</span><span class="s2">:</span>
+        <span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s3">100</span><span class="s2">):</span>
+            <span class="s1">sm</span><span class="s2">[</span><span class="s1">j</span><span class="s2">] = </span><span class="s1">j</span>
+    <span class="s1">cuda</span><span class="s2">.</span><span class="s1">syncthreads</span><span class="s2">()</span>
+    <span class="s1">ary</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] = </span><span class="s1">sm</span><span class="s2">[</span><span class="s1">i</span><span class="s2">]</span>
+
+
+<span class="s0">def </span><span class="s1">coop_smem2d</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">):</span>
+    <span class="s1">i</span><span class="s2">, </span><span class="s1">j </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">grid</span><span class="s2">(</span><span class="s3">2</span><span class="s2">)</span>
+    <span class="s1">sm </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">shared</span><span class="s2">.</span><span class="s1">array</span><span class="s2">((</span><span class="s3">10</span><span class="s2">, </span><span class="s3">20</span><span class="s2">), </span><span class="s1">float32</span><span class="s2">)</span>
+    <span class="s1">sm</span><span class="s2">[</span><span class="s1">i</span><span class="s2">, </span><span class="s1">j</span><span class="s2">] = (</span><span class="s1">i </span><span class="s2">+ </span><span class="s3">1</span><span class="s2">) / (</span><span class="s1">j </span><span class="s2">+ </span><span class="s3">1</span><span class="s2">)</span>
+    <span class="s1">cuda</span><span class="s2">.</span><span class="s1">syncthreads</span><span class="s2">()</span>
+    <span class="s1">ary</span><span class="s2">[</span><span class="s1">i</span><span class="s2">, </span><span class="s1">j</span><span class="s2">] = </span><span class="s1">sm</span><span class="s2">[</span><span class="s1">i</span><span class="s2">, </span><span class="s1">j</span><span class="s2">]</span>
+
+
+<span class="s0">def </span><span class="s1">simple_maxthreads</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">):</span>
+    <span class="s1">i </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">grid</span><span class="s2">(</span><span class="s3">1</span><span class="s2">)</span>
+    <span class="s1">ary</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] = </span><span class="s1">i</span>
+
+
+<span class="s1">LMEM_SIZE </span><span class="s2">= </span><span class="s3">1000</span>
+
+
+<span class="s0">def </span><span class="s1">simple_lmem</span><span class="s2">(</span><span class="s1">A</span><span class="s2">, </span><span class="s1">B</span><span class="s2">, </span><span class="s1">dty</span><span class="s2">):</span>
+    <span class="s1">C </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">local</span><span class="s2">.</span><span class="s1">array</span><span class="s2">(</span><span class="s1">LMEM_SIZE</span><span class="s2">, </span><span class="s1">dty</span><span class="s2">)</span>
+    <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">C</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s3">0</span><span class="s2">]):</span>
+        <span class="s1">C</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] = </span><span class="s1">A</span><span class="s2">[</span><span class="s1">i</span><span class="s2">]</span>
+    <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">C</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s3">0</span><span class="s2">]):</span>
+        <span class="s1">B</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] = </span><span class="s1">C</span><span class="s2">[</span><span class="s1">i</span><span class="s2">]</span>
+
+
+<span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s4">'Linking unsupported in the simulator'</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">TestLinker</span><span class="s2">(</span><span class="s1">CUDATestCase</span><span class="s2">):</span>
+    <span class="s1">_NUMBA_NVIDIA_BINDING_0_ENV </span><span class="s2">= {</span><span class="s4">'NUMBA_CUDA_USE_NVIDIA_BINDING'</span><span class="s2">: </span><span class="s4">'0'</span><span class="s2">}</span>
+
+    <span class="s2">@</span><span class="s1">require_context</span>
+    <span class="s0">def </span><span class="s1">test_linker_basic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">'''Simply go through the constructor and destructor 
+        '''</span>
+        <span class="s1">linker </span><span class="s2">= </span><span class="s1">Linker</span><span class="s2">.</span><span class="s1">new</span><span class="s2">(</span><span class="s1">cc</span><span class="s2">=(</span><span class="s3">5</span><span class="s2">, </span><span class="s3">3</span><span class="s2">))</span>
+        <span class="s0">del </span><span class="s1">linker</span>
+
+    <span class="s0">def </span><span class="s1">_test_linking</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">eager</span><span class="s2">):</span>
+        <span class="s0">global </span><span class="s1">bar  </span><span class="s6"># must be a global; other it is recognized as a freevar</span>
+        <span class="s1">bar </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">declare_device</span><span class="s2">(</span><span class="s4">'bar'</span><span class="s2">, </span><span class="s4">'int32(int32)'</span><span class="s2">)</span>
+
+        <span class="s1">link </span><span class="s2">= </span><span class="s1">str</span><span class="s2">(</span><span class="s1">test_data_dir </span><span class="s2">/ </span><span class="s4">'jitlink.ptx'</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">eager</span><span class="s2">:</span>
+            <span class="s1">args </span><span class="s2">= [</span><span class="s4">'void(int32[:], int32[:])'</span><span class="s2">]</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">args </span><span class="s2">= []</span>
+
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">, </span><span class="s1">link</span><span class="s2">=[</span><span class="s1">link</span><span class="s2">])</span>
+        <span class="s0">def </span><span class="s1">foo</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">):</span>
+            <span class="s1">i </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">grid</span><span class="s2">(</span><span class="s3">1</span><span class="s2">)</span>
+            <span class="s1">x</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] += </span><span class="s1">bar</span><span class="s2">(</span><span class="s1">y</span><span class="s2">[</span><span class="s1">i</span><span class="s2">])</span>
+
+        <span class="s1">A </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">array</span><span class="s2">([</span><span class="s3">123</span><span class="s2">], </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">)</span>
+        <span class="s1">B </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">array</span><span class="s2">([</span><span class="s3">321</span><span class="s2">], </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">)</span>
+
+        <span class="s1">foo</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">A</span><span class="s2">, </span><span class="s1">B</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">A</span><span class="s2">[</span><span class="s3">0</span><span class="s2">] == </span><span class="s3">123 </span><span class="s2">+ </span><span class="s3">2 </span><span class="s2">* </span><span class="s3">321</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_linking_lazy_compile</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_test_linking</span><span class="s2">(</span><span class="s1">eager</span><span class="s2">=</span><span class="s0">False</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_linking_eager_compile</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_test_linking</span><span class="s2">(</span><span class="s1">eager</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_linking_cu</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">bar </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">declare_device</span><span class="s2">(</span><span class="s4">'bar'</span><span class="s2">, </span><span class="s4">'int32(int32)'</span><span class="s2">)</span>
+
+        <span class="s1">link </span><span class="s2">= </span><span class="s1">str</span><span class="s2">(</span><span class="s1">test_data_dir </span><span class="s2">/ </span><span class="s4">'jitlink.cu'</span><span class="s2">)</span>
+
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">link</span><span class="s2">=[</span><span class="s1">link</span><span class="s2">])</span>
+        <span class="s0">def </span><span class="s1">kernel</span><span class="s2">(</span><span class="s1">r</span><span class="s2">, </span><span class="s1">x</span><span class="s2">):</span>
+            <span class="s1">i </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">grid</span><span class="s2">(</span><span class="s3">1</span><span class="s2">)</span>
+
+            <span class="s0">if </span><span class="s1">i </span><span class="s2">&lt; </span><span class="s1">len</span><span class="s2">(</span><span class="s1">r</span><span class="s2">):</span>
+                <span class="s1">r</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] = </span><span class="s1">bar</span><span class="s2">(</span><span class="s1">x</span><span class="s2">[</span><span class="s1">i</span><span class="s2">])</span>
+
+        <span class="s1">x </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s3">10</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">)</span>
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros_like</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+
+        <span class="s1">kernel</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">32</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s1">x</span><span class="s2">)</span>
+
+        <span class="s6"># Matches the operation of bar() in jitlink.cu</span>
+        <span class="s1">expected </span><span class="s2">= </span><span class="s1">x </span><span class="s2">* </span><span class="s3">2</span>
+        <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_array_equal</span><span class="s2">(</span><span class="s1">r</span><span class="s2">, </span><span class="s1">expected</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_linking_cu_log_warning</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">bar </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">declare_device</span><span class="s2">(</span><span class="s4">'bar'</span><span class="s2">, </span><span class="s4">'int32(int32)'</span><span class="s2">)</span>
+
+        <span class="s1">link </span><span class="s2">= </span><span class="s1">str</span><span class="s2">(</span><span class="s1">test_data_dir </span><span class="s2">/ </span><span class="s4">'warn.cu'</span><span class="s2">)</span>
+
+        <span class="s0">with </span><span class="s1">warnings</span><span class="s2">.</span><span class="s1">catch_warnings</span><span class="s2">(</span><span class="s1">record</span><span class="s2">=</span><span class="s0">True</span><span class="s2">) </span><span class="s0">as </span><span class="s1">w</span><span class="s2">:</span>
+            <span class="s1">ignore_internal_warnings</span><span class="s2">()</span>
+
+            <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s4">'void(int32)'</span><span class="s2">, </span><span class="s1">link</span><span class="s2">=[</span><span class="s1">link</span><span class="s2">])</span>
+            <span class="s0">def </span><span class="s1">kernel</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+                <span class="s1">bar</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">w</span><span class="s2">), </span><span class="s3">1</span><span class="s2">, </span><span class="s4">'Expected warnings from NVRTC'</span><span class="s2">)</span>
+        <span class="s6"># Check the warning refers to the log messages</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s4">'NVRTC log messages'</span><span class="s2">, </span><span class="s1">str</span><span class="s2">(</span><span class="s1">w</span><span class="s2">[</span><span class="s3">0</span><span class="s2">].</span><span class="s1">message</span><span class="s2">))</span>
+        <span class="s6"># Check the message pertaining to the unused variable is provided</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s4">'declared but never referenced'</span><span class="s2">, </span><span class="s1">str</span><span class="s2">(</span><span class="s1">w</span><span class="s2">[</span><span class="s3">0</span><span class="s2">].</span><span class="s1">message</span><span class="s2">))</span>
+
+    <span class="s0">def </span><span class="s1">test_linking_cu_error</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">bar </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">declare_device</span><span class="s2">(</span><span class="s4">'bar'</span><span class="s2">, </span><span class="s4">'int32(int32)'</span><span class="s2">)</span>
+
+        <span class="s1">link </span><span class="s2">= </span><span class="s1">str</span><span class="s2">(</span><span class="s1">test_data_dir </span><span class="s2">/ </span><span class="s4">'error.cu'</span><span class="s2">)</span>
+
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaises</span><span class="s2">(</span><span class="s1">NvrtcError</span><span class="s2">) </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+            <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s4">'void(int32)'</span><span class="s2">, </span><span class="s1">link</span><span class="s2">=[</span><span class="s1">link</span><span class="s2">])</span>
+            <span class="s0">def </span><span class="s1">kernel</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+                <span class="s1">bar</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+
+        <span class="s1">msg </span><span class="s2">= </span><span class="s1">e</span><span class="s2">.</span><span class="s1">exception</span><span class="s2">.</span><span class="s1">args</span><span class="s2">[</span><span class="s3">0</span><span class="s2">]</span>
+        <span class="s6"># Check the error message refers to the NVRTC compile</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s4">'NVRTC Compilation failure'</span><span class="s2">, </span><span class="s1">msg</span><span class="s2">)</span>
+        <span class="s6"># Check the expected error in the CUDA source is reported</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s4">'identifier &quot;SYNTAX&quot; is undefined'</span><span class="s2">, </span><span class="s1">msg</span><span class="s2">)</span>
+        <span class="s6"># Check the filename is reported correctly</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s4">'in the compilation of &quot;error.cu&quot;'</span><span class="s2">, </span><span class="s1">msg</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_linking_unknown_filetype_error</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">expected_err </span><span class="s2">= </span><span class="s4">&quot;Don't know how to link file with extension .cuh&quot;</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaisesRegex</span><span class="s2">(</span><span class="s1">RuntimeError</span><span class="s2">, </span><span class="s1">expected_err</span><span class="s2">):</span>
+            <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s4">'void()'</span><span class="s2">, </span><span class="s1">link</span><span class="s2">=[</span><span class="s4">'header.cuh'</span><span class="s2">])</span>
+            <span class="s0">def </span><span class="s1">kernel</span><span class="s2">():</span>
+                <span class="s0">pass</span>
+
+    <span class="s0">def </span><span class="s1">test_linking_file_with_no_extension_error</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">expected_err </span><span class="s2">= </span><span class="s4">&quot;Don't know how to link file with no extension&quot;</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaisesRegex</span><span class="s2">(</span><span class="s1">RuntimeError</span><span class="s2">, </span><span class="s1">expected_err</span><span class="s2">):</span>
+            <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s4">'void()'</span><span class="s2">, </span><span class="s1">link</span><span class="s2">=[</span><span class="s4">'data'</span><span class="s2">])</span>
+            <span class="s0">def </span><span class="s1">kernel</span><span class="s2">():</span>
+                <span class="s0">pass</span>
+
+    <span class="s2">@</span><span class="s1">skip_if_cuda_includes_missing</span>
+    <span class="s0">def </span><span class="s1">test_linking_cu_cuda_include</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">link </span><span class="s2">= </span><span class="s1">str</span><span class="s2">(</span><span class="s1">test_data_dir </span><span class="s2">/ </span><span class="s4">'cuda_include.cu'</span><span class="s2">)</span>
+
+        <span class="s6"># An exception will be raised when linking this kernel due to the</span>
+        <span class="s6"># compile failure if CUDA includes cannot be found by Nvrtc.</span>
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s4">'void()'</span><span class="s2">, </span><span class="s1">link</span><span class="s2">=[</span><span class="s1">link</span><span class="s2">])</span>
+        <span class="s0">def </span><span class="s1">kernel</span><span class="s2">():</span>
+            <span class="s0">pass</span>
+
+    <span class="s0">def </span><span class="s1">test_try_to_link_nonexistent</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaises</span><span class="s2">(</span><span class="s1">LinkerError</span><span class="s2">) </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+            <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s4">'void(int32[::1])'</span><span class="s2">, </span><span class="s1">link</span><span class="s2">=[</span><span class="s4">'nonexistent.a'</span><span class="s2">])</span>
+            <span class="s0">def </span><span class="s1">f</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+                <span class="s1">x</span><span class="s2">[</span><span class="s3">0</span><span class="s2">] = </span><span class="s3">0</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s4">'nonexistent.a not found'</span><span class="s2">, </span><span class="s1">e</span><span class="s2">.</span><span class="s1">exception</span><span class="s2">.</span><span class="s1">args</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_set_registers_no_max</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot;Ensure that the jitted kernel used in the test_set_registers_* tests 
+        uses more than 57 registers - this ensures that test_set_registers_* 
+        are really checking that they reduced the number of registers used from 
+        something greater than the maximum.&quot;&quot;&quot;</span>
+        <span class="s1">compiled </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">func_with_lots_of_registers</span><span class="s2">)</span>
+        <span class="s1">compiled </span><span class="s2">= </span><span class="s1">compiled</span><span class="s2">.</span><span class="s1">specialize</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">empty</span><span class="s2">(</span><span class="s3">32</span><span class="s2">), *</span><span class="s1">range</span><span class="s2">(</span><span class="s3">6</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreater</span><span class="s2">(</span><span class="s1">compiled</span><span class="s2">.</span><span class="s1">get_regs_per_thread</span><span class="s2">(), </span><span class="s3">57</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_set_registers_57</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">compiled </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">max_registers</span><span class="s2">=</span><span class="s3">57</span><span class="s2">)(</span><span class="s1">func_with_lots_of_registers</span><span class="s2">)</span>
+        <span class="s1">compiled </span><span class="s2">= </span><span class="s1">compiled</span><span class="s2">.</span><span class="s1">specialize</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">empty</span><span class="s2">(</span><span class="s3">32</span><span class="s2">), *</span><span class="s1">range</span><span class="s2">(</span><span class="s3">6</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertLessEqual</span><span class="s2">(</span><span class="s1">compiled</span><span class="s2">.</span><span class="s1">get_regs_per_thread</span><span class="s2">(), </span><span class="s3">57</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_set_registers_38</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">compiled </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">max_registers</span><span class="s2">=</span><span class="s3">38</span><span class="s2">)(</span><span class="s1">func_with_lots_of_registers</span><span class="s2">)</span>
+        <span class="s1">compiled </span><span class="s2">= </span><span class="s1">compiled</span><span class="s2">.</span><span class="s1">specialize</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">empty</span><span class="s2">(</span><span class="s3">32</span><span class="s2">), *</span><span class="s1">range</span><span class="s2">(</span><span class="s3">6</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertLessEqual</span><span class="s2">(</span><span class="s1">compiled</span><span class="s2">.</span><span class="s1">get_regs_per_thread</span><span class="s2">(), </span><span class="s3">38</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_set_registers_eager</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">sig </span><span class="s2">= </span><span class="s1">void</span><span class="s2">(</span><span class="s1">float64</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">], </span><span class="s1">int64</span><span class="s2">, </span><span class="s1">int64</span><span class="s2">, </span><span class="s1">int64</span><span class="s2">, </span><span class="s1">int64</span><span class="s2">, </span><span class="s1">int64</span><span class="s2">, </span><span class="s1">int64</span><span class="s2">)</span>
+        <span class="s1">compiled </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">, </span><span class="s1">max_registers</span><span class="s2">=</span><span class="s3">38</span><span class="s2">)(</span><span class="s1">func_with_lots_of_registers</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertLessEqual</span><span class="s2">(</span><span class="s1">compiled</span><span class="s2">.</span><span class="s1">get_regs_per_thread</span><span class="s2">(), </span><span class="s3">38</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_get_const_mem_size</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">sig </span><span class="s2">= </span><span class="s1">void</span><span class="s2">(</span><span class="s1">float64</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">])</span>
+        <span class="s1">compiled </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">)(</span><span class="s1">simple_const_mem</span><span class="s2">)</span>
+        <span class="s1">const_mem_size </span><span class="s2">= </span><span class="s1">compiled</span><span class="s2">.</span><span class="s1">get_const_mem_size</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreaterEqual</span><span class="s2">(</span><span class="s1">const_mem_size</span><span class="s2">, </span><span class="s1">CONST1D</span><span class="s2">.</span><span class="s1">nbytes</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_get_no_shared_memory</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">compiled </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">func_with_lots_of_registers</span><span class="s2">)</span>
+        <span class="s1">compiled </span><span class="s2">= </span><span class="s1">compiled</span><span class="s2">.</span><span class="s1">specialize</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">empty</span><span class="s2">(</span><span class="s3">32</span><span class="s2">), *</span><span class="s1">range</span><span class="s2">(</span><span class="s3">6</span><span class="s2">))</span>
+        <span class="s1">shared_mem_size </span><span class="s2">= </span><span class="s1">compiled</span><span class="s2">.</span><span class="s1">get_shared_mem_per_block</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">shared_mem_size</span><span class="s2">, </span><span class="s3">0</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_get_shared_mem_per_block</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">sig </span><span class="s2">= </span><span class="s1">void</span><span class="s2">(</span><span class="s1">int32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">], </span><span class="s1">typeof</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">))</span>
+        <span class="s1">compiled </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">)(</span><span class="s1">simple_smem</span><span class="s2">)</span>
+        <span class="s1">shared_mem_size </span><span class="s2">= </span><span class="s1">compiled</span><span class="s2">.</span><span class="s1">get_shared_mem_per_block</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">shared_mem_size</span><span class="s2">, </span><span class="s3">400</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_get_shared_mem_per_specialized</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">compiled </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">simple_smem</span><span class="s2">)</span>
+        <span class="s1">compiled_specialized </span><span class="s2">= </span><span class="s1">compiled</span><span class="s2">.</span><span class="s1">specialize</span><span class="s2">(</span>
+            <span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">100</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">), </span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+        <span class="s1">shared_mem_size </span><span class="s2">= </span><span class="s1">compiled_specialized</span><span class="s2">.</span><span class="s1">get_shared_mem_per_block</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">shared_mem_size</span><span class="s2">, </span><span class="s3">800</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_get_max_threads_per_block</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">compiled </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s4">&quot;void(float32[:,::1])&quot;</span><span class="s2">)(</span><span class="s1">coop_smem2d</span><span class="s2">)</span>
+        <span class="s1">max_threads </span><span class="s2">= </span><span class="s1">compiled</span><span class="s2">.</span><span class="s1">get_max_threads_per_block</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreater</span><span class="s2">(</span><span class="s1">max_threads</span><span class="s2">, </span><span class="s3">0</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_max_threads_exceeded</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">compiled </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s4">&quot;void(int32[::1])&quot;</span><span class="s2">)(</span><span class="s1">simple_maxthreads</span><span class="s2">)</span>
+        <span class="s1">max_threads </span><span class="s2">= </span><span class="s1">compiled</span><span class="s2">.</span><span class="s1">get_max_threads_per_block</span><span class="s2">()</span>
+        <span class="s1">nelem </span><span class="s2">= </span><span class="s1">max_threads </span><span class="s2">+ </span><span class="s3">1</span>
+        <span class="s1">ary </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">empty</span><span class="s2">(</span><span class="s1">nelem</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">)</span>
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s1">compiled</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s1">nelem</span><span class="s2">](</span><span class="s1">ary</span><span class="s2">)</span>
+        <span class="s0">except </span><span class="s1">CudaAPIError </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s4">&quot;cuLaunchKernel&quot;</span><span class="s2">, </span><span class="s1">e</span><span class="s2">.</span><span class="s1">msg</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_get_local_mem_per_thread</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">sig </span><span class="s2">= </span><span class="s1">void</span><span class="s2">(</span><span class="s1">int32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">], </span><span class="s1">int32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">], </span><span class="s1">typeof</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">))</span>
+        <span class="s1">compiled </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">)(</span><span class="s1">simple_lmem</span><span class="s2">)</span>
+        <span class="s1">local_mem_size </span><span class="s2">= </span><span class="s1">compiled</span><span class="s2">.</span><span class="s1">get_local_mem_per_thread</span><span class="s2">()</span>
+        <span class="s1">calc_size </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">).</span><span class="s1">itemsize </span><span class="s2">* </span><span class="s1">LMEM_SIZE</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreaterEqual</span><span class="s2">(</span><span class="s1">local_mem_size</span><span class="s2">, </span><span class="s1">calc_size</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_get_local_mem_per_specialized</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">compiled </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">simple_lmem</span><span class="s2">)</span>
+        <span class="s1">compiled_specialized </span><span class="s2">= </span><span class="s1">compiled</span><span class="s2">.</span><span class="s1">specialize</span><span class="s2">(</span>
+            <span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s1">LMEM_SIZE</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">),</span>
+            <span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s1">LMEM_SIZE</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">),</span>
+            <span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+        <span class="s1">local_mem_size </span><span class="s2">= </span><span class="s1">compiled_specialized</span><span class="s2">.</span><span class="s1">get_local_mem_per_thread</span><span class="s2">()</span>
+        <span class="s1">calc_size </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">).</span><span class="s1">itemsize </span><span class="s2">* </span><span class="s1">LMEM_SIZE</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreaterEqual</span><span class="s2">(</span><span class="s1">local_mem_size</span><span class="s2">, </span><span class="s1">calc_size</span><span class="s2">)</span>
+
+
+<span class="s0">if </span><span class="s1">__name__ </span><span class="s2">== </span><span class="s4">'__main__'</span><span class="s2">:</span>
+    <span class="s1">unittest</span><span class="s2">.</span><span class="s1">main</span><span class="s2">()</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,723 @@
+<html>
+<head>
+<title>test_dispatcher.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #2aacb8;}
+.s4 { color: #6aab73;}
+.s5 { color: #7a7e85;}
+.s6 { color: #5f826b; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_dispatcher.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">import </span><span class="s1">threading</span>
+
+<span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">boolean</span><span class="s2">, </span><span class="s1">config</span><span class="s2">, </span><span class="s1">cuda</span><span class="s2">, </span><span class="s1">float32</span><span class="s2">, </span><span class="s1">float64</span><span class="s2">, </span><span class="s1">int32</span><span class="s2">, </span><span class="s1">int64</span><span class="s2">, </span><span class="s1">void</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">errors </span><span class="s0">import </span><span class="s1">TypingError</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">testing </span><span class="s0">import </span><span class="s1">skip_on_cudasim</span><span class="s2">, </span><span class="s1">unittest</span><span class="s2">, </span><span class="s1">CUDATestCase</span>
+<span class="s0">import </span><span class="s1">math</span>
+
+
+<span class="s0">def </span><span class="s1">add</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">):</span>
+    <span class="s0">return </span><span class="s1">x </span><span class="s2">+ </span><span class="s1">y</span>
+
+
+<span class="s0">def </span><span class="s1">add_kernel</span><span class="s2">(</span><span class="s1">r</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">):</span>
+    <span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">] = </span><span class="s1">x </span><span class="s2">+ </span><span class="s1">y</span>
+
+
+<span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s4">'Specialization not implemented in the simulator'</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">TestDispatcherSpecialization</span><span class="s2">(</span><span class="s1">CUDATestCase</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">_test_no_double_specialize</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">dispatcher</span><span class="s2">, </span><span class="s1">ty</span><span class="s2">):</span>
+
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaises</span><span class="s2">(</span><span class="s1">RuntimeError</span><span class="s2">) </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+            <span class="s1">dispatcher</span><span class="s2">.</span><span class="s1">specialize</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s4">'Dispatcher already specialized'</span><span class="s2">, </span><span class="s1">str</span><span class="s2">(</span><span class="s1">e</span><span class="s2">.</span><span class="s1">exception</span><span class="s2">))</span>
+
+    <span class="s0">def </span><span class="s1">test_no_double_specialize_sig_same_types</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Attempting to specialize a kernel jitted with a signature is illegal,</span>
+        <span class="s5"># even for the same types the kernel is already specialized for.</span>
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s4">'void(float32[::1])'</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">f</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+            <span class="s0">pass</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_test_no_double_specialize</span><span class="s2">(</span><span class="s1">f</span><span class="s2">, </span><span class="s1">float32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">])</span>
+
+    <span class="s0">def </span><span class="s1">test_no_double_specialize_no_sig_same_types</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Attempting to specialize an already-specialized kernel is illegal,</span>
+        <span class="s5"># even for the same types the kernel is already specialized for.</span>
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span>
+        <span class="s0">def </span><span class="s1">f</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+            <span class="s0">pass</span>
+
+        <span class="s1">f_specialized </span><span class="s2">= </span><span class="s1">f</span><span class="s2">.</span><span class="s1">specialize</span><span class="s2">(</span><span class="s1">float32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">])</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_test_no_double_specialize</span><span class="s2">(</span><span class="s1">f_specialized</span><span class="s2">, </span><span class="s1">float32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">])</span>
+
+    <span class="s0">def </span><span class="s1">test_no_double_specialize_sig_diff_types</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Attempting to specialize a kernel jitted with a signature is illegal.</span>
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s4">'void(int32[::1])'</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">f</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+            <span class="s0">pass</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_test_no_double_specialize</span><span class="s2">(</span><span class="s1">f</span><span class="s2">, </span><span class="s1">float32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">])</span>
+
+    <span class="s0">def </span><span class="s1">test_no_double_specialize_no_sig_diff_types</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Attempting to specialize an already-specialized kernel is illegal.</span>
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span>
+        <span class="s0">def </span><span class="s1">f</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+            <span class="s0">pass</span>
+
+        <span class="s1">f_specialized </span><span class="s2">= </span><span class="s1">f</span><span class="s2">.</span><span class="s1">specialize</span><span class="s2">(</span><span class="s1">int32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">])</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_test_no_double_specialize</span><span class="s2">(</span><span class="s1">f_specialized</span><span class="s2">, </span><span class="s1">float32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">])</span>
+
+    <span class="s0">def </span><span class="s1">test_specialize_cache_same</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Ensure that the same dispatcher is returned for the same argument</span>
+        <span class="s5"># types, and that different dispatchers are returned for different</span>
+        <span class="s5"># argument types.</span>
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span>
+        <span class="s0">def </span><span class="s1">f</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+            <span class="s0">pass</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">f</span><span class="s2">.</span><span class="s1">specializations</span><span class="s2">), </span><span class="s3">0</span><span class="s2">)</span>
+
+        <span class="s1">f_float32 </span><span class="s2">= </span><span class="s1">f</span><span class="s2">.</span><span class="s1">specialize</span><span class="s2">(</span><span class="s1">float32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">])</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">f</span><span class="s2">.</span><span class="s1">specializations</span><span class="s2">), </span><span class="s3">1</span><span class="s2">)</span>
+
+        <span class="s1">f_float32_2 </span><span class="s2">= </span><span class="s1">f</span><span class="s2">.</span><span class="s1">specialize</span><span class="s2">(</span><span class="s1">float32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">])</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">f</span><span class="s2">.</span><span class="s1">specializations</span><span class="s2">), </span><span class="s3">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIs</span><span class="s2">(</span><span class="s1">f_float32</span><span class="s2">, </span><span class="s1">f_float32_2</span><span class="s2">)</span>
+
+        <span class="s1">f_int32 </span><span class="s2">= </span><span class="s1">f</span><span class="s2">.</span><span class="s1">specialize</span><span class="s2">(</span><span class="s1">int32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">])</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">f</span><span class="s2">.</span><span class="s1">specializations</span><span class="s2">), </span><span class="s3">2</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsNot</span><span class="s2">(</span><span class="s1">f_int32</span><span class="s2">, </span><span class="s1">f_float32</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_specialize_cache_same_with_ordering</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Ensure that the same dispatcher is returned for the same argument</span>
+        <span class="s5"># types, and that different dispatchers are returned for different</span>
+        <span class="s5"># argument types, taking into account array ordering and multiple</span>
+        <span class="s5"># arguments.</span>
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span>
+        <span class="s0">def </span><span class="s1">f</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">):</span>
+            <span class="s0">pass</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">f</span><span class="s2">.</span><span class="s1">specializations</span><span class="s2">), </span><span class="s3">0</span><span class="s2">)</span>
+
+        <span class="s5"># 'A' order specialization</span>
+        <span class="s1">f_f32a_f32a </span><span class="s2">= </span><span class="s1">f</span><span class="s2">.</span><span class="s1">specialize</span><span class="s2">(</span><span class="s1">float32</span><span class="s2">[:], </span><span class="s1">float32</span><span class="s2">[:])</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">f</span><span class="s2">.</span><span class="s1">specializations</span><span class="s2">), </span><span class="s3">1</span><span class="s2">)</span>
+
+        <span class="s5"># 'C' order specialization</span>
+        <span class="s1">f_f32c_f32c </span><span class="s2">= </span><span class="s1">f</span><span class="s2">.</span><span class="s1">specialize</span><span class="s2">(</span><span class="s1">float32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">], </span><span class="s1">float32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">])</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">f</span><span class="s2">.</span><span class="s1">specializations</span><span class="s2">), </span><span class="s3">2</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsNot</span><span class="s2">(</span><span class="s1">f_f32a_f32a</span><span class="s2">, </span><span class="s1">f_f32c_f32c</span><span class="s2">)</span>
+
+        <span class="s5"># Reuse 'C' order specialization</span>
+        <span class="s1">f_f32c_f32c_2 </span><span class="s2">= </span><span class="s1">f</span><span class="s2">.</span><span class="s1">specialize</span><span class="s2">(</span><span class="s1">float32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">], </span><span class="s1">float32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">])</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">f</span><span class="s2">.</span><span class="s1">specializations</span><span class="s2">), </span><span class="s3">2</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIs</span><span class="s2">(</span><span class="s1">f_f32c_f32c</span><span class="s2">, </span><span class="s1">f_f32c_f32c_2</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">TestDispatcher</span><span class="s2">(</span><span class="s1">CUDATestCase</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot;Most tests based on those in numba.tests.test_dispatcher.&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">test_coerce_input_types</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Do not allow unsafe conversions if we can still compile other</span>
+        <span class="s5"># specializations.</span>
+        <span class="s1">c_add </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">add_kernel</span><span class="s2">)</span>
+
+        <span class="s5"># Using a complex128 allows us to represent any result produced by the</span>
+        <span class="s5"># test</span>
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">complex128</span><span class="s2">)</span>
+
+        <span class="s1">c_add</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">123</span><span class="s2">, </span><span class="s3">456</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s1">add</span><span class="s2">(</span><span class="s3">123</span><span class="s2">, </span><span class="s3">456</span><span class="s2">))</span>
+
+        <span class="s1">c_add</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">12.3</span><span class="s2">, </span><span class="s3">45.6</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s1">add</span><span class="s2">(</span><span class="s3">12.3</span><span class="s2">, </span><span class="s3">45.6</span><span class="s2">))</span>
+
+        <span class="s1">c_add</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">12.3</span><span class="s2">, </span><span class="s3">45.6j</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s1">add</span><span class="s2">(</span><span class="s3">12.3</span><span class="s2">, </span><span class="s3">45.6j</span><span class="s2">))</span>
+
+        <span class="s1">c_add</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">12300000000</span><span class="s2">, </span><span class="s3">456</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s1">add</span><span class="s2">(</span><span class="s3">12300000000</span><span class="s2">, </span><span class="s3">456</span><span class="s2">))</span>
+
+        <span class="s5"># Now force compilation of only a single specialization</span>
+        <span class="s1">c_add </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s4">'(i4[::1], i4, i4)'</span><span class="s2">)(</span><span class="s1">add_kernel</span><span class="s2">)</span>
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">)</span>
+
+        <span class="s1">c_add</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">123</span><span class="s2">, </span><span class="s3">456</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s1">add</span><span class="s2">(</span><span class="s3">123</span><span class="s2">, </span><span class="s3">456</span><span class="s2">))</span>
+
+    <span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s4">'Simulator ignores signature'</span><span class="s2">)</span>
+    <span class="s2">@</span><span class="s1">unittest</span><span class="s2">.</span><span class="s1">expectedFailure</span>
+    <span class="s0">def </span><span class="s1">test_coerce_input_types_unsafe</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Implicit (unsafe) conversion of float to int, originally from</span>
+        <span class="s5"># test_coerce_input_types. This test presently fails with the CUDA</span>
+        <span class="s5"># Dispatcher because argument preparation is done by</span>
+        <span class="s5"># _Kernel._prepare_args, which is currently inflexible with respect to</span>
+        <span class="s5"># the types it can accept when preparing.</span>
+        <span class="s5">#</span>
+        <span class="s5"># This test is marked as xfail until future changes enable this</span>
+        <span class="s5"># behavior.</span>
+        <span class="s1">c_add </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s4">'(i4[::1], i4, i4)'</span><span class="s2">)(</span><span class="s1">add_kernel</span><span class="s2">)</span>
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">)</span>
+
+        <span class="s1">c_add</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">12.3</span><span class="s2">, </span><span class="s3">45.6</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s1">add</span><span class="s2">(</span><span class="s3">12</span><span class="s2">, </span><span class="s3">45</span><span class="s2">))</span>
+
+    <span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s4">'Simulator ignores signature'</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">test_coerce_input_types_unsafe_complex</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Implicit conversion of complex to int disallowed</span>
+        <span class="s1">c_add </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s4">'(i4[::1], i4, i4)'</span><span class="s2">)(</span><span class="s1">add_kernel</span><span class="s2">)</span>
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">)</span>
+
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaises</span><span class="s2">(</span><span class="s1">TypeError</span><span class="s2">):</span>
+            <span class="s1">c_add</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">12.3</span><span class="s2">, </span><span class="s3">45.6j</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s4">'Simulator does not track overloads'</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">test_ambiguous_new_version</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot;Test compiling new version in an ambiguous case 
+        &quot;&quot;&quot;</span>
+        <span class="s1">c_add </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">add_kernel</span><span class="s2">)</span>
+
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+        <span class="s1">INT </span><span class="s2">= </span><span class="s3">1</span>
+        <span class="s1">FLT </span><span class="s2">= </span><span class="s3">1.5</span>
+
+        <span class="s1">c_add</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s1">INT</span><span class="s2">, </span><span class="s1">FLT</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertAlmostEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s1">INT </span><span class="s2">+ </span><span class="s1">FLT</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">c_add</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">), </span><span class="s3">1</span><span class="s2">)</span>
+
+        <span class="s1">c_add</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s1">FLT</span><span class="s2">, </span><span class="s1">INT</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertAlmostEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s1">FLT </span><span class="s2">+ </span><span class="s1">INT</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">c_add</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">), </span><span class="s3">2</span><span class="s2">)</span>
+
+        <span class="s1">c_add</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s1">FLT</span><span class="s2">, </span><span class="s1">FLT</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertAlmostEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s1">FLT </span><span class="s2">+ </span><span class="s1">FLT</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">c_add</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">), </span><span class="s3">3</span><span class="s2">)</span>
+
+        <span class="s5"># The following call is ambiguous because (int, int) can resolve</span>
+        <span class="s5"># to (float, int) or (int, float) with equal weight.</span>
+        <span class="s1">c_add</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertAlmostEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s1">INT </span><span class="s2">+ </span><span class="s1">INT</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">c_add</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">), </span><span class="s3">4</span><span class="s2">, </span><span class="s4">&quot;didn't compile a new &quot;</span>
+                                                  <span class="s4">&quot;version&quot;</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s4">&quot;Simulator doesn't support concurrent kernels&quot;</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">test_lock</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Test that (lazy) compiling from several threads at once doesn't 
+        produce errors (see issue #908). 
+        &quot;&quot;&quot;</span>
+        <span class="s1">errors </span><span class="s2">= []</span>
+
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span>
+        <span class="s0">def </span><span class="s1">foo</span><span class="s2">(</span><span class="s1">r</span><span class="s2">, </span><span class="s1">x</span><span class="s2">):</span>
+            <span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">] = </span><span class="s1">x </span><span class="s2">+ </span><span class="s3">1</span>
+
+        <span class="s0">def </span><span class="s1">wrapper</span><span class="s2">():</span>
+            <span class="s0">try</span><span class="s2">:</span>
+                <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">)</span>
+                <span class="s1">foo</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">1</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s3">2</span><span class="s2">)</span>
+            <span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+                <span class="s1">errors</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">e</span><span class="s2">)</span>
+
+        <span class="s1">threads </span><span class="s2">= [</span><span class="s1">threading</span><span class="s2">.</span><span class="s1">Thread</span><span class="s2">(</span><span class="s1">target</span><span class="s2">=</span><span class="s1">wrapper</span><span class="s2">) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s3">16</span><span class="s2">)]</span>
+        <span class="s0">for </span><span class="s1">t </span><span class="s0">in </span><span class="s1">threads</span><span class="s2">:</span>
+            <span class="s1">t</span><span class="s2">.</span><span class="s1">start</span><span class="s2">()</span>
+        <span class="s0">for </span><span class="s1">t </span><span class="s0">in </span><span class="s1">threads</span><span class="s2">:</span>
+            <span class="s1">t</span><span class="s2">.</span><span class="s1">join</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertFalse</span><span class="s2">(</span><span class="s1">errors</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">_test_explicit_signatures</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">sigs</span><span class="s2">):</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">sigs</span><span class="s2">)(</span><span class="s1">add_kernel</span><span class="s2">)</span>
+
+        <span class="s5"># Exact signature matches</span>
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">)</span>
+        <span class="s1">f</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s3">3</span><span class="s2">)</span>
+
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+        <span class="s1">f</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">1.5</span><span class="s2">, </span><span class="s3">2.5</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s3">4.0</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">config</span><span class="s2">.</span><span class="s1">ENABLE_CUDASIM</span><span class="s2">:</span>
+            <span class="s5"># Pass - we can't check for no conversion on the simulator.</span>
+            <span class="s0">return</span>
+
+        <span class="s5"># No conversion</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaises</span><span class="s2">(</span><span class="s1">TypeError</span><span class="s2">) </span><span class="s0">as </span><span class="s1">cm</span><span class="s2">:</span>
+            <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">complex128</span><span class="s2">)</span>
+            <span class="s1">f</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">1j</span><span class="s2">, </span><span class="s3">1j</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s4">&quot;No matching definition&quot;</span><span class="s2">, </span><span class="s1">str</span><span class="s2">(</span><span class="s1">cm</span><span class="s2">.</span><span class="s1">exception</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">f</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">), </span><span class="s3">2</span><span class="s2">, </span><span class="s1">f</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_explicit_signatures_strings</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Check with a list of strings for signatures</span>
+        <span class="s1">sigs </span><span class="s2">= [</span><span class="s4">&quot;(int64[::1], int64, int64)&quot;</span><span class="s2">,</span>
+                <span class="s4">&quot;(float64[::1], float64, float64)&quot;</span><span class="s2">]</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_test_explicit_signatures</span><span class="s2">(</span><span class="s1">sigs</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_explicit_signatures_tuples</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Check with a list of tuples of argument types for signatures</span>
+        <span class="s1">sigs </span><span class="s2">= [(</span><span class="s1">int64</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">], </span><span class="s1">int64</span><span class="s2">, </span><span class="s1">int64</span><span class="s2">), (</span><span class="s1">float64</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">], </span><span class="s1">float64</span><span class="s2">, </span><span class="s1">float64</span><span class="s2">)]</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_test_explicit_signatures</span><span class="s2">(</span><span class="s1">sigs</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_explicit_signatures_signatures</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Check with a list of Signature objects for signatures</span>
+        <span class="s1">sigs </span><span class="s2">= [</span><span class="s1">void</span><span class="s2">(</span><span class="s1">int64</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">], </span><span class="s1">int64</span><span class="s2">, </span><span class="s1">int64</span><span class="s2">),</span>
+                <span class="s1">void</span><span class="s2">(</span><span class="s1">float64</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">], </span><span class="s1">float64</span><span class="s2">, </span><span class="s1">float64</span><span class="s2">)]</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_test_explicit_signatures</span><span class="s2">(</span><span class="s1">sigs</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_explicit_signatures_mixed</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Check when we mix types of signature objects in a list of signatures</span>
+
+        <span class="s5"># Tuple and string</span>
+        <span class="s1">sigs </span><span class="s2">= [(</span><span class="s1">int64</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">], </span><span class="s1">int64</span><span class="s2">, </span><span class="s1">int64</span><span class="s2">),</span>
+                <span class="s4">&quot;(float64[::1], float64, float64)&quot;</span><span class="s2">]</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_test_explicit_signatures</span><span class="s2">(</span><span class="s1">sigs</span><span class="s2">)</span>
+
+        <span class="s5"># Tuple and Signature object</span>
+        <span class="s1">sigs </span><span class="s2">= [(</span><span class="s1">int64</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">], </span><span class="s1">int64</span><span class="s2">, </span><span class="s1">int64</span><span class="s2">),</span>
+                <span class="s1">void</span><span class="s2">(</span><span class="s1">float64</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">], </span><span class="s1">float64</span><span class="s2">, </span><span class="s1">float64</span><span class="s2">)]</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_test_explicit_signatures</span><span class="s2">(</span><span class="s1">sigs</span><span class="s2">)</span>
+
+        <span class="s5"># Signature object and string</span>
+        <span class="s1">sigs </span><span class="s2">= [</span><span class="s1">void</span><span class="s2">(</span><span class="s1">int64</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">], </span><span class="s1">int64</span><span class="s2">, </span><span class="s1">int64</span><span class="s2">),</span>
+                <span class="s4">&quot;(float64[::1], float64, float64)&quot;</span><span class="s2">]</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_test_explicit_signatures</span><span class="s2">(</span><span class="s1">sigs</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_explicit_signatures_same_type_class</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># A more interesting one...</span>
+        <span class="s5"># (Note that the type of r is deliberately float64 in both cases so</span>
+        <span class="s5"># that dispatch is differentiated on the types of x and y only, to</span>
+        <span class="s5"># closely preserve the intent of the original test from</span>
+        <span class="s5"># numba.tests.test_dispatcher)</span>
+        <span class="s1">sigs </span><span class="s2">= [</span><span class="s4">&quot;(float64[::1], float32, float32)&quot;</span><span class="s2">,</span>
+                <span class="s4">&quot;(float64[::1], float64, float64)&quot;</span><span class="s2">]</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">sigs</span><span class="s2">)(</span><span class="s1">add_kernel</span><span class="s2">)</span>
+
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+        <span class="s1">f</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">(</span><span class="s3">1</span><span class="s2">), </span><span class="s1">np</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">(</span><span class="s3">2</span><span class="s2">**-</span><span class="s3">25</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s3">1.0</span><span class="s2">)</span>
+
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+        <span class="s1">f</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">**-</span><span class="s3">25</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s3">1.0000000298023224</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s4">'No overload resolution in the simulator'</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">test_explicit_signatures_ambiguous_resolution</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Fail to resolve ambiguity between the two best overloads</span>
+        <span class="s5"># (Also deliberate float64[::1] for the first argument in all cases)</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">([</span><span class="s4">&quot;(float64[::1], float32, float64)&quot;</span><span class="s2">,</span>
+                      <span class="s4">&quot;(float64[::1], float64, float32)&quot;</span><span class="s2">,</span>
+                      <span class="s4">&quot;(float64[::1], int64, int64)&quot;</span><span class="s2">])(</span><span class="s1">add_kernel</span><span class="s2">)</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaises</span><span class="s2">(</span><span class="s1">TypeError</span><span class="s2">) </span><span class="s0">as </span><span class="s1">cm</span><span class="s2">:</span>
+            <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+            <span class="s1">f</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">1.0</span><span class="s2">, </span><span class="s3">2.0</span><span class="s2">)</span>
+
+        <span class="s5"># The two best matches are output in the error message, as well</span>
+        <span class="s5"># as the actual argument types.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertRegex</span><span class="s2">(</span>
+            <span class="s1">str</span><span class="s2">(</span><span class="s1">cm</span><span class="s2">.</span><span class="s1">exception</span><span class="s2">),</span>
+            <span class="s4">r&quot;Ambiguous overloading for &lt;function add_kernel [^&gt;]*&gt; &quot;</span>
+            <span class="s4">r&quot;\(Array\(float64, 1, 'C', False, aligned=True\), float64,&quot;</span>
+            <span class="s4">r&quot; float64\):\n&quot;</span>
+            <span class="s4">r&quot;\(Array\(float64, 1, 'C', False, aligned=True\), float32,&quot;</span>
+            <span class="s4">r&quot; float64\) -&gt; none\n&quot;</span>
+            <span class="s4">r&quot;\(Array\(float64, 1, 'C', False, aligned=True\), float64,&quot;</span>
+            <span class="s4">r&quot; float32\) -&gt; none&quot;</span>
+        <span class="s2">)</span>
+        <span class="s5"># The integer signature is not part of the best matches</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertNotIn</span><span class="s2">(</span><span class="s4">&quot;int64&quot;</span><span class="s2">, </span><span class="s1">str</span><span class="s2">(</span><span class="s1">cm</span><span class="s2">.</span><span class="s1">exception</span><span class="s2">))</span>
+
+    <span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s4">'Simulator does not use _prepare_args'</span><span class="s2">)</span>
+    <span class="s2">@</span><span class="s1">unittest</span><span class="s2">.</span><span class="s1">expectedFailure</span>
+    <span class="s0">def </span><span class="s1">test_explicit_signatures_unsafe</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># These tests are from test_explicit_signatures, but have to be xfail</span>
+        <span class="s5"># at present because _prepare_args in the CUDA target cannot handle</span>
+        <span class="s5"># unsafe conversions of arguments.</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s4">&quot;(int64[::1], int64, int64)&quot;</span><span class="s2">)(</span><span class="s1">add_kernel</span><span class="s2">)</span>
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">)</span>
+
+        <span class="s5"># Approximate match (unsafe conversion)</span>
+        <span class="s1">f</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">1.5</span><span class="s2">, </span><span class="s3">2.5</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s3">3</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">f</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">), </span><span class="s3">1</span><span class="s2">, </span><span class="s1">f</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">)</span>
+
+        <span class="s1">sigs </span><span class="s2">= [</span><span class="s4">&quot;(int64[::1], int64, int64)&quot;</span><span class="s2">,</span>
+                <span class="s4">&quot;(float64[::1], float64, float64)&quot;</span><span class="s2">]</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">sigs</span><span class="s2">)(</span><span class="s1">add_kernel</span><span class="s2">)</span>
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+        <span class="s5"># Approximate match (int32 -&gt; float64 is a safe conversion)</span>
+        <span class="s1">f</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">(</span><span class="s3">1</span><span class="s2">), </span><span class="s3">2.5</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s3">3.5</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">add_device_usecase</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">sigs</span><span class="s2">):</span>
+        <span class="s5"># Generate a kernel that calls the add device function compiled with a</span>
+        <span class="s5"># given set of signatures</span>
+        <span class="s1">add_device </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">sigs</span><span class="s2">, </span><span class="s1">device</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">add</span><span class="s2">)</span>
+
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span>
+        <span class="s0">def </span><span class="s1">f</span><span class="s2">(</span><span class="s1">r</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">):</span>
+            <span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">] = </span><span class="s1">add_device</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">)</span>
+
+        <span class="s0">return </span><span class="s1">f</span>
+
+    <span class="s0">def </span><span class="s1">test_explicit_signatures_device</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Tests similar to test_explicit_signatures, but on a device function</span>
+        <span class="s5"># instead of a kernel</span>
+        <span class="s1">sigs </span><span class="s2">= [</span><span class="s4">&quot;(int64, int64)&quot;</span><span class="s2">, </span><span class="s4">&quot;(float64, float64)&quot;</span><span class="s2">]</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">add_device_usecase</span><span class="s2">(</span><span class="s1">sigs</span><span class="s2">)</span>
+
+        <span class="s5"># Exact signature matches</span>
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">)</span>
+        <span class="s1">f</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s3">3</span><span class="s2">)</span>
+
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+        <span class="s1">f</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">1.5</span><span class="s2">, </span><span class="s3">2.5</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s3">4.0</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">config</span><span class="s2">.</span><span class="s1">ENABLE_CUDASIM</span><span class="s2">:</span>
+            <span class="s5"># Pass - we can't check for no conversion on the simulator.</span>
+            <span class="s0">return</span>
+
+        <span class="s5"># No conversion</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaises</span><span class="s2">(</span><span class="s1">TypingError</span><span class="s2">) </span><span class="s0">as </span><span class="s1">cm</span><span class="s2">:</span>
+            <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">complex128</span><span class="s2">)</span>
+            <span class="s1">f</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">1j</span><span class="s2">, </span><span class="s3">1j</span><span class="s2">)</span>
+
+        <span class="s1">msg </span><span class="s2">= </span><span class="s1">str</span><span class="s2">(</span><span class="s1">cm</span><span class="s2">.</span><span class="s1">exception</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s4">&quot;Invalid use of type&quot;</span><span class="s2">, </span><span class="s1">msg</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s4">&quot;with parameters (complex128, complex128)&quot;</span><span class="s2">, </span><span class="s1">msg</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">f</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">), </span><span class="s3">2</span><span class="s2">, </span><span class="s1">f</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_explicit_signatures_device_same_type_class</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># A more interesting one...</span>
+        <span class="s5"># (Note that the type of r is deliberately float64 in both cases so</span>
+        <span class="s5"># that dispatch is differentiated on the types of x and y only, to</span>
+        <span class="s5"># closely preserve the intent of the original test from</span>
+        <span class="s5"># numba.tests.test_dispatcher)</span>
+        <span class="s1">sigs </span><span class="s2">= [</span><span class="s4">&quot;(float32, float32)&quot;</span><span class="s2">, </span><span class="s4">&quot;(float64, float64)&quot;</span><span class="s2">]</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">add_device_usecase</span><span class="s2">(</span><span class="s1">sigs</span><span class="s2">)</span>
+
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+        <span class="s1">f</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">(</span><span class="s3">1</span><span class="s2">), </span><span class="s1">np</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">(</span><span class="s3">2</span><span class="s2">**-</span><span class="s3">25</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s3">1.0</span><span class="s2">)</span>
+
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+        <span class="s1">f</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">**-</span><span class="s3">25</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s3">1.0000000298023224</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_explicit_signatures_device_ambiguous</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Ambiguity between the two best overloads resolves. This is somewhat</span>
+        <span class="s5"># surprising given that ambiguity is not permitted for dispatching</span>
+        <span class="s5"># overloads when launching a kernel, but seems to be the general</span>
+        <span class="s5"># behaviour of Numba (See Issue #8307:</span>
+        <span class="s5"># https://github.com/numba/numba/issues/8307).</span>
+        <span class="s1">sigs </span><span class="s2">= [</span><span class="s4">&quot;(float32, float64)&quot;</span><span class="s2">, </span><span class="s4">&quot;(float64, float32)&quot;</span><span class="s2">, </span><span class="s4">&quot;(int64, int64)&quot;</span><span class="s2">]</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">add_device_usecase</span><span class="s2">(</span><span class="s1">sigs</span><span class="s2">)</span>
+
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+        <span class="s1">f</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">1.5</span><span class="s2">, </span><span class="s3">2.5</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s3">4.0</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s4">'CUDA Simulator does not force casting'</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">test_explicit_signatures_device_unsafe</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># These tests are from test_explicit_signatures. The device function</span>
+        <span class="s5"># variant of these tests can succeed on CUDA because the compilation</span>
+        <span class="s5"># can handle unsafe casting (c.f. test_explicit_signatures_unsafe which</span>
+        <span class="s5"># has to xfail due to _prepare_args not supporting unsafe casting).</span>
+        <span class="s1">sigs </span><span class="s2">= [</span><span class="s4">&quot;(int64, int64)&quot;</span><span class="s2">]</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">add_device_usecase</span><span class="s2">(</span><span class="s1">sigs</span><span class="s2">)</span>
+
+        <span class="s5"># Approximate match (unsafe conversion)</span>
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">)</span>
+        <span class="s1">f</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s3">1.5</span><span class="s2">, </span><span class="s3">2.5</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s3">3</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">f</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">), </span><span class="s3">1</span><span class="s2">, </span><span class="s1">f</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">)</span>
+
+        <span class="s1">sigs </span><span class="s2">= [</span><span class="s4">&quot;(int64, int64)&quot;</span><span class="s2">, </span><span class="s4">&quot;(float64, float64)&quot;</span><span class="s2">]</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">add_device_usecase</span><span class="s2">(</span><span class="s1">sigs</span><span class="s2">)</span>
+
+        <span class="s5"># Approximate match (int32 -&gt; float64 is a safe conversion)</span>
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+        <span class="s1">f</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">r</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">(</span><span class="s3">1</span><span class="s2">), </span><span class="s3">2.5</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertPreciseEqual</span><span class="s2">(</span><span class="s1">r</span><span class="s2">[</span><span class="s3">0</span><span class="s2">], </span><span class="s3">3.5</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_dispatcher_docstring</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Ensure that CUDA-jitting a function preserves its docstring. See</span>
+        <span class="s5"># Issue #5902: https://github.com/numba/numba/issues/5902</span>
+
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span>
+        <span class="s0">def </span><span class="s1">add_kernel</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">):</span>
+            <span class="s6">&quot;&quot;&quot;Add two integers, kernel version&quot;&quot;&quot;</span>
+
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">device</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">add_device</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">):</span>
+            <span class="s6">&quot;&quot;&quot;Add two integers, device version&quot;&quot;&quot;</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s4">&quot;Add two integers, kernel version&quot;</span><span class="s2">, </span><span class="s1">add_kernel</span><span class="s2">.</span><span class="s1">__doc__</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s4">&quot;Add two integers, device version&quot;</span><span class="s2">, </span><span class="s1">add_device</span><span class="s2">.</span><span class="s1">__doc__</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s4">&quot;CUDA simulator doesn't implement kernel properties&quot;</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">TestDispatcherKernelProperties</span><span class="s2">(</span><span class="s1">CUDATestCase</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">test_get_regs_per_thread_unspecialized</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># A kernel where the register usage per thread is likely to differ</span>
+        <span class="s5"># between different specializations</span>
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span>
+        <span class="s0">def </span><span class="s1">pi_sin_array</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">n</span><span class="s2">):</span>
+            <span class="s1">i </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">grid</span><span class="s2">(</span><span class="s3">1</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">i </span><span class="s2">&lt; </span><span class="s1">n</span><span class="s2">:</span>
+                <span class="s1">x</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] = </span><span class="s3">3.14 </span><span class="s2">* </span><span class="s1">math</span><span class="s2">.</span><span class="s1">sin</span><span class="s2">(</span><span class="s1">x</span><span class="s2">[</span><span class="s1">i</span><span class="s2">])</span>
+
+        <span class="s5"># Call the kernel with different arguments to create two different</span>
+        <span class="s5"># definitions within the Dispatcher object</span>
+        <span class="s1">N </span><span class="s2">= </span><span class="s3">10</span>
+        <span class="s1">arr_f32 </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s1">N</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">)</span>
+        <span class="s1">arr_f64 </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s1">N</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+
+        <span class="s1">pi_sin_array</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s1">N</span><span class="s2">](</span><span class="s1">arr_f32</span><span class="s2">, </span><span class="s1">N</span><span class="s2">)</span>
+        <span class="s1">pi_sin_array</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s1">N</span><span class="s2">](</span><span class="s1">arr_f64</span><span class="s2">, </span><span class="s1">N</span><span class="s2">)</span>
+
+        <span class="s5"># Check we get a positive integer for the two different variations</span>
+        <span class="s1">sig_f32 </span><span class="s2">= </span><span class="s1">void</span><span class="s2">(</span><span class="s1">float32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">], </span><span class="s1">int64</span><span class="s2">)</span>
+        <span class="s1">sig_f64 </span><span class="s2">= </span><span class="s1">void</span><span class="s2">(</span><span class="s1">float64</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">], </span><span class="s1">int64</span><span class="s2">)</span>
+        <span class="s1">regs_per_thread_f32 </span><span class="s2">= </span><span class="s1">pi_sin_array</span><span class="s2">.</span><span class="s1">get_regs_per_thread</span><span class="s2">(</span><span class="s1">sig_f32</span><span class="s2">)</span>
+        <span class="s1">regs_per_thread_f64 </span><span class="s2">= </span><span class="s1">pi_sin_array</span><span class="s2">.</span><span class="s1">get_regs_per_thread</span><span class="s2">(</span><span class="s1">sig_f64</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsInstance</span><span class="s2">(</span><span class="s1">regs_per_thread_f32</span><span class="s2">, </span><span class="s1">int</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsInstance</span><span class="s2">(</span><span class="s1">regs_per_thread_f64</span><span class="s2">, </span><span class="s1">int</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreater</span><span class="s2">(</span><span class="s1">regs_per_thread_f32</span><span class="s2">, </span><span class="s3">0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreater</span><span class="s2">(</span><span class="s1">regs_per_thread_f64</span><span class="s2">, </span><span class="s3">0</span><span class="s2">)</span>
+
+        <span class="s5"># Check that getting the registers per thread for all signatures</span>
+        <span class="s5"># provides the same values as getting the registers per thread for</span>
+        <span class="s5"># individual signatures.</span>
+        <span class="s1">regs_per_thread_all </span><span class="s2">= </span><span class="s1">pi_sin_array</span><span class="s2">.</span><span class="s1">get_regs_per_thread</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">regs_per_thread_all</span><span class="s2">[</span><span class="s1">sig_f32</span><span class="s2">.</span><span class="s1">args</span><span class="s2">],</span>
+                         <span class="s1">regs_per_thread_f32</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">regs_per_thread_all</span><span class="s2">[</span><span class="s1">sig_f64</span><span class="s2">.</span><span class="s1">args</span><span class="s2">],</span>
+                         <span class="s1">regs_per_thread_f64</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">regs_per_thread_f32 </span><span class="s2">== </span><span class="s1">regs_per_thread_f64</span><span class="s2">:</span>
+            <span class="s5"># If the register usage is the same for both variants, there may be</span>
+            <span class="s5"># a bug, but this may also be an artifact of the compiler / driver</span>
+            <span class="s5"># / device combination, so produce an informational message only.</span>
+            <span class="s1">print</span><span class="s2">(</span><span class="s4">'f32 and f64 variant thread usages are equal.'</span><span class="s2">)</span>
+            <span class="s1">print</span><span class="s2">(</span><span class="s4">'This may warrant some investigation. Devices:'</span><span class="s2">)</span>
+            <span class="s1">cuda</span><span class="s2">.</span><span class="s1">detect</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">test_get_regs_per_thread_specialized</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">void</span><span class="s2">(</span><span class="s1">float32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">], </span><span class="s1">int64</span><span class="s2">))</span>
+        <span class="s0">def </span><span class="s1">pi_sin_array</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">n</span><span class="s2">):</span>
+            <span class="s1">i </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">grid</span><span class="s2">(</span><span class="s3">1</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">i </span><span class="s2">&lt; </span><span class="s1">n</span><span class="s2">:</span>
+                <span class="s1">x</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] = </span><span class="s3">3.14 </span><span class="s2">* </span><span class="s1">math</span><span class="s2">.</span><span class="s1">sin</span><span class="s2">(</span><span class="s1">x</span><span class="s2">[</span><span class="s1">i</span><span class="s2">])</span>
+
+        <span class="s5"># Check we get a positive integer for the specialized variation</span>
+        <span class="s1">regs_per_thread </span><span class="s2">= </span><span class="s1">pi_sin_array</span><span class="s2">.</span><span class="s1">get_regs_per_thread</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsInstance</span><span class="s2">(</span><span class="s1">regs_per_thread</span><span class="s2">, </span><span class="s1">int</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreater</span><span class="s2">(</span><span class="s1">regs_per_thread</span><span class="s2">, </span><span class="s3">0</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_get_const_mem_unspecialized</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span>
+        <span class="s0">def </span><span class="s1">const_fmt_string</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">to_print</span><span class="s2">):</span>
+            <span class="s5"># We guard the print with a conditional to prevent noise from the</span>
+            <span class="s5"># test suite</span>
+            <span class="s0">if </span><span class="s1">to_print</span><span class="s2">:</span>
+                <span class="s1">print</span><span class="s2">(</span><span class="s1">val</span><span class="s2">)</span>
+
+        <span class="s5"># Call the kernel with different arguments to create two different</span>
+        <span class="s5"># definitions within the Dispatcher object</span>
+        <span class="s1">const_fmt_string</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s3">1</span><span class="s2">, </span><span class="s0">False</span><span class="s2">)</span>
+        <span class="s1">const_fmt_string</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s3">1.0</span><span class="s2">, </span><span class="s0">False</span><span class="s2">)</span>
+
+        <span class="s5"># Check we get a positive integer for the two different variations</span>
+        <span class="s1">sig_i64 </span><span class="s2">= </span><span class="s1">void</span><span class="s2">(</span><span class="s1">int64</span><span class="s2">, </span><span class="s1">boolean</span><span class="s2">)</span>
+        <span class="s1">sig_f64 </span><span class="s2">= </span><span class="s1">void</span><span class="s2">(</span><span class="s1">float64</span><span class="s2">, </span><span class="s1">boolean</span><span class="s2">)</span>
+        <span class="s1">const_mem_size_i64 </span><span class="s2">= </span><span class="s1">const_fmt_string</span><span class="s2">.</span><span class="s1">get_const_mem_size</span><span class="s2">(</span><span class="s1">sig_i64</span><span class="s2">)</span>
+        <span class="s1">const_mem_size_f64 </span><span class="s2">= </span><span class="s1">const_fmt_string</span><span class="s2">.</span><span class="s1">get_const_mem_size</span><span class="s2">(</span><span class="s1">sig_f64</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsInstance</span><span class="s2">(</span><span class="s1">const_mem_size_i64</span><span class="s2">, </span><span class="s1">int</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsInstance</span><span class="s2">(</span><span class="s1">const_mem_size_f64</span><span class="s2">, </span><span class="s1">int</span><span class="s2">)</span>
+
+        <span class="s5"># 6 bytes for the equivalent of b'%lld\n\0'</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreaterEqual</span><span class="s2">(</span><span class="s1">const_mem_size_i64</span><span class="s2">, </span><span class="s3">6</span><span class="s2">)</span>
+        <span class="s5"># 4 bytes for the equivalent of b'%f\n\0'</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreaterEqual</span><span class="s2">(</span><span class="s1">const_mem_size_f64</span><span class="s2">, </span><span class="s3">4</span><span class="s2">)</span>
+
+        <span class="s5"># Check that getting the const memory size for all signatures</span>
+        <span class="s5"># provides the same values as getting the const memory size for</span>
+        <span class="s5"># individual signatures.</span>
+
+        <span class="s1">const_mem_size_all </span><span class="s2">= </span><span class="s1">const_fmt_string</span><span class="s2">.</span><span class="s1">get_const_mem_size</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">const_mem_size_all</span><span class="s2">[</span><span class="s1">sig_i64</span><span class="s2">.</span><span class="s1">args</span><span class="s2">], </span><span class="s1">const_mem_size_i64</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">const_mem_size_all</span><span class="s2">[</span><span class="s1">sig_f64</span><span class="s2">.</span><span class="s1">args</span><span class="s2">], </span><span class="s1">const_mem_size_f64</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_get_const_mem_specialized</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">arr </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s3">32</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">)</span>
+        <span class="s1">sig </span><span class="s2">= </span><span class="s1">void</span><span class="s2">(</span><span class="s1">int64</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">])</span>
+
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">const_array_use</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+            <span class="s1">C </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">const</span><span class="s2">.</span><span class="s1">array_like</span><span class="s2">(</span><span class="s1">arr</span><span class="s2">)</span>
+            <span class="s1">i </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">grid</span><span class="s2">(</span><span class="s3">1</span><span class="s2">)</span>
+            <span class="s1">x</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] = </span><span class="s1">C</span><span class="s2">[</span><span class="s1">i</span><span class="s2">]</span>
+
+        <span class="s1">const_mem_size </span><span class="s2">= </span><span class="s1">const_array_use</span><span class="s2">.</span><span class="s1">get_const_mem_size</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsInstance</span><span class="s2">(</span><span class="s1">const_mem_size</span><span class="s2">, </span><span class="s1">int</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreaterEqual</span><span class="s2">(</span><span class="s1">const_mem_size</span><span class="s2">, </span><span class="s1">arr</span><span class="s2">.</span><span class="s1">nbytes</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_get_shared_mem_per_block_unspecialized</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">N </span><span class="s2">= </span><span class="s3">10</span>
+
+        <span class="s5"># A kernel where the shared memory per block is likely to differ</span>
+        <span class="s5"># between different specializations</span>
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span>
+        <span class="s0">def </span><span class="s1">simple_smem</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">):</span>
+            <span class="s1">sm </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">shared</span><span class="s2">.</span><span class="s1">array</span><span class="s2">(</span><span class="s1">N</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+            <span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">N</span><span class="s2">):</span>
+                <span class="s1">sm</span><span class="s2">[</span><span class="s1">j</span><span class="s2">] = </span><span class="s1">j</span>
+            <span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">N</span><span class="s2">):</span>
+                <span class="s1">ary</span><span class="s2">[</span><span class="s1">j</span><span class="s2">] = </span><span class="s1">sm</span><span class="s2">[</span><span class="s1">j</span><span class="s2">]</span>
+
+        <span class="s5"># Call the kernel with different arguments to create two different</span>
+        <span class="s5"># definitions within the Dispatcher object</span>
+        <span class="s1">arr_f32 </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s1">N</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">)</span>
+        <span class="s1">arr_f64 </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s1">N</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+
+        <span class="s1">simple_smem</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">arr_f32</span><span class="s2">)</span>
+        <span class="s1">simple_smem</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">arr_f64</span><span class="s2">)</span>
+
+        <span class="s1">sig_f32 </span><span class="s2">= </span><span class="s1">void</span><span class="s2">(</span><span class="s1">float32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">])</span>
+        <span class="s1">sig_f64 </span><span class="s2">= </span><span class="s1">void</span><span class="s2">(</span><span class="s1">float64</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">])</span>
+
+        <span class="s1">sh_mem_f32 </span><span class="s2">= </span><span class="s1">simple_smem</span><span class="s2">.</span><span class="s1">get_shared_mem_per_block</span><span class="s2">(</span><span class="s1">sig_f32</span><span class="s2">)</span>
+        <span class="s1">sh_mem_f64 </span><span class="s2">= </span><span class="s1">simple_smem</span><span class="s2">.</span><span class="s1">get_shared_mem_per_block</span><span class="s2">(</span><span class="s1">sig_f64</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsInstance</span><span class="s2">(</span><span class="s1">sh_mem_f32</span><span class="s2">, </span><span class="s1">int</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsInstance</span><span class="s2">(</span><span class="s1">sh_mem_f64</span><span class="s2">, </span><span class="s1">int</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">sh_mem_f32</span><span class="s2">, </span><span class="s1">N </span><span class="s2">* </span><span class="s3">4</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">sh_mem_f64</span><span class="s2">, </span><span class="s1">N </span><span class="s2">* </span><span class="s3">8</span><span class="s2">)</span>
+
+        <span class="s5"># Check that getting the shared memory per block for all signatures</span>
+        <span class="s5"># provides the same values as getting the shared mem per block for</span>
+        <span class="s5"># individual signatures.</span>
+        <span class="s1">sh_mem_f32_all </span><span class="s2">= </span><span class="s1">simple_smem</span><span class="s2">.</span><span class="s1">get_shared_mem_per_block</span><span class="s2">()</span>
+        <span class="s1">sh_mem_f64_all </span><span class="s2">= </span><span class="s1">simple_smem</span><span class="s2">.</span><span class="s1">get_shared_mem_per_block</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">sh_mem_f32_all</span><span class="s2">[</span><span class="s1">sig_f32</span><span class="s2">.</span><span class="s1">args</span><span class="s2">], </span><span class="s1">sh_mem_f32</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">sh_mem_f64_all</span><span class="s2">[</span><span class="s1">sig_f64</span><span class="s2">.</span><span class="s1">args</span><span class="s2">], </span><span class="s1">sh_mem_f64</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_get_shared_mem_per_block_specialized</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">void</span><span class="s2">(</span><span class="s1">float32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">]))</span>
+        <span class="s0">def </span><span class="s1">simple_smem</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">):</span>
+            <span class="s1">sm </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">shared</span><span class="s2">.</span><span class="s1">array</span><span class="s2">(</span><span class="s3">100</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">float32</span><span class="s2">)</span>
+            <span class="s1">i </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">grid</span><span class="s2">(</span><span class="s3">1</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">i </span><span class="s2">== </span><span class="s3">0</span><span class="s2">:</span>
+                <span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s3">100</span><span class="s2">):</span>
+                    <span class="s1">sm</span><span class="s2">[</span><span class="s1">j</span><span class="s2">] = </span><span class="s1">j</span>
+            <span class="s1">cuda</span><span class="s2">.</span><span class="s1">syncthreads</span><span class="s2">()</span>
+            <span class="s1">ary</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] = </span><span class="s1">sm</span><span class="s2">[</span><span class="s1">i</span><span class="s2">]</span>
+
+        <span class="s1">shared_mem_per_block </span><span class="s2">= </span><span class="s1">simple_smem</span><span class="s2">.</span><span class="s1">get_shared_mem_per_block</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsInstance</span><span class="s2">(</span><span class="s1">shared_mem_per_block</span><span class="s2">, </span><span class="s1">int</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">shared_mem_per_block</span><span class="s2">, </span><span class="s3">400</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_get_max_threads_per_block_unspecialized</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">N </span><span class="s2">= </span><span class="s3">10</span>
+
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span>
+        <span class="s0">def </span><span class="s1">simple_maxthreads</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">):</span>
+            <span class="s1">i </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">grid</span><span class="s2">(</span><span class="s3">1</span><span class="s2">)</span>
+            <span class="s1">ary</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] = </span><span class="s1">i</span>
+
+        <span class="s1">arr_f32 </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s1">N</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">)</span>
+        <span class="s1">simple_maxthreads</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">arr_f32</span><span class="s2">)</span>
+        <span class="s1">sig_f32 </span><span class="s2">= </span><span class="s1">void</span><span class="s2">(</span><span class="s1">float32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">])</span>
+        <span class="s1">max_threads_f32 </span><span class="s2">= </span><span class="s1">simple_maxthreads</span><span class="s2">.</span><span class="s1">get_max_threads_per_block</span><span class="s2">(</span><span class="s1">sig_f32</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsInstance</span><span class="s2">(</span><span class="s1">max_threads_f32</span><span class="s2">, </span><span class="s1">int</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreater</span><span class="s2">(</span><span class="s1">max_threads_f32</span><span class="s2">, </span><span class="s3">0</span><span class="s2">)</span>
+
+        <span class="s1">max_threads_f32_all </span><span class="s2">= </span><span class="s1">simple_maxthreads</span><span class="s2">.</span><span class="s1">get_max_threads_per_block</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">max_threads_f32_all</span><span class="s2">[</span><span class="s1">sig_f32</span><span class="s2">.</span><span class="s1">args</span><span class="s2">], </span><span class="s1">max_threads_f32</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_get_local_mem_per_thread_unspecialized</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># NOTE: A large amount of local memory must be allocated</span>
+        <span class="s5"># otherwise the compiler will optimize out the call to</span>
+        <span class="s5"># cuda.local.array and use local registers instead</span>
+        <span class="s1">N </span><span class="s2">= </span><span class="s3">1000</span>
+
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span>
+        <span class="s0">def </span><span class="s1">simple_lmem</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">):</span>
+            <span class="s1">lm </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">local</span><span class="s2">.</span><span class="s1">array</span><span class="s2">(</span><span class="s1">N</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+            <span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">N</span><span class="s2">):</span>
+                <span class="s1">lm</span><span class="s2">[</span><span class="s1">j</span><span class="s2">] = </span><span class="s1">j</span>
+            <span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">N</span><span class="s2">):</span>
+                <span class="s1">ary</span><span class="s2">[</span><span class="s1">j</span><span class="s2">] = </span><span class="s1">lm</span><span class="s2">[</span><span class="s1">j</span><span class="s2">]</span>
+
+        <span class="s5"># Call the kernel with different arguments to create two different</span>
+        <span class="s5"># definitions within the Dispatcher object</span>
+        <span class="s1">arr_f32 </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s1">N</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">)</span>
+        <span class="s1">arr_f64 </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s1">N</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+
+        <span class="s1">simple_lmem</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">arr_f32</span><span class="s2">)</span>
+        <span class="s1">simple_lmem</span><span class="s2">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">](</span><span class="s1">arr_f64</span><span class="s2">)</span>
+
+        <span class="s1">sig_f32 </span><span class="s2">= </span><span class="s1">void</span><span class="s2">(</span><span class="s1">float32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">])</span>
+        <span class="s1">sig_f64 </span><span class="s2">= </span><span class="s1">void</span><span class="s2">(</span><span class="s1">float64</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">])</span>
+        <span class="s1">local_mem_f32 </span><span class="s2">= </span><span class="s1">simple_lmem</span><span class="s2">.</span><span class="s1">get_local_mem_per_thread</span><span class="s2">(</span><span class="s1">sig_f32</span><span class="s2">)</span>
+        <span class="s1">local_mem_f64 </span><span class="s2">= </span><span class="s1">simple_lmem</span><span class="s2">.</span><span class="s1">get_local_mem_per_thread</span><span class="s2">(</span><span class="s1">sig_f64</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsInstance</span><span class="s2">(</span><span class="s1">local_mem_f32</span><span class="s2">, </span><span class="s1">int</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsInstance</span><span class="s2">(</span><span class="s1">local_mem_f64</span><span class="s2">, </span><span class="s1">int</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreaterEqual</span><span class="s2">(</span><span class="s1">local_mem_f32</span><span class="s2">, </span><span class="s1">N </span><span class="s2">* </span><span class="s3">4</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreaterEqual</span><span class="s2">(</span><span class="s1">local_mem_f64</span><span class="s2">, </span><span class="s1">N </span><span class="s2">* </span><span class="s3">8</span><span class="s2">)</span>
+
+        <span class="s5"># Check that getting the local memory per thread for all signatures</span>
+        <span class="s5"># provides the same values as getting the shared mem per block for</span>
+        <span class="s5"># individual signatures.</span>
+        <span class="s1">local_mem_all </span><span class="s2">= </span><span class="s1">simple_lmem</span><span class="s2">.</span><span class="s1">get_local_mem_per_thread</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">local_mem_all</span><span class="s2">[</span><span class="s1">sig_f32</span><span class="s2">.</span><span class="s1">args</span><span class="s2">], </span><span class="s1">local_mem_f32</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">local_mem_all</span><span class="s2">[</span><span class="s1">sig_f64</span><span class="s2">.</span><span class="s1">args</span><span class="s2">], </span><span class="s1">local_mem_f64</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_get_local_mem_per_thread_specialized</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># NOTE: A large amount of local memory must be allocated</span>
+        <span class="s5"># otherwise the compiler will optimize out the call to</span>
+        <span class="s5"># cuda.local.array and use local registers instead</span>
+        <span class="s1">N </span><span class="s2">= </span><span class="s3">1000</span>
+
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">void</span><span class="s2">(</span><span class="s1">float32</span><span class="s2">[::</span><span class="s3">1</span><span class="s2">]))</span>
+        <span class="s0">def </span><span class="s1">simple_lmem</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">):</span>
+            <span class="s1">lm </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">local</span><span class="s2">.</span><span class="s1">array</span><span class="s2">(</span><span class="s1">N</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+            <span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">N</span><span class="s2">):</span>
+                <span class="s1">lm</span><span class="s2">[</span><span class="s1">j</span><span class="s2">] = </span><span class="s1">j</span>
+            <span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">N</span><span class="s2">):</span>
+                <span class="s1">ary</span><span class="s2">[</span><span class="s1">j</span><span class="s2">] = </span><span class="s1">lm</span><span class="s2">[</span><span class="s1">j</span><span class="s2">]</span>
+
+        <span class="s1">local_mem_per_thread </span><span class="s2">= </span><span class="s1">simple_lmem</span><span class="s2">.</span><span class="s1">get_local_mem_per_thread</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsInstance</span><span class="s2">(</span><span class="s1">local_mem_per_thread</span><span class="s2">, </span><span class="s1">int</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreaterEqual</span><span class="s2">(</span><span class="s1">local_mem_per_thread</span><span class="s2">, </span><span class="s1">N </span><span class="s2">* </span><span class="s3">4</span><span class="s2">)</span>
+
+
+<span class="s0">if </span><span class="s1">__name__ </span><span class="s2">== </span><span class="s4">'__main__'</span><span class="s2">:</span>
+    <span class="s1">unittest</span><span class="s2">.</span><span class="s1">main</span><span class="s2">()</span>
+</pre>
+</body>
+</html>

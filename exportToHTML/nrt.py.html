@@ -1,0 +1,154 @@
+<html>
+<head>
+<title>nrt.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #5f826b; font-style: italic;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+nrt.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">namedtuple</span>
+<span class="s0">from </span><span class="s1">weakref </span><span class="s0">import </span><span class="s1">finalize </span><span class="s0">as </span><span class="s1">_finalize</span>
+
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">runtime </span><span class="s0">import </span><span class="s1">nrtdynmod</span>
+<span class="s0">from </span><span class="s1">llvmlite </span><span class="s0">import </span><span class="s1">binding </span><span class="s0">as </span><span class="s1">ll</span>
+
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">compiler_lock </span><span class="s0">import </span><span class="s1">global_compiler_lock</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">typing</span><span class="s2">.</span><span class="s1">typeof </span><span class="s0">import </span><span class="s1">typeof_impl</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">types</span><span class="s2">, </span><span class="s1">config</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">runtime </span><span class="s0">import </span><span class="s1">_nrt_python </span><span class="s0">as </span><span class="s1">_nrt</span>
+
+<span class="s1">_nrt_mstats </span><span class="s2">= </span><span class="s1">namedtuple</span><span class="s2">(</span><span class="s3">&quot;nrt_mstats&quot;</span><span class="s2">, [</span><span class="s3">&quot;alloc&quot;</span><span class="s2">, </span><span class="s3">&quot;free&quot;</span><span class="s2">, </span><span class="s3">&quot;mi_alloc&quot;</span><span class="s2">, </span><span class="s3">&quot;mi_free&quot;</span><span class="s2">])</span>
+
+
+<span class="s0">class </span><span class="s1">_Runtime</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_init </span><span class="s2">= </span><span class="s0">False</span>
+
+    <span class="s2">@</span><span class="s1">global_compiler_lock</span>
+    <span class="s0">def </span><span class="s1">initialize</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ctx</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot;Initializes the NRT 
+ 
+        Must be called before any actual call to the NRT API. 
+        Safe to be called multiple times. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_init</span><span class="s2">:</span>
+            <span class="s5"># Already initialized</span>
+            <span class="s0">return</span>
+
+        <span class="s5"># Switch stats on if the config requests them.</span>
+        <span class="s0">if </span><span class="s1">config</span><span class="s2">.</span><span class="s1">NRT_STATS</span><span class="s2">:</span>
+            <span class="s1">_nrt</span><span class="s2">.</span><span class="s1">memsys_enable_stats</span><span class="s2">()</span>
+
+        <span class="s5"># Register globals into the system</span>
+        <span class="s0">for </span><span class="s1">py_name </span><span class="s0">in </span><span class="s1">_nrt</span><span class="s2">.</span><span class="s1">c_helpers</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">py_name</span><span class="s2">.</span><span class="s1">startswith</span><span class="s2">(</span><span class="s3">&quot;_&quot;</span><span class="s2">):</span>
+                <span class="s5"># internal API</span>
+                <span class="s1">c_name </span><span class="s2">= </span><span class="s1">py_name</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s1">c_name </span><span class="s2">= </span><span class="s3">&quot;NRT_&quot; </span><span class="s2">+ </span><span class="s1">py_name</span>
+            <span class="s1">c_address </span><span class="s2">= </span><span class="s1">_nrt</span><span class="s2">.</span><span class="s1">c_helpers</span><span class="s2">[</span><span class="s1">py_name</span><span class="s2">]</span>
+            <span class="s1">ll</span><span class="s2">.</span><span class="s1">add_symbol</span><span class="s2">(</span><span class="s1">c_name</span><span class="s2">, </span><span class="s1">c_address</span><span class="s2">)</span>
+
+        <span class="s5"># Compile atomic operations</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_library </span><span class="s2">= </span><span class="s1">nrtdynmod</span><span class="s2">.</span><span class="s1">compile_nrt_functions</span><span class="s2">(</span><span class="s1">ctx</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_init </span><span class="s2">= </span><span class="s0">True</span>
+
+    <span class="s0">def </span><span class="s1">_init_guard</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_init</span><span class="s2">:</span>
+            <span class="s1">msg </span><span class="s2">= </span><span class="s3">&quot;Runtime must be initialized before use.&quot;</span>
+            <span class="s0">raise </span><span class="s1">RuntimeError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s0">def </span><span class="s1">shutdown</span><span class="s2">():</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Shutdown the NRT 
+        Safe to be called without calling Runtime.initialize first 
+        &quot;&quot;&quot;</span>
+        <span class="s1">_nrt</span><span class="s2">.</span><span class="s1">memsys_shutdown</span><span class="s2">()</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">library</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Return the Library object containing the various NRT functions. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_init_guard</span><span class="s2">()</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_library</span>
+
+    <span class="s0">def </span><span class="s1">meminfo_new</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">pyobj</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Returns a MemInfo object that tracks memory at `data` owned by `pyobj`. 
+        MemInfo will acquire a reference on `pyobj`. 
+        The release of MemInfo will release a reference on `pyobj`. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_init_guard</span><span class="s2">()</span>
+        <span class="s1">mi </span><span class="s2">= </span><span class="s1">_nrt</span><span class="s2">.</span><span class="s1">meminfo_new</span><span class="s2">(</span><span class="s1">data</span><span class="s2">, </span><span class="s1">pyobj</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">MemInfo</span><span class="s2">(</span><span class="s1">mi</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">meminfo_alloc</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">size</span><span class="s2">, </span><span class="s1">safe</span><span class="s2">=</span><span class="s0">False</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Allocate a new memory of `size` bytes and returns a MemInfo object 
+        that tracks the allocation.  When there is no more reference to the 
+        MemInfo object, the underlying memory will be deallocated. 
+ 
+        If `safe` flag is True, the memory is allocated using the `safe` scheme. 
+        This is used for debugging and testing purposes. 
+        See `NRT_MemInfo_alloc_safe()` in &quot;nrt.h&quot; for details. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_init_guard</span><span class="s2">()</span>
+        <span class="s0">if </span><span class="s1">size </span><span class="s2">&lt; </span><span class="s6">0</span><span class="s2">:</span>
+            <span class="s1">msg </span><span class="s2">= </span><span class="s3">f&quot;Cannot allocate a negative number of bytes: </span><span class="s0">{</span><span class="s1">size</span><span class="s0">}</span><span class="s3">.&quot;</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">safe</span><span class="s2">:</span>
+            <span class="s1">mi </span><span class="s2">= </span><span class="s1">_nrt</span><span class="s2">.</span><span class="s1">meminfo_alloc_safe</span><span class="s2">(</span><span class="s1">size</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">mi </span><span class="s2">= </span><span class="s1">_nrt</span><span class="s2">.</span><span class="s1">meminfo_alloc</span><span class="s2">(</span><span class="s1">size</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">mi </span><span class="s2">== </span><span class="s6">0</span><span class="s2">: </span><span class="s5"># alloc failed or size was 0 and alloc returned NULL.</span>
+            <span class="s1">msg </span><span class="s2">= </span><span class="s3">f&quot;Requested allocation of </span><span class="s0">{</span><span class="s1">size</span><span class="s0">} </span><span class="s3">bytes failed.&quot;</span>
+            <span class="s0">raise </span><span class="s1">MemoryError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">MemInfo</span><span class="s2">(</span><span class="s1">mi</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">get_allocation_stats</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Returns a namedtuple of (alloc, free, mi_alloc, mi_free) for count of 
+        each memory operations. 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># No init guard needed to access stats members</span>
+        <span class="s0">return </span><span class="s1">_nrt_mstats</span><span class="s2">(</span><span class="s1">alloc</span><span class="s2">=</span><span class="s1">_nrt</span><span class="s2">.</span><span class="s1">memsys_get_stats_alloc</span><span class="s2">(),</span>
+                           <span class="s1">free</span><span class="s2">=</span><span class="s1">_nrt</span><span class="s2">.</span><span class="s1">memsys_get_stats_free</span><span class="s2">(),</span>
+                           <span class="s1">mi_alloc</span><span class="s2">=</span><span class="s1">_nrt</span><span class="s2">.</span><span class="s1">memsys_get_stats_mi_alloc</span><span class="s2">(),</span>
+                           <span class="s1">mi_free</span><span class="s2">=</span><span class="s1">_nrt</span><span class="s2">.</span><span class="s1">memsys_get_stats_mi_free</span><span class="s2">())</span>
+
+
+<span class="s5"># Alias to _nrt_python._MemInfo</span>
+<span class="s1">MemInfo </span><span class="s2">= </span><span class="s1">_nrt</span><span class="s2">.</span><span class="s1">_MemInfo</span>
+
+
+<span class="s2">@</span><span class="s1">typeof_impl</span><span class="s2">.</span><span class="s1">register</span><span class="s2">(</span><span class="s1">MemInfo</span><span class="s2">)</span>
+<span class="s0">def </span><span class="s1">typeof_meminfo</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">c</span><span class="s2">):</span>
+    <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">MemInfoPointer</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">voidptr</span><span class="s2">)</span>
+
+
+<span class="s5"># Create runtime</span>
+<span class="s1">_nrt</span><span class="s2">.</span><span class="s1">memsys_use_cpython_allocator</span><span class="s2">()</span>
+<span class="s1">rtsys </span><span class="s2">= </span><span class="s1">_Runtime</span><span class="s2">()</span>
+
+<span class="s5"># Install finalizer</span>
+<span class="s1">_finalize</span><span class="s2">(</span><span class="s1">rtsys</span><span class="s2">, </span><span class="s1">_Runtime</span><span class="s2">.</span><span class="s1">shutdown</span><span class="s2">)</span>
+
+<span class="s5"># Avoid future use of the class</span>
+<span class="s0">del </span><span class="s1">_Runtime</span>
+</pre>
+</body>
+</html>

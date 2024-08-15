@@ -1,0 +1,654 @@
+<html>
+<head>
+<title>test_ssa.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_ssa.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Tests for SSA reconstruction 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">import </span><span class="s1">copy</span>
+<span class="s2">import </span><span class="s1">logging</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">from </span><span class="s1">numba </span><span class="s2">import </span><span class="s1">njit</span><span class="s3">, </span><span class="s1">jit</span><span class="s3">, </span><span class="s1">types</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">errors</span><span class="s3">, </span><span class="s1">ir</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">compiler_machinery </span><span class="s2">import </span><span class="s1">FunctionPass</span><span class="s3">, </span><span class="s1">register_pass</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">compiler </span><span class="s2">import </span><span class="s1">DefaultPassBuilder</span><span class="s3">, </span><span class="s1">CompilerBase</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">untyped_passes </span><span class="s2">import </span><span class="s1">ReconstructSSA</span><span class="s3">, </span><span class="s1">PreserveIR</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">typed_passes </span><span class="s2">import </span><span class="s1">NativeLowering</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">extending </span><span class="s2">import </span><span class="s1">overload</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">tests</span><span class="s3">.</span><span class="s1">support </span><span class="s2">import </span><span class="s1">MemoryLeakMixin</span><span class="s3">, </span><span class="s1">TestCase</span><span class="s3">, </span><span class="s1">override_config</span>
+
+
+<span class="s1">_DEBUG </span><span class="s3">= </span><span class="s2">False</span>
+
+<span class="s2">if </span><span class="s1">_DEBUG</span><span class="s3">:</span>
+    <span class="s4"># Enable debug logger on SSA reconstruction</span>
+    <span class="s1">ssa_logger </span><span class="s3">= </span><span class="s1">logging</span><span class="s3">.</span><span class="s1">getLogger</span><span class="s3">(</span><span class="s5">&quot;numba.core.ssa&quot;</span><span class="s3">)</span>
+    <span class="s1">ssa_logger</span><span class="s3">.</span><span class="s1">setLevel</span><span class="s3">(</span><span class="s1">level</span><span class="s3">=</span><span class="s1">logging</span><span class="s3">.</span><span class="s1">DEBUG</span><span class="s3">)</span>
+    <span class="s1">ssa_logger</span><span class="s3">.</span><span class="s1">addHandler</span><span class="s3">(</span><span class="s1">logging</span><span class="s3">.</span><span class="s1">StreamHandler</span><span class="s3">(</span><span class="s1">sys</span><span class="s3">.</span><span class="s1">stderr</span><span class="s3">))</span>
+
+
+<span class="s2">class </span><span class="s1">SSABaseTest</span><span class="s3">(</span><span class="s1">TestCase</span><span class="s3">):</span>
+
+    <span class="s2">def </span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">func</span><span class="s3">, *</span><span class="s1">args</span><span class="s3">):</span>
+        <span class="s1">got </span><span class="s3">= </span><span class="s1">func</span><span class="s3">(*</span><span class="s1">copy</span><span class="s3">.</span><span class="s1">deepcopy</span><span class="s3">(</span><span class="s1">args</span><span class="s3">))</span>
+        <span class="s1">exp </span><span class="s3">= </span><span class="s1">func</span><span class="s3">.</span><span class="s1">py_func</span><span class="s3">(*</span><span class="s1">copy</span><span class="s3">.</span><span class="s1">deepcopy</span><span class="s3">(</span><span class="s1">args</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">got</span><span class="s3">, </span><span class="s1">exp</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestSSA</span><span class="s3">(</span><span class="s1">SSABaseTest</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Contains tests to help isolate problems in SSA 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">test_argument_name_reused</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s1">x </span><span class="s3">+= </span><span class="s6">1</span>
+            <span class="s2">return </span><span class="s1">x</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">, </span><span class="s6">123</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_if_else_redefine</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">):</span>
+            <span class="s1">z </span><span class="s3">= </span><span class="s1">x </span><span class="s3">* </span><span class="s1">y</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s3">&lt; </span><span class="s1">y</span><span class="s3">:</span>
+                <span class="s1">z </span><span class="s3">= </span><span class="s1">x</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">z </span><span class="s3">= </span><span class="s1">y</span>
+            <span class="s2">return </span><span class="s1">z</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">, </span><span class="s6">3</span><span class="s3">, </span><span class="s6">2</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">, </span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_sum_loop</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">(</span><span class="s1">n</span><span class="s3">):</span>
+            <span class="s1">c </span><span class="s3">= </span><span class="s6">0</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n</span><span class="s3">):</span>
+                <span class="s1">c </span><span class="s3">+= </span><span class="s1">i</span>
+            <span class="s2">return </span><span class="s1">c</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">, </span><span class="s6">0</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">, </span><span class="s6">10</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_sum_loop_2vars</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">(</span><span class="s1">n</span><span class="s3">):</span>
+            <span class="s1">c </span><span class="s3">= </span><span class="s6">0</span>
+            <span class="s1">d </span><span class="s3">= </span><span class="s1">n</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n</span><span class="s3">):</span>
+                <span class="s1">c </span><span class="s3">+= </span><span class="s1">i</span>
+                <span class="s1">d </span><span class="s3">+= </span><span class="s1">n</span>
+            <span class="s2">return </span><span class="s1">c</span><span class="s3">, </span><span class="s1">d</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">, </span><span class="s6">0</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">, </span><span class="s6">10</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_sum_2d_loop</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">(</span><span class="s1">n</span><span class="s3">):</span>
+            <span class="s1">c </span><span class="s3">= </span><span class="s6">0</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n</span><span class="s3">):</span>
+                <span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n</span><span class="s3">):</span>
+                    <span class="s1">c </span><span class="s3">+= </span><span class="s1">j</span>
+                <span class="s1">c </span><span class="s3">+= </span><span class="s1">i</span>
+            <span class="s2">return </span><span class="s1">c</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">, </span><span class="s6">0</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">, </span><span class="s6">10</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">check_undefined_var</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">should_warn</span><span class="s3">):</span>
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">(</span><span class="s1">n</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">n</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">n </span><span class="s3">&gt; </span><span class="s6">0</span><span class="s3">:</span>
+                    <span class="s1">c </span><span class="s3">= </span><span class="s6">0</span>
+                <span class="s2">return </span><span class="s1">c</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s4"># variable c is not defined in this branch</span>
+                <span class="s1">c </span><span class="s3">+= </span><span class="s6">1</span>
+                <span class="s2">return </span><span class="s1">c</span>
+
+        <span class="s2">if </span><span class="s1">should_warn</span><span class="s3">:</span>
+            <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">assertWarns</span><span class="s3">(</span><span class="s1">errors</span><span class="s3">.</span><span class="s1">NumbaWarning</span><span class="s3">) </span><span class="s2">as </span><span class="s1">warns</span><span class="s3">:</span>
+                <span class="s4"># n=1 so we won't actually run the branch with the uninitialized</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">, </span><span class="s6">1</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIn</span><span class="s3">(</span><span class="s5">&quot;Detected uninitialized variable c&quot;</span><span class="s3">,</span>
+                          <span class="s1">str</span><span class="s3">(</span><span class="s1">warns</span><span class="s3">.</span><span class="s1">warning</span><span class="s3">))</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">, </span><span class="s6">1</span><span class="s3">)</span>
+
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">assertRaises</span><span class="s3">(</span><span class="s1">UnboundLocalError</span><span class="s3">):</span>
+            <span class="s1">foo</span><span class="s3">.</span><span class="s1">py_func</span><span class="s3">(</span><span class="s6">0</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_undefined_var</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">override_config</span><span class="s3">(</span><span class="s5">'ALWAYS_WARN_UNINIT_VAR'</span><span class="s3">, </span><span class="s6">0</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_undefined_var</span><span class="s3">(</span><span class="s1">should_warn</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)</span>
+        <span class="s2">with </span><span class="s1">override_config</span><span class="s3">(</span><span class="s5">'ALWAYS_WARN_UNINIT_VAR'</span><span class="s3">, </span><span class="s6">1</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_undefined_var</span><span class="s3">(</span><span class="s1">should_warn</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_phi_propagation</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">(</span><span class="s1">actions</span><span class="s3">):</span>
+            <span class="s1">n </span><span class="s3">= </span><span class="s6">1</span>
+
+            <span class="s1">i </span><span class="s3">= </span><span class="s6">0</span>
+            <span class="s1">ct </span><span class="s3">= </span><span class="s6">0</span>
+            <span class="s2">while </span><span class="s1">n </span><span class="s3">&gt; </span><span class="s6">0 </span><span class="s2">and </span><span class="s1">i </span><span class="s3">&lt; </span><span class="s1">len</span><span class="s3">(</span><span class="s1">actions</span><span class="s3">):</span>
+                <span class="s1">n </span><span class="s3">-= </span><span class="s6">1</span>
+
+                <span class="s2">while </span><span class="s1">actions</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]:</span>
+                    <span class="s2">if </span><span class="s1">actions</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]:</span>
+                        <span class="s2">if </span><span class="s1">actions</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]:</span>
+                            <span class="s1">n </span><span class="s3">+= </span><span class="s6">10</span>
+                        <span class="s1">actions</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] -= </span><span class="s6">1</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s2">if </span><span class="s1">actions</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]:</span>
+                            <span class="s1">n </span><span class="s3">+= </span><span class="s6">20</span>
+                        <span class="s1">actions</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] += </span><span class="s6">1</span>
+
+                    <span class="s1">ct </span><span class="s3">+= </span><span class="s1">n</span>
+                <span class="s1">ct </span><span class="s3">+= </span><span class="s1">n</span>
+            <span class="s2">return </span><span class="s1">ct</span><span class="s3">, </span><span class="s1">n</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">]))</span>
+
+    <span class="s2">def </span><span class="s1">test_unhandled_undefined</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">def </span><span class="s1">function1</span><span class="s3">(</span><span class="s1">arg1</span><span class="s3">, </span><span class="s1">arg2</span><span class="s3">, </span><span class="s1">arg3</span><span class="s3">, </span><span class="s1">arg4</span><span class="s3">, </span><span class="s1">arg5</span><span class="s3">):</span>
+            <span class="s4"># This function is auto-generated.</span>
+            <span class="s2">if </span><span class="s1">arg1</span><span class="s3">:</span>
+                <span class="s1">var1 </span><span class="s3">= </span><span class="s1">arg2</span>
+                <span class="s1">var2 </span><span class="s3">= </span><span class="s1">arg3</span>
+                <span class="s1">var3 </span><span class="s3">= </span><span class="s1">var2</span>
+                <span class="s1">var4 </span><span class="s3">= </span><span class="s1">arg1</span>
+                <span class="s2">return</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">arg2</span><span class="s3">:</span>
+                    <span class="s2">if </span><span class="s1">arg4</span><span class="s3">:</span>
+                        <span class="s1">var5 </span><span class="s3">= </span><span class="s1">arg4         </span><span class="s4"># noqa: F841</span>
+                        <span class="s2">return</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s1">var6 </span><span class="s3">= </span><span class="s1">var4</span>
+                        <span class="s2">return</span>
+                    <span class="s2">return </span><span class="s1">var6</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s2">if </span><span class="s1">arg5</span><span class="s3">:</span>
+                        <span class="s2">if </span><span class="s1">var1</span><span class="s3">:</span>
+                            <span class="s2">if </span><span class="s1">arg5</span><span class="s3">:</span>
+                                <span class="s1">var1 </span><span class="s3">= </span><span class="s1">var6</span>
+                                <span class="s2">return</span>
+                            <span class="s2">else</span><span class="s3">:</span>
+                                <span class="s1">var7 </span><span class="s3">= </span><span class="s1">arg2     </span><span class="s4"># noqa: F841</span>
+                                <span class="s2">return </span><span class="s1">arg2</span>
+                            <span class="s2">return</span>
+                        <span class="s2">else</span><span class="s3">:</span>
+                            <span class="s2">if </span><span class="s1">var2</span><span class="s3">:</span>
+                                <span class="s1">arg5 </span><span class="s3">= </span><span class="s1">arg2</span>
+                                <span class="s2">return </span><span class="s1">arg1</span>
+                            <span class="s2">else</span><span class="s3">:</span>
+                                <span class="s1">var6 </span><span class="s3">= </span><span class="s1">var3</span>
+                                <span class="s2">return </span><span class="s1">var4</span>
+                            <span class="s2">return</span>
+                        <span class="s2">return</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s1">var8 </span><span class="s3">= </span><span class="s1">var1</span>
+                        <span class="s2">return</span>
+                    <span class="s2">return </span><span class="s1">var8</span>
+                <span class="s1">var9 </span><span class="s3">= </span><span class="s1">var3         </span><span class="s4"># noqa: F841</span>
+                <span class="s1">var10 </span><span class="s3">= </span><span class="s1">arg5        </span><span class="s4"># noqa: F841</span>
+                <span class="s2">return </span><span class="s1">var1</span>
+
+        <span class="s4"># The argument values is not critical for re-creating the bug</span>
+        <span class="s4"># because the bug is in compile-time.</span>
+        <span class="s1">expect </span><span class="s3">= </span><span class="s1">function1</span><span class="s3">(</span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">, </span><span class="s6">6</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">7</span><span class="s3">)</span>
+        <span class="s1">got </span><span class="s3">= </span><span class="s1">njit</span><span class="s3">(</span><span class="s1">function1</span><span class="s3">)(</span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">, </span><span class="s6">6</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">7</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">expect</span><span class="s3">, </span><span class="s1">got</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestReportedSSAIssues</span><span class="s3">(</span><span class="s1">SSABaseTest</span><span class="s3">):</span>
+    <span class="s4"># Tests from issues</span>
+    <span class="s4"># https://github.com/numba/numba/issues?q=is%3Aopen+is%3Aissue+label%3ASSA</span>
+
+    <span class="s2">def </span><span class="s1">test_issue2194</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">():</span>
+            <span class="s1">V </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s6">1</span><span class="s3">)</span>
+            <span class="s1">s </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">uint32</span><span class="s3">(</span><span class="s6">1</span><span class="s3">)</span>
+
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">s</span><span class="s3">):</span>
+                <span class="s1">V</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s6">1</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">s</span><span class="s3">, </span><span class="s6">1</span><span class="s3">):</span>
+                <span class="s2">pass</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">, )</span>
+
+    <span class="s2">def </span><span class="s1">test_issue3094</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">doit</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">x</span>
+
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">(</span><span class="s1">pred</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">pred</span><span class="s3">:</span>
+                <span class="s1">x </span><span class="s3">= </span><span class="s2">True</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">x </span><span class="s3">= </span><span class="s2">False</span>
+            <span class="s4"># do something with x</span>
+            <span class="s2">return </span><span class="s1">doit</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">, </span><span class="s2">False</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_issue3931</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">(</span><span class="s1">arr</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s6">1</span><span class="s3">):</span>
+                <span class="s1">arr </span><span class="s3">= </span><span class="s1">arr</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(</span><span class="s6">3 </span><span class="s3">* </span><span class="s6">2</span><span class="s3">)</span>
+                <span class="s1">arr </span><span class="s3">= </span><span class="s1">arr</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(</span><span class="s6">3</span><span class="s3">, </span><span class="s6">2</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s3">(</span><span class="s1">arr</span><span class="s3">)</span>
+
+        <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_allclose</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s6">3</span><span class="s3">, </span><span class="s6">2</span><span class="s3">))),</span>
+                                   <span class="s1">foo</span><span class="s3">.</span><span class="s1">py_func</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s6">3</span><span class="s3">, </span><span class="s6">2</span><span class="s3">))))</span>
+
+    <span class="s2">def </span><span class="s1">test_issue3976</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">overload_this</span><span class="s3">(</span><span class="s1">a</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s5">'dummy'</span>
+
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">(</span><span class="s1">a</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">a</span><span class="s3">:</span>
+                <span class="s1">s </span><span class="s3">= </span><span class="s6">5</span>
+                <span class="s1">s </span><span class="s3">= </span><span class="s1">overload_this</span><span class="s3">(</span><span class="s1">s</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">s </span><span class="s3">= </span><span class="s5">'b'</span>
+
+            <span class="s2">return </span><span class="s1">s</span>
+
+        <span class="s3">@</span><span class="s1">overload</span><span class="s3">(</span><span class="s1">overload_this</span><span class="s3">)</span>
+        <span class="s2">def </span><span class="s1">ol</span><span class="s3">(</span><span class="s1">a</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">overload_this</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">, </span><span class="s2">True</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_issue3979</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">(</span><span class="s1">A</span><span class="s3">, </span><span class="s1">B</span><span class="s3">):</span>
+            <span class="s1">x </span><span class="s3">= </span><span class="s1">A</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+            <span class="s1">y </span><span class="s3">= </span><span class="s1">B</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">A</span><span class="s3">:</span>
+                <span class="s1">x </span><span class="s3">= </span><span class="s1">i</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">B</span><span class="s3">:</span>
+                <span class="s1">y </span><span class="s3">= </span><span class="s1">i</span>
+            <span class="s2">return </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">, (</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">), (</span><span class="s5">'A'</span><span class="s3">, </span><span class="s5">'B'</span><span class="s3">))</span>
+
+    <span class="s2">def </span><span class="s1">test_issue5219</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">overload_this</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">b</span><span class="s3">, </span><span class="s1">tuple</span><span class="s3">):</span>
+                <span class="s1">b </span><span class="s3">= </span><span class="s1">b</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+            <span class="s2">return </span><span class="s1">b</span>
+
+        <span class="s3">@</span><span class="s1">overload</span><span class="s3">(</span><span class="s1">overload_this</span><span class="s3">)</span>
+        <span class="s2">def </span><span class="s1">ol</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+            <span class="s1">b_is_tuple </span><span class="s3">= </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">b</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">Tuple</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">UniTuple</span><span class="s3">))</span>
+
+            <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+                <span class="s2">if </span><span class="s1">b_is_tuple </span><span class="s2">is True</span><span class="s3">:</span>
+                    <span class="s1">b </span><span class="s3">= </span><span class="s1">b</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+                <span class="s2">return </span><span class="s1">b</span>
+            <span class="s2">return </span><span class="s1">impl</span>
+
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">test_tuple</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+            <span class="s1">overload_this</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">test_tuple</span><span class="s3">, </span><span class="s6">1</span><span class="s3">, (</span><span class="s6">2</span><span class="s3">, ))</span>
+
+    <span class="s2">def </span><span class="s1">test_issue5223</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">bar</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">x</span><span class="s3">) == </span><span class="s6">5</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">x</span>
+            <span class="s1">x </span><span class="s3">= </span><span class="s1">x</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)):</span>
+                <span class="s1">x</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] += </span><span class="s6">1</span>
+            <span class="s2">return </span><span class="s1">x</span>
+
+        <span class="s1">a </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">(</span><span class="s6">5</span><span class="s3">)</span>
+        <span class="s1">a</span><span class="s3">.</span><span class="s1">flags</span><span class="s3">.</span><span class="s1">writeable </span><span class="s3">= </span><span class="s2">False</span>
+
+        <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_allclose</span><span class="s3">(</span><span class="s1">bar</span><span class="s3">(</span><span class="s1">a</span><span class="s3">), </span><span class="s1">bar</span><span class="s3">.</span><span class="s1">py_func</span><span class="s3">(</span><span class="s1">a</span><span class="s3">))</span>
+
+    <span class="s2">def </span><span class="s1">test_issue5243</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">(</span><span class="s1">q</span><span class="s3">):</span>
+            <span class="s1">lin </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">((</span><span class="s6">0.1</span><span class="s3">, </span><span class="s6">0.6</span><span class="s3">, </span><span class="s6">0.3</span><span class="s3">))</span>
+            <span class="s1">stencil </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s6">3</span><span class="s3">, </span><span class="s6">3</span><span class="s3">))</span>
+            <span class="s1">stencil</span><span class="s3">[</span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">] = </span><span class="s1">q</span><span class="s3">[</span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">]</span>
+            <span class="s2">return </span><span class="s1">lin</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_func</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s6">2</span><span class="s3">, </span><span class="s6">2</span><span class="s3">)))</span>
+
+    <span class="s2">def </span><span class="s1">test_issue5482_missing_variable_init</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s4"># Test error that lowering fails because variable is missing</span>
+        <span class="s4"># a definition before use.</span>
+        <span class="s3">@</span><span class="s1">njit</span><span class="s3">(</span><span class="s5">&quot;(intp, intp, intp)&quot;</span><span class="s3">)</span>
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">v</span><span class="s3">, </span><span class="s1">n</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n</span><span class="s3">):</span>
+                <span class="s2">if </span><span class="s1">i </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+                    <span class="s2">if </span><span class="s1">i </span><span class="s3">== </span><span class="s1">x</span><span class="s3">:</span>
+                        <span class="s2">pass</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s1">problematic </span><span class="s3">= </span><span class="s1">v</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s2">if </span><span class="s1">i </span><span class="s3">== </span><span class="s1">x</span><span class="s3">:</span>
+                        <span class="s2">pass</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s1">problematic </span><span class="s3">= </span><span class="s1">problematic </span><span class="s3">+ </span><span class="s1">v</span>
+            <span class="s2">return </span><span class="s1">problematic</span>
+
+    <span class="s2">def </span><span class="s1">test_issue5482_objmode_expr_null_lowering</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s4"># Existing pipelines will not have the Expr.null in objmode.</span>
+        <span class="s4"># We have to create a custom pipeline to force a SSA reconstruction</span>
+        <span class="s4"># and stripping.</span>
+        <span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">compiler </span><span class="s2">import </span><span class="s1">CompilerBase</span><span class="s3">, </span><span class="s1">DefaultPassBuilder</span>
+        <span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">untyped_passes </span><span class="s2">import </span><span class="s1">ReconstructSSA</span><span class="s3">, </span><span class="s1">IRProcessing</span>
+        <span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">typed_passes </span><span class="s2">import </span><span class="s1">PreLowerStripPhis</span>
+
+        <span class="s2">class </span><span class="s1">CustomPipeline</span><span class="s3">(</span><span class="s1">CompilerBase</span><span class="s3">):</span>
+            <span class="s2">def </span><span class="s1">define_pipelines</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+                <span class="s1">pm </span><span class="s3">= </span><span class="s1">DefaultPassBuilder</span><span class="s3">.</span><span class="s1">define_objectmode_pipeline</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">state</span><span class="s3">)</span>
+                <span class="s4"># Force SSA reconstruction and stripping</span>
+                <span class="s1">pm</span><span class="s3">.</span><span class="s1">add_pass_after</span><span class="s3">(</span><span class="s1">ReconstructSSA</span><span class="s3">, </span><span class="s1">IRProcessing</span><span class="s3">)</span>
+                <span class="s1">pm</span><span class="s3">.</span><span class="s1">add_pass_after</span><span class="s3">(</span><span class="s1">PreLowerStripPhis</span><span class="s3">, </span><span class="s1">ReconstructSSA</span><span class="s3">)</span>
+                <span class="s1">pm</span><span class="s3">.</span><span class="s1">finalize</span><span class="s3">()</span>
+                <span class="s2">return </span><span class="s3">[</span><span class="s1">pm</span><span class="s3">]</span>
+
+        <span class="s3">@</span><span class="s1">jit</span><span class="s3">(</span><span class="s5">&quot;(intp, intp, intp)&quot;</span><span class="s3">, </span><span class="s1">looplift</span><span class="s3">=</span><span class="s2">False</span><span class="s3">,</span>
+             <span class="s1">pipeline_class</span><span class="s3">=</span><span class="s1">CustomPipeline</span><span class="s3">)</span>
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">v</span><span class="s3">, </span><span class="s1">n</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n</span><span class="s3">):</span>
+                <span class="s2">if </span><span class="s1">i </span><span class="s3">== </span><span class="s1">n</span><span class="s3">:</span>
+                    <span class="s2">if </span><span class="s1">i </span><span class="s3">== </span><span class="s1">x</span><span class="s3">:</span>
+                        <span class="s2">pass</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s1">problematic </span><span class="s3">= </span><span class="s1">v</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s2">if </span><span class="s1">i </span><span class="s3">== </span><span class="s1">x</span><span class="s3">:</span>
+                        <span class="s2">pass</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s1">problematic </span><span class="s3">= </span><span class="s1">problematic </span><span class="s3">+ </span><span class="s1">v</span>
+            <span class="s2">return </span><span class="s1">problematic</span>
+
+    <span class="s2">def </span><span class="s1">test_issue5493_unneeded_phi</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s4"># Test error that unneeded phi is inserted because variable does not</span>
+        <span class="s4"># have a dominance definition.</span>
+        <span class="s1">data </span><span class="s3">= (</span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">(</span><span class="s6">2</span><span class="s3">), </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">(</span><span class="s6">2</span><span class="s3">))</span>
+        <span class="s1">A </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">(</span><span class="s6">1</span><span class="s3">)</span>
+        <span class="s1">B </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">((</span><span class="s6">1</span><span class="s3">,</span><span class="s6">1</span><span class="s3">))</span>
+
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">(</span><span class="s1">m</span><span class="s3">, </span><span class="s1">n</span><span class="s3">, </span><span class="s1">data</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">data</span><span class="s3">) == </span><span class="s6">1</span><span class="s3">:</span>
+                <span class="s1">v0 </span><span class="s3">= </span><span class="s1">data</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">v0 </span><span class="s3">= </span><span class="s1">data</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+                <span class="s4"># Unneeded PHI node for `problematic` would be placed here</span>
+                <span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s6">1</span><span class="s3">, </span><span class="s1">len</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)):</span>
+                    <span class="s1">v0 </span><span class="s3">+= </span><span class="s1">A</span>
+
+            <span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s6">1</span><span class="s3">, </span><span class="s1">m</span><span class="s3">):</span>
+                <span class="s2">for </span><span class="s1">idx </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n</span><span class="s3">):</span>
+                    <span class="s1">t </span><span class="s3">= </span><span class="s1">B</span>
+
+                    <span class="s2">if </span><span class="s1">idx </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+                        <span class="s2">if </span><span class="s1">idx </span><span class="s3">== </span><span class="s1">n </span><span class="s3">- </span><span class="s6">1</span><span class="s3">:</span>
+                            <span class="s2">pass</span>
+                        <span class="s2">else</span><span class="s3">:</span>
+                            <span class="s1">problematic </span><span class="s3">= </span><span class="s1">t</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s2">if </span><span class="s1">idx </span><span class="s3">== </span><span class="s1">n </span><span class="s3">- </span><span class="s6">1</span><span class="s3">:</span>
+                            <span class="s2">pass</span>
+                        <span class="s2">else</span><span class="s3">:</span>
+                            <span class="s1">problematic </span><span class="s3">= </span><span class="s1">problematic </span><span class="s3">+ </span><span class="s1">t</span>
+            <span class="s2">return </span><span class="s1">problematic</span>
+
+        <span class="s1">expect </span><span class="s3">= </span><span class="s1">foo</span><span class="s3">(</span><span class="s6">10</span><span class="s3">, </span><span class="s6">10</span><span class="s3">, </span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s1">res1 </span><span class="s3">= </span><span class="s1">njit</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">)(</span><span class="s6">10</span><span class="s3">, </span><span class="s6">10</span><span class="s3">, </span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s1">res2 </span><span class="s3">= </span><span class="s1">jit</span><span class="s3">(</span><span class="s1">forceobj</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">looplift</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)(</span><span class="s1">foo</span><span class="s3">)(</span><span class="s6">10</span><span class="s3">, </span><span class="s6">10</span><span class="s3">, </span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">expect</span><span class="s3">, </span><span class="s1">res1</span><span class="s3">)</span>
+        <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">expect</span><span class="s3">, </span><span class="s1">res2</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_issue5623_equal_statements_in_same_bb</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">(</span><span class="s1">pred</span><span class="s3">, </span><span class="s1">stack</span><span class="s3">):</span>
+            <span class="s1">i </span><span class="s3">= </span><span class="s6">0</span>
+            <span class="s1">c </span><span class="s3">= </span><span class="s6">1</span>
+
+            <span class="s2">if </span><span class="s1">pred </span><span class="s2">is True</span><span class="s3">:</span>
+                <span class="s1">stack</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s1">c</span>
+                <span class="s1">i </span><span class="s3">+= </span><span class="s6">1</span>
+                <span class="s1">stack</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s1">c</span>
+                <span class="s1">i </span><span class="s3">+= </span><span class="s6">1</span>
+
+        <span class="s1">python </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([</span><span class="s6">0</span><span class="s3">, </span><span class="s6">666</span><span class="s3">])</span>
+        <span class="s1">foo</span><span class="s3">(</span><span class="s2">True</span><span class="s3">, </span><span class="s1">python</span><span class="s3">)</span>
+
+        <span class="s1">nb </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([</span><span class="s6">0</span><span class="s3">, </span><span class="s6">666</span><span class="s3">])</span>
+        <span class="s1">njit</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">)(</span><span class="s2">True</span><span class="s3">, </span><span class="s1">nb</span><span class="s3">)</span>
+
+        <span class="s1">expect </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([</span><span class="s6">1</span><span class="s3">, </span><span class="s6">1</span><span class="s3">])</span>
+
+        <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">python</span><span class="s3">, </span><span class="s1">expect</span><span class="s3">)</span>
+        <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">nb</span><span class="s3">, </span><span class="s1">expect</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_issue5678_non_minimal_phi</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s4"># There should be only one phi for variable &quot;i&quot;</span>
+
+        <span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">compiler </span><span class="s2">import </span><span class="s1">CompilerBase</span><span class="s3">, </span><span class="s1">DefaultPassBuilder</span>
+        <span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">untyped_passes </span><span class="s2">import </span><span class="s3">(</span>
+            <span class="s1">ReconstructSSA</span><span class="s3">, </span><span class="s1">FunctionPass</span><span class="s3">, </span><span class="s1">register_pass</span><span class="s3">,</span>
+        <span class="s3">)</span>
+
+        <span class="s1">phi_counter </span><span class="s3">= []</span>
+
+        <span class="s3">@</span><span class="s1">register_pass</span><span class="s3">(</span><span class="s1">mutates_CFG</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, </span><span class="s1">analysis_only</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+        <span class="s2">class </span><span class="s1">CheckSSAMinimal</span><span class="s3">(</span><span class="s1">FunctionPass</span><span class="s3">):</span>
+            <span class="s4"># A custom pass to count the number of phis</span>
+
+            <span class="s1">_name </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__qualname__ </span><span class="s3">+ </span><span class="s5">&quot;.CheckSSAMinimal&quot;</span>
+
+            <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+                <span class="s1">super</span><span class="s3">().</span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">)</span>
+
+            <span class="s2">def </span><span class="s1">run_pass</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">state</span><span class="s3">):</span>
+                <span class="s1">ct </span><span class="s3">= </span><span class="s6">0</span>
+                <span class="s2">for </span><span class="s1">blk </span><span class="s2">in </span><span class="s1">state</span><span class="s3">.</span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">values</span><span class="s3">():</span>
+                    <span class="s1">ct </span><span class="s3">+= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">list</span><span class="s3">(</span><span class="s1">blk</span><span class="s3">.</span><span class="s1">find_exprs</span><span class="s3">(</span><span class="s5">'phi'</span><span class="s3">)))</span>
+                <span class="s1">phi_counter</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">ct</span><span class="s3">)</span>
+                <span class="s2">return True</span>
+
+        <span class="s2">class </span><span class="s1">CustomPipeline</span><span class="s3">(</span><span class="s1">CompilerBase</span><span class="s3">):</span>
+            <span class="s2">def </span><span class="s1">define_pipelines</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+                <span class="s1">pm </span><span class="s3">= </span><span class="s1">DefaultPassBuilder</span><span class="s3">.</span><span class="s1">define_nopython_pipeline</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">state</span><span class="s3">)</span>
+                <span class="s1">pm</span><span class="s3">.</span><span class="s1">add_pass_after</span><span class="s3">(</span><span class="s1">CheckSSAMinimal</span><span class="s3">, </span><span class="s1">ReconstructSSA</span><span class="s3">)</span>
+                <span class="s1">pm</span><span class="s3">.</span><span class="s1">finalize</span><span class="s3">()</span>
+                <span class="s2">return </span><span class="s3">[</span><span class="s1">pm</span><span class="s3">]</span>
+
+        <span class="s3">@</span><span class="s1">njit</span><span class="s3">(</span><span class="s1">pipeline_class</span><span class="s3">=</span><span class="s1">CustomPipeline</span><span class="s3">)</span>
+        <span class="s2">def </span><span class="s1">while_for</span><span class="s3">(</span><span class="s1">n</span><span class="s3">, </span><span class="s1">max_iter</span><span class="s3">=</span><span class="s6">1</span><span class="s3">):</span>
+            <span class="s1">a </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">((</span><span class="s1">n</span><span class="s3">,</span><span class="s1">n</span><span class="s3">))</span>
+            <span class="s1">i </span><span class="s3">= </span><span class="s6">0</span>
+            <span class="s2">while </span><span class="s1">i </span><span class="s3">&lt;= </span><span class="s1">max_iter</span><span class="s3">:</span>
+                <span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">a</span><span class="s3">)):</span>
+                    <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">a</span><span class="s3">)):</span>
+                        <span class="s1">a</span><span class="s3">[</span><span class="s1">j</span><span class="s3">,</span><span class="s1">k</span><span class="s3">] = </span><span class="s1">j </span><span class="s3">+ </span><span class="s1">k</span>
+                <span class="s1">i </span><span class="s3">+= </span><span class="s6">1</span>
+            <span class="s2">return </span><span class="s1">a</span>
+
+        <span class="s4"># Runs fine?</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertPreciseEqual</span><span class="s3">(</span><span class="s1">while_for</span><span class="s3">(</span><span class="s6">10</span><span class="s3">), </span><span class="s1">while_for</span><span class="s3">.</span><span class="s1">py_func</span><span class="s3">(</span><span class="s6">10</span><span class="s3">))</span>
+        <span class="s4"># One phi?</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">phi_counter</span><span class="s3">, [</span><span class="s6">1</span><span class="s3">])</span>
+
+    <span class="s2">def </span><span class="s1">test_issue9242_use_not_dom_def</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">ir </span><span class="s2">import </span><span class="s1">FunctionIR</span>
+        <span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">compiler_machinery </span><span class="s2">import </span><span class="s3">(</span>
+            <span class="s1">AnalysisPass</span><span class="s3">,</span>
+            <span class="s1">register_pass</span><span class="s3">,</span>
+        <span class="s3">)</span>
+
+        <span class="s2">def </span><span class="s1">check</span><span class="s3">(</span><span class="s1">fir</span><span class="s3">: </span><span class="s1">FunctionIR</span><span class="s3">):</span>
+            <span class="s3">[</span><span class="s1">blk</span><span class="s3">, *</span><span class="s1">_</span><span class="s3">] = </span><span class="s1">fir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">values</span><span class="s3">()</span>
+            <span class="s1">var </span><span class="s3">= </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">scope</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s5">&quot;d&quot;</span><span class="s3">)</span>
+            <span class="s1">defn </span><span class="s3">= </span><span class="s1">fir</span><span class="s3">.</span><span class="s1">get_definition</span><span class="s3">(</span><span class="s1">var</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">defn</span><span class="s3">.</span><span class="s1">op</span><span class="s3">, </span><span class="s5">&quot;phi&quot;</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIn</span><span class="s3">(</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">UNDEFINED</span><span class="s3">, </span><span class="s1">defn</span><span class="s3">.</span><span class="s1">incoming_values</span><span class="s3">)</span>
+
+        <span class="s3">@</span><span class="s1">register_pass</span><span class="s3">(</span><span class="s1">mutates_CFG</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, </span><span class="s1">analysis_only</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+        <span class="s2">class </span><span class="s1">SSACheck</span><span class="s3">(</span><span class="s1">AnalysisPass</span><span class="s3">):</span>
+            <span class="s0">&quot;&quot;&quot; 
+            Check SSA on variable `d` 
+            &quot;&quot;&quot;</span>
+
+            <span class="s1">_name </span><span class="s3">= </span><span class="s5">&quot;SSA_Check&quot;</span>
+
+            <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+                <span class="s1">AnalysisPass</span><span class="s3">.</span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">)</span>
+
+            <span class="s2">def </span><span class="s1">run_pass</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">state</span><span class="s3">):</span>
+                <span class="s1">check</span><span class="s3">(</span><span class="s1">state</span><span class="s3">.</span><span class="s1">func_ir</span><span class="s3">)</span>
+                <span class="s2">return False</span>
+
+        <span class="s2">class </span><span class="s1">SSACheckPipeline</span><span class="s3">(</span><span class="s1">CompilerBase</span><span class="s3">):</span>
+            <span class="s0">&quot;&quot;&quot;Inject SSACheck pass into the default pipeline following the SSA 
+            pass 
+            &quot;&quot;&quot;</span>
+
+            <span class="s2">def </span><span class="s1">define_pipelines</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+                <span class="s1">pipeline </span><span class="s3">= </span><span class="s1">DefaultPassBuilder</span><span class="s3">.</span><span class="s1">define_nopython_pipeline</span><span class="s3">(</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">state</span><span class="s3">, </span><span class="s5">&quot;ssa_check_custom_pipeline&quot;</span><span class="s3">)</span>
+
+                <span class="s1">pipeline</span><span class="s3">.</span><span class="s1">_finalized </span><span class="s3">= </span><span class="s2">False</span>
+                <span class="s1">pipeline</span><span class="s3">.</span><span class="s1">add_pass_after</span><span class="s3">(</span><span class="s1">SSACheck</span><span class="s3">, </span><span class="s1">ReconstructSSA</span><span class="s3">)</span>
+
+                <span class="s1">pipeline</span><span class="s3">.</span><span class="s1">finalize</span><span class="s3">()</span>
+                <span class="s2">return </span><span class="s3">[</span><span class="s1">pipeline</span><span class="s3">]</span>
+
+        <span class="s3">@</span><span class="s1">njit</span><span class="s3">(</span><span class="s1">pipeline_class</span><span class="s3">=</span><span class="s1">SSACheckPipeline</span><span class="s3">)</span>
+        <span class="s2">def </span><span class="s1">py_func</span><span class="s3">(</span><span class="s1">a</span><span class="s3">):</span>
+            <span class="s1">c </span><span class="s3">= </span><span class="s1">a </span><span class="s3">&gt; </span><span class="s6">0</span>
+            <span class="s2">if </span><span class="s1">c</span><span class="s3">:</span>
+                <span class="s1">d </span><span class="s3">= </span><span class="s1">a </span><span class="s3">+ </span><span class="s6">5  </span><span class="s4"># d is only defined here; undef in the else branch</span>
+
+            <span class="s2">return </span><span class="s1">c </span><span class="s2">and </span><span class="s1">d </span><span class="s3">&gt; </span><span class="s6">0</span>
+
+        <span class="s1">py_func</span><span class="s3">(</span><span class="s6">10</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestSROAIssues</span><span class="s3">(</span><span class="s1">MemoryLeakMixin</span><span class="s3">, </span><span class="s1">TestCase</span><span class="s3">):</span>
+    <span class="s4"># This tests issues related to the SROA optimization done in lowering, which</span>
+    <span class="s4"># reduces time spent in the LLVM SROA pass. The optimization is related to</span>
+    <span class="s4"># SSA and tries to reduce the number of alloca statements for variables with</span>
+    <span class="s4"># only a single assignment.</span>
+    <span class="s2">def </span><span class="s1">test_issue7258_multiple_assignment_post_SSA</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s4"># This test adds a pass that will duplicate assignment statements to</span>
+        <span class="s4"># variables named &quot;foobar&quot;.</span>
+        <span class="s4"># In the reported issue, the bug will cause a memory leak.</span>
+        <span class="s1">cloned </span><span class="s3">= []</span>
+
+        <span class="s3">@</span><span class="s1">register_pass</span><span class="s3">(</span><span class="s1">analysis_only</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, </span><span class="s1">mutates_CFG</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+        <span class="s2">class </span><span class="s1">CloneFoobarAssignments</span><span class="s3">(</span><span class="s1">FunctionPass</span><span class="s3">):</span>
+            <span class="s4"># A pass that clones variable assignments into &quot;foobar&quot;</span>
+            <span class="s1">_name </span><span class="s3">= </span><span class="s5">&quot;clone_foobar_assignments_pass&quot;</span>
+
+            <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+                <span class="s1">FunctionPass</span><span class="s3">.</span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">)</span>
+
+            <span class="s2">def </span><span class="s1">run_pass</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">state</span><span class="s3">):</span>
+                <span class="s1">mutated </span><span class="s3">= </span><span class="s2">False</span>
+                <span class="s2">for </span><span class="s1">blk </span><span class="s2">in </span><span class="s1">state</span><span class="s3">.</span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">values</span><span class="s3">():</span>
+                    <span class="s1">to_clone </span><span class="s3">= []</span>
+                    <span class="s4"># find assignments to &quot;foobar&quot;</span>
+                    <span class="s2">for </span><span class="s1">assign </span><span class="s2">in </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">find_insts</span><span class="s3">(</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Assign</span><span class="s3">):</span>
+                        <span class="s2">if </span><span class="s1">assign</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name </span><span class="s3">== </span><span class="s5">&quot;foobar&quot;</span><span class="s3">:</span>
+                            <span class="s1">to_clone</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">assign</span><span class="s3">)</span>
+                    <span class="s4"># clone</span>
+                    <span class="s2">for </span><span class="s1">assign </span><span class="s2">in </span><span class="s1">to_clone</span><span class="s3">:</span>
+                        <span class="s1">clone </span><span class="s3">= </span><span class="s1">copy</span><span class="s3">.</span><span class="s1">deepcopy</span><span class="s3">(</span><span class="s1">assign</span><span class="s3">)</span>
+                        <span class="s1">blk</span><span class="s3">.</span><span class="s1">insert_after</span><span class="s3">(</span><span class="s1">clone</span><span class="s3">, </span><span class="s1">assign</span><span class="s3">)</span>
+                        <span class="s1">mutated </span><span class="s3">= </span><span class="s2">True</span>
+                        <span class="s4"># keep track of cloned statements</span>
+                        <span class="s1">cloned</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">clone</span><span class="s3">)</span>
+                <span class="s2">return </span><span class="s1">mutated</span>
+
+        <span class="s2">class </span><span class="s1">CustomCompiler</span><span class="s3">(</span><span class="s1">CompilerBase</span><span class="s3">):</span>
+            <span class="s2">def </span><span class="s1">define_pipelines</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+                <span class="s1">pm </span><span class="s3">= </span><span class="s1">DefaultPassBuilder</span><span class="s3">.</span><span class="s1">define_nopython_pipeline</span><span class="s3">(</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">state</span><span class="s3">, </span><span class="s5">&quot;custom_pipeline&quot;</span><span class="s3">,</span>
+                <span class="s3">)</span>
+                <span class="s1">pm</span><span class="s3">.</span><span class="s1">_finalized </span><span class="s3">= </span><span class="s2">False</span>
+                <span class="s4"># Insert the cloning pass after SSA</span>
+                <span class="s1">pm</span><span class="s3">.</span><span class="s1">add_pass_after</span><span class="s3">(</span><span class="s1">CloneFoobarAssignments</span><span class="s3">, </span><span class="s1">ReconstructSSA</span><span class="s3">)</span>
+                <span class="s4"># Capture IR post lowering</span>
+                <span class="s1">pm</span><span class="s3">.</span><span class="s1">add_pass_after</span><span class="s3">(</span><span class="s1">PreserveIR</span><span class="s3">, </span><span class="s1">NativeLowering</span><span class="s3">)</span>
+                <span class="s1">pm</span><span class="s3">.</span><span class="s1">finalize</span><span class="s3">()</span>
+                <span class="s2">return </span><span class="s3">[</span><span class="s1">pm</span><span class="s3">]</span>
+
+        <span class="s3">@</span><span class="s1">njit</span><span class="s3">(</span><span class="s1">pipeline_class</span><span class="s3">=</span><span class="s1">CustomCompiler</span><span class="s3">)</span>
+        <span class="s2">def </span><span class="s1">udt</span><span class="s3">(</span><span class="s1">arr</span><span class="s3">):</span>
+            <span class="s1">foobar </span><span class="s3">= </span><span class="s1">arr </span><span class="s3">+ </span><span class="s6">1  </span><span class="s4"># this assignment will be cloned</span>
+            <span class="s2">return </span><span class="s1">foobar</span>
+
+        <span class="s1">arr </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s6">10</span><span class="s3">)</span>
+        <span class="s4"># Verify that the function works as expected</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertPreciseEqual</span><span class="s3">(</span><span class="s1">udt</span><span class="s3">(</span><span class="s1">arr</span><span class="s3">), </span><span class="s1">arr </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">)</span>
+        <span class="s4"># Verify that the expected statement is cloned</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">cloned</span><span class="s3">), </span><span class="s6">1</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">cloned</span><span class="s3">[</span><span class="s6">0</span><span class="s3">].</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name</span><span class="s3">, </span><span class="s5">&quot;foobar&quot;</span><span class="s3">)</span>
+        <span class="s4"># Verify in the Numba IR that the expected statement is cloned</span>
+        <span class="s1">nir </span><span class="s3">= </span><span class="s1">udt</span><span class="s3">.</span><span class="s1">overloads</span><span class="s3">[</span><span class="s1">udt</span><span class="s3">.</span><span class="s1">signatures</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]].</span><span class="s1">metadata</span><span class="s3">[</span><span class="s5">'preserved_ir'</span><span class="s3">]</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">nir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">), </span><span class="s6">1</span><span class="s3">,</span>
+                         <span class="s5">&quot;only one block&quot;</span><span class="s3">)</span>
+        <span class="s3">[</span><span class="s1">blk</span><span class="s3">] = </span><span class="s1">nir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">values</span><span class="s3">()</span>
+        <span class="s1">assigns </span><span class="s3">= </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">find_insts</span><span class="s3">(</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Assign</span><span class="s3">)</span>
+        <span class="s1">foobar_assigns </span><span class="s3">= [</span><span class="s1">stmt </span><span class="s2">for </span><span class="s1">stmt </span><span class="s2">in </span><span class="s1">assigns</span>
+                          <span class="s2">if </span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name </span><span class="s3">== </span><span class="s5">&quot;foobar&quot;</span><span class="s3">]</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span>
+            <span class="s1">len</span><span class="s3">(</span><span class="s1">foobar_assigns</span><span class="s3">), </span><span class="s6">2</span><span class="s3">,</span>
+            <span class="s5">&quot;expected two assignment statements into 'foobar'&quot;</span><span class="s3">,</span>
+        <span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span>
+            <span class="s1">foobar_assigns</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">foobar_assigns</span><span class="s3">[</span><span class="s6">1</span><span class="s3">],</span>
+            <span class="s5">&quot;expected the two assignment statements to be the same&quot;</span><span class="s3">,</span>
+        <span class="s3">)</span>
+</pre>
+</body>
+</html>

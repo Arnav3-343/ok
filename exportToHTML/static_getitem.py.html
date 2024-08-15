@@ -1,0 +1,198 @@
+<html>
+<head>
+<title>static_getitem.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #5f826b; font-style: italic;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+static_getitem.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">errors</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">, </span><span class="s1">types</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">rewrites </span><span class="s0">import </span><span class="s1">register_rewrite</span><span class="s2">, </span><span class="s1">Rewrite</span>
+
+
+<span class="s2">@</span><span class="s1">register_rewrite</span><span class="s2">(</span><span class="s3">'before-inference'</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">RewriteConstGetitems</span><span class="s2">(</span><span class="s1">Rewrite</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Rewrite IR expressions of the kind `getitem(value=arr, index=$constXX)` 
+    where `$constXX` is a known constant as 
+    `static_getitem(value=arr, index=&lt;constant value&gt;)`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">match</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func_ir</span><span class="s2">, </span><span class="s1">block</span><span class="s2">, </span><span class="s1">typemap</span><span class="s2">, </span><span class="s1">calltypes</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">getitems </span><span class="s2">= </span><span class="s1">getitems </span><span class="s2">= {}</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">block </span><span class="s2">= </span><span class="s1">block</span>
+        <span class="s5"># Detect all getitem expressions and find which ones can be</span>
+        <span class="s5"># rewritten</span>
+        <span class="s0">for </span><span class="s1">expr </span><span class="s0">in </span><span class="s1">block</span><span class="s2">.</span><span class="s1">find_exprs</span><span class="s2">(</span><span class="s1">op</span><span class="s2">=</span><span class="s3">'getitem'</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s1">expr</span><span class="s2">.</span><span class="s1">op </span><span class="s2">== </span><span class="s3">'getitem'</span><span class="s2">:</span>
+                <span class="s0">try</span><span class="s2">:</span>
+                    <span class="s1">const </span><span class="s2">= </span><span class="s1">func_ir</span><span class="s2">.</span><span class="s1">infer_constant</span><span class="s2">(</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">index</span><span class="s2">)</span>
+                <span class="s0">except </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">ConstantInferenceError</span><span class="s2">:</span>
+                    <span class="s0">continue</span>
+                <span class="s1">getitems</span><span class="s2">[</span><span class="s1">expr</span><span class="s2">] = </span><span class="s1">const</span>
+
+        <span class="s0">return </span><span class="s1">len</span><span class="s2">(</span><span class="s1">getitems</span><span class="s2">) &gt; </span><span class="s6">0</span>
+
+    <span class="s0">def </span><span class="s1">apply</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Rewrite all matching getitems as static_getitems. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">new_block </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">block</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">()</span>
+        <span class="s1">new_block</span><span class="s2">.</span><span class="s1">clear</span><span class="s2">()</span>
+        <span class="s0">for </span><span class="s1">inst </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">block</span><span class="s2">.</span><span class="s1">body</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Assign</span><span class="s2">):</span>
+                <span class="s1">expr </span><span class="s2">= </span><span class="s1">inst</span><span class="s2">.</span><span class="s1">value</span>
+                <span class="s0">if </span><span class="s1">expr </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">getitems</span><span class="s2">:</span>
+                    <span class="s1">const </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">getitems</span><span class="s2">[</span><span class="s1">expr</span><span class="s2">]</span>
+                    <span class="s1">new_expr </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Expr</span><span class="s2">.</span><span class="s1">static_getitem</span><span class="s2">(</span><span class="s1">value</span><span class="s2">=</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">value</span><span class="s2">,</span>
+                                                      <span class="s1">index</span><span class="s2">=</span><span class="s1">const</span><span class="s2">,</span>
+                                                      <span class="s1">index_var</span><span class="s2">=</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">index</span><span class="s2">,</span>
+                                                      <span class="s1">loc</span><span class="s2">=</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">)</span>
+                    <span class="s1">inst </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Assign</span><span class="s2">(</span><span class="s1">value</span><span class="s2">=</span><span class="s1">new_expr</span><span class="s2">, </span><span class="s1">target</span><span class="s2">=</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">target</span><span class="s2">,</span>
+                                     <span class="s1">loc</span><span class="s2">=</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">)</span>
+            <span class="s1">new_block</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">new_block</span>
+
+
+<span class="s2">@</span><span class="s1">register_rewrite</span><span class="s2">(</span><span class="s3">'after-inference'</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">RewriteStringLiteralGetitems</span><span class="s2">(</span><span class="s1">Rewrite</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Rewrite IR expressions of the kind `getitem(value=arr, index=$XX)` 
+    where `$XX` is a StringLiteral value as 
+    `static_getitem(value=arr, index=&lt;literal value&gt;)`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">match</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func_ir</span><span class="s2">, </span><span class="s1">block</span><span class="s2">, </span><span class="s1">typemap</span><span class="s2">, </span><span class="s1">calltypes</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Detect all getitem expressions and find which ones have 
+        string literal indexes 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">getitems </span><span class="s2">= </span><span class="s1">getitems </span><span class="s2">= {}</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">block </span><span class="s2">= </span><span class="s1">block</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">calltypes </span><span class="s2">= </span><span class="s1">calltypes</span>
+        <span class="s0">for </span><span class="s1">expr </span><span class="s0">in </span><span class="s1">block</span><span class="s2">.</span><span class="s1">find_exprs</span><span class="s2">(</span><span class="s1">op</span><span class="s2">=</span><span class="s3">'getitem'</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s1">expr</span><span class="s2">.</span><span class="s1">op </span><span class="s2">== </span><span class="s3">'getitem'</span><span class="s2">:</span>
+                <span class="s1">index_ty </span><span class="s2">= </span><span class="s1">typemap</span><span class="s2">[</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">index</span><span class="s2">.</span><span class="s1">name</span><span class="s2">]</span>
+                <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">index_ty</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">StringLiteral</span><span class="s2">):</span>
+                    <span class="s1">getitems</span><span class="s2">[</span><span class="s1">expr</span><span class="s2">] = (</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">index</span><span class="s2">, </span><span class="s1">index_ty</span><span class="s2">.</span><span class="s1">literal_value</span><span class="s2">)</span>
+
+        <span class="s0">return </span><span class="s1">len</span><span class="s2">(</span><span class="s1">getitems</span><span class="s2">) &gt; </span><span class="s6">0</span>
+
+    <span class="s0">def </span><span class="s1">apply</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Rewrite all matching getitems as static_getitems where the index 
+        is the literal value of the string. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">new_block </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Block</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">block</span><span class="s2">.</span><span class="s1">scope</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">block</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">)</span>
+        <span class="s0">for </span><span class="s1">inst </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">block</span><span class="s2">.</span><span class="s1">body</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Assign</span><span class="s2">):</span>
+                <span class="s1">expr </span><span class="s2">= </span><span class="s1">inst</span><span class="s2">.</span><span class="s1">value</span>
+                <span class="s0">if </span><span class="s1">expr </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">getitems</span><span class="s2">:</span>
+                    <span class="s1">const</span><span class="s2">, </span><span class="s1">lit_val </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">getitems</span><span class="s2">[</span><span class="s1">expr</span><span class="s2">]</span>
+                    <span class="s1">new_expr </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Expr</span><span class="s2">.</span><span class="s1">static_getitem</span><span class="s2">(</span><span class="s1">value</span><span class="s2">=</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">value</span><span class="s2">,</span>
+                                                      <span class="s1">index</span><span class="s2">=</span><span class="s1">lit_val</span><span class="s2">,</span>
+                                                      <span class="s1">index_var</span><span class="s2">=</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">index</span><span class="s2">,</span>
+                                                      <span class="s1">loc</span><span class="s2">=</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">)</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">calltypes</span><span class="s2">[</span><span class="s1">new_expr</span><span class="s2">] = </span><span class="s1">self</span><span class="s2">.</span><span class="s1">calltypes</span><span class="s2">[</span><span class="s1">expr</span><span class="s2">]</span>
+                    <span class="s1">inst </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Assign</span><span class="s2">(</span><span class="s1">value</span><span class="s2">=</span><span class="s1">new_expr</span><span class="s2">, </span><span class="s1">target</span><span class="s2">=</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">target</span><span class="s2">,</span>
+                                     <span class="s1">loc</span><span class="s2">=</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">)</span>
+            <span class="s1">new_block</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">new_block</span>
+
+
+<span class="s2">@</span><span class="s1">register_rewrite</span><span class="s2">(</span><span class="s3">'after-inference'</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">RewriteStringLiteralSetitems</span><span class="s2">(</span><span class="s1">Rewrite</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Rewrite IR expressions of the kind `setitem(value=arr, index=$XX, value=)` 
+    where `$XX` is a StringLiteral value as 
+    `static_setitem(value=arr, index=&lt;literal value&gt;, value=)`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">match</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func_ir</span><span class="s2">, </span><span class="s1">block</span><span class="s2">, </span><span class="s1">typemap</span><span class="s2">, </span><span class="s1">calltypes</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Detect all setitem expressions and find which ones have 
+        string literal indexes 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">setitems </span><span class="s2">= </span><span class="s1">setitems </span><span class="s2">= {}</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">block </span><span class="s2">= </span><span class="s1">block</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">calltypes </span><span class="s2">= </span><span class="s1">calltypes</span>
+        <span class="s0">for </span><span class="s1">inst </span><span class="s0">in </span><span class="s1">block</span><span class="s2">.</span><span class="s1">find_insts</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">SetItem</span><span class="s2">):</span>
+            <span class="s1">index_ty </span><span class="s2">= </span><span class="s1">typemap</span><span class="s2">[</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">index</span><span class="s2">.</span><span class="s1">name</span><span class="s2">]</span>
+            <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">index_ty</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">StringLiteral</span><span class="s2">):</span>
+                <span class="s1">setitems</span><span class="s2">[</span><span class="s1">inst</span><span class="s2">] = (</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">index</span><span class="s2">, </span><span class="s1">index_ty</span><span class="s2">.</span><span class="s1">literal_value</span><span class="s2">)</span>
+
+        <span class="s0">return </span><span class="s1">len</span><span class="s2">(</span><span class="s1">setitems</span><span class="s2">) &gt; </span><span class="s6">0</span>
+
+    <span class="s0">def </span><span class="s1">apply</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Rewrite all matching setitems as static_setitems where the index 
+        is the literal value of the string. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">new_block </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Block</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">block</span><span class="s2">.</span><span class="s1">scope</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">block</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">)</span>
+        <span class="s0">for </span><span class="s1">inst </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">block</span><span class="s2">.</span><span class="s1">body</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">SetItem</span><span class="s2">):</span>
+                <span class="s0">if </span><span class="s1">inst </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">setitems</span><span class="s2">:</span>
+                    <span class="s1">const</span><span class="s2">, </span><span class="s1">lit_val </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">setitems</span><span class="s2">[</span><span class="s1">inst</span><span class="s2">]</span>
+                    <span class="s1">new_inst </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">StaticSetItem</span><span class="s2">(</span><span class="s1">target</span><span class="s2">=</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">target</span><span class="s2">,</span>
+                                                <span class="s1">index</span><span class="s2">=</span><span class="s1">lit_val</span><span class="s2">,</span>
+                                                <span class="s1">index_var</span><span class="s2">=</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">index</span><span class="s2">,</span>
+                                                <span class="s1">value</span><span class="s2">=</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">value</span><span class="s2">,</span>
+                                                <span class="s1">loc</span><span class="s2">=</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">)</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">calltypes</span><span class="s2">[</span><span class="s1">new_inst</span><span class="s2">] = </span><span class="s1">self</span><span class="s2">.</span><span class="s1">calltypes</span><span class="s2">[</span><span class="s1">inst</span><span class="s2">]</span>
+                    <span class="s1">inst </span><span class="s2">= </span><span class="s1">new_inst</span>
+            <span class="s1">new_block</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">new_block</span>
+
+
+<span class="s2">@</span><span class="s1">register_rewrite</span><span class="s2">(</span><span class="s3">'before-inference'</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">RewriteConstSetitems</span><span class="s2">(</span><span class="s1">Rewrite</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Rewrite IR statements of the kind `setitem(target=arr, index=$constXX, ...)` 
+    where `$constXX` is a known constant as 
+    `static_setitem(target=arr, index=&lt;constant value&gt;, ...)`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">match</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func_ir</span><span class="s2">, </span><span class="s1">block</span><span class="s2">, </span><span class="s1">typemap</span><span class="s2">, </span><span class="s1">calltypes</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">setitems </span><span class="s2">= </span><span class="s1">setitems </span><span class="s2">= {}</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">block </span><span class="s2">= </span><span class="s1">block</span>
+        <span class="s5"># Detect all setitem statements and find which ones can be</span>
+        <span class="s5"># rewritten</span>
+        <span class="s0">for </span><span class="s1">inst </span><span class="s0">in </span><span class="s1">block</span><span class="s2">.</span><span class="s1">find_insts</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">SetItem</span><span class="s2">):</span>
+            <span class="s0">try</span><span class="s2">:</span>
+                <span class="s1">const </span><span class="s2">= </span><span class="s1">func_ir</span><span class="s2">.</span><span class="s1">infer_constant</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">index</span><span class="s2">)</span>
+            <span class="s0">except </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">ConstantInferenceError</span><span class="s2">:</span>
+                <span class="s0">continue</span>
+            <span class="s1">setitems</span><span class="s2">[</span><span class="s1">inst</span><span class="s2">] = </span><span class="s1">const</span>
+
+        <span class="s0">return </span><span class="s1">len</span><span class="s2">(</span><span class="s1">setitems</span><span class="s2">) &gt; </span><span class="s6">0</span>
+
+    <span class="s0">def </span><span class="s1">apply</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Rewrite all matching setitems as static_setitems. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">new_block </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">block</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">()</span>
+        <span class="s1">new_block</span><span class="s2">.</span><span class="s1">clear</span><span class="s2">()</span>
+        <span class="s0">for </span><span class="s1">inst </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">block</span><span class="s2">.</span><span class="s1">body</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">inst </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">setitems</span><span class="s2">:</span>
+                <span class="s1">const </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">setitems</span><span class="s2">[</span><span class="s1">inst</span><span class="s2">]</span>
+                <span class="s1">new_inst </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">StaticSetItem</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">target</span><span class="s2">, </span><span class="s1">const</span><span class="s2">,</span>
+                                            <span class="s1">inst</span><span class="s2">.</span><span class="s1">index</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">.</span><span class="s1">value</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">)</span>
+                <span class="s1">new_block</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">new_inst</span><span class="s2">)</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s1">new_block</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">new_block</span>
+</pre>
+</body>
+</html>

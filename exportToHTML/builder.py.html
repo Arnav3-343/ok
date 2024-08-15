@@ -1,0 +1,1027 @@
+<html>
+<head>
+<title>builder.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+builder.py</font>
+</center></td></tr></table>
+<pre><span class="s0">''' 
+Builder 
+====== 
+ 
+Class used for the registering and application of rules for specific widgets. 
+'''</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">from </span><span class="s1">os </span><span class="s2">import </span><span class="s1">environ</span>
+<span class="s2">from </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path </span><span class="s2">import </span><span class="s1">join</span>
+<span class="s2">from </span><span class="s1">copy </span><span class="s2">import </span><span class="s1">copy</span>
+<span class="s2">from </span><span class="s1">types </span><span class="s2">import </span><span class="s1">CodeType</span>
+<span class="s2">from </span><span class="s1">functools </span><span class="s2">import </span><span class="s1">partial</span>
+
+<span class="s2">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">factory </span><span class="s2">import </span><span class="s1">Factory</span>
+<span class="s2">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">lang</span><span class="s3">.</span><span class="s1">parser </span><span class="s2">import </span><span class="s3">(</span>
+    <span class="s1">Parser</span><span class="s3">,</span>
+    <span class="s1">ParserException</span><span class="s3">,</span>
+    <span class="s1">_handlers</span><span class="s3">,</span>
+    <span class="s1">global_idmap</span><span class="s3">,</span>
+    <span class="s1">ParserRuleProperty</span><span class="s3">,</span>
+<span class="s3">)</span>
+<span class="s2">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">logger </span><span class="s2">import </span><span class="s1">Logger</span>
+<span class="s2">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">utils </span><span class="s2">import </span><span class="s1">QueryDict</span>
+<span class="s2">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">cache </span><span class="s2">import </span><span class="s1">Cache</span>
+<span class="s2">from </span><span class="s1">kivy </span><span class="s2">import </span><span class="s1">kivy_data_dir</span>
+<span class="s2">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">context </span><span class="s2">import </span><span class="s1">register_context</span>
+<span class="s2">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">resources </span><span class="s2">import </span><span class="s1">resource_find</span>
+<span class="s2">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">_event </span><span class="s2">import </span><span class="s1">Observable</span><span class="s3">, </span><span class="s1">EventDispatcher</span>
+
+<span class="s1">__all__ </span><span class="s3">= (</span><span class="s4">'Observable'</span><span class="s3">, </span><span class="s4">'Builder'</span><span class="s3">, </span><span class="s4">'BuilderBase'</span><span class="s3">, </span><span class="s4">'BuilderException'</span><span class="s3">)</span>
+
+
+<span class="s1">trace </span><span class="s3">= </span><span class="s1">Logger</span><span class="s3">.</span><span class="s1">trace</span>
+
+<span class="s5"># late import</span>
+<span class="s1">Instruction </span><span class="s3">= </span><span class="s2">None</span>
+
+<span class="s5"># delayed calls are canvas expression triggered during an loop. It is one</span>
+<span class="s5"># directional linked list of args to call call_fn with. Each element is a list</span>
+<span class="s5"># whose last element points to the next list of args to execute when</span>
+<span class="s5"># Builder.sync is called.</span>
+<span class="s1">_delayed_start </span><span class="s3">= </span><span class="s2">None</span>
+
+
+<span class="s2">class </span><span class="s1">BuilderException</span><span class="s3">(</span><span class="s1">ParserException</span><span class="s3">):</span>
+    <span class="s0">'''Exception raised when the Builder fails to apply a rule on a widget. 
+    '''</span>
+    <span class="s2">pass</span>
+
+
+<span class="s2">def </span><span class="s1">get_proxy</span><span class="s3">(</span><span class="s1">widget</span><span class="s3">):</span>
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">widget</span><span class="s3">.</span><span class="s1">proxy_ref</span>
+    <span class="s2">except </span><span class="s1">AttributeError</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">widget</span>
+
+
+<span class="s2">def </span><span class="s1">custom_callback</span><span class="s3">(</span><span class="s1">__kvlang__</span><span class="s3">, </span><span class="s1">idmap</span><span class="s3">, *</span><span class="s1">largs</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">):</span>
+    <span class="s1">idmap</span><span class="s3">[</span><span class="s4">'args'</span><span class="s3">] = </span><span class="s1">largs</span>
+    <span class="s1">exec</span><span class="s3">(</span><span class="s1">__kvlang__</span><span class="s3">.</span><span class="s1">co_value</span><span class="s3">, </span><span class="s1">idmap</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">call_fn</span><span class="s3">(</span><span class="s1">args</span><span class="s3">, </span><span class="s1">instance</span><span class="s3">, </span><span class="s1">v</span><span class="s3">):</span>
+    <span class="s1">element</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">, </span><span class="s1">idmap </span><span class="s3">= </span><span class="s1">args</span>
+    <span class="s2">if __debug__</span><span class="s3">:</span>
+        <span class="s1">trace</span><span class="s3">(</span><span class="s4">'Lang: call_fn %s, key=%s, value=%r, %r' </span><span class="s3">% (</span>
+            <span class="s1">element</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">value</span><span class="s3">))</span>
+    <span class="s1">rule</span><span class="s3">.</span><span class="s1">count </span><span class="s3">+= </span><span class="s6">1</span>
+    <span class="s1">e_value </span><span class="s3">= </span><span class="s1">eval</span><span class="s3">(</span><span class="s1">value</span><span class="s3">, </span><span class="s1">idmap</span><span class="s3">)</span>
+    <span class="s2">if __debug__</span><span class="s3">:</span>
+        <span class="s1">trace</span><span class="s3">(</span><span class="s4">'Lang: call_fn =&gt; value=%r' </span><span class="s3">% (</span><span class="s1">e_value</span><span class="s3">, ))</span>
+    <span class="s1">setattr</span><span class="s3">(</span><span class="s1">element</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">e_value</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">delayed_call_fn</span><span class="s3">(</span><span class="s1">args</span><span class="s3">, </span><span class="s1">instance</span><span class="s3">, </span><span class="s1">v</span><span class="s3">):</span>
+    <span class="s5"># it's already on the list</span>
+    <span class="s2">if </span><span class="s1">args</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">] </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s2">return</span>
+
+    <span class="s2">global </span><span class="s1">_delayed_start</span>
+    <span class="s2">if </span><span class="s1">_delayed_start </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">_delayed_start </span><span class="s3">= </span><span class="s1">args</span>
+        <span class="s1">args</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">] = </span><span class="s1">StopIteration</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">args</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">] = </span><span class="s1">_delayed_start</span>
+        <span class="s1">_delayed_start </span><span class="s3">= </span><span class="s1">args</span>
+
+
+<span class="s2">def </span><span class="s1">update_intermediates</span><span class="s3">(</span><span class="s1">base</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">bound</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">fn</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">instance</span><span class="s3">, </span><span class="s1">value</span><span class="s3">):</span>
+    <span class="s0">''' Function that is called when an intermediate property is updated 
+    and `rebind` of that property is True. In that case, we unbind 
+    all bound funcs that were bound to attrs of the old value of the 
+    property and rebind them to the new value of the property. 
+ 
+    For example, if the rule is `self.a.b.c.d`, then when b is changed, we 
+    unbind from `b`, `c` and `d`, if they were bound before (they were not 
+    None and `rebind` of the respective properties was True) and we rebind 
+    to the new values of the attrs `b`, `c``, `d` that are not None and 
+    `rebind` is True. 
+ 
+    :Parameters: 
+        `base` 
+            A (proxied) ref to the base widget, `self` in the example 
+            above. 
+        `keys` 
+            A list of the name off the attrs of `base` being watched. In 
+            the example above it'd be `['a', 'b', 'c', 'd']`. 
+        `bound` 
+            A list 4-tuples, each tuple being (widget, attr, callback, uid) 
+            representing callback functions bound to the attributed `attr` 
+            of `widget`. `uid` is returned by `fbind` when binding. 
+            The callback may be None, in which case the attr 
+            was not bound, but is there to be able to walk the attr tree. 
+            E.g. in the example above, if `b` was not an eventdispatcher, 
+            `(_b_ref_, `c`, None)` would be added to the list so we can get 
+            to `c` and `d`, which may be eventdispatchers and their attrs. 
+        `s` 
+            The index in `keys` of the of the attr that needs to be 
+            updated. That is all the keys from `s` and further will be 
+            rebound, since the `s` key was changed. In bound, the 
+            corresponding index is `s - 1`. If `s` is None, we start from 
+            1 (first attr). 
+        `fn` 
+            The function to be called args, `args` on bound callback. 
+    '''</span>
+    <span class="s5"># first remove all the old bound functions from `s` and down.</span>
+    <span class="s2">for </span><span class="s1">f</span><span class="s3">, </span><span class="s1">k</span><span class="s3">, </span><span class="s1">fun</span><span class="s3">, </span><span class="s1">uid </span><span class="s2">in </span><span class="s1">bound</span><span class="s3">[</span><span class="s1">s</span><span class="s3">:]:</span>
+        <span class="s2">if </span><span class="s1">fun </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">continue</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">f</span><span class="s3">.</span><span class="s1">unbind_uid</span><span class="s3">(</span><span class="s1">k</span><span class="s3">, </span><span class="s1">uid</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">ReferenceError</span><span class="s3">:</span>
+            <span class="s2">pass</span>
+    <span class="s2">del </span><span class="s1">bound</span><span class="s3">[</span><span class="s1">s</span><span class="s3">:]</span>
+
+    <span class="s5"># find the first attr from which we need to start rebinding.</span>
+    <span class="s1">f </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(*</span><span class="s1">bound</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">][:</span><span class="s6">2</span><span class="s3">])</span>
+    <span class="s2">if </span><span class="s1">f </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">fn</span><span class="s3">(</span><span class="s1">args</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s2">return</span>
+    <span class="s1">s </span><span class="s3">+= </span><span class="s6">1</span>
+    <span class="s1">append </span><span class="s3">= </span><span class="s1">bound</span><span class="s3">.</span><span class="s1">append</span>
+
+    <span class="s5"># bind all attrs, except last to update_intermediates</span>
+    <span class="s2">for </span><span class="s1">val </span><span class="s2">in </span><span class="s1">keys</span><span class="s3">[</span><span class="s1">s</span><span class="s3">:-</span><span class="s6">1</span><span class="s3">]:</span>
+        <span class="s5"># if we need to dynamically rebind, bindm otherwise just</span>
+        <span class="s5"># add the attr to the list</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, (</span><span class="s1">EventDispatcher</span><span class="s3">, </span><span class="s1">Observable</span><span class="s3">)):</span>
+            <span class="s1">prop </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">property</span><span class="s3">(</span><span class="s1">val</span><span class="s3">, </span><span class="s2">True</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">prop </span><span class="s2">is not None and </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">prop</span><span class="s3">, </span><span class="s4">'rebind'</span><span class="s3">, </span><span class="s2">False</span><span class="s3">):</span>
+                <span class="s5"># fbind should not dispatch, otherwise</span>
+                <span class="s5"># update_intermediates might be called in the middle</span>
+                <span class="s5"># here messing things up</span>
+                <span class="s1">uid </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">fbind</span><span class="s3">(</span>
+                    <span class="s1">val</span><span class="s3">, </span><span class="s1">update_intermediates</span><span class="s3">, </span><span class="s1">base</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">bound</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">fn</span><span class="s3">, </span><span class="s1">args</span><span class="s3">)</span>
+                <span class="s1">append</span><span class="s3">([</span><span class="s1">f</span><span class="s3">.</span><span class="s1">proxy_ref</span><span class="s3">, </span><span class="s1">val</span><span class="s3">, </span><span class="s1">update_intermediates</span><span class="s3">, </span><span class="s1">uid</span><span class="s3">])</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">append</span><span class="s3">([</span><span class="s1">f</span><span class="s3">.</span><span class="s1">proxy_ref</span><span class="s3">, </span><span class="s1">val</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">])</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">append</span><span class="s3">([</span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s4">'proxy_ref'</span><span class="s3">, </span><span class="s1">f</span><span class="s3">), </span><span class="s1">val</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">])</span>
+
+        <span class="s1">f </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">val</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">f </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">break</span>
+        <span class="s1">s </span><span class="s3">+= </span><span class="s6">1</span>
+
+    <span class="s5"># for the last attr we bind directly to the setting function,</span>
+    <span class="s5"># because that attr sets the value of the rule.</span>
+    <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, (</span><span class="s1">EventDispatcher</span><span class="s3">, </span><span class="s1">Observable</span><span class="s3">)):</span>
+        <span class="s1">uid </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">fbind</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">], </span><span class="s1">fn</span><span class="s3">, </span><span class="s1">args</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">uid</span><span class="s3">:</span>
+            <span class="s1">append</span><span class="s3">([</span><span class="s1">f</span><span class="s3">.</span><span class="s1">proxy_ref</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">], </span><span class="s1">fn</span><span class="s3">, </span><span class="s1">uid</span><span class="s3">])</span>
+    <span class="s5"># when we rebind we have to update the</span>
+    <span class="s5"># rule with the most recent value, otherwise, the value might be wrong</span>
+    <span class="s5"># and wouldn't be updated since we might not have tracked it before.</span>
+    <span class="s5"># This only happens for a callback when rebind was True for the prop.</span>
+    <span class="s1">fn</span><span class="s3">(</span><span class="s1">args</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">create_handler</span><span class="s3">(</span><span class="s1">iself</span><span class="s3">, </span><span class="s1">element</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">, </span><span class="s1">idmap</span><span class="s3">, </span><span class="s1">delayed</span><span class="s3">=</span><span class="s2">False</span><span class="s3">):</span>
+    <span class="s1">idmap </span><span class="s3">= </span><span class="s1">copy</span><span class="s3">(</span><span class="s1">idmap</span><span class="s3">)</span>
+    <span class="s1">idmap</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">global_idmap</span><span class="s3">)</span>
+    <span class="s1">idmap</span><span class="s3">[</span><span class="s4">'self'</span><span class="s3">] = </span><span class="s1">iself</span><span class="s3">.</span><span class="s1">proxy_ref</span>
+    <span class="s1">bound_list </span><span class="s3">= </span><span class="s1">_handlers</span><span class="s3">[</span><span class="s1">iself</span><span class="s3">.</span><span class="s1">uid</span><span class="s3">][</span><span class="s1">key</span><span class="s3">]</span>
+    <span class="s1">handler_append </span><span class="s3">= </span><span class="s1">bound_list</span><span class="s3">.</span><span class="s1">append</span>
+
+    <span class="s5"># we need a hash for when delayed, so we don't execute duplicate canvas</span>
+    <span class="s5"># callbacks from the same handler during a sync op</span>
+    <span class="s2">if </span><span class="s1">delayed</span><span class="s3">:</span>
+        <span class="s1">fn </span><span class="s3">= </span><span class="s1">delayed_call_fn</span>
+        <span class="s1">args </span><span class="s3">= [</span><span class="s1">element</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">, </span><span class="s1">idmap</span><span class="s3">, </span><span class="s2">None</span><span class="s3">]  </span><span class="s5"># see _delayed_start</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">fn </span><span class="s3">= </span><span class="s1">call_fn</span>
+        <span class="s1">args </span><span class="s3">= (</span><span class="s1">element</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">, </span><span class="s1">idmap</span><span class="s3">)</span>
+
+    <span class="s5"># bind every key.value</span>
+    <span class="s2">if </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">watched_keys </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s2">for </span><span class="s1">keys </span><span class="s2">in </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">watched_keys</span><span class="s3">:</span>
+            <span class="s1">base </span><span class="s3">= </span><span class="s1">idmap</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">[</span><span class="s6">0</span><span class="s3">])</span>
+            <span class="s2">if </span><span class="s1">base </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s2">continue</span>
+            <span class="s1">f </span><span class="s3">= </span><span class="s1">base </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">base</span><span class="s3">, </span><span class="s4">'proxy_ref'</span><span class="s3">, </span><span class="s1">base</span><span class="s3">)</span>
+            <span class="s1">bound </span><span class="s3">= []</span>
+            <span class="s1">was_bound </span><span class="s3">= </span><span class="s2">False</span>
+            <span class="s1">append </span><span class="s3">= </span><span class="s1">bound</span><span class="s3">.</span><span class="s1">append</span>
+
+            <span class="s5"># bind all attrs, except last to update_intermediates</span>
+            <span class="s1">k </span><span class="s3">= </span><span class="s6">1</span>
+            <span class="s2">for </span><span class="s1">val </span><span class="s2">in </span><span class="s1">keys</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:-</span><span class="s6">1</span><span class="s3">]:</span>
+                <span class="s5"># if we need to dynamically rebind, bindm otherwise</span>
+                <span class="s5"># just add the attr to the list</span>
+                <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, (</span><span class="s1">EventDispatcher</span><span class="s3">, </span><span class="s1">Observable</span><span class="s3">)):</span>
+                    <span class="s1">prop </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">property</span><span class="s3">(</span><span class="s1">val</span><span class="s3">, </span><span class="s2">True</span><span class="s3">)</span>
+                    <span class="s2">if </span><span class="s1">prop </span><span class="s2">is not None and </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">prop</span><span class="s3">, </span><span class="s4">'rebind'</span><span class="s3">, </span><span class="s2">False</span><span class="s3">):</span>
+                        <span class="s5"># fbind should not dispatch, otherwise</span>
+                        <span class="s5"># update_intermediates might be called in the middle</span>
+                        <span class="s5"># here messing things up</span>
+                        <span class="s1">uid </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">fbind</span><span class="s3">(</span>
+                            <span class="s1">val</span><span class="s3">, </span><span class="s1">update_intermediates</span><span class="s3">, </span><span class="s1">base</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">bound</span><span class="s3">, </span><span class="s1">k</span><span class="s3">,</span>
+                            <span class="s1">fn</span><span class="s3">, </span><span class="s1">args</span><span class="s3">)</span>
+                        <span class="s1">append</span><span class="s3">([</span><span class="s1">f</span><span class="s3">.</span><span class="s1">proxy_ref</span><span class="s3">, </span><span class="s1">val</span><span class="s3">, </span><span class="s1">update_intermediates</span><span class="s3">, </span><span class="s1">uid</span><span class="s3">])</span>
+                        <span class="s1">was_bound </span><span class="s3">= </span><span class="s2">True</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s1">append</span><span class="s3">([</span><span class="s1">f</span><span class="s3">.</span><span class="s1">proxy_ref</span><span class="s3">, </span><span class="s1">val</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">])</span>
+                <span class="s2">elif not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">type</span><span class="s3">):</span>
+                    <span class="s1">append</span><span class="s3">([</span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s4">'proxy_ref'</span><span class="s3">, </span><span class="s1">f</span><span class="s3">), </span><span class="s1">val</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">])</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">append</span><span class="s3">([</span><span class="s1">f</span><span class="s3">, </span><span class="s1">val</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">])</span>
+                <span class="s1">f </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">val</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">f </span><span class="s2">is None</span><span class="s3">:</span>
+                    <span class="s2">break</span>
+                <span class="s1">k </span><span class="s3">+= </span><span class="s6">1</span>
+
+            <span class="s5"># for the last attr we bind directly to the setting</span>
+            <span class="s5"># function, because that attr sets the value of the rule.</span>
+            <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, (</span><span class="s1">EventDispatcher</span><span class="s3">, </span><span class="s1">Observable</span><span class="s3">)):</span>
+                <span class="s1">uid </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">fbind</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">], </span><span class="s1">fn</span><span class="s3">, </span><span class="s1">args</span><span class="s3">)  </span><span class="s5"># f is not None</span>
+                <span class="s2">if </span><span class="s1">uid</span><span class="s3">:</span>
+                    <span class="s1">append</span><span class="s3">([</span><span class="s1">f</span><span class="s3">.</span><span class="s1">proxy_ref</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">], </span><span class="s1">fn</span><span class="s3">, </span><span class="s1">uid</span><span class="s3">])</span>
+                    <span class="s1">was_bound </span><span class="s3">= </span><span class="s2">True</span>
+            <span class="s2">if </span><span class="s1">was_bound</span><span class="s3">:</span>
+                <span class="s1">handler_append</span><span class="s3">(</span><span class="s1">bound</span><span class="s3">)</span>
+
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">eval</span><span class="s3">(</span><span class="s1">value</span><span class="s3">, </span><span class="s1">idmap</span><span class="s3">), </span><span class="s1">bound_list</span>
+    <span class="s2">except </span><span class="s1">Exception </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+        <span class="s1">tb </span><span class="s3">= </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">exc_info</span><span class="s3">()[</span><span class="s6">2</span><span class="s3">]</span>
+        <span class="s2">raise </span><span class="s1">BuilderException</span><span class="s3">(</span><span class="s1">rule</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">line</span><span class="s3">,</span>
+                               <span class="s4">'{}: {}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">e</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">, </span><span class="s1">e</span><span class="s3">),</span>
+                               <span class="s1">cause</span><span class="s3">=</span><span class="s1">tb</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">BuilderBase</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s0">'''The Builder is responsible for creating a :class:`Parser` for parsing a 
+    kv file, merging the results into its internal rules, templates, etc. 
+ 
+    By default, :class:`Builder` is a global Kivy instance used in widgets 
+    that you can use to load other kv files in addition to the default ones. 
+    '''</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">super</span><span class="s3">(</span><span class="s1">BuilderBase</span><span class="s3">, </span><span class="s1">self</span><span class="s3">).</span><span class="s1">__init__</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_match_cache </span><span class="s3">= {}</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_match_name_cache </span><span class="s3">= {}</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">files </span><span class="s3">= []</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">dynamic_classes </span><span class="s3">= {}</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">templates </span><span class="s3">= {}</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">rules </span><span class="s3">= []</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">rulectx </span><span class="s3">= {}</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">create_from</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Creates a instance of the class, and initializes to the state of 
+        ``builder``. 
+ 
+        :param builder: The builder to initialize from. 
+        :return: A new instance of this class. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">obj </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">()</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">_match_cache </span><span class="s3">= </span><span class="s1">copy</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">_match_cache</span><span class="s3">)</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">_match_name_cache </span><span class="s3">= </span><span class="s1">copy</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">_match_name_cache</span><span class="s3">)</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">files </span><span class="s3">= </span><span class="s1">copy</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">files</span><span class="s3">)</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">dynamic_classes </span><span class="s3">= </span><span class="s1">copy</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">dynamic_classes</span><span class="s3">)</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">templates </span><span class="s3">= </span><span class="s1">copy</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">templates</span><span class="s3">)</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">rules </span><span class="s3">= </span><span class="s1">list</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">rules</span><span class="s3">)</span>
+        <span class="s2">assert not </span><span class="s1">builder</span><span class="s3">.</span><span class="s1">rulectx</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">rulectx </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">rulectx</span><span class="s3">)</span>
+
+        <span class="s2">return </span><span class="s1">obj</span>
+
+    <span class="s2">def </span><span class="s1">load_file</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">encoding</span><span class="s3">=</span><span class="s4">'utf8'</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">):</span>
+        <span class="s0">'''Insert a file into the language builder and return the root widget 
+        (if defined) of the kv file. 
+ 
+        :parameters: 
+            `rulesonly`: bool, defaults to False 
+                If True, the Builder will raise an exception if you have a root 
+                widget inside the definition. 
+ 
+            `encoding`: File character encoding. Defaults to utf-8, 
+        '''</span>
+
+        <span class="s1">filename </span><span class="s3">= </span><span class="s1">resource_find</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">) </span><span class="s2">or </span><span class="s1">filename</span>
+        <span class="s2">if __debug__</span><span class="s3">:</span>
+            <span class="s1">trace</span><span class="s3">(</span><span class="s4">'Lang: load file %s, using %s encoding'</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">encoding</span><span class="s3">)</span>
+
+        <span class="s1">kwargs</span><span class="s3">[</span><span class="s4">'filename'</span><span class="s3">] = </span><span class="s1">filename</span>
+        <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s4">'r'</span><span class="s3">, </span><span class="s1">encoding</span><span class="s3">=</span><span class="s1">encoding</span><span class="s3">) </span><span class="s2">as </span><span class="s1">fd</span><span class="s3">:</span>
+            <span class="s1">data </span><span class="s3">= </span><span class="s1">fd</span><span class="s3">.</span><span class="s1">read</span><span class="s3">()</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">load_string</span><span class="s3">(</span><span class="s1">data</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">unload_file</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">):</span>
+        <span class="s0">'''Unload all rules associated with a previously imported file. 
+ 
+        .. versionadded:: 1.0.8 
+ 
+        .. warning:: 
+ 
+            This will not remove rules or templates already applied/used on 
+            current widgets. It will only effect the next widgets creation or 
+            template invocation. 
+        '''</span>
+        <span class="s5"># remove rules and templates</span>
+        <span class="s1">filename </span><span class="s3">= </span><span class="s1">resource_find</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">) </span><span class="s2">or </span><span class="s1">filename</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">rules </span><span class="s3">= [</span><span class="s1">x </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">rules </span><span class="s2">if </span><span class="s1">x</span><span class="s3">[</span><span class="s6">1</span><span class="s3">].</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">filename </span><span class="s3">!= </span><span class="s1">filename</span><span class="s3">]</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_clear_matchcache</span><span class="s3">()</span>
+        <span class="s1">templates </span><span class="s3">= {}</span>
+        <span class="s2">for </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">templates</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+            <span class="s2">if </span><span class="s1">y</span><span class="s3">[</span><span class="s6">2</span><span class="s3">] != </span><span class="s1">filename</span><span class="s3">:</span>
+                <span class="s1">templates</span><span class="s3">[</span><span class="s1">x</span><span class="s3">] = </span><span class="s1">y</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">templates </span><span class="s3">= </span><span class="s1">templates</span>
+
+        <span class="s2">if </span><span class="s1">filename </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">files</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">files</span><span class="s3">.</span><span class="s1">remove</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)</span>
+
+        <span class="s5"># unregister all the dynamic classes</span>
+        <span class="s1">Factory</span><span class="s3">.</span><span class="s1">unregister_from_filename</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">load_string</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">string</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">):</span>
+        <span class="s0">'''Insert a string into the Language Builder and return the root widget 
+        (if defined) of the kv string. 
+ 
+        :Parameters: 
+            `rulesonly`: bool, defaults to False 
+                If True, the Builder will raise an exception if you have a root 
+                widget inside the definition. 
+            `filename`: str, defaults to None 
+                If specified, the filename used to index the kv rules. 
+ 
+        The filename parameter can be used to unload kv strings in the same way 
+        as you unload kv files. This can be achieved using pseudo file names 
+        e.g.:: 
+ 
+            Build.load_string(&quot;&quot;&quot; 
+                &lt;MyRule&gt;: 
+                    Label: 
+                        text=&quot;Hello&quot; 
+            &quot;&quot;&quot;, filename=&quot;myrule.kv&quot;) 
+ 
+        can be unloaded via:: 
+ 
+            Build.unload_file(&quot;myrule.kv&quot;) 
+ 
+        '''</span>
+
+        <span class="s1">kwargs</span><span class="s3">.</span><span class="s1">setdefault</span><span class="s3">(</span><span class="s4">'rulesonly'</span><span class="s3">, </span><span class="s2">False</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_current_filename </span><span class="s3">= </span><span class="s1">fn </span><span class="s3">= </span><span class="s1">kwargs</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s4">'filename'</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+
+        <span class="s5"># put a warning if a file is loaded multiple times</span>
+        <span class="s2">if </span><span class="s1">fn </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">files</span><span class="s3">:</span>
+            <span class="s1">Logger</span><span class="s3">.</span><span class="s1">warning</span><span class="s3">(</span>
+                <span class="s4">'Lang: The file {} is loaded multiples times, '</span>
+                <span class="s4">'you might have unwanted behaviors.'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">fn</span><span class="s3">))</span>
+
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s5"># parse the string</span>
+            <span class="s1">parser </span><span class="s3">= </span><span class="s1">Parser</span><span class="s3">(</span><span class="s1">content</span><span class="s3">=</span><span class="s1">string</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">=</span><span class="s1">fn</span><span class="s3">)</span>
+
+            <span class="s5"># merge rules with our rules</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">rules</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">(</span><span class="s1">parser</span><span class="s3">.</span><span class="s1">rules</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_clear_matchcache</span><span class="s3">()</span>
+
+            <span class="s5"># add the template found by the parser into ours</span>
+            <span class="s2">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">cls</span><span class="s3">, </span><span class="s1">template </span><span class="s2">in </span><span class="s1">parser</span><span class="s3">.</span><span class="s1">templates</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">templates</span><span class="s3">[</span><span class="s1">name</span><span class="s3">] = (</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">template</span><span class="s3">, </span><span class="s1">fn</span><span class="s3">)</span>
+                <span class="s1">Factory</span><span class="s3">.</span><span class="s1">register</span><span class="s3">(</span><span class="s1">name</span><span class="s3">,</span>
+                                 <span class="s1">cls</span><span class="s3">=</span><span class="s1">partial</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">template</span><span class="s3">, </span><span class="s1">name</span><span class="s3">),</span>
+                                 <span class="s1">is_template</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">warn</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+
+            <span class="s5"># register all the dynamic classes</span>
+            <span class="s2">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">baseclasses </span><span class="s2">in </span><span class="s1">parser</span><span class="s3">.</span><span class="s1">dynamic_classes</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+                <span class="s1">Factory</span><span class="s3">.</span><span class="s1">register</span><span class="s3">(</span><span class="s1">name</span><span class="s3">, </span><span class="s1">baseclasses</span><span class="s3">=</span><span class="s1">baseclasses</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">=</span><span class="s1">fn</span><span class="s3">,</span>
+                                 <span class="s1">warn</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+
+            <span class="s5"># create root object is exist</span>
+            <span class="s2">if </span><span class="s1">kwargs</span><span class="s3">[</span><span class="s4">'rulesonly'</span><span class="s3">] </span><span class="s2">and </span><span class="s1">parser</span><span class="s3">.</span><span class="s1">root</span><span class="s3">:</span>
+                <span class="s1">filename </span><span class="s3">= </span><span class="s1">kwargs</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s4">'rulesonly'</span><span class="s3">, </span><span class="s4">'&lt;string&gt;'</span><span class="s3">)</span>
+                <span class="s2">raise </span><span class="s1">Exception</span><span class="s3">(</span><span class="s4">'The file &lt;%s&gt; contain also non-rules '</span>
+                                <span class="s4">'directives' </span><span class="s3">% </span><span class="s1">filename</span><span class="s3">)</span>
+
+            <span class="s5"># save the loaded files only if there is a root without</span>
+            <span class="s5"># template/dynamic classes</span>
+            <span class="s2">if </span><span class="s1">fn </span><span class="s2">and </span><span class="s3">(</span><span class="s1">parser</span><span class="s3">.</span><span class="s1">templates </span><span class="s2">or</span>
+                       <span class="s1">parser</span><span class="s3">.</span><span class="s1">dynamic_classes </span><span class="s2">or </span><span class="s1">parser</span><span class="s3">.</span><span class="s1">rules</span><span class="s3">):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">files</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">fn</span><span class="s3">)</span>
+
+            <span class="s2">if </span><span class="s1">parser</span><span class="s3">.</span><span class="s1">root</span><span class="s3">:</span>
+                <span class="s1">widget </span><span class="s3">= </span><span class="s1">Factory</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">parser</span><span class="s3">.</span><span class="s1">root</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)(</span><span class="s1">__no_builder</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+                <span class="s1">rule_children </span><span class="s3">= []</span>
+                <span class="s1">widget</span><span class="s3">.</span><span class="s1">apply_class_lang_rules</span><span class="s3">(</span>
+                    <span class="s1">root</span><span class="s3">=</span><span class="s1">widget</span><span class="s3">, </span><span class="s1">rule_children</span><span class="s3">=</span><span class="s1">rule_children</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_apply_rule</span><span class="s3">(</span>
+                    <span class="s1">widget</span><span class="s3">, </span><span class="s1">parser</span><span class="s3">.</span><span class="s1">root</span><span class="s3">, </span><span class="s1">parser</span><span class="s3">.</span><span class="s1">root</span><span class="s3">,</span>
+                    <span class="s1">rule_children</span><span class="s3">=</span><span class="s1">rule_children</span><span class="s3">)</span>
+
+                <span class="s2">for </span><span class="s1">child </span><span class="s2">in </span><span class="s1">rule_children</span><span class="s3">:</span>
+                    <span class="s1">child</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_kv_post'</span><span class="s3">, </span><span class="s1">widget</span><span class="s3">)</span>
+                <span class="s1">widget</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_kv_post'</span><span class="s3">, </span><span class="s1">widget</span><span class="s3">)</span>
+                <span class="s2">return </span><span class="s1">widget</span>
+        <span class="s2">finally</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_current_filename </span><span class="s3">= </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">template</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, *</span><span class="s1">args</span><span class="s3">, **</span><span class="s1">ctx</span><span class="s3">):</span>
+        <span class="s0">'''Create a specialized template using a specific context. 
+ 
+        .. versionadded:: 1.0.5 
+ 
+        With templates, you can construct custom widgets from a kv lang 
+        definition by giving them a context. Check :ref:`Template usage 
+        &lt;template_usage&gt;`. 
+        '''</span>
+        <span class="s5"># Prevent naming clash with whatever the user might be putting into the</span>
+        <span class="s5"># ctx as key.</span>
+        <span class="s1">name </span><span class="s3">= </span><span class="s1">args</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">name </span><span class="s2">not in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">templates</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">Exception</span><span class="s3">(</span><span class="s4">'Unknown &lt;%s&gt; template name' </span><span class="s3">% </span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s1">baseclasses</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">, </span><span class="s1">fn </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">templates</span><span class="s3">[</span><span class="s1">name</span><span class="s3">]</span>
+        <span class="s1">key </span><span class="s3">= </span><span class="s4">'%s|%s' </span><span class="s3">% (</span><span class="s1">name</span><span class="s3">, </span><span class="s1">baseclasses</span><span class="s3">)</span>
+        <span class="s1">cls </span><span class="s3">= </span><span class="s1">Cache</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s4">'kv.lang'</span><span class="s3">, </span><span class="s1">key</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">cls </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">rootwidgets </span><span class="s3">= []</span>
+            <span class="s2">for </span><span class="s1">basecls </span><span class="s2">in </span><span class="s1">baseclasses</span><span class="s3">.</span><span class="s1">split</span><span class="s3">(</span><span class="s4">'+'</span><span class="s3">):</span>
+                <span class="s1">rootwidgets</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">Factory</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">basecls</span><span class="s3">))</span>
+            <span class="s1">cls </span><span class="s3">= </span><span class="s1">type</span><span class="s3">(</span><span class="s1">name</span><span class="s3">, </span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">rootwidgets</span><span class="s3">), {})</span>
+            <span class="s1">Cache</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s4">'kv.lang'</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">cls</span><span class="s3">)</span>
+        <span class="s1">widget </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">()</span>
+        <span class="s5"># in previous versions, ``ctx`` is passed as is as ``template_ctx``</span>
+        <span class="s5"># preventing widgets in it from be collected by the GC. This was</span>
+        <span class="s5"># especially relevant to AccordionItem's title_template.</span>
+        <span class="s1">proxy_ctx </span><span class="s3">= {</span><span class="s1">k</span><span class="s3">: </span><span class="s1">get_proxy</span><span class="s3">(</span><span class="s1">v</span><span class="s3">) </span><span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">items</span><span class="s3">()}</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_apply_rule</span><span class="s3">(</span><span class="s1">widget</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">, </span><span class="s1">template_ctx</span><span class="s3">=</span><span class="s1">proxy_ctx</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">widget</span>
+
+    <span class="s2">def </span><span class="s1">apply_rules</span><span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">, </span><span class="s1">widget</span><span class="s3">, </span><span class="s1">rule_name</span><span class="s3">, </span><span class="s1">ignored_consts</span><span class="s3">=</span><span class="s1">set</span><span class="s3">(), </span><span class="s1">rule_children</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+            <span class="s1">dispatch_kv_post</span><span class="s3">=</span><span class="s2">False</span><span class="s3">):</span>
+        <span class="s0">'''Search all the rules that match the name `rule_name` 
+        and apply them to `widget`. 
+ 
+        .. versionadded:: 1.10.0 
+ 
+        :Parameters: 
+ 
+            `widget`: :class:`~kivy.uix.widget.Widget` 
+                The widget to whom the matching rules should be applied to. 
+            `ignored_consts`: set 
+                A set or list type whose elements are property names for which 
+                constant KV rules (i.e. those that don't create bindings) of 
+                that widget will not be applied. This allows e.g. skipping 
+                constant rules that overwrite a value initialized in python. 
+            `rule_children`: list 
+                If not ``None``, it should be a list that will be populated 
+                with all the widgets created by the kv rules being applied. 
+ 
+                .. versionchanged:: 1.11.0 
+ 
+            `dispatch_kv_post`: bool 
+                Normally the class `Widget` dispatches the `on_kv_post` event 
+                to widgets created during kv rule application. 
+                But if the rules are manually applied by calling :meth:`apply`, 
+                that may not happen, so if this is `True`, we will dispatch the 
+                `on_kv_post` event where needed after applying the rules to 
+                `widget` (we won't dispatch it for `widget` itself). 
+ 
+                Defaults to False. 
+ 
+                .. versionchanged:: 1.11.0 
+        '''</span>
+        <span class="s1">rules </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">match_rule_name</span><span class="s3">(</span><span class="s1">rule_name</span><span class="s3">)</span>
+        <span class="s2">if __debug__</span><span class="s3">:</span>
+            <span class="s1">trace</span><span class="s3">(</span><span class="s4">'Lang: Found %d rules for %s' </span><span class="s3">% (</span><span class="s1">len</span><span class="s3">(</span><span class="s1">rules</span><span class="s3">), </span><span class="s1">rule_name</span><span class="s3">))</span>
+        <span class="s2">if not </span><span class="s1">rules</span><span class="s3">:</span>
+            <span class="s2">return</span>
+
+        <span class="s2">if </span><span class="s1">dispatch_kv_post</span><span class="s3">:</span>
+            <span class="s1">rule_children </span><span class="s3">= </span><span class="s1">rule_children </span><span class="s2">if </span><span class="s1">rule_children </span><span class="s2">is not None else </span><span class="s3">[]</span>
+        <span class="s2">for </span><span class="s1">rule </span><span class="s2">in </span><span class="s1">rules</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_apply_rule</span><span class="s3">(</span>
+                <span class="s1">widget</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">, </span><span class="s1">ignored_consts</span><span class="s3">=</span><span class="s1">ignored_consts</span><span class="s3">,</span>
+                <span class="s1">rule_children</span><span class="s3">=</span><span class="s1">rule_children</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">dispatch_kv_post</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">w </span><span class="s2">in </span><span class="s1">rule_children</span><span class="s3">:</span>
+                <span class="s1">w</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_kv_post'</span><span class="s3">, </span><span class="s1">widget</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">apply</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">widget</span><span class="s3">, </span><span class="s1">ignored_consts</span><span class="s3">=</span><span class="s1">set</span><span class="s3">(), </span><span class="s1">rule_children</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+              <span class="s1">dispatch_kv_post</span><span class="s3">=</span><span class="s2">False</span><span class="s3">):</span>
+        <span class="s0">'''Search all the rules that match the widget and apply them. 
+ 
+        :Parameters: 
+ 
+            `widget`: :class:`~kivy.uix.widget.Widget` 
+                The widget whose class rules should be applied to this widget. 
+            `ignored_consts`: set 
+                A set or list type whose elements are property names for which 
+                constant KV rules (i.e. those that don't create bindings) of 
+                that widget will not be applied. This allows e.g. skipping 
+                constant rules that overwrite a value initialized in python. 
+            `rule_children`: list 
+                If not ``None``, it should be a list that will be populated 
+                with all the widgets created by the kv rules being applied. 
+ 
+                .. versionchanged:: 1.11.0 
+ 
+            `dispatch_kv_post`: bool 
+                Normally the class `Widget` dispatches the `on_kv_post` event 
+                to widgets created during kv rule application. 
+                But if the rules are manually applied by calling :meth:`apply`, 
+                that may not happen, so if this is `True`, we will dispatch the 
+                `on_kv_post` event where needed after applying the rules to 
+                `widget` (we won't dispatch it for `widget` itself). 
+ 
+                Defaults to False. 
+ 
+                .. versionchanged:: 1.11.0 
+        '''</span>
+        <span class="s1">rules </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">widget</span><span class="s3">)</span>
+        <span class="s2">if __debug__</span><span class="s3">:</span>
+            <span class="s1">trace</span><span class="s3">(</span><span class="s4">'Lang: Found %d rules for %s' </span><span class="s3">% (</span><span class="s1">len</span><span class="s3">(</span><span class="s1">rules</span><span class="s3">), </span><span class="s1">widget</span><span class="s3">))</span>
+        <span class="s2">if not </span><span class="s1">rules</span><span class="s3">:</span>
+            <span class="s2">return</span>
+
+        <span class="s2">if </span><span class="s1">dispatch_kv_post</span><span class="s3">:</span>
+            <span class="s1">rule_children </span><span class="s3">= </span><span class="s1">rule_children </span><span class="s2">if </span><span class="s1">rule_children </span><span class="s2">is not None else </span><span class="s3">[]</span>
+        <span class="s2">for </span><span class="s1">rule </span><span class="s2">in </span><span class="s1">rules</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_apply_rule</span><span class="s3">(</span>
+                <span class="s1">widget</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">, </span><span class="s1">ignored_consts</span><span class="s3">=</span><span class="s1">ignored_consts</span><span class="s3">,</span>
+                <span class="s1">rule_children</span><span class="s3">=</span><span class="s1">rule_children</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">dispatch_kv_post</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">w </span><span class="s2">in </span><span class="s1">rule_children</span><span class="s3">:</span>
+                <span class="s1">w</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_kv_post'</span><span class="s3">, </span><span class="s1">widget</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_clear_matchcache</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_match_cache</span><span class="s3">.</span><span class="s1">clear</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_match_name_cache</span><span class="s3">.</span><span class="s1">clear</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">_apply_rule</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">widget</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">, </span><span class="s1">rootrule</span><span class="s3">, </span><span class="s1">template_ctx</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                    <span class="s1">ignored_consts</span><span class="s3">=</span><span class="s1">set</span><span class="s3">(), </span><span class="s1">rule_children</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s5"># widget: the current instantiated widget</span>
+        <span class="s5"># rule: the current rule</span>
+        <span class="s5"># rootrule: the current root rule (for children of a rule)</span>
+
+        <span class="s5"># will collect reference to all the id in children</span>
+        <span class="s2">assert </span><span class="s1">rule </span><span class="s2">not in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">rulectx</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">rulectx</span><span class="s3">[</span><span class="s1">rule</span><span class="s3">] = </span><span class="s1">rctx </span><span class="s3">= {</span>
+            <span class="s4">'ids'</span><span class="s3">: {</span><span class="s4">'root'</span><span class="s3">: </span><span class="s1">widget</span><span class="s3">.</span><span class="s1">proxy_ref</span><span class="s3">},</span>
+            <span class="s4">'set'</span><span class="s3">: [], </span><span class="s4">'hdl'</span><span class="s3">: []}</span>
+
+        <span class="s5"># extract the context of the rootrule (not rule!)</span>
+        <span class="s2">assert </span><span class="s1">rootrule </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">rulectx</span>
+        <span class="s1">rctx </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">rulectx</span><span class="s3">[</span><span class="s1">rootrule</span><span class="s3">]</span>
+
+        <span class="s5"># if a template context is passed, put it as &quot;ctx&quot;</span>
+        <span class="s2">if </span><span class="s1">template_ctx </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">rctx</span><span class="s3">[</span><span class="s4">'ids'</span><span class="s3">][</span><span class="s4">'ctx'</span><span class="s3">] = </span><span class="s1">QueryDict</span><span class="s3">(</span><span class="s1">template_ctx</span><span class="s3">)</span>
+
+        <span class="s5"># if we got an id, put it in the root rule for a later global usage</span>
+        <span class="s2">if </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">id</span><span class="s3">:</span>
+            <span class="s5"># use only the first word as `id` discard the rest.</span>
+            <span class="s1">rule</span><span class="s3">.</span><span class="s1">id </span><span class="s3">= </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">id</span><span class="s3">.</span><span class="s1">split</span><span class="s3">(</span><span class="s4">'#'</span><span class="s3">, </span><span class="s6">1</span><span class="s3">)[</span><span class="s6">0</span><span class="s3">].</span><span class="s1">strip</span><span class="s3">()</span>
+            <span class="s1">rctx</span><span class="s3">[</span><span class="s4">'ids'</span><span class="s3">][</span><span class="s1">rule</span><span class="s3">.</span><span class="s1">id</span><span class="s3">] = </span><span class="s1">widget</span><span class="s3">.</span><span class="s1">proxy_ref</span>
+            <span class="s5"># set id name as a attribute for root widget so one can in python</span>
+            <span class="s5"># code simply access root_widget.id_name</span>
+            <span class="s1">_ids </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">rctx</span><span class="s3">[</span><span class="s4">'ids'</span><span class="s3">])</span>
+            <span class="s1">_root </span><span class="s3">= </span><span class="s1">_ids</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s4">'root'</span><span class="s3">)</span>
+            <span class="s1">_new_ids </span><span class="s3">= </span><span class="s1">_root</span><span class="s3">.</span><span class="s1">ids</span>
+            <span class="s2">for </span><span class="s1">_key</span><span class="s3">, </span><span class="s1">_value </span><span class="s2">in </span><span class="s1">_ids</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+                <span class="s2">if </span><span class="s1">_value </span><span class="s3">== </span><span class="s1">_root</span><span class="s3">:</span>
+                    <span class="s5"># skip on self</span>
+                    <span class="s2">continue</span>
+                <span class="s1">_new_ids</span><span class="s3">[</span><span class="s1">_key</span><span class="s3">] = </span><span class="s1">_value</span>
+            <span class="s1">_root</span><span class="s3">.</span><span class="s1">ids </span><span class="s3">= </span><span class="s1">_new_ids</span>
+
+        <span class="s5"># first, ensure that the widget have all the properties used in</span>
+        <span class="s5"># the rule if not, they will be created as ObjectProperty.</span>
+        <span class="s1">rule</span><span class="s3">.</span><span class="s1">create_missing</span><span class="s3">(</span><span class="s1">widget</span><span class="s3">)</span>
+
+        <span class="s5"># build the widget canvas</span>
+        <span class="s2">if </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">canvas_before</span><span class="s3">:</span>
+            <span class="s2">with </span><span class="s1">widget</span><span class="s3">.</span><span class="s1">canvas</span><span class="s3">.</span><span class="s1">before</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_build_canvas</span><span class="s3">(</span><span class="s1">widget</span><span class="s3">.</span><span class="s1">canvas</span><span class="s3">.</span><span class="s1">before</span><span class="s3">, </span><span class="s1">widget</span><span class="s3">,</span>
+                                   <span class="s1">rule</span><span class="s3">.</span><span class="s1">canvas_before</span><span class="s3">, </span><span class="s1">rootrule</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">canvas_root</span><span class="s3">:</span>
+            <span class="s2">with </span><span class="s1">widget</span><span class="s3">.</span><span class="s1">canvas</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_build_canvas</span><span class="s3">(</span><span class="s1">widget</span><span class="s3">.</span><span class="s1">canvas</span><span class="s3">, </span><span class="s1">widget</span><span class="s3">,</span>
+                                   <span class="s1">rule</span><span class="s3">.</span><span class="s1">canvas_root</span><span class="s3">, </span><span class="s1">rootrule</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">canvas_after</span><span class="s3">:</span>
+            <span class="s2">with </span><span class="s1">widget</span><span class="s3">.</span><span class="s1">canvas</span><span class="s3">.</span><span class="s1">after</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_build_canvas</span><span class="s3">(</span><span class="s1">widget</span><span class="s3">.</span><span class="s1">canvas</span><span class="s3">.</span><span class="s1">after</span><span class="s3">, </span><span class="s1">widget</span><span class="s3">,</span>
+                                   <span class="s1">rule</span><span class="s3">.</span><span class="s1">canvas_after</span><span class="s3">, </span><span class="s1">rootrule</span><span class="s3">)</span>
+
+        <span class="s5"># create children tree</span>
+        <span class="s1">Factory_get </span><span class="s3">= </span><span class="s1">Factory</span><span class="s3">.</span><span class="s1">get</span>
+        <span class="s1">Factory_is_template </span><span class="s3">= </span><span class="s1">Factory</span><span class="s3">.</span><span class="s1">is_template</span>
+        <span class="s2">for </span><span class="s1">crule </span><span class="s2">in </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">children</span><span class="s3">:</span>
+            <span class="s1">cname </span><span class="s3">= </span><span class="s1">crule</span><span class="s3">.</span><span class="s1">name</span>
+
+            <span class="s2">if </span><span class="s1">cname </span><span class="s2">in </span><span class="s3">(</span><span class="s4">'canvas'</span><span class="s3">, </span><span class="s4">'canvas.before'</span><span class="s3">, </span><span class="s4">'canvas.after'</span><span class="s3">):</span>
+                <span class="s2">raise </span><span class="s1">ParserException</span><span class="s3">(</span>
+                    <span class="s1">crule</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">, </span><span class="s1">crule</span><span class="s3">.</span><span class="s1">line</span><span class="s3">,</span>
+                    <span class="s4">'Canvas instructions added in kv must '</span>
+                    <span class="s4">'be declared before child widgets.'</span><span class="s3">)</span>
+
+            <span class="s5"># depending if the child rule is a template or not, we are not</span>
+            <span class="s5"># having the same approach</span>
+            <span class="s1">cls </span><span class="s3">= </span><span class="s1">Factory_get</span><span class="s3">(</span><span class="s1">cname</span><span class="s3">)</span>
+
+            <span class="s2">if </span><span class="s1">Factory_is_template</span><span class="s3">(</span><span class="s1">cname</span><span class="s3">):</span>
+                <span class="s5"># we got a template, so extract all the properties and</span>
+                <span class="s5"># handlers, and push them in a &quot;ctx&quot; dictionary.</span>
+                <span class="s1">ctx </span><span class="s3">= {}</span>
+                <span class="s1">idmap </span><span class="s3">= </span><span class="s1">copy</span><span class="s3">(</span><span class="s1">global_idmap</span><span class="s3">)</span>
+                <span class="s1">idmap</span><span class="s3">.</span><span class="s1">update</span><span class="s3">({</span><span class="s4">'root'</span><span class="s3">: </span><span class="s1">rctx</span><span class="s3">[</span><span class="s4">'ids'</span><span class="s3">][</span><span class="s4">'root'</span><span class="s3">]})</span>
+                <span class="s2">if </span><span class="s4">'ctx' </span><span class="s2">in </span><span class="s1">rctx</span><span class="s3">[</span><span class="s4">'ids'</span><span class="s3">]:</span>
+                    <span class="s1">idmap</span><span class="s3">.</span><span class="s1">update</span><span class="s3">({</span><span class="s4">'ctx'</span><span class="s3">: </span><span class="s1">rctx</span><span class="s3">[</span><span class="s4">'ids'</span><span class="s3">][</span><span class="s4">'ctx'</span><span class="s3">]})</span>
+                <span class="s2">try</span><span class="s3">:</span>
+                    <span class="s2">for </span><span class="s1">prule </span><span class="s2">in </span><span class="s1">crule</span><span class="s3">.</span><span class="s1">properties</span><span class="s3">.</span><span class="s1">values</span><span class="s3">():</span>
+                        <span class="s1">value </span><span class="s3">= </span><span class="s1">prule</span><span class="s3">.</span><span class="s1">co_value</span>
+                        <span class="s2">if </span><span class="s1">type</span><span class="s3">(</span><span class="s1">value</span><span class="s3">) </span><span class="s2">is </span><span class="s1">CodeType</span><span class="s3">:</span>
+                            <span class="s1">value </span><span class="s3">= </span><span class="s1">eval</span><span class="s3">(</span><span class="s1">value</span><span class="s3">, </span><span class="s1">idmap</span><span class="s3">)</span>
+                        <span class="s1">ctx</span><span class="s3">[</span><span class="s1">prule</span><span class="s3">.</span><span class="s1">name</span><span class="s3">] = </span><span class="s1">value</span>
+                    <span class="s2">for </span><span class="s1">prule </span><span class="s2">in </span><span class="s1">crule</span><span class="s3">.</span><span class="s1">handlers</span><span class="s3">:</span>
+                        <span class="s1">value </span><span class="s3">= </span><span class="s1">eval</span><span class="s3">(</span><span class="s1">prule</span><span class="s3">.</span><span class="s1">value</span><span class="s3">, </span><span class="s1">idmap</span><span class="s3">)</span>
+                        <span class="s1">ctx</span><span class="s3">[</span><span class="s1">prule</span><span class="s3">.</span><span class="s1">name</span><span class="s3">] = </span><span class="s1">value</span>
+                <span class="s2">except </span><span class="s1">Exception </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+                    <span class="s1">tb </span><span class="s3">= </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">exc_info</span><span class="s3">()[</span><span class="s6">2</span><span class="s3">]</span>
+                    <span class="s2">raise </span><span class="s1">BuilderException</span><span class="s3">(</span>
+                        <span class="s1">prule</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">, </span><span class="s1">prule</span><span class="s3">.</span><span class="s1">line</span><span class="s3">,</span>
+                        <span class="s4">'{}: {}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">e</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">, </span><span class="s1">e</span><span class="s3">), </span><span class="s1">cause</span><span class="s3">=</span><span class="s1">tb</span><span class="s3">)</span>
+
+                <span class="s5"># create the template with an explicit ctx</span>
+                <span class="s1">child </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">(**</span><span class="s1">ctx</span><span class="s3">)</span>
+                <span class="s1">widget</span><span class="s3">.</span><span class="s1">add_widget</span><span class="s3">(</span><span class="s1">child</span><span class="s3">)</span>
+
+                <span class="s5"># reference it on our root rule context</span>
+                <span class="s2">if </span><span class="s1">crule</span><span class="s3">.</span><span class="s1">id</span><span class="s3">:</span>
+                    <span class="s1">rctx</span><span class="s3">[</span><span class="s4">'ids'</span><span class="s3">][</span><span class="s1">crule</span><span class="s3">.</span><span class="s1">id</span><span class="s3">] = </span><span class="s1">child</span>
+
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s5"># we got a &quot;normal&quot; rule, construct it manually</span>
+                <span class="s5"># we can't construct it without __no_builder=True, because the</span>
+                <span class="s5"># previous implementation was doing the add_widget() before</span>
+                <span class="s5"># apply(), and so, we could use &quot;self.parent&quot;.</span>
+                <span class="s1">child </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">(</span><span class="s1">__no_builder</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+                <span class="s1">widget</span><span class="s3">.</span><span class="s1">add_widget</span><span class="s3">(</span><span class="s1">child</span><span class="s3">)</span>
+                <span class="s1">child</span><span class="s3">.</span><span class="s1">apply_class_lang_rules</span><span class="s3">(</span>
+                    <span class="s1">root</span><span class="s3">=</span><span class="s1">rctx</span><span class="s3">[</span><span class="s4">'ids'</span><span class="s3">][</span><span class="s4">'root'</span><span class="s3">], </span><span class="s1">rule_children</span><span class="s3">=</span><span class="s1">rule_children</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_apply_rule</span><span class="s3">(</span>
+                    <span class="s1">child</span><span class="s3">, </span><span class="s1">crule</span><span class="s3">, </span><span class="s1">rootrule</span><span class="s3">, </span><span class="s1">rule_children</span><span class="s3">=</span><span class="s1">rule_children</span><span class="s3">)</span>
+
+                <span class="s2">if </span><span class="s1">rule_children </span><span class="s2">is not None</span><span class="s3">:</span>
+                    <span class="s1">rule_children</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">child</span><span class="s3">)</span>
+
+        <span class="s5"># append the properties and handlers to our final resolution task</span>
+        <span class="s2">if </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">properties</span><span class="s3">:</span>
+            <span class="s1">rctx</span><span class="s3">[</span><span class="s4">'set'</span><span class="s3">].</span><span class="s1">append</span><span class="s3">((</span><span class="s1">widget</span><span class="s3">.</span><span class="s1">proxy_ref</span><span class="s3">,</span>
+                                <span class="s1">list</span><span class="s3">(</span><span class="s1">rule</span><span class="s3">.</span><span class="s1">properties</span><span class="s3">.</span><span class="s1">values</span><span class="s3">())))</span>
+            <span class="s2">for </span><span class="s1">key</span><span class="s3">, </span><span class="s1">crule </span><span class="s2">in </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">properties</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+                <span class="s5"># clear previously applied rules if asked</span>
+                <span class="s2">if </span><span class="s1">crule</span><span class="s3">.</span><span class="s1">ignore_prev</span><span class="s3">:</span>
+                    <span class="s1">Builder</span><span class="s3">.</span><span class="s1">unbind_property</span><span class="s3">(</span><span class="s1">widget</span><span class="s3">, </span><span class="s1">key</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">handlers</span><span class="s3">:</span>
+            <span class="s1">rctx</span><span class="s3">[</span><span class="s4">'hdl'</span><span class="s3">].</span><span class="s1">append</span><span class="s3">((</span><span class="s1">widget</span><span class="s3">.</span><span class="s1">proxy_ref</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">handlers</span><span class="s3">))</span>
+
+        <span class="s5"># if we are applying another rule that the root one, then it's done for</span>
+        <span class="s5"># us!</span>
+        <span class="s2">if </span><span class="s1">rootrule </span><span class="s2">is not </span><span class="s1">rule</span><span class="s3">:</span>
+            <span class="s2">del </span><span class="s1">self</span><span class="s3">.</span><span class="s1">rulectx</span><span class="s3">[</span><span class="s1">rule</span><span class="s3">]</span>
+            <span class="s2">return</span>
+
+        <span class="s5"># normally, we can apply a list of properties with a proper context</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">rule </span><span class="s3">= </span><span class="s2">None</span>
+            <span class="s2">for </span><span class="s1">widget_set</span><span class="s3">, </span><span class="s1">rules </span><span class="s2">in </span><span class="s1">reversed</span><span class="s3">(</span><span class="s1">rctx</span><span class="s3">[</span><span class="s4">'set'</span><span class="s3">]):</span>
+                <span class="s2">for </span><span class="s1">rule </span><span class="s2">in </span><span class="s1">rules</span><span class="s3">:</span>
+                    <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">rule</span><span class="s3">, </span><span class="s1">ParserRuleProperty</span><span class="s3">)</span>
+                    <span class="s1">key </span><span class="s3">= </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">name</span>
+                    <span class="s1">value </span><span class="s3">= </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">co_value</span>
+                    <span class="s2">if </span><span class="s1">type</span><span class="s3">(</span><span class="s1">value</span><span class="s3">) </span><span class="s2">is </span><span class="s1">CodeType</span><span class="s3">:</span>
+                        <span class="s1">value</span><span class="s3">, </span><span class="s1">bound </span><span class="s3">= </span><span class="s1">create_handler</span><span class="s3">(</span>
+                            <span class="s1">widget_set</span><span class="s3">, </span><span class="s1">widget_set</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">,</span>
+                            <span class="s1">rctx</span><span class="s3">[</span><span class="s4">'ids'</span><span class="s3">])</span>
+                        <span class="s5"># if there's a rule</span>
+                        <span class="s2">if </span><span class="s3">(</span><span class="s1">widget_set </span><span class="s3">!= </span><span class="s1">widget </span><span class="s2">or </span><span class="s1">bound </span><span class="s2">or</span>
+                                <span class="s1">key </span><span class="s2">not in </span><span class="s1">ignored_consts</span><span class="s3">):</span>
+                            <span class="s1">setattr</span><span class="s3">(</span><span class="s1">widget_set</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">value</span><span class="s3">)</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s2">if </span><span class="s3">(</span><span class="s1">widget_set </span><span class="s3">!= </span><span class="s1">widget </span><span class="s2">or</span>
+                                <span class="s1">key </span><span class="s2">not in </span><span class="s1">ignored_consts</span><span class="s3">):</span>
+                            <span class="s1">setattr</span><span class="s3">(</span><span class="s1">widget_set</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">value</span><span class="s3">)</span>
+
+        <span class="s2">except </span><span class="s1">Exception </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">rule </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">tb </span><span class="s3">= </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">exc_info</span><span class="s3">()[</span><span class="s6">2</span><span class="s3">]</span>
+                <span class="s2">raise </span><span class="s1">BuilderException</span><span class="s3">(</span><span class="s1">rule</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">line</span><span class="s3">,</span>
+                                       <span class="s4">'{}: {}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">e</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">,</span>
+                                                       <span class="s1">e</span><span class="s3">), </span><span class="s1">cause</span><span class="s3">=</span><span class="s1">tb</span><span class="s3">)</span>
+            <span class="s2">raise </span><span class="s1">e</span>
+
+        <span class="s5"># build handlers</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">crule </span><span class="s3">= </span><span class="s2">None</span>
+            <span class="s2">for </span><span class="s1">widget_set</span><span class="s3">, </span><span class="s1">rules </span><span class="s2">in </span><span class="s1">rctx</span><span class="s3">[</span><span class="s4">'hdl'</span><span class="s3">]:</span>
+                <span class="s2">for </span><span class="s1">crule </span><span class="s2">in </span><span class="s1">rules</span><span class="s3">:</span>
+                    <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">crule</span><span class="s3">, </span><span class="s1">ParserRuleProperty</span><span class="s3">)</span>
+                    <span class="s2">assert </span><span class="s1">crule</span><span class="s3">.</span><span class="s1">name</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s4">'on_'</span><span class="s3">)</span>
+                    <span class="s1">key </span><span class="s3">= </span><span class="s1">crule</span><span class="s3">.</span><span class="s1">name</span>
+                    <span class="s2">if not </span><span class="s1">widget_set</span><span class="s3">.</span><span class="s1">is_event_type</span><span class="s3">(</span><span class="s1">key</span><span class="s3">):</span>
+                        <span class="s1">key </span><span class="s3">= </span><span class="s1">key</span><span class="s3">[</span><span class="s6">3</span><span class="s3">:]</span>
+                    <span class="s1">idmap </span><span class="s3">= </span><span class="s1">copy</span><span class="s3">(</span><span class="s1">global_idmap</span><span class="s3">)</span>
+                    <span class="s1">idmap</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">rctx</span><span class="s3">[</span><span class="s4">'ids'</span><span class="s3">])</span>
+                    <span class="s1">idmap</span><span class="s3">[</span><span class="s4">'self'</span><span class="s3">] = </span><span class="s1">widget_set</span><span class="s3">.</span><span class="s1">proxy_ref</span>
+                    <span class="s2">if not </span><span class="s1">widget_set</span><span class="s3">.</span><span class="s1">fbind</span><span class="s3">(</span><span class="s1">key</span><span class="s3">, </span><span class="s1">custom_callback</span><span class="s3">, </span><span class="s1">crule</span><span class="s3">,</span>
+                                            <span class="s1">idmap</span><span class="s3">):</span>
+                        <span class="s2">raise </span><span class="s1">AttributeError</span><span class="s3">(</span><span class="s1">key</span><span class="s3">)</span>
+                    <span class="s5"># hack for on_parent</span>
+                    <span class="s2">if </span><span class="s1">crule</span><span class="s3">.</span><span class="s1">name </span><span class="s3">== </span><span class="s4">'on_parent'</span><span class="s3">:</span>
+                        <span class="s1">Factory</span><span class="s3">.</span><span class="s1">Widget</span><span class="s3">.</span><span class="s1">parent</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s1">widget_set</span><span class="s3">.</span><span class="s1">__self__</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">Exception </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">crule </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">tb </span><span class="s3">= </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">exc_info</span><span class="s3">()[</span><span class="s6">2</span><span class="s3">]</span>
+                <span class="s2">raise </span><span class="s1">BuilderException</span><span class="s3">(</span>
+                    <span class="s1">crule</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">, </span><span class="s1">crule</span><span class="s3">.</span><span class="s1">line</span><span class="s3">,</span>
+                    <span class="s4">'{}: {}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">e</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">, </span><span class="s1">e</span><span class="s3">), </span><span class="s1">cause</span><span class="s3">=</span><span class="s1">tb</span><span class="s3">)</span>
+            <span class="s2">raise </span><span class="s1">e</span>
+
+        <span class="s5"># rule finished, forget it</span>
+        <span class="s2">del </span><span class="s1">self</span><span class="s3">.</span><span class="s1">rulectx</span><span class="s3">[</span><span class="s1">rootrule</span><span class="s3">]</span>
+
+    <span class="s2">def </span><span class="s1">match</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">widget</span><span class="s3">):</span>
+        <span class="s0">'''Return a list of :class:`ParserRule` objects matching the widget. 
+        '''</span>
+        <span class="s1">cache </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_match_cache</span>
+        <span class="s1">k </span><span class="s3">= (</span><span class="s1">widget</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">, </span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">widget</span><span class="s3">.</span><span class="s1">cls</span><span class="s3">))</span>
+        <span class="s2">if </span><span class="s1">k </span><span class="s2">in </span><span class="s1">cache</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">cache</span><span class="s3">[</span><span class="s1">k</span><span class="s3">]</span>
+        <span class="s1">rules </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">selector</span><span class="s3">, </span><span class="s1">rule </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">rules</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">selector</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">widget</span><span class="s3">):</span>
+                <span class="s2">if </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">avoid_previous_rules</span><span class="s3">:</span>
+                    <span class="s2">del </span><span class="s1">rules</span><span class="s3">[:]</span>
+                <span class="s1">rules</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">rule</span><span class="s3">)</span>
+        <span class="s1">cache</span><span class="s3">[</span><span class="s1">k</span><span class="s3">] = </span><span class="s1">rules</span>
+        <span class="s2">return </span><span class="s1">rules</span>
+
+    <span class="s2">def </span><span class="s1">match_rule_name</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">rule_name</span><span class="s3">):</span>
+        <span class="s0">'''Return a list of :class:`ParserRule` objects matching the widget. 
+        '''</span>
+        <span class="s1">cache </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_match_name_cache</span>
+        <span class="s1">rule_name </span><span class="s3">= </span><span class="s1">str</span><span class="s3">(</span><span class="s1">rule_name</span><span class="s3">)</span>
+        <span class="s1">k </span><span class="s3">= </span><span class="s1">rule_name</span><span class="s3">.</span><span class="s1">lower</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">k </span><span class="s2">in </span><span class="s1">cache</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">cache</span><span class="s3">[</span><span class="s1">k</span><span class="s3">]</span>
+        <span class="s1">rules </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">selector</span><span class="s3">, </span><span class="s1">rule </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">rules</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">selector</span><span class="s3">.</span><span class="s1">match_rule_name</span><span class="s3">(</span><span class="s1">rule_name</span><span class="s3">):</span>
+                <span class="s2">if </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">avoid_previous_rules</span><span class="s3">:</span>
+                    <span class="s2">del </span><span class="s1">rules</span><span class="s3">[:]</span>
+                <span class="s1">rules</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">rule</span><span class="s3">)</span>
+        <span class="s1">cache</span><span class="s3">[</span><span class="s1">k</span><span class="s3">] = </span><span class="s1">rules</span>
+        <span class="s2">return </span><span class="s1">rules</span>
+
+    <span class="s2">def </span><span class="s1">sync</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">'''Execute all the waiting operations, such as the execution of all the 
+        expressions related to the canvas. 
+ 
+        .. versionadded:: 1.7.0 
+        '''</span>
+        <span class="s2">global </span><span class="s1">_delayed_start</span>
+        <span class="s1">next_args </span><span class="s3">= </span><span class="s1">_delayed_start</span>
+        <span class="s2">if </span><span class="s1">next_args </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">return</span>
+
+        <span class="s2">while </span><span class="s1">next_args </span><span class="s2">is not </span><span class="s1">StopIteration</span><span class="s3">:</span>
+            <span class="s5"># is this try/except still needed? yes, in case widget died in this</span>
+            <span class="s5"># frame after the call was scheduled</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s1">call_fn</span><span class="s3">(</span><span class="s1">next_args</span><span class="s3">[:-</span><span class="s6">1</span><span class="s3">], </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+            <span class="s2">except </span><span class="s1">ReferenceError</span><span class="s3">:</span>
+                <span class="s2">pass</span>
+            <span class="s1">args </span><span class="s3">= </span><span class="s1">next_args</span>
+            <span class="s1">next_args </span><span class="s3">= </span><span class="s1">args</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">]</span>
+            <span class="s1">args</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">] = </span><span class="s2">None</span>
+        <span class="s1">_delayed_start </span><span class="s3">= </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">unbind_widget</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">uid</span><span class="s3">):</span>
+        <span class="s0">'''Unbind all the handlers created by the KV rules of the 
+        widget. The :attr:`kivy.uix.widget.Widget.uid` is passed here 
+        instead of the widget itself, because Builder is using it in the 
+        widget destructor. 
+ 
+        This effectively clears all the KV rules associated with this widget. 
+        For example: 
+ 
+        .. code-block:: python 
+ 
+            &gt;&gt;&gt; w = Builder.load_string(\''' 
+            ... Widget: 
+            ...     height: self.width / 2. if self.disabled else self.width 
+            ...     x: self.y + 50 
+            ... \''') 
+            &gt;&gt;&gt; w.size 
+            [100, 100] 
+            &gt;&gt;&gt; w.pos 
+            [50, 0] 
+            &gt;&gt;&gt; w.width = 500 
+            &gt;&gt;&gt; w.size 
+            [500, 500] 
+            &gt;&gt;&gt; Builder.unbind_widget(w.uid) 
+            &gt;&gt;&gt; w.width = 222 
+            &gt;&gt;&gt; w.y = 500 
+            &gt;&gt;&gt; w.size 
+            [222, 500] 
+            &gt;&gt;&gt; w.pos 
+            [50, 500] 
+ 
+        .. versionadded:: 1.7.2 
+        '''</span>
+        <span class="s2">if </span><span class="s1">uid </span><span class="s2">not in </span><span class="s1">_handlers</span><span class="s3">:</span>
+            <span class="s2">return</span>
+        <span class="s2">for </span><span class="s1">prop_callbacks </span><span class="s2">in </span><span class="s1">_handlers</span><span class="s3">[</span><span class="s1">uid</span><span class="s3">].</span><span class="s1">values</span><span class="s3">():</span>
+            <span class="s2">for </span><span class="s1">callbacks </span><span class="s2">in </span><span class="s1">prop_callbacks</span><span class="s3">:</span>
+                <span class="s2">for </span><span class="s1">f</span><span class="s3">, </span><span class="s1">k</span><span class="s3">, </span><span class="s1">fn</span><span class="s3">, </span><span class="s1">bound_uid </span><span class="s2">in </span><span class="s1">callbacks</span><span class="s3">:</span>
+                    <span class="s2">if </span><span class="s1">fn </span><span class="s2">is None</span><span class="s3">:  </span><span class="s5"># it's not a kivy prop.</span>
+                        <span class="s2">continue</span>
+                    <span class="s2">try</span><span class="s3">:</span>
+                        <span class="s1">f</span><span class="s3">.</span><span class="s1">unbind_uid</span><span class="s3">(</span><span class="s1">k</span><span class="s3">, </span><span class="s1">bound_uid</span><span class="s3">)</span>
+                    <span class="s2">except </span><span class="s1">ReferenceError</span><span class="s3">:</span>
+                        <span class="s5"># proxy widget is already gone, that's cool :)</span>
+                        <span class="s2">pass</span>
+        <span class="s2">del </span><span class="s1">_handlers</span><span class="s3">[</span><span class="s1">uid</span><span class="s3">]</span>
+
+    <span class="s2">def </span><span class="s1">unbind_property</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">widget</span><span class="s3">, </span><span class="s1">name</span><span class="s3">):</span>
+        <span class="s0">'''Unbind the handlers created by all the rules of the widget that set 
+        the name. 
+ 
+        This effectively clears all the rules of widget that take the form:: 
+ 
+            name: rule 
+ 
+        For example: 
+ 
+        .. code-block:: python 
+ 
+            &gt;&gt;&gt; w = Builder.load_string(\''' 
+            ... Widget: 
+            ...     height: self.width / 2. if self.disabled else self.width 
+            ...     x: self.y + 50 
+            ... \''') 
+            &gt;&gt;&gt; w.size 
+            [100, 100] 
+            &gt;&gt;&gt; w.pos 
+            [50, 0] 
+            &gt;&gt;&gt; w.width = 500 
+            &gt;&gt;&gt; w.size 
+            [500, 500] 
+            &gt;&gt;&gt; Builder.unbind_property(w, 'height') 
+            &gt;&gt;&gt; w.width = 222 
+            &gt;&gt;&gt; w.size 
+            [222, 500] 
+            &gt;&gt;&gt; w.y = 500 
+            &gt;&gt;&gt; w.pos 
+            [550, 500] 
+ 
+        .. versionadded:: 1.9.1 
+        '''</span>
+        <span class="s1">uid </span><span class="s3">= </span><span class="s1">widget</span><span class="s3">.</span><span class="s1">uid</span>
+        <span class="s2">if </span><span class="s1">uid </span><span class="s2">not in </span><span class="s1">_handlers</span><span class="s3">:</span>
+            <span class="s2">return</span>
+
+        <span class="s1">prop_handlers </span><span class="s3">= </span><span class="s1">_handlers</span><span class="s3">[</span><span class="s1">uid</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">name </span><span class="s2">not in </span><span class="s1">prop_handlers</span><span class="s3">:</span>
+            <span class="s2">return</span>
+
+        <span class="s2">for </span><span class="s1">callbacks </span><span class="s2">in </span><span class="s1">prop_handlers</span><span class="s3">[</span><span class="s1">name</span><span class="s3">]:</span>
+            <span class="s2">for </span><span class="s1">f</span><span class="s3">, </span><span class="s1">k</span><span class="s3">, </span><span class="s1">fn</span><span class="s3">, </span><span class="s1">bound_uid </span><span class="s2">in </span><span class="s1">callbacks</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">fn </span><span class="s2">is None</span><span class="s3">:  </span><span class="s5"># it's not a kivy prop.</span>
+                    <span class="s2">continue</span>
+                <span class="s2">try</span><span class="s3">:</span>
+                    <span class="s1">f</span><span class="s3">.</span><span class="s1">unbind_uid</span><span class="s3">(</span><span class="s1">k</span><span class="s3">, </span><span class="s1">bound_uid</span><span class="s3">)</span>
+                <span class="s2">except </span><span class="s1">ReferenceError</span><span class="s3">:</span>
+                    <span class="s5"># proxy widget is already gone, that's cool :)</span>
+                    <span class="s2">pass</span>
+        <span class="s2">del </span><span class="s1">prop_handlers</span><span class="s3">[</span><span class="s1">name</span><span class="s3">]</span>
+        <span class="s2">if not </span><span class="s1">prop_handlers</span><span class="s3">:</span>
+            <span class="s2">del </span><span class="s1">_handlers</span><span class="s3">[</span><span class="s1">uid</span><span class="s3">]</span>
+
+    <span class="s2">def </span><span class="s1">_build_canvas</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">canvas</span><span class="s3">, </span><span class="s1">widget</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">, </span><span class="s1">rootrule</span><span class="s3">):</span>
+        <span class="s2">global </span><span class="s1">Instruction</span>
+        <span class="s2">if </span><span class="s1">Instruction </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">Instruction </span><span class="s3">= </span><span class="s1">Factory</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s4">'Instruction'</span><span class="s3">)</span>
+        <span class="s1">idmap </span><span class="s3">= </span><span class="s1">copy</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">rulectx</span><span class="s3">[</span><span class="s1">rootrule</span><span class="s3">][</span><span class="s4">'ids'</span><span class="s3">])</span>
+        <span class="s2">for </span><span class="s1">crule </span><span class="s2">in </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">children</span><span class="s3">:</span>
+            <span class="s1">name </span><span class="s3">= </span><span class="s1">crule</span><span class="s3">.</span><span class="s1">name</span>
+            <span class="s2">if </span><span class="s1">name </span><span class="s3">== </span><span class="s4">'Clear'</span><span class="s3">:</span>
+                <span class="s1">canvas</span><span class="s3">.</span><span class="s1">clear</span><span class="s3">()</span>
+                <span class="s2">continue</span>
+            <span class="s1">instr </span><span class="s3">= </span><span class="s1">Factory</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)()</span>
+            <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">instr</span><span class="s3">, </span><span class="s1">Instruction</span><span class="s3">):</span>
+                <span class="s2">raise </span><span class="s1">BuilderException</span><span class="s3">(</span>
+                    <span class="s1">crule</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">, </span><span class="s1">crule</span><span class="s3">.</span><span class="s1">line</span><span class="s3">,</span>
+                    <span class="s4">'You can add only graphics Instruction in canvas.'</span><span class="s3">)</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s2">for </span><span class="s1">prule </span><span class="s2">in </span><span class="s1">crule</span><span class="s3">.</span><span class="s1">properties</span><span class="s3">.</span><span class="s1">values</span><span class="s3">():</span>
+                    <span class="s1">key </span><span class="s3">= </span><span class="s1">prule</span><span class="s3">.</span><span class="s1">name</span>
+                    <span class="s1">value </span><span class="s3">= </span><span class="s1">prule</span><span class="s3">.</span><span class="s1">co_value</span>
+                    <span class="s2">if </span><span class="s1">type</span><span class="s3">(</span><span class="s1">value</span><span class="s3">) </span><span class="s2">is </span><span class="s1">CodeType</span><span class="s3">:</span>
+                        <span class="s1">value</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">= </span><span class="s1">create_handler</span><span class="s3">(</span>
+                            <span class="s1">widget</span><span class="s3">, </span><span class="s1">instr</span><span class="s3">.</span><span class="s1">proxy_ref</span><span class="s3">,</span>
+                            <span class="s1">key</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">prule</span><span class="s3">, </span><span class="s1">idmap</span><span class="s3">, </span><span class="s2">True</span><span class="s3">)</span>
+                    <span class="s1">setattr</span><span class="s3">(</span><span class="s1">instr</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">value</span><span class="s3">)</span>
+            <span class="s2">except </span><span class="s1">Exception </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+                <span class="s1">tb </span><span class="s3">= </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">exc_info</span><span class="s3">()[</span><span class="s6">2</span><span class="s3">]</span>
+                <span class="s2">raise </span><span class="s1">BuilderException</span><span class="s3">(</span>
+                    <span class="s1">prule</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">, </span><span class="s1">prule</span><span class="s3">.</span><span class="s1">line</span><span class="s3">,</span>
+                    <span class="s4">'{}: {}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">e</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">, </span><span class="s1">e</span><span class="s3">), </span><span class="s1">cause</span><span class="s3">=</span><span class="s1">tb</span><span class="s3">)</span>
+
+
+<span class="s5">#: Main instance of a :class:`BuilderBase`.</span>
+<span class="s1">Builder</span><span class="s3">: </span><span class="s1">BuilderBase </span><span class="s3">= </span><span class="s1">register_context</span><span class="s3">(</span><span class="s4">'Builder'</span><span class="s3">, </span><span class="s1">BuilderBase</span><span class="s3">)</span>
+<span class="s1">Builder</span><span class="s3">.</span><span class="s1">load_file</span><span class="s3">(</span><span class="s1">join</span><span class="s3">(</span><span class="s1">kivy_data_dir</span><span class="s3">, </span><span class="s4">'style.kv'</span><span class="s3">), </span><span class="s1">rulesonly</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+
+<span class="s2">if </span><span class="s4">'KIVY_PROFILE_LANG' </span><span class="s2">in </span><span class="s1">environ</span><span class="s3">:</span>
+    <span class="s2">import </span><span class="s1">atexit</span>
+    <span class="s2">from </span><span class="s1">html </span><span class="s2">import </span><span class="s1">escape</span>
+
+    <span class="s2">def </span><span class="s1">match_rule</span><span class="s3">(</span><span class="s1">fn</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">filename </span><span class="s3">!= </span><span class="s1">fn</span><span class="s3">:</span>
+            <span class="s2">return</span>
+        <span class="s2">for </span><span class="s1">prop</span><span class="s3">, </span><span class="s1">prp </span><span class="s2">in </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">properties</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+            <span class="s2">if </span><span class="s1">prp</span><span class="s3">.</span><span class="s1">line </span><span class="s3">!= </span><span class="s1">index</span><span class="s3">:</span>
+                <span class="s2">continue</span>
+            <span class="s2">yield </span><span class="s1">prp</span>
+        <span class="s2">for </span><span class="s1">child </span><span class="s2">in </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">children</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">r </span><span class="s2">in </span><span class="s1">match_rule</span><span class="s3">(</span><span class="s1">fn</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">child</span><span class="s3">):</span>
+                <span class="s2">yield </span><span class="s1">r</span>
+        <span class="s2">if </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">canvas_root</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">r </span><span class="s2">in </span><span class="s1">match_rule</span><span class="s3">(</span><span class="s1">fn</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">canvas_root</span><span class="s3">):</span>
+                <span class="s2">yield </span><span class="s1">r</span>
+        <span class="s2">if </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">canvas_before</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">r </span><span class="s2">in </span><span class="s1">match_rule</span><span class="s3">(</span><span class="s1">fn</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">canvas_before</span><span class="s3">):</span>
+                <span class="s2">yield </span><span class="s1">r</span>
+        <span class="s2">if </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">canvas_after</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">r </span><span class="s2">in </span><span class="s1">match_rule</span><span class="s3">(</span><span class="s1">fn</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">.</span><span class="s1">canvas_after</span><span class="s3">):</span>
+                <span class="s2">yield </span><span class="s1">r</span>
+
+    <span class="s2">def </span><span class="s1">dump_builder_stats</span><span class="s3">():</span>
+        <span class="s1">html </span><span class="s3">= [</span>
+            <span class="s4">'&lt;!doctype html&gt;'</span>
+            <span class="s4">'&lt;html&gt;&lt;body&gt;'</span><span class="s3">,</span>
+            <span class="s4">'&lt;style type=&quot;text/css&quot;&gt;</span><span class="s2">\n</span><span class="s4">'</span><span class="s3">,</span>
+            <span class="s4">'pre { margin: 0; }</span><span class="s2">\n</span><span class="s4">'</span><span class="s3">,</span>
+            <span class="s4">'&lt;/style&gt;'</span><span class="s3">]</span>
+        <span class="s1">files </span><span class="s3">= {</span><span class="s1">x</span><span class="s3">[</span><span class="s6">1</span><span class="s3">].</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">filename </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">Builder</span><span class="s3">.</span><span class="s1">rules</span><span class="s3">}</span>
+        <span class="s2">for </span><span class="s1">fn </span><span class="s2">in </span><span class="s1">files</span><span class="s3">:</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">fn</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+                    <span class="s1">lines </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">readlines</span><span class="s3">()</span>
+            <span class="s2">except </span><span class="s3">(</span><span class="s1">IOError</span><span class="s3">, </span><span class="s1">TypeError</span><span class="s3">) </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+                <span class="s2">continue</span>
+            <span class="s1">html </span><span class="s3">+= [</span><span class="s4">'&lt;h2&gt;'</span><span class="s3">, </span><span class="s1">fn</span><span class="s3">, </span><span class="s4">'&lt;/h2&gt;'</span><span class="s3">, </span><span class="s4">'&lt;table&gt;'</span><span class="s3">]</span>
+            <span class="s1">count </span><span class="s3">= </span><span class="s6">0</span>
+            <span class="s2">for </span><span class="s1">index</span><span class="s3">, </span><span class="s1">line </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">lines</span><span class="s3">):</span>
+                <span class="s1">line </span><span class="s3">= </span><span class="s1">line</span><span class="s3">.</span><span class="s1">rstrip</span><span class="s3">()</span>
+                <span class="s1">line </span><span class="s3">= </span><span class="s1">escape</span><span class="s3">(</span><span class="s1">line</span><span class="s3">)</span>
+                <span class="s1">matched_prp </span><span class="s3">= []</span>
+                <span class="s2">for </span><span class="s1">psn</span><span class="s3">, </span><span class="s1">rule </span><span class="s2">in </span><span class="s1">Builder</span><span class="s3">.</span><span class="s1">rules</span><span class="s3">:</span>
+                    <span class="s1">matched_prp</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">(</span><span class="s1">match_rule</span><span class="s3">(</span><span class="s1">fn</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">rule</span><span class="s3">))</span>
+
+                <span class="s1">count </span><span class="s3">= </span><span class="s1">sum</span><span class="s3">({</span><span class="s1">x</span><span class="s3">.</span><span class="s1">count </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">matched_prp</span><span class="s3">})</span>
+
+                <span class="s1">color </span><span class="s3">= (</span><span class="s6">255</span><span class="s3">, </span><span class="s6">155</span><span class="s3">, </span><span class="s6">155</span><span class="s3">) </span><span class="s2">if </span><span class="s1">count </span><span class="s2">else </span><span class="s3">(</span><span class="s6">255</span><span class="s3">, </span><span class="s6">255</span><span class="s3">, </span><span class="s6">255</span><span class="s3">)</span>
+                <span class="s1">html </span><span class="s3">+= [</span><span class="s4">'&lt;tr style=&quot;background-color: rgb{}&quot;&gt;'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">color</span><span class="s3">),</span>
+                         <span class="s4">'&lt;td&gt;'</span><span class="s3">, </span><span class="s1">str</span><span class="s3">(</span><span class="s1">index </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">), </span><span class="s4">'&lt;/td&gt;'</span><span class="s3">,</span>
+                         <span class="s4">'&lt;td&gt;'</span><span class="s3">, </span><span class="s1">str</span><span class="s3">(</span><span class="s1">count</span><span class="s3">), </span><span class="s4">'&lt;/td&gt;'</span><span class="s3">,</span>
+                         <span class="s4">'&lt;td&gt;&lt;pre&gt;'</span><span class="s3">, </span><span class="s1">line</span><span class="s3">, </span><span class="s4">'&lt;/pre&gt;&lt;/td&gt;'</span><span class="s3">,</span>
+                         <span class="s4">'&lt;/tr&gt;'</span><span class="s3">]</span>
+            <span class="s1">html </span><span class="s3">+= [</span><span class="s4">'&lt;/table&gt;'</span><span class="s3">]</span>
+        <span class="s1">html </span><span class="s3">+= [</span><span class="s4">'&lt;/body&gt;&lt;/html&gt;'</span><span class="s3">]</span>
+        <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s4">'builder_stats.html'</span><span class="s3">, </span><span class="s4">'w'</span><span class="s3">, </span><span class="s1">encoding</span><span class="s3">=</span><span class="s4">'utf-8'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">fd</span><span class="s3">:</span>
+            <span class="s1">fd</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s4">''</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">html</span><span class="s3">))</span>
+
+        <span class="s1">print</span><span class="s3">(</span><span class="s4">'Profiling written at builder_stats.html'</span><span class="s3">)</span>
+
+    <span class="s1">atexit</span><span class="s3">.</span><span class="s1">register</span><span class="s3">(</span><span class="s1">dump_builder_stats</span><span class="s3">)</span>
+</pre>
+</body>
+</html>

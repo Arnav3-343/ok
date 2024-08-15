@@ -1,0 +1,239 @@
+<html>
+<head>
+<title>tracing.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #5f826b; font-style: italic;}
+.s4 { color: #2aacb8;}
+.s5 { color: #6aab73;}
+.s6 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+tracing.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">import </span><span class="s1">sys</span>
+<span class="s0">import </span><span class="s1">types</span>
+<span class="s0">import </span><span class="s1">threading</span>
+<span class="s0">import </span><span class="s1">inspect</span>
+<span class="s0">from </span><span class="s1">functools </span><span class="s0">import </span><span class="s1">wraps</span>
+<span class="s0">from </span><span class="s1">itertools </span><span class="s0">import </span><span class="s1">chain</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">config</span>
+
+<span class="s0">class </span><span class="s1">TLS</span><span class="s2">(</span><span class="s1">threading</span><span class="s2">.</span><span class="s1">local</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Use a subclass to properly initialize the TLS variables in all threads.&quot;&quot;&quot;</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">tracing </span><span class="s2">= </span><span class="s0">False</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">indent </span><span class="s2">= </span><span class="s4">0</span>
+
+<span class="s1">tls </span><span class="s2">= </span><span class="s1">TLS</span><span class="s2">()</span>
+
+<span class="s0">def </span><span class="s1">find_function_info</span><span class="s2">(</span><span class="s1">func</span><span class="s2">, </span><span class="s1">spec</span><span class="s2">, </span><span class="s1">args</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Return function meta-data in a tuple. 
+ 
+    (name, type)&quot;&quot;&quot;</span>
+
+    <span class="s1">module </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">func</span><span class="s2">, </span><span class="s5">'__module__'</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+    <span class="s1">name </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">func</span><span class="s2">, </span><span class="s5">'__name__'</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+    <span class="s1">self </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">func</span><span class="s2">, </span><span class="s5">'__self__'</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+    <span class="s1">cname </span><span class="s2">= </span><span class="s0">None</span>
+    <span class="s0">if </span><span class="s1">self</span><span class="s2">:</span>
+        <span class="s1">cname </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">__name__</span>
+        <span class="s6">#cname = self.__class__.__name__</span>
+    <span class="s6"># Try to deduce the class' name even for unbound methods from their</span>
+    <span class="s6"># first argument, which we assume to be a class instance if named 'self'...</span>
+    <span class="s0">elif </span><span class="s1">len</span><span class="s2">(</span><span class="s1">spec</span><span class="s2">.</span><span class="s1">args</span><span class="s2">) </span><span class="s0">and </span><span class="s1">spec</span><span class="s2">.</span><span class="s1">args</span><span class="s2">[</span><span class="s4">0</span><span class="s2">] == </span><span class="s5">'self'</span><span class="s2">:</span>
+        <span class="s1">cname </span><span class="s2">= </span><span class="s1">args</span><span class="s2">[</span><span class="s4">0</span><span class="s2">].</span><span class="s1">__class__</span><span class="s2">.</span><span class="s1">__name__</span>
+    <span class="s6"># ...or a class object if named 'cls'</span>
+    <span class="s0">elif </span><span class="s1">len</span><span class="s2">(</span><span class="s1">spec</span><span class="s2">.</span><span class="s1">args</span><span class="s2">) </span><span class="s0">and </span><span class="s1">spec</span><span class="s2">.</span><span class="s1">args</span><span class="s2">[</span><span class="s4">0</span><span class="s2">] == </span><span class="s5">'cls'</span><span class="s2">:</span>
+        <span class="s1">cname </span><span class="s2">= </span><span class="s1">args</span><span class="s2">[</span><span class="s4">0</span><span class="s2">].</span><span class="s1">__name__</span>
+    <span class="s0">if </span><span class="s1">name</span><span class="s2">:</span>
+        <span class="s1">qname </span><span class="s2">= []</span>
+        <span class="s0">if </span><span class="s1">module </span><span class="s0">and </span><span class="s1">module </span><span class="s2">!= </span><span class="s5">'__main__'</span><span class="s2">:</span>
+            <span class="s1">qname</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">module</span><span class="s2">)</span>
+            <span class="s1">qname</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s5">'.'</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">cname</span><span class="s2">:</span>
+            <span class="s1">qname</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">cname</span><span class="s2">)</span>
+            <span class="s1">qname</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s5">'.'</span><span class="s2">)</span>
+        <span class="s1">qname</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">name</span><span class="s2">)</span>
+        <span class="s1">name </span><span class="s2">= </span><span class="s5">''</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">qname</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">name</span><span class="s2">, </span><span class="s0">None</span>
+
+<span class="s0">def </span><span class="s1">chop</span><span class="s2">(</span><span class="s1">value</span><span class="s2">):</span>
+    <span class="s1">MAX_SIZE </span><span class="s2">= </span><span class="s4">320</span>
+    <span class="s1">s </span><span class="s2">= </span><span class="s1">repr</span><span class="s2">(</span><span class="s1">value</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">s</span><span class="s2">) &gt; </span><span class="s1">MAX_SIZE</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">s</span><span class="s2">[:</span><span class="s1">MAX_SIZE</span><span class="s2">] + </span><span class="s5">'...' </span><span class="s2">+ </span><span class="s1">s</span><span class="s2">[-</span><span class="s4">1</span><span class="s2">]</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">s</span>
+
+<span class="s0">def </span><span class="s1">create_events</span><span class="s2">(</span><span class="s1">fname</span><span class="s2">, </span><span class="s1">spec</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kwds</span><span class="s2">):</span>
+
+    <span class="s1">values </span><span class="s2">= </span><span class="s1">dict</span><span class="s2">()</span>
+    <span class="s0">if </span><span class="s1">spec</span><span class="s2">.</span><span class="s1">defaults</span><span class="s2">:</span>
+        <span class="s1">values </span><span class="s2">= </span><span class="s1">dict</span><span class="s2">(</span><span class="s1">zip</span><span class="s2">(</span><span class="s1">spec</span><span class="s2">.</span><span class="s1">args</span><span class="s2">[-</span><span class="s1">len</span><span class="s2">(</span><span class="s1">spec</span><span class="s2">.</span><span class="s1">defaults</span><span class="s2">):],</span><span class="s1">spec</span><span class="s2">.</span><span class="s1">defaults</span><span class="s2">))</span>
+    <span class="s1">values</span><span class="s2">.</span><span class="s1">update</span><span class="s2">(</span><span class="s1">kwds</span><span class="s2">)</span>
+    <span class="s1">values</span><span class="s2">.</span><span class="s1">update</span><span class="s2">(</span><span class="s1">list</span><span class="s2">(</span><span class="s1">zip</span><span class="s2">(</span><span class="s1">spec</span><span class="s2">.</span><span class="s1">args</span><span class="s2">[:</span><span class="s1">len</span><span class="s2">(</span><span class="s1">args</span><span class="s2">)], </span><span class="s1">args</span><span class="s2">)))</span>
+    <span class="s1">positional </span><span class="s2">= [</span><span class="s5">'%s=%r'</span><span class="s2">%(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">values</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s1">a</span><span class="s2">)) </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">spec</span><span class="s2">.</span><span class="s1">args</span><span class="s2">]</span>
+    <span class="s1">anonymous </span><span class="s2">= [</span><span class="s1">str</span><span class="s2">(</span><span class="s1">a</span><span class="s2">) </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">args</span><span class="s2">[</span><span class="s1">len</span><span class="s2">(</span><span class="s1">positional</span><span class="s2">):]]</span>
+    <span class="s1">keywords </span><span class="s2">= [</span><span class="s5">'%s=%r'</span><span class="s2">%(</span><span class="s1">k</span><span class="s2">, </span><span class="s1">values</span><span class="s2">[</span><span class="s1">k</span><span class="s2">]) </span><span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">sorted</span><span class="s2">(</span><span class="s1">values</span><span class="s2">.</span><span class="s1">keys</span><span class="s2">())]</span>
+    <span class="s1">params </span><span class="s2">= </span><span class="s5">', '</span><span class="s2">.</span><span class="s1">join</span><span class="s2">([</span><span class="s1">f </span><span class="s0">for </span><span class="s1">f </span><span class="s0">in </span><span class="s1">chain</span><span class="s2">(</span><span class="s1">positional</span><span class="s2">, </span><span class="s1">anonymous</span><span class="s2">, </span><span class="s1">keywords</span><span class="s2">) </span><span class="s0">if </span><span class="s1">f</span><span class="s2">])</span>
+
+    <span class="s1">enter </span><span class="s2">= [</span><span class="s5">'&gt;&gt; '</span><span class="s2">, </span><span class="s1">tls</span><span class="s2">.</span><span class="s1">indent </span><span class="s2">* </span><span class="s5">' '</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">, </span><span class="s5">'('</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s5">')'</span><span class="s2">]</span>
+    <span class="s1">leave </span><span class="s2">= [</span><span class="s5">'&lt;&lt; '</span><span class="s2">, </span><span class="s1">tls</span><span class="s2">.</span><span class="s1">indent </span><span class="s2">* </span><span class="s5">' '</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">]</span>
+    <span class="s0">return </span><span class="s1">enter</span><span class="s2">, </span><span class="s1">leave</span>
+
+
+<span class="s0">def </span><span class="s1">dotrace</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwds</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Function decorator to trace a function's entry and exit. 
+ 
+    *args: categories in which to trace this function. Example usage: 
+ 
+    @trace 
+    def function(...):... 
+ 
+    @trace('mycategory') 
+    def function(...):... 
+ 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">recursive </span><span class="s2">= </span><span class="s1">kwds</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s5">'recursive'</span><span class="s2">, </span><span class="s0">False</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">decorator</span><span class="s2">(</span><span class="s1">func</span><span class="s2">):</span>
+
+        <span class="s1">spec </span><span class="s2">= </span><span class="s0">None</span>
+        <span class="s1">logger </span><span class="s2">= </span><span class="s1">logging</span><span class="s2">.</span><span class="s1">getLogger</span><span class="s2">(</span><span class="s5">'trace'</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">wrapper</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwds</span><span class="s2">):</span>
+            <span class="s0">if not </span><span class="s1">logger</span><span class="s2">.</span><span class="s1">isEnabledFor</span><span class="s2">(</span><span class="s1">logging</span><span class="s2">.</span><span class="s1">INFO</span><span class="s2">) </span><span class="s0">or </span><span class="s1">tls</span><span class="s2">.</span><span class="s1">tracing</span><span class="s2">:</span>
+                <span class="s0">return </span><span class="s1">func</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwds</span><span class="s2">)</span>
+
+            <span class="s1">fname</span><span class="s2">, </span><span class="s1">ftype </span><span class="s2">= </span><span class="s1">find_function_info</span><span class="s2">(</span><span class="s1">func</span><span class="s2">, </span><span class="s1">spec</span><span class="s2">, </span><span class="s1">args</span><span class="s2">)</span>
+
+            <span class="s0">try</span><span class="s2">:</span>
+                <span class="s1">tls</span><span class="s2">.</span><span class="s1">tracing </span><span class="s2">= </span><span class="s0">True</span>
+                <span class="s1">enter</span><span class="s2">, </span><span class="s1">leave </span><span class="s2">= </span><span class="s1">create_events</span><span class="s2">(</span><span class="s1">fname</span><span class="s2">, </span><span class="s1">spec</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kwds</span><span class="s2">)</span>
+
+                <span class="s0">try</span><span class="s2">:</span>
+                    <span class="s1">logger</span><span class="s2">.</span><span class="s1">info</span><span class="s2">(</span><span class="s5">''</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">enter</span><span class="s2">))</span>
+                    <span class="s1">tls</span><span class="s2">.</span><span class="s1">indent </span><span class="s2">+= </span><span class="s4">1</span>
+                    <span class="s0">try</span><span class="s2">:</span>
+                        <span class="s0">try</span><span class="s2">:</span>
+                            <span class="s1">tls</span><span class="s2">.</span><span class="s1">tracing </span><span class="s2">= </span><span class="s0">False</span>
+                            <span class="s1">result </span><span class="s2">= </span><span class="s1">func</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwds</span><span class="s2">)</span>
+                        <span class="s0">finally</span><span class="s2">:</span>
+                            <span class="s1">tls</span><span class="s2">.</span><span class="s1">tracing </span><span class="s2">= </span><span class="s0">True</span>
+                    <span class="s0">except</span><span class="s2">:</span>
+                        <span class="s1">type</span><span class="s2">, </span><span class="s1">value</span><span class="s2">, </span><span class="s1">traceback </span><span class="s2">= </span><span class="s1">sys</span><span class="s2">.</span><span class="s1">exc_info</span><span class="s2">()</span>
+                        <span class="s1">leave</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s5">' =&gt; exception thrown</span><span class="s0">\n\t</span><span class="s5">raise '</span><span class="s2">)</span>
+                        <span class="s1">mname </span><span class="s2">= </span><span class="s1">type</span><span class="s2">.</span><span class="s1">__module__</span>
+                        <span class="s0">if </span><span class="s1">mname </span><span class="s2">!= </span><span class="s5">'__main__'</span><span class="s2">:</span>
+                            <span class="s1">leave</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">mname</span><span class="s2">)</span>
+                            <span class="s1">leave</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s5">'.'</span><span class="s2">)</span>
+                        <span class="s1">leave</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">type</span><span class="s2">.</span><span class="s1">__name__</span><span class="s2">)</span>
+                        <span class="s0">if </span><span class="s1">value</span><span class="s2">.</span><span class="s1">args</span><span class="s2">:</span>
+                            <span class="s1">leave</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s5">'('</span><span class="s2">)</span>
+                            <span class="s1">leave</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s5">', '</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">chop</span><span class="s2">(</span><span class="s1">v</span><span class="s2">) </span><span class="s0">for </span><span class="s1">v </span><span class="s0">in </span><span class="s1">value</span><span class="s2">.</span><span class="s1">args</span><span class="s2">))</span>
+                            <span class="s1">leave</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s5">')'</span><span class="s2">)</span>
+                        <span class="s0">else</span><span class="s2">:</span>
+                            <span class="s1">leave</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s5">'()'</span><span class="s2">)</span>
+                        <span class="s0">raise</span>
+                    <span class="s0">else</span><span class="s2">:</span>
+                        <span class="s0">if </span><span class="s1">result </span><span class="s0">is not None</span><span class="s2">:</span>
+                            <span class="s1">leave</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s5">' -&gt; '</span><span class="s2">)</span>
+                            <span class="s1">leave</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">chop</span><span class="s2">(</span><span class="s1">result</span><span class="s2">))</span>
+                <span class="s0">finally</span><span class="s2">:</span>
+                    <span class="s1">tls</span><span class="s2">.</span><span class="s1">indent </span><span class="s2">-= </span><span class="s4">1</span>
+                    <span class="s1">logger</span><span class="s2">.</span><span class="s1">info</span><span class="s2">(</span><span class="s5">''</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">leave</span><span class="s2">))</span>
+            <span class="s0">finally</span><span class="s2">:</span>
+                <span class="s1">tls</span><span class="s2">.</span><span class="s1">tracing </span><span class="s2">= </span><span class="s0">False</span>
+            <span class="s0">return </span><span class="s1">result</span>
+        <span class="s6"># wrapper end</span>
+
+        <span class="s1">result </span><span class="s2">= </span><span class="s0">None</span>
+        <span class="s1">rewrap </span><span class="s2">= </span><span class="s0">lambda </span><span class="s1">x</span><span class="s2">: </span><span class="s1">x</span>
+        <span class="s6"># Unwrap already wrapped functions</span>
+        <span class="s6"># (to be rewrapped again later)</span>
+        <span class="s0">if </span><span class="s1">type</span><span class="s2">(</span><span class="s1">func</span><span class="s2">) == </span><span class="s1">classmethod</span><span class="s2">:</span>
+            <span class="s1">rewrap </span><span class="s2">= </span><span class="s1">type</span><span class="s2">(</span><span class="s1">func</span><span class="s2">)</span>
+            <span class="s6"># Note: 'func.__func__' only works in Python 3</span>
+            <span class="s1">func </span><span class="s2">= </span><span class="s1">func</span><span class="s2">.</span><span class="s1">__get__</span><span class="s2">(</span><span class="s0">True</span><span class="s2">).</span><span class="s1">__func__</span>
+        <span class="s0">elif </span><span class="s1">type</span><span class="s2">(</span><span class="s1">func</span><span class="s2">) == </span><span class="s1">staticmethod</span><span class="s2">:</span>
+            <span class="s1">rewrap </span><span class="s2">= </span><span class="s1">type</span><span class="s2">(</span><span class="s1">func</span><span class="s2">)</span>
+            <span class="s6"># Note: 'func.__func__' only works in Python 3</span>
+            <span class="s1">func </span><span class="s2">= </span><span class="s1">func</span><span class="s2">.</span><span class="s1">__get__</span><span class="s2">(</span><span class="s0">True</span><span class="s2">)</span>
+        <span class="s0">elif </span><span class="s1">type</span><span class="s2">(</span><span class="s1">func</span><span class="s2">) == </span><span class="s1">property</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+        <span class="s1">spec </span><span class="s2">= </span><span class="s1">inspect</span><span class="s2">.</span><span class="s1">getfullargspec</span><span class="s2">(</span><span class="s1">func</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">rewrap</span><span class="s2">(</span><span class="s1">wraps</span><span class="s2">(</span><span class="s1">func</span><span class="s2">)(</span><span class="s1">wrapper</span><span class="s2">))</span>
+
+    <span class="s1">arg0 </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">args</span><span class="s2">) </span><span class="s0">and </span><span class="s1">args</span><span class="s2">[</span><span class="s4">0</span><span class="s2">] </span><span class="s0">or None</span>
+    <span class="s6"># not supported yet...</span>
+    <span class="s0">if </span><span class="s1">recursive</span><span class="s2">:</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+        <span class="s0">if </span><span class="s1">inspect</span><span class="s2">.</span><span class="s1">ismodule</span><span class="s2">(</span><span class="s1">arg0</span><span class="s2">):</span>
+            <span class="s0">for </span><span class="s1">n</span><span class="s2">, </span><span class="s1">f </span><span class="s0">in </span><span class="s1">inspect</span><span class="s2">.</span><span class="s1">getmembers</span><span class="s2">(</span><span class="s1">arg0</span><span class="s2">, </span><span class="s1">inspect</span><span class="s2">.</span><span class="s1">isfunction</span><span class="s2">):</span>
+                <span class="s1">setattr</span><span class="s2">(</span><span class="s1">arg0</span><span class="s2">, </span><span class="s1">n</span><span class="s2">, </span><span class="s1">decorator</span><span class="s2">(</span><span class="s1">f</span><span class="s2">))</span>
+            <span class="s0">for </span><span class="s1">n</span><span class="s2">, </span><span class="s1">c </span><span class="s0">in </span><span class="s1">inspect</span><span class="s2">.</span><span class="s1">getmembers</span><span class="s2">(</span><span class="s1">arg0</span><span class="s2">, </span><span class="s1">inspect</span><span class="s2">.</span><span class="s1">isclass</span><span class="s2">):</span>
+                <span class="s1">dotrace</span><span class="s2">(</span><span class="s1">c</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, </span><span class="s1">recursive</span><span class="s2">=</span><span class="s1">recursive</span><span class="s2">)</span>
+        <span class="s0">elif </span><span class="s1">inspect</span><span class="s2">.</span><span class="s1">isclass</span><span class="s2">(</span><span class="s1">arg0</span><span class="s2">):</span>
+            <span class="s0">for </span><span class="s1">n</span><span class="s2">, </span><span class="s1">f </span><span class="s0">in </span><span class="s1">inspect</span><span class="s2">.</span><span class="s1">getmembers</span><span class="s2">(</span><span class="s1">arg0</span><span class="s2">, </span><span class="s0">lambda </span><span class="s1">x</span><span class="s2">: (</span><span class="s1">inspect</span><span class="s2">.</span><span class="s1">isfunction</span><span class="s2">(</span><span class="s1">x</span><span class="s2">) </span><span class="s0">or</span>
+                                                            <span class="s1">inspect</span><span class="s2">.</span><span class="s1">ismethod</span><span class="s2">(</span><span class="s1">x</span><span class="s2">))):</span>
+                <span class="s1">setattr</span><span class="s2">(</span><span class="s1">arg0</span><span class="s2">, </span><span class="s1">n</span><span class="s2">, </span><span class="s1">decorator</span><span class="s2">(</span><span class="s1">f</span><span class="s2">))</span>
+
+
+    <span class="s0">if </span><span class="s1">callable</span><span class="s2">(</span><span class="s1">arg0</span><span class="s2">) </span><span class="s0">or </span><span class="s1">type</span><span class="s2">(</span><span class="s1">arg0</span><span class="s2">) </span><span class="s0">in </span><span class="s2">(</span><span class="s1">classmethod</span><span class="s2">, </span><span class="s1">staticmethod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">decorator</span><span class="s2">(</span><span class="s1">arg0</span><span class="s2">)</span>
+    <span class="s0">elif </span><span class="s1">type</span><span class="s2">(</span><span class="s1">arg0</span><span class="s2">) == </span><span class="s1">property</span><span class="s2">:</span>
+        <span class="s6"># properties combine up to three functions: 'get', 'set', 'del',</span>
+        <span class="s6"># so let's wrap them all.</span>
+        <span class="s1">pget</span><span class="s2">, </span><span class="s1">pset</span><span class="s2">, </span><span class="s1">pdel </span><span class="s2">= </span><span class="s0">None</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, </span><span class="s0">None</span>
+        <span class="s0">if </span><span class="s1">arg0</span><span class="s2">.</span><span class="s1">fget</span><span class="s2">:</span>
+            <span class="s1">pget </span><span class="s2">= </span><span class="s1">decorator</span><span class="s2">(</span><span class="s1">arg0</span><span class="s2">.</span><span class="s1">fget</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">arg0</span><span class="s2">.</span><span class="s1">fset</span><span class="s2">:</span>
+            <span class="s1">pset </span><span class="s2">= </span><span class="s1">decorator</span><span class="s2">(</span><span class="s1">arg0</span><span class="s2">.</span><span class="s1">fset</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">arg0</span><span class="s2">.</span><span class="s1">fdel</span><span class="s2">:</span>
+            <span class="s1">pdel </span><span class="s2">= </span><span class="s1">decorator</span><span class="s2">(</span><span class="s1">arg0</span><span class="s2">.</span><span class="s1">fdel</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">property</span><span class="s2">(</span><span class="s1">pget</span><span class="s2">, </span><span class="s1">pset</span><span class="s2">, </span><span class="s1">pdel</span><span class="s2">)</span>
+
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">decorator</span>
+
+<span class="s0">def </span><span class="s1">notrace</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwds</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Just a no-op in case tracing is disabled.&quot;&quot;&quot;</span>
+    <span class="s0">def </span><span class="s1">decorator</span><span class="s2">(</span><span class="s1">func</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">func</span>
+    <span class="s1">arg0 </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">args</span><span class="s2">) </span><span class="s0">and </span><span class="s1">args</span><span class="s2">[</span><span class="s4">0</span><span class="s2">] </span><span class="s0">or None</span>
+
+    <span class="s0">if </span><span class="s1">callable</span><span class="s2">(</span><span class="s1">arg0</span><span class="s2">) </span><span class="s0">or </span><span class="s1">type</span><span class="s2">(</span><span class="s1">arg0</span><span class="s2">) </span><span class="s0">in </span><span class="s2">(</span><span class="s1">classmethod</span><span class="s2">, </span><span class="s1">staticmethod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">decorator</span><span class="s2">(</span><span class="s1">arg0</span><span class="s2">)</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">decorator</span>
+
+<span class="s0">def </span><span class="s1">doevent</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">):</span>
+    <span class="s1">msg </span><span class="s2">= [</span><span class="s5">'== '</span><span class="s2">, </span><span class="s1">tls</span><span class="s2">.</span><span class="s1">indent </span><span class="s2">* </span><span class="s5">' '</span><span class="s2">, </span><span class="s1">msg</span><span class="s2">]</span>
+    <span class="s1">logger </span><span class="s2">= </span><span class="s1">logging</span><span class="s2">.</span><span class="s1">getLogger</span><span class="s2">(</span><span class="s5">'trace'</span><span class="s2">)</span>
+    <span class="s1">logger</span><span class="s2">.</span><span class="s1">info</span><span class="s2">(</span><span class="s5">''</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">))</span>
+
+<span class="s0">def </span><span class="s1">noevent</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">):</span>
+    <span class="s0">pass</span>
+
+<span class="s0">if </span><span class="s1">config</span><span class="s2">.</span><span class="s1">TRACE</span><span class="s2">:</span>
+    <span class="s1">logger </span><span class="s2">= </span><span class="s1">logging</span><span class="s2">.</span><span class="s1">getLogger</span><span class="s2">(</span><span class="s5">'trace'</span><span class="s2">)</span>
+    <span class="s1">logger</span><span class="s2">.</span><span class="s1">setLevel</span><span class="s2">(</span><span class="s1">logging</span><span class="s2">.</span><span class="s1">INFO</span><span class="s2">)</span>
+    <span class="s1">logger</span><span class="s2">.</span><span class="s1">handlers </span><span class="s2">= [</span><span class="s1">logging</span><span class="s2">.</span><span class="s1">StreamHandler</span><span class="s2">()]</span>
+    <span class="s1">trace </span><span class="s2">= </span><span class="s1">dotrace</span>
+    <span class="s1">event </span><span class="s2">= </span><span class="s1">doevent</span>
+<span class="s0">else</span><span class="s2">:</span>
+    <span class="s1">trace </span><span class="s2">= </span><span class="s1">notrace</span>
+    <span class="s1">event </span><span class="s2">= </span><span class="s1">noevent</span>
+</pre>
+</body>
+</html>

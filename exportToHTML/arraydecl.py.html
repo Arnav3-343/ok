@@ -1,0 +1,895 @@
+<html>
+<head>
+<title>arraydecl.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #7a7e85;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+.s6 { color: #5f826b; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+arraydecl.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">import </span><span class="s1">operator</span>
+<span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">namedtuple</span>
+
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">types</span><span class="s2">, </span><span class="s1">utils</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">typing</span><span class="s2">.</span><span class="s1">templates </span><span class="s0">import </span><span class="s2">(</span><span class="s1">AttributeTemplate</span><span class="s2">, </span><span class="s1">AbstractTemplate</span><span class="s2">,</span>
+                                         <span class="s1">infer</span><span class="s2">, </span><span class="s1">infer_global</span><span class="s2">, </span><span class="s1">infer_getattr</span><span class="s2">,</span>
+                                         <span class="s1">signature</span><span class="s2">, </span><span class="s1">bound_function</span><span class="s2">)</span>
+<span class="s3"># import time side effect: array operations requires typing support of sequence</span>
+<span class="s3"># defined in collections: e.g. array.shape[i]</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">typing </span><span class="s0">import </span><span class="s1">collections</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">errors </span><span class="s0">import </span><span class="s2">(</span><span class="s1">TypingError</span><span class="s2">, </span><span class="s1">RequireLiteralValue</span><span class="s2">, </span><span class="s1">NumbaTypeError</span><span class="s2">,</span>
+                               <span class="s1">NumbaNotImplementedError</span><span class="s2">, </span><span class="s1">NumbaAssertionError</span><span class="s2">,</span>
+                               <span class="s1">NumbaKeyError</span><span class="s2">, </span><span class="s1">NumbaIndexError</span><span class="s2">)</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">cgutils </span><span class="s0">import </span><span class="s1">is_nonelike</span>
+
+<span class="s1">numpy_version </span><span class="s2">= </span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">map</span><span class="s2">(</span><span class="s1">int</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">__version__</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s4">'.'</span><span class="s2">)[:</span><span class="s5">2</span><span class="s2">]))</span>
+
+
+<span class="s1">Indexing </span><span class="s2">= </span><span class="s1">namedtuple</span><span class="s2">(</span><span class="s4">&quot;Indexing&quot;</span><span class="s2">, (</span><span class="s4">&quot;index&quot;</span><span class="s2">, </span><span class="s4">&quot;result&quot;</span><span class="s2">, </span><span class="s4">&quot;advanced&quot;</span><span class="s2">))</span>
+
+
+<span class="s0">def </span><span class="s1">get_array_index_type</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">, </span><span class="s1">idx</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    Returns None or a tuple-3 for the types of the input array, index, and 
+    resulting type of ``array[index]``. 
+ 
+    Note: This is shared logic for ndarray getitem and setitem. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Buffer</span><span class="s2">):</span>
+        <span class="s0">return</span>
+
+    <span class="s1">ndim </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim</span>
+
+    <span class="s1">left_indices </span><span class="s2">= []</span>
+    <span class="s1">right_indices </span><span class="s2">= []</span>
+    <span class="s1">ellipsis_met </span><span class="s2">= </span><span class="s0">False</span>
+    <span class="s1">advanced </span><span class="s2">= </span><span class="s0">False</span>
+    <span class="s1">num_newaxis </span><span class="s2">= </span><span class="s5">0</span>
+
+    <span class="s0">if not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">idx</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">BaseTuple</span><span class="s2">):</span>
+        <span class="s1">idx </span><span class="s2">= [</span><span class="s1">idx</span><span class="s2">]</span>
+
+    <span class="s3"># Here, a subspace is considered as a contiguous group of advanced indices.</span>
+    <span class="s3"># num_subspaces keeps track of the number of such</span>
+    <span class="s3"># contiguous groups.</span>
+    <span class="s1">in_subspace </span><span class="s2">= </span><span class="s0">False</span>
+    <span class="s1">num_subspaces </span><span class="s2">= </span><span class="s5">0</span>
+    <span class="s1">array_indices </span><span class="s2">= </span><span class="s5">0</span>
+
+    <span class="s3"># Walk indices</span>
+    <span class="s0">for </span><span class="s1">ty </span><span class="s0">in </span><span class="s1">idx</span><span class="s2">:</span>
+        <span class="s0">if </span><span class="s1">ty </span><span class="s0">is </span><span class="s1">types</span><span class="s2">.</span><span class="s1">ellipsis</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">ellipsis_met</span><span class="s2">:</span>
+                <span class="s0">raise </span><span class="s1">NumbaTypeError</span><span class="s2">(</span>
+                    <span class="s4">&quot;Only one ellipsis allowed in array indices &quot;</span>
+                    <span class="s4">&quot;(got %s)&quot; </span><span class="s2">% (</span><span class="s1">idx</span><span class="s2">,))</span>
+            <span class="s1">ellipsis_met </span><span class="s2">= </span><span class="s0">True</span>
+            <span class="s1">in_subspace </span><span class="s2">= </span><span class="s0">False</span>
+        <span class="s0">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">SliceType</span><span class="s2">):</span>
+            <span class="s3"># If we encounter a non-advanced index while in a</span>
+            <span class="s3"># subspace then that subspace ends.</span>
+            <span class="s1">in_subspace </span><span class="s2">= </span><span class="s0">False</span>
+        <span class="s3"># In advanced indexing, any index broadcastable to an</span>
+        <span class="s3"># array is considered an advanced index. Hence all the</span>
+        <span class="s3"># branches below are considered as advanced indices.</span>
+        <span class="s0">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Integer</span><span class="s2">):</span>
+            <span class="s3"># Normalize integer index</span>
+            <span class="s1">ty </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp </span><span class="s0">if </span><span class="s1">ty</span><span class="s2">.</span><span class="s1">signed </span><span class="s0">else </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uintp</span>
+            <span class="s3"># Integer indexing removes the given dimension</span>
+            <span class="s1">ndim </span><span class="s2">-= </span><span class="s5">1</span>
+            <span class="s3"># If we're within a subspace/contiguous group of</span>
+            <span class="s3"># advanced indices then no action is necessary</span>
+            <span class="s3"># since we've already counted that subspace once.</span>
+            <span class="s0">if not </span><span class="s1">in_subspace</span><span class="s2">:</span>
+                <span class="s3"># If we're not within a subspace and we encounter</span>
+                <span class="s3"># this branch then we have a new subspace/group.</span>
+                <span class="s1">num_subspaces </span><span class="s2">+= </span><span class="s5">1</span>
+                <span class="s1">in_subspace </span><span class="s2">= </span><span class="s0">True</span>
+        <span class="s0">elif </span><span class="s2">(</span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">) </span><span class="s0">and </span><span class="s1">ty</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">== </span><span class="s5">0</span>
+              <span class="s0">and </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Integer</span><span class="s2">)):</span>
+            <span class="s3"># 0-d array used as integer index</span>
+            <span class="s1">ndim </span><span class="s2">-= </span><span class="s5">1</span>
+            <span class="s0">if not </span><span class="s1">in_subspace</span><span class="s2">:</span>
+                <span class="s1">num_subspaces </span><span class="s2">+= </span><span class="s5">1</span>
+                <span class="s1">in_subspace </span><span class="s2">= </span><span class="s0">True</span>
+        <span class="s0">elif </span><span class="s2">(</span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">)</span>
+              <span class="s0">and </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, (</span><span class="s1">types</span><span class="s2">.</span><span class="s1">Integer</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Boolean</span><span class="s2">))):</span>
+            <span class="s0">if </span><span class="s1">ty</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">&gt; </span><span class="s5">1</span><span class="s2">:</span>
+                <span class="s3"># Advanced indexing limitation # 1</span>
+                <span class="s0">raise </span><span class="s1">NumbaTypeError</span><span class="s2">(</span>
+                    <span class="s4">&quot;Multi-dimensional indices are not supported.&quot;</span><span class="s2">)</span>
+            <span class="s1">array_indices </span><span class="s2">+= </span><span class="s5">1</span>
+            <span class="s3"># The condition for activating advanced indexing is simply</span>
+            <span class="s3"># having at least one array with size &gt; 1.</span>
+            <span class="s1">advanced </span><span class="s2">= </span><span class="s0">True</span>
+            <span class="s0">if not </span><span class="s1">in_subspace</span><span class="s2">:</span>
+                <span class="s1">num_subspaces </span><span class="s2">+= </span><span class="s5">1</span>
+                <span class="s1">in_subspace </span><span class="s2">= </span><span class="s0">True</span>
+        <span class="s0">elif </span><span class="s2">(</span><span class="s1">is_nonelike</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">)):</span>
+            <span class="s1">ndim </span><span class="s2">+= </span><span class="s5">1</span>
+            <span class="s1">num_newaxis </span><span class="s2">+= </span><span class="s5">1</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">NumbaTypeError</span><span class="s2">(</span><span class="s4">&quot;Unsupported array index type %s in %s&quot;</span>
+                                 <span class="s2">% (</span><span class="s1">ty</span><span class="s2">, </span><span class="s1">idx</span><span class="s2">))</span>
+        <span class="s2">(</span><span class="s1">right_indices </span><span class="s0">if </span><span class="s1">ellipsis_met </span><span class="s0">else </span><span class="s1">left_indices</span><span class="s2">).</span><span class="s1">append</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">)</span>
+
+    <span class="s0">if </span><span class="s1">advanced</span><span class="s2">:</span>
+        <span class="s0">if </span><span class="s1">array_indices </span><span class="s2">&gt; </span><span class="s5">1</span><span class="s2">:</span>
+            <span class="s3"># Advanced indexing limitation # 2</span>
+            <span class="s1">msg </span><span class="s2">= </span><span class="s4">&quot;Using more than one non-scalar array index is unsupported.&quot;</span>
+            <span class="s0">raise </span><span class="s1">NumbaTypeError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">num_subspaces </span><span class="s2">&gt; </span><span class="s5">1</span><span class="s2">:</span>
+            <span class="s3"># Advanced indexing limitation # 3</span>
+            <span class="s1">msg </span><span class="s2">= (</span><span class="s4">&quot;Using more than one indexing subspace is unsupported.&quot;</span>
+                   <span class="s4">&quot; An indexing subspace is a group of one or more&quot;</span>
+                   <span class="s4">&quot; consecutive indices comprising integer or array types.&quot;</span><span class="s2">)</span>
+            <span class="s0">raise </span><span class="s1">NumbaTypeError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">)</span>
+
+    <span class="s3"># Only Numpy arrays support advanced indexing</span>
+    <span class="s0">if </span><span class="s1">advanced </span><span class="s0">and not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">):</span>
+        <span class="s0">return</span>
+
+    <span class="s3"># Check indices and result dimensionality</span>
+    <span class="s1">all_indices </span><span class="s2">= </span><span class="s1">left_indices </span><span class="s2">+ </span><span class="s1">right_indices</span>
+    <span class="s0">if </span><span class="s1">ellipsis_met</span><span class="s2">:</span>
+        <span class="s0">assert </span><span class="s1">right_indices</span><span class="s2">[</span><span class="s5">0</span><span class="s2">] </span><span class="s0">is </span><span class="s1">types</span><span class="s2">.</span><span class="s1">ellipsis</span>
+        <span class="s0">del </span><span class="s1">right_indices</span><span class="s2">[</span><span class="s5">0</span><span class="s2">]</span>
+
+    <span class="s1">n_indices </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">all_indices</span><span class="s2">) - </span><span class="s1">ellipsis_met </span><span class="s2">- </span><span class="s1">num_newaxis</span>
+    <span class="s0">if </span><span class="s1">n_indices </span><span class="s2">&gt; </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim</span><span class="s2">:</span>
+        <span class="s0">raise </span><span class="s1">NumbaTypeError</span><span class="s2">(</span><span class="s4">&quot;cannot index %s with %d indices: %s&quot;</span>
+                             <span class="s2">% (</span><span class="s1">ary</span><span class="s2">, </span><span class="s1">n_indices</span><span class="s2">, </span><span class="s1">idx</span><span class="s2">))</span>
+    <span class="s0">if </span><span class="s1">n_indices </span><span class="s2">== </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim </span><span class="s0">and </span><span class="s1">ndim </span><span class="s2">== </span><span class="s5">0 </span><span class="s0">and not </span><span class="s1">ellipsis_met</span><span class="s2">:</span>
+        <span class="s3"># Full integer indexing =&gt; scalar result</span>
+        <span class="s3"># (note if ellipsis is present, a 0-d view is returned instead)</span>
+        <span class="s1">res </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span>
+
+    <span class="s0">elif </span><span class="s1">advanced</span><span class="s2">:</span>
+        <span class="s3"># Result is a copy</span>
+        <span class="s1">res </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">ndim</span><span class="s2">=</span><span class="s1">ndim</span><span class="s2">, </span><span class="s1">layout</span><span class="s2">=</span><span class="s4">'C'</span><span class="s2">, </span><span class="s1">readonly</span><span class="s2">=</span><span class="s0">False</span><span class="s2">)</span>
+
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s3"># Result is a view</span>
+        <span class="s0">if </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">slice_is_copy</span><span class="s2">:</span>
+            <span class="s3"># Avoid view semantics when the original type creates a copy</span>
+            <span class="s3"># when slicing.</span>
+            <span class="s0">return</span>
+
+        <span class="s3"># Infer layout</span>
+        <span class="s1">layout </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">layout</span>
+
+        <span class="s0">def </span><span class="s1">keeps_contiguity</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">, </span><span class="s1">is_innermost</span><span class="s2">):</span>
+            <span class="s3"># A slice can only keep an array contiguous if it is the</span>
+            <span class="s3"># innermost index and it is not strided</span>
+            <span class="s0">return </span><span class="s2">(</span><span class="s1">ty </span><span class="s0">is </span><span class="s1">types</span><span class="s2">.</span><span class="s1">ellipsis </span><span class="s0">or </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Integer</span><span class="s2">)</span>
+                    <span class="s0">or </span><span class="s2">(</span><span class="s1">is_innermost </span><span class="s0">and </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">SliceType</span><span class="s2">)</span>
+                        <span class="s0">and not </span><span class="s1">ty</span><span class="s2">.</span><span class="s1">has_step</span><span class="s2">))</span>
+
+        <span class="s0">def </span><span class="s1">check_contiguity</span><span class="s2">(</span><span class="s1">outer_indices</span><span class="s2">):</span>
+            <span class="s6">&quot;&quot;&quot; 
+            Whether indexing with the given indices (from outer to inner in 
+            physical layout order) can keep an array contiguous. 
+            &quot;&quot;&quot;</span>
+            <span class="s0">for </span><span class="s1">ty </span><span class="s0">in </span><span class="s1">outer_indices</span><span class="s2">[:-</span><span class="s5">1</span><span class="s2">]:</span>
+                <span class="s0">if not </span><span class="s1">keeps_contiguity</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">, </span><span class="s0">False</span><span class="s2">):</span>
+                    <span class="s0">return False</span>
+            <span class="s0">if </span><span class="s1">outer_indices </span><span class="s0">and not </span><span class="s1">keeps_contiguity</span><span class="s2">(</span><span class="s1">outer_indices</span><span class="s2">[-</span><span class="s5">1</span><span class="s2">], </span><span class="s0">True</span><span class="s2">):</span>
+                <span class="s0">return False</span>
+            <span class="s0">return True</span>
+
+        <span class="s0">if </span><span class="s1">layout </span><span class="s2">== </span><span class="s4">'C'</span><span class="s2">:</span>
+            <span class="s3"># Integer indexing on the left keeps the array C-contiguous</span>
+            <span class="s0">if </span><span class="s1">n_indices </span><span class="s2">== </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim</span><span class="s2">:</span>
+                <span class="s3"># If all indices are there, ellipsis's place is indifferent</span>
+                <span class="s1">left_indices </span><span class="s2">= </span><span class="s1">left_indices </span><span class="s2">+ </span><span class="s1">right_indices</span>
+                <span class="s1">right_indices </span><span class="s2">= []</span>
+            <span class="s0">if </span><span class="s1">right_indices</span><span class="s2">:</span>
+                <span class="s1">layout </span><span class="s2">= </span><span class="s4">'A'</span>
+            <span class="s0">elif not </span><span class="s1">check_contiguity</span><span class="s2">(</span><span class="s1">left_indices</span><span class="s2">):</span>
+                <span class="s1">layout </span><span class="s2">= </span><span class="s4">'A'</span>
+        <span class="s0">elif </span><span class="s1">layout </span><span class="s2">== </span><span class="s4">'F'</span><span class="s2">:</span>
+            <span class="s3"># Integer indexing on the right keeps the array F-contiguous</span>
+            <span class="s0">if </span><span class="s1">n_indices </span><span class="s2">== </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim</span><span class="s2">:</span>
+                <span class="s3"># If all indices are there, ellipsis's place is indifferent</span>
+                <span class="s1">right_indices </span><span class="s2">= </span><span class="s1">left_indices </span><span class="s2">+ </span><span class="s1">right_indices</span>
+                <span class="s1">left_indices </span><span class="s2">= []</span>
+            <span class="s0">if </span><span class="s1">left_indices</span><span class="s2">:</span>
+                <span class="s1">layout </span><span class="s2">= </span><span class="s4">'A'</span>
+            <span class="s0">elif not </span><span class="s1">check_contiguity</span><span class="s2">(</span><span class="s1">right_indices</span><span class="s2">[::-</span><span class="s5">1</span><span class="s2">]):</span>
+                <span class="s1">layout </span><span class="s2">= </span><span class="s4">'A'</span>
+
+        <span class="s0">if </span><span class="s1">ndim </span><span class="s2">== </span><span class="s5">0</span><span class="s2">:</span>
+            <span class="s3"># Implicitly convert to a scalar if the output ndim==0</span>
+            <span class="s1">res </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">res </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">ndim</span><span class="s2">=</span><span class="s1">ndim</span><span class="s2">, </span><span class="s1">layout</span><span class="s2">=</span><span class="s1">layout</span><span class="s2">)</span>
+
+    <span class="s3"># Re-wrap indices</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">idx</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">BaseTuple</span><span class="s2">):</span>
+        <span class="s1">idx </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">BaseTuple</span><span class="s2">.</span><span class="s1">from_types</span><span class="s2">(</span><span class="s1">all_indices</span><span class="s2">)</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s1">idx</span><span class="s2">, = </span><span class="s1">all_indices</span>
+
+    <span class="s0">return </span><span class="s1">Indexing</span><span class="s2">(</span><span class="s1">idx</span><span class="s2">, </span><span class="s1">res</span><span class="s2">, </span><span class="s1">advanced</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">infer_global</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">getitem</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">GetItemBuffer</span><span class="s2">(</span><span class="s1">AbstractTemplate</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">generic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s0">assert not </span><span class="s1">kws</span>
+        <span class="s2">[</span><span class="s1">ary</span><span class="s2">, </span><span class="s1">idx</span><span class="s2">] = </span><span class="s1">args</span>
+        <span class="s1">out </span><span class="s2">= </span><span class="s1">get_array_index_type</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">, </span><span class="s1">idx</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">out </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">out</span><span class="s2">.</span><span class="s1">result</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">out</span><span class="s2">.</span><span class="s1">index</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">infer_global</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">setitem</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">SetItemBuffer</span><span class="s2">(</span><span class="s1">AbstractTemplate</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">generic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s0">assert not </span><span class="s1">kws</span>
+        <span class="s1">ary</span><span class="s2">, </span><span class="s1">idx</span><span class="s2">, </span><span class="s1">val </span><span class="s2">= </span><span class="s1">args</span>
+        <span class="s0">if not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Buffer</span><span class="s2">):</span>
+            <span class="s0">return</span>
+        <span class="s0">if not </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">mutable</span><span class="s2">:</span>
+            <span class="s1">msg </span><span class="s2">= </span><span class="s4">f&quot;Cannot modify readonly array of type: </span><span class="s0">{</span><span class="s1">ary</span><span class="s0">}</span><span class="s4">&quot;</span>
+            <span class="s0">raise </span><span class="s1">NumbaTypeError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">)</span>
+        <span class="s1">out </span><span class="s2">= </span><span class="s1">get_array_index_type</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">, </span><span class="s1">idx</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">out </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s0">return</span>
+
+        <span class="s1">idx </span><span class="s2">= </span><span class="s1">out</span><span class="s2">.</span><span class="s1">index</span>
+        <span class="s1">res </span><span class="s2">= </span><span class="s1">out</span><span class="s2">.</span><span class="s1">result  </span><span class="s3"># res is the result type of the access ary[idx]</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">res</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">):</span>
+            <span class="s3"># Indexing produces an array</span>
+            <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">):</span>
+                <span class="s0">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">can_convert</span><span class="s2">(</span><span class="s1">val</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">res</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">):</span>
+                    <span class="s3"># DType conversion not possible</span>
+                    <span class="s0">return</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s1">res </span><span class="s2">= </span><span class="s1">val</span>
+            <span class="s0">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Sequence</span><span class="s2">):</span>
+                <span class="s0">if </span><span class="s2">(</span><span class="s1">res</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">== </span><span class="s5">1 </span><span class="s0">and</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">can_convert</span><span class="s2">(</span><span class="s1">val</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">res</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)):</span>
+                    <span class="s3"># Allow assignment of sequence to 1d array</span>
+                    <span class="s1">res </span><span class="s2">= </span><span class="s1">val</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s3"># NOTE: sequence-to-array broadcasting is unsupported</span>
+                    <span class="s0">return</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s3"># Allow scalar broadcasting</span>
+                <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">can_convert</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">res</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">):</span>
+                    <span class="s1">res </span><span class="s2">= </span><span class="s1">res</span><span class="s2">.</span><span class="s1">dtype</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s3"># Incompatible scalar type</span>
+                    <span class="s0">return</span>
+        <span class="s0">elif not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">):</span>
+            <span class="s3"># Single item assignment</span>
+            <span class="s0">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">can_convert</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">res</span><span class="s2">):</span>
+                <span class="s3"># if the array dtype is not yet defined</span>
+                <span class="s0">if not </span><span class="s1">res</span><span class="s2">.</span><span class="s1">is_precise</span><span class="s2">():</span>
+                    <span class="s3"># set the array type to use the dtype of value (RHS)</span>
+                    <span class="s1">newary </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">val</span><span class="s2">)</span>
+                    <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">none</span><span class="s2">, </span><span class="s1">newary</span><span class="s2">, </span><span class="s1">idx</span><span class="s2">, </span><span class="s1">res</span><span class="s2">)</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s0">return</span>
+            <span class="s1">res </span><span class="s2">= </span><span class="s1">val</span>
+        <span class="s0">elif </span><span class="s2">(</span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">) </span><span class="s0">and </span><span class="s1">val</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">== </span><span class="s5">0</span>
+              <span class="s0">and </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">can_convert</span><span class="s2">(</span><span class="s1">val</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">res</span><span class="s2">)):</span>
+            <span class="s3"># val is an array(T, 0d, O), where T is the type of res, O is order</span>
+            <span class="s1">res </span><span class="s2">= </span><span class="s1">val</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s0">return</span>
+        <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">none</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">idx</span><span class="s2">, </span><span class="s1">res</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">normalize_shape</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">):</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">UniTuple</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Integer</span><span class="s2">):</span>
+            <span class="s1">dimtype </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp </span><span class="s0">if </span><span class="s1">shape</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">signed </span><span class="s0">else </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uintp</span>
+            <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">UniTuple</span><span class="s2">(</span><span class="s1">dimtype</span><span class="s2">, </span><span class="s1">len</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">))</span>
+
+    <span class="s0">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Tuple</span><span class="s2">) </span><span class="s0">and </span><span class="s1">shape</span><span class="s2">.</span><span class="s1">count </span><span class="s2">== </span><span class="s5">0</span><span class="s2">:</span>
+        <span class="s3"># Force (0 x intp) for consistency with other shapes</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">UniTuple</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">infer_getattr</span>
+<span class="s0">class </span><span class="s1">ArrayAttribute</span><span class="s2">(</span><span class="s1">AttributeTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span>
+
+    <span class="s0">def </span><span class="s1">resolve_dtype</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">DType</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_nbytes</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span>
+
+    <span class="s0">def </span><span class="s1">resolve_itemsize</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span>
+
+    <span class="s0">def </span><span class="s1">resolve_shape</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">UniTuple</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_strides</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">UniTuple</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_ndim</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span>
+
+    <span class="s0">def </span><span class="s1">resolve_size</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span>
+
+    <span class="s0">def </span><span class="s1">resolve_flat</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">NumpyFlatType</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_ctypes</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">ArrayCTypes</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_flags</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">ArrayFlags</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_T</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">&lt;= </span><span class="s5">1</span><span class="s2">:</span>
+            <span class="s1">retty </span><span class="s2">= </span><span class="s1">ary</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">layout </span><span class="s2">= {</span><span class="s4">&quot;C&quot;</span><span class="s2">: </span><span class="s4">&quot;F&quot;</span><span class="s2">, </span><span class="s4">&quot;F&quot;</span><span class="s2">: </span><span class="s4">&quot;C&quot;</span><span class="s2">}.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">layout</span><span class="s2">, </span><span class="s4">&quot;A&quot;</span><span class="s2">)</span>
+            <span class="s1">retty </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">layout</span><span class="s2">=</span><span class="s1">layout</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">retty</span>
+
+    <span class="s0">def </span><span class="s1">resolve_real</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_resolve_real_imag</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">, </span><span class="s1">attr</span><span class="s2">=</span><span class="s4">'real'</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_imag</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_resolve_real_imag</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">, </span><span class="s1">attr</span><span class="s2">=</span><span class="s4">'imag'</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">_resolve_real_imag</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">attr</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype </span><span class="s0">in </span><span class="s1">types</span><span class="s2">.</span><span class="s1">complex_domain</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">underlying_float</span><span class="s2">, </span><span class="s1">layout</span><span class="s2">=</span><span class="s4">'A'</span><span class="s2">)</span>
+        <span class="s0">elif </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype </span><span class="s0">in </span><span class="s1">types</span><span class="s2">.</span><span class="s1">number_domain</span><span class="s2">:</span>
+            <span class="s1">res </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">attr </span><span class="s2">== </span><span class="s4">'imag'</span><span class="s2">:</span>
+                <span class="s1">res </span><span class="s2">= </span><span class="s1">res</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">readonly</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+            <span class="s0">return </span><span class="s1">res</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">msg </span><span class="s2">= </span><span class="s4">&quot;cannot access .{} of array of {}&quot;</span>
+            <span class="s0">raise </span><span class="s1">TypingError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">attr</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">))</span>
+
+    <span class="s2">@</span><span class="s1">bound_function</span><span class="s2">(</span><span class="s4">&quot;array.transpose&quot;</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">resolve_transpose</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s0">def </span><span class="s1">sentry_shape_scalar</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s1">ty </span><span class="s0">in </span><span class="s1">types</span><span class="s2">.</span><span class="s1">number_domain</span><span class="s2">:</span>
+                <span class="s3"># Guard against non integer type</span>
+                <span class="s0">if not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Integer</span><span class="s2">):</span>
+                    <span class="s0">raise </span><span class="s1">TypeError</span><span class="s2">(</span><span class="s4">&quot;transpose() arg cannot be {0}&quot;</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">))</span>
+                <span class="s0">return True</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s0">return False</span>
+
+        <span class="s0">assert not </span><span class="s1">kws</span>
+        <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">args</span><span class="s2">) == </span><span class="s5">0</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">resolve_T</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">))</span>
+
+        <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">args</span><span class="s2">) == </span><span class="s5">1</span><span class="s2">:</span>
+            <span class="s1">shape</span><span class="s2">, = </span><span class="s1">args</span>
+
+            <span class="s0">if </span><span class="s1">sentry_shape_scalar</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">):</span>
+                <span class="s0">assert </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">== </span><span class="s5">1</span>
+                <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">)</span>
+
+            <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">NoneType</span><span class="s2">):</span>
+                <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">resolve_T</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">))</span>
+
+            <span class="s1">shape </span><span class="s2">= </span><span class="s1">normalize_shape</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">shape </span><span class="s0">is None</span><span class="s2">:</span>
+                <span class="s0">return</span>
+
+            <span class="s0">assert </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">== </span><span class="s1">shape</span><span class="s2">.</span><span class="s1">count</span>
+            <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">resolve_T</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">).</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">layout</span><span class="s2">=</span><span class="s4">&quot;A&quot;</span><span class="s2">), </span><span class="s1">shape</span><span class="s2">)</span>
+
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">any</span><span class="s2">(</span><span class="s0">not </span><span class="s1">sentry_shape_scalar</span><span class="s2">(</span><span class="s1">a</span><span class="s2">) </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">args</span><span class="s2">):</span>
+                <span class="s0">raise </span><span class="s1">TypeError</span><span class="s2">(</span><span class="s4">&quot;transpose({0}) is not supported&quot;</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span>
+                    <span class="s4">', '</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">args</span><span class="s2">)))</span>
+            <span class="s0">assert </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">== </span><span class="s1">len</span><span class="s2">(</span><span class="s1">args</span><span class="s2">)</span>
+            <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">resolve_T</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">).</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">layout</span><span class="s2">=</span><span class="s4">&quot;A&quot;</span><span class="s2">), *</span><span class="s1">args</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">bound_function</span><span class="s2">(</span><span class="s4">&quot;array.copy&quot;</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">resolve_copy</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s0">assert not </span><span class="s1">args</span>
+        <span class="s0">assert not </span><span class="s1">kws</span>
+        <span class="s1">retty </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">layout</span><span class="s2">=</span><span class="s4">&quot;C&quot;</span><span class="s2">, </span><span class="s1">readonly</span><span class="s2">=</span><span class="s0">False</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">retty</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">bound_function</span><span class="s2">(</span><span class="s4">&quot;array.item&quot;</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">resolve_item</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s0">assert not </span><span class="s1">kws</span>
+        <span class="s3"># We don't support explicit arguments as that's exactly equivalent</span>
+        <span class="s3"># to regular indexing.  The no-argument form is interesting to</span>
+        <span class="s3"># allow some degree of genericity when writing functions.</span>
+        <span class="s0">if not </span><span class="s1">args</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+
+    <span class="s0">if </span><span class="s1">numpy_version </span><span class="s2">&lt; (</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">):</span>
+        <span class="s2">@</span><span class="s1">bound_function</span><span class="s2">(</span><span class="s4">&quot;array.itemset&quot;</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">resolve_itemset</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+            <span class="s0">assert not </span><span class="s1">kws</span>
+            <span class="s3"># We don't support explicit arguments as that's exactly equivalent</span>
+            <span class="s3"># to regular indexing.  The no-argument form is interesting to</span>
+            <span class="s3"># allow some degree of genericity when writing functions.</span>
+            <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">args</span><span class="s2">) == </span><span class="s5">1</span><span class="s2">:</span>
+                <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">none</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">bound_function</span><span class="s2">(</span><span class="s4">&quot;array.nonzero&quot;</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">resolve_nonzero</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s0">assert not </span><span class="s1">args</span>
+        <span class="s0">assert not </span><span class="s1">kws</span>
+        <span class="s3"># 0-dim arrays return one result array</span>
+        <span class="s1">ndim </span><span class="s2">= </span><span class="s1">max</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim</span><span class="s2">, </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">retty </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">UniTuple</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s4">'C'</span><span class="s2">), </span><span class="s1">ndim</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">retty</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">bound_function</span><span class="s2">(</span><span class="s4">&quot;array.reshape&quot;</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">resolve_reshape</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s0">def </span><span class="s1">sentry_shape_scalar</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s1">ty </span><span class="s0">in </span><span class="s1">types</span><span class="s2">.</span><span class="s1">number_domain</span><span class="s2">:</span>
+                <span class="s3"># Guard against non integer type</span>
+                <span class="s0">if not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Integer</span><span class="s2">):</span>
+                    <span class="s0">raise </span><span class="s1">TypeError</span><span class="s2">(</span><span class="s4">&quot;reshape() arg cannot be {0}&quot;</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">))</span>
+                <span class="s0">return True</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s0">return False</span>
+
+        <span class="s0">assert not </span><span class="s1">kws</span>
+        <span class="s0">if </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">layout </span><span class="s0">not in </span><span class="s4">'CF'</span><span class="s2">:</span>
+            <span class="s3"># only work for contiguous array</span>
+            <span class="s0">raise </span><span class="s1">TypeError</span><span class="s2">(</span><span class="s4">&quot;reshape() supports contiguous array only&quot;</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">args</span><span class="s2">) == </span><span class="s5">1</span><span class="s2">:</span>
+            <span class="s3"># single arg</span>
+            <span class="s1">shape</span><span class="s2">, = </span><span class="s1">args</span>
+
+            <span class="s0">if </span><span class="s1">sentry_shape_scalar</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">):</span>
+                <span class="s1">ndim </span><span class="s2">= </span><span class="s5">1</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s1">shape </span><span class="s2">= </span><span class="s1">normalize_shape</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">)</span>
+                <span class="s0">if </span><span class="s1">shape </span><span class="s0">is None</span><span class="s2">:</span>
+                    <span class="s0">return</span>
+                <span class="s1">ndim </span><span class="s2">= </span><span class="s1">shape</span><span class="s2">.</span><span class="s1">count</span>
+            <span class="s1">retty </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">ndim</span><span class="s2">=</span><span class="s1">ndim</span><span class="s2">)</span>
+            <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">retty</span><span class="s2">, </span><span class="s1">shape</span><span class="s2">)</span>
+
+        <span class="s0">elif </span><span class="s1">len</span><span class="s2">(</span><span class="s1">args</span><span class="s2">) == </span><span class="s5">0</span><span class="s2">:</span>
+            <span class="s3"># no arg</span>
+            <span class="s0">raise </span><span class="s1">TypeError</span><span class="s2">(</span><span class="s4">&quot;reshape() take at least one arg&quot;</span><span class="s2">)</span>
+
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s3"># vararg case</span>
+            <span class="s0">if </span><span class="s1">any</span><span class="s2">(</span><span class="s0">not </span><span class="s1">sentry_shape_scalar</span><span class="s2">(</span><span class="s1">a</span><span class="s2">) </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">args</span><span class="s2">):</span>
+                <span class="s0">raise </span><span class="s1">TypeError</span><span class="s2">(</span><span class="s4">&quot;reshape({0}) is not supported&quot;</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span>
+                    <span class="s4">', '</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">map</span><span class="s2">(</span><span class="s1">str</span><span class="s2">, </span><span class="s1">args</span><span class="s2">))))</span>
+
+            <span class="s1">retty </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">ndim</span><span class="s2">=</span><span class="s1">len</span><span class="s2">(</span><span class="s1">args</span><span class="s2">))</span>
+            <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">retty</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">bound_function</span><span class="s2">(</span><span class="s4">&quot;array.sort&quot;</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">resolve_sort</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s0">assert not </span><span class="s1">args</span>
+        <span class="s0">assert not </span><span class="s1">kws</span>
+        <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">none</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">bound_function</span><span class="s2">(</span><span class="s4">&quot;array.argsort&quot;</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">resolve_argsort</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s0">assert not </span><span class="s1">args</span>
+        <span class="s1">kwargs </span><span class="s2">= </span><span class="s1">dict</span><span class="s2">(</span><span class="s1">kws</span><span class="s2">)</span>
+        <span class="s1">kind </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s4">'kind'</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">StringLiteral</span><span class="s2">(</span><span class="s4">'quicksort'</span><span class="s2">))</span>
+        <span class="s0">if not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">kind</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">StringLiteral</span><span class="s2">):</span>
+            <span class="s0">raise </span><span class="s1">TypingError</span><span class="s2">(</span><span class="s4">'&quot;kind&quot; must be a string literal'</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">kwargs</span><span class="s2">:</span>
+            <span class="s1">msg </span><span class="s2">= </span><span class="s4">&quot;Unsupported keywords: {!r}&quot;</span>
+            <span class="s0">raise </span><span class="s1">TypingError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">.</span><span class="s1">format</span><span class="s2">([</span><span class="s1">k </span><span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">keys</span><span class="s2">()]))</span>
+        <span class="s0">if </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">== </span><span class="s5">1</span><span class="s2">:</span>
+            <span class="s0">def </span><span class="s1">argsort_stub</span><span class="s2">(</span><span class="s1">kind</span><span class="s2">=</span><span class="s4">'quicksort'</span><span class="s2">):</span>
+                <span class="s0">pass</span>
+            <span class="s1">pysig </span><span class="s2">= </span><span class="s1">utils</span><span class="s2">.</span><span class="s1">pysignature</span><span class="s2">(</span><span class="s1">argsort_stub</span><span class="s2">)</span>
+            <span class="s1">sig </span><span class="s2">= </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s4">'C'</span><span class="s2">), </span><span class="s1">kind</span><span class="s2">).</span><span class="s1">replace</span><span class="s2">(</span><span class="s1">pysig</span><span class="s2">=</span><span class="s1">pysig</span><span class="s2">)</span>
+            <span class="s0">return </span><span class="s1">sig</span>
+
+    <span class="s2">@</span><span class="s1">bound_function</span><span class="s2">(</span><span class="s4">&quot;array.view&quot;</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">resolve_view</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s0">from </span><span class="s2">.</span><span class="s1">npydecl </span><span class="s0">import </span><span class="s1">parse_dtype</span>
+        <span class="s0">assert not </span><span class="s1">kws</span>
+        <span class="s1">dtype</span><span class="s2">, = </span><span class="s1">args</span>
+        <span class="s1">dtype </span><span class="s2">= </span><span class="s1">parse_dtype</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">dtype </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s0">return</span>
+        <span class="s1">retty </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">dtype</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">retty</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">bound_function</span><span class="s2">(</span><span class="s4">&quot;array.astype&quot;</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">resolve_astype</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s0">from </span><span class="s2">.</span><span class="s1">npydecl </span><span class="s0">import </span><span class="s1">parse_dtype</span>
+        <span class="s0">assert not </span><span class="s1">kws</span>
+        <span class="s1">dtype</span><span class="s2">, = </span><span class="s1">args</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">UnicodeType</span><span class="s2">):</span>
+            <span class="s0">raise </span><span class="s1">RequireLiteralValue</span><span class="s2">((</span><span class="s4">&quot;array.astype if dtype is a string it &quot;</span>
+                                       <span class="s4">&quot;must be constant&quot;</span><span class="s2">))</span>
+        <span class="s1">dtype </span><span class="s2">= </span><span class="s1">parse_dtype</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">dtype </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s0">return</span>
+        <span class="s0">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">can_convert</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">):</span>
+            <span class="s0">raise </span><span class="s1">TypeError</span><span class="s2">(</span><span class="s4">&quot;astype(%s) not supported on %s: &quot;</span>
+                            <span class="s4">&quot;cannot convert from %s to %s&quot;</span>
+                            <span class="s2">% (</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">))</span>
+        <span class="s1">layout </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">layout </span><span class="s0">if </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">layout </span><span class="s0">in </span><span class="s4">'CF' </span><span class="s0">else </span><span class="s4">'C'</span>
+        <span class="s3"># reset the write bit irrespective of whether the cast type is the same</span>
+        <span class="s3"># as the current dtype, this replicates numpy</span>
+        <span class="s1">retty </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">layout</span><span class="s2">=</span><span class="s1">layout</span><span class="s2">, </span><span class="s1">readonly</span><span class="s2">=</span><span class="s0">False</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">retty</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">bound_function</span><span class="s2">(</span><span class="s4">&quot;array.ravel&quot;</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">resolve_ravel</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s3"># Only support no argument version (default order='C')</span>
+        <span class="s0">assert not </span><span class="s1">kws</span>
+        <span class="s0">assert not </span><span class="s1">args</span>
+        <span class="s1">copy_will_be_made </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">layout </span><span class="s2">!= </span><span class="s4">'C'</span>
+        <span class="s1">readonly </span><span class="s2">= </span><span class="s0">not </span><span class="s2">(</span><span class="s1">copy_will_be_made </span><span class="s0">or </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">mutable</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">ndim</span><span class="s2">=</span><span class="s5">1</span><span class="s2">, </span><span class="s1">layout</span><span class="s2">=</span><span class="s4">'C'</span><span class="s2">, </span><span class="s1">readonly</span><span class="s2">=</span><span class="s1">readonly</span><span class="s2">))</span>
+
+    <span class="s2">@</span><span class="s1">bound_function</span><span class="s2">(</span><span class="s4">&quot;array.flatten&quot;</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">resolve_flatten</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s3"># Only support no argument version (default order='C')</span>
+        <span class="s0">assert not </span><span class="s1">kws</span>
+        <span class="s0">assert not </span><span class="s1">args</span>
+        <span class="s3"># To ensure that Numba behaves exactly like NumPy,</span>
+        <span class="s3"># we also clear the read-only flag when doing a &quot;flatten&quot;</span>
+        <span class="s3"># Why? Two reasons:</span>
+        <span class="s3"># Because flatten always returns a copy. (see NumPy docs for &quot;flatten&quot;)</span>
+        <span class="s3"># And because a copy always returns a writeable array.</span>
+        <span class="s3"># ref: https://numpy.org/doc/stable/reference/generated/numpy.copy.html</span>
+        <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">ndim</span><span class="s2">=</span><span class="s5">1</span><span class="s2">, </span><span class="s1">layout</span><span class="s2">=</span><span class="s4">'C'</span><span class="s2">, </span><span class="s1">readonly</span><span class="s2">=</span><span class="s0">False</span><span class="s2">))</span>
+
+    <span class="s0">def </span><span class="s1">generic_resolve</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">attr</span><span class="s2">):</span>
+        <span class="s3"># Resolution of other attributes, for record arrays</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Record</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s1">attr </span><span class="s0">in </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">fields</span><span class="s2">:</span>
+                <span class="s1">attr_dtype </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">typeof</span><span class="s2">(</span><span class="s1">attr</span><span class="s2">)</span>
+                <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">attr_dtype</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">NestedArray</span><span class="s2">):</span>
+                    <span class="s0">return </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span>
+                        <span class="s1">dtype</span><span class="s2">=</span><span class="s1">attr_dtype</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">,</span>
+                        <span class="s1">ndim</span><span class="s2">=</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">+ </span><span class="s1">attr_dtype</span><span class="s2">.</span><span class="s1">ndim</span><span class="s2">,</span>
+                        <span class="s1">layout</span><span class="s2">=</span><span class="s4">'A'</span>
+                    <span class="s2">)</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s0">return </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">attr_dtype</span><span class="s2">, </span><span class="s1">layout</span><span class="s2">=</span><span class="s4">'A'</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">infer_getattr</span>
+<span class="s0">class </span><span class="s1">DTypeAttr</span><span class="s2">(</span><span class="s1">AttributeTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">DType</span>
+
+    <span class="s0">def </span><span class="s1">resolve_type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">):</span>
+        <span class="s3"># Wrap the numeric type in NumberClass</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">NumberClass</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_kind</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">key</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">scalars</span><span class="s2">.</span><span class="s1">Float</span><span class="s2">):</span>
+            <span class="s1">val </span><span class="s2">= </span><span class="s4">'f'</span>
+        <span class="s0">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">key</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">scalars</span><span class="s2">.</span><span class="s1">Integer</span><span class="s2">):</span>
+            <span class="s1">val </span><span class="s2">= </span><span class="s4">'i'</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s0">return None  </span><span class="s3"># other types not supported yet</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">StringLiteral</span><span class="s2">(</span><span class="s1">val</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">infer</span>
+<span class="s0">class </span><span class="s1">StaticGetItemArray</span><span class="s2">(</span><span class="s1">AbstractTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s4">&quot;static_getitem&quot;</span>
+
+    <span class="s0">def </span><span class="s1">generic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s3"># Resolution of members for record and structured arrays</span>
+        <span class="s1">ary</span><span class="s2">, </span><span class="s1">idx </span><span class="s2">= </span><span class="s1">args</span>
+        <span class="s0">if </span><span class="s2">(</span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">) </span><span class="s0">and </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">idx</span><span class="s2">, </span><span class="s1">str</span><span class="s2">) </span><span class="s0">and</span>
+                <span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Record</span><span class="s2">)):</span>
+            <span class="s0">if </span><span class="s1">idx </span><span class="s0">in </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">fields</span><span class="s2">:</span>
+                <span class="s1">attr_dtype </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">typeof</span><span class="s2">(</span><span class="s1">idx</span><span class="s2">)</span>
+                <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">attr_dtype</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">NestedArray</span><span class="s2">):</span>
+                    <span class="s1">ret </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span>
+                        <span class="s1">dtype</span><span class="s2">=</span><span class="s1">attr_dtype</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">,</span>
+                        <span class="s1">ndim</span><span class="s2">=</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">+ </span><span class="s1">attr_dtype</span><span class="s2">.</span><span class="s1">ndim</span><span class="s2">,</span>
+                        <span class="s1">layout</span><span class="s2">=</span><span class="s4">'A'</span>
+                    <span class="s2">)</span>
+                    <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">ret</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">)</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s1">ret </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">attr_dtype</span><span class="s2">, </span><span class="s1">layout</span><span class="s2">=</span><span class="s4">'A'</span><span class="s2">)</span>
+                    <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">ret</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">infer_getattr</span>
+<span class="s0">class </span><span class="s1">RecordAttribute</span><span class="s2">(</span><span class="s1">AttributeTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Record</span>
+
+    <span class="s0">def </span><span class="s1">generic_resolve</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">record</span><span class="s2">, </span><span class="s1">attr</span><span class="s2">):</span>
+        <span class="s1">ret </span><span class="s2">= </span><span class="s1">record</span><span class="s2">.</span><span class="s1">typeof</span><span class="s2">(</span><span class="s1">attr</span><span class="s2">)</span>
+        <span class="s0">assert </span><span class="s1">ret</span>
+        <span class="s0">return </span><span class="s1">ret</span>
+
+
+<span class="s2">@</span><span class="s1">infer</span>
+<span class="s0">class </span><span class="s1">StaticGetItemRecord</span><span class="s2">(</span><span class="s1">AbstractTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s4">&quot;static_getitem&quot;</span>
+
+    <span class="s0">def </span><span class="s1">generic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s3"># Resolution of members for records</span>
+        <span class="s1">record</span><span class="s2">, </span><span class="s1">idx </span><span class="s2">= </span><span class="s1">args</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">record</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Record</span><span class="s2">) </span><span class="s0">and </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">idx</span><span class="s2">, </span><span class="s1">str</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s1">idx </span><span class="s0">not in </span><span class="s1">record</span><span class="s2">.</span><span class="s1">fields</span><span class="s2">:</span>
+                <span class="s0">raise </span><span class="s1">KeyError</span><span class="s2">(</span><span class="s4">f&quot;Field '</span><span class="s0">{</span><span class="s1">idx</span><span class="s0">}</span><span class="s4">' was not found in record with &quot;</span>
+                               <span class="s4">f&quot;fields </span><span class="s0">{</span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">record</span><span class="s2">.</span><span class="s1">fields</span><span class="s2">.</span><span class="s1">keys</span><span class="s2">())</span><span class="s0">}</span><span class="s4">&quot;</span><span class="s2">)</span>
+            <span class="s1">ret </span><span class="s2">= </span><span class="s1">record</span><span class="s2">.</span><span class="s1">typeof</span><span class="s2">(</span><span class="s1">idx</span><span class="s2">)</span>
+            <span class="s0">assert </span><span class="s1">ret</span>
+            <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">ret</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">infer_global</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">getitem</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">StaticGetItemLiteralRecord</span><span class="s2">(</span><span class="s1">AbstractTemplate</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">generic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s3"># Resolution of members for records</span>
+        <span class="s1">record</span><span class="s2">, </span><span class="s1">idx </span><span class="s2">= </span><span class="s1">args</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">record</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Record</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">idx</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">StringLiteral</span><span class="s2">):</span>
+                <span class="s0">if </span><span class="s1">idx</span><span class="s2">.</span><span class="s1">literal_value </span><span class="s0">not in </span><span class="s1">record</span><span class="s2">.</span><span class="s1">fields</span><span class="s2">:</span>
+                    <span class="s1">msg </span><span class="s2">= (</span><span class="s4">f&quot;Field '</span><span class="s0">{</span><span class="s1">idx</span><span class="s2">.</span><span class="s1">literal_value</span><span class="s0">}</span><span class="s4">' was not found in &quot;</span>
+                           <span class="s4">f&quot;record with fields </span><span class="s0">{</span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">record</span><span class="s2">.</span><span class="s1">fields</span><span class="s2">.</span><span class="s1">keys</span><span class="s2">())</span><span class="s0">}</span><span class="s4">&quot;</span><span class="s2">)</span>
+                    <span class="s0">raise </span><span class="s1">NumbaKeyError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">)</span>
+                <span class="s1">ret </span><span class="s2">= </span><span class="s1">record</span><span class="s2">.</span><span class="s1">typeof</span><span class="s2">(</span><span class="s1">idx</span><span class="s2">.</span><span class="s1">literal_value</span><span class="s2">)</span>
+                <span class="s0">assert </span><span class="s1">ret</span>
+                <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">ret</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">)</span>
+            <span class="s0">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">idx</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">IntegerLiteral</span><span class="s2">):</span>
+                <span class="s0">if </span><span class="s1">idx</span><span class="s2">.</span><span class="s1">literal_value </span><span class="s2">&gt;= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">record</span><span class="s2">.</span><span class="s1">fields</span><span class="s2">):</span>
+                    <span class="s1">msg </span><span class="s2">= </span><span class="s4">f&quot;Requested index </span><span class="s0">{</span><span class="s1">idx</span><span class="s2">.</span><span class="s1">literal_value</span><span class="s0">} </span><span class="s4">is out of range&quot;</span>
+                    <span class="s0">raise </span><span class="s1">NumbaIndexError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">)</span>
+                <span class="s1">field_names </span><span class="s2">= </span><span class="s1">list</span><span class="s2">(</span><span class="s1">record</span><span class="s2">.</span><span class="s1">fields</span><span class="s2">)</span>
+                <span class="s1">ret </span><span class="s2">= </span><span class="s1">record</span><span class="s2">.</span><span class="s1">typeof</span><span class="s2">(</span><span class="s1">field_names</span><span class="s2">[</span><span class="s1">idx</span><span class="s2">.</span><span class="s1">literal_value</span><span class="s2">])</span>
+                <span class="s0">assert </span><span class="s1">ret</span>
+                <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">ret</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">infer</span>
+<span class="s0">class </span><span class="s1">StaticSetItemRecord</span><span class="s2">(</span><span class="s1">AbstractTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s4">&quot;static_setitem&quot;</span>
+
+    <span class="s0">def </span><span class="s1">generic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s3"># Resolution of members for record and structured arrays</span>
+        <span class="s1">record</span><span class="s2">, </span><span class="s1">idx</span><span class="s2">, </span><span class="s1">value </span><span class="s2">= </span><span class="s1">args</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">record</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Record</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">idx</span><span class="s2">, </span><span class="s1">str</span><span class="s2">):</span>
+                <span class="s1">expectedty </span><span class="s2">= </span><span class="s1">record</span><span class="s2">.</span><span class="s1">typeof</span><span class="s2">(</span><span class="s1">idx</span><span class="s2">)</span>
+                <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">can_convert</span><span class="s2">(</span><span class="s1">value</span><span class="s2">, </span><span class="s1">expectedty</span><span class="s2">) </span><span class="s0">is not None</span><span class="s2">:</span>
+                    <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">void</span><span class="s2">, </span><span class="s1">record</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">literal</span><span class="s2">(</span><span class="s1">idx</span><span class="s2">),</span>
+                                     <span class="s1">value</span><span class="s2">)</span>
+            <span class="s0">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">idx</span><span class="s2">, </span><span class="s1">int</span><span class="s2">):</span>
+                <span class="s0">if </span><span class="s1">idx </span><span class="s2">&gt;= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">record</span><span class="s2">.</span><span class="s1">fields</span><span class="s2">):</span>
+                    <span class="s1">msg </span><span class="s2">= </span><span class="s4">f&quot;Requested index </span><span class="s0">{</span><span class="s1">idx</span><span class="s0">} </span><span class="s4">is out of range&quot;</span>
+                    <span class="s0">raise </span><span class="s1">NumbaIndexError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">)</span>
+                <span class="s1">str_field </span><span class="s2">= </span><span class="s1">list</span><span class="s2">(</span><span class="s1">record</span><span class="s2">.</span><span class="s1">fields</span><span class="s2">)[</span><span class="s1">idx</span><span class="s2">]</span>
+                <span class="s1">expectedty </span><span class="s2">= </span><span class="s1">record</span><span class="s2">.</span><span class="s1">typeof</span><span class="s2">(</span><span class="s1">str_field</span><span class="s2">)</span>
+                <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">can_convert</span><span class="s2">(</span><span class="s1">value</span><span class="s2">, </span><span class="s1">expectedty</span><span class="s2">) </span><span class="s0">is not None</span><span class="s2">:</span>
+                    <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">void</span><span class="s2">, </span><span class="s1">record</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">literal</span><span class="s2">(</span><span class="s1">idx</span><span class="s2">),</span>
+                                     <span class="s1">value</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">infer_global</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">setitem</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">StaticSetItemLiteralRecord</span><span class="s2">(</span><span class="s1">AbstractTemplate</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">generic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s3"># Resolution of members for records</span>
+        <span class="s1">target</span><span class="s2">, </span><span class="s1">idx</span><span class="s2">, </span><span class="s1">value </span><span class="s2">= </span><span class="s1">args</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">target</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Record</span><span class="s2">) </span><span class="s0">and </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">idx</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">StringLiteral</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s1">idx</span><span class="s2">.</span><span class="s1">literal_value </span><span class="s0">not in </span><span class="s1">target</span><span class="s2">.</span><span class="s1">fields</span><span class="s2">:</span>
+                <span class="s1">msg </span><span class="s2">= (</span><span class="s4">f&quot;Field '</span><span class="s0">{</span><span class="s1">idx</span><span class="s2">.</span><span class="s1">literal_value</span><span class="s0">}</span><span class="s4">' was not found in record &quot;</span>
+                       <span class="s4">f&quot;with fields </span><span class="s0">{</span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">target</span><span class="s2">.</span><span class="s1">fields</span><span class="s2">.</span><span class="s1">keys</span><span class="s2">())</span><span class="s0">}</span><span class="s4">&quot;</span><span class="s2">)</span>
+                <span class="s0">raise </span><span class="s1">NumbaKeyError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">)</span>
+            <span class="s1">expectedty </span><span class="s2">= </span><span class="s1">target</span><span class="s2">.</span><span class="s1">typeof</span><span class="s2">(</span><span class="s1">idx</span><span class="s2">.</span><span class="s1">literal_value</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">can_convert</span><span class="s2">(</span><span class="s1">value</span><span class="s2">, </span><span class="s1">expectedty</span><span class="s2">) </span><span class="s0">is not None</span><span class="s2">:</span>
+                <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">void</span><span class="s2">, </span><span class="s1">target</span><span class="s2">, </span><span class="s1">idx</span><span class="s2">, </span><span class="s1">value</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">infer_getattr</span>
+<span class="s0">class </span><span class="s1">ArrayCTypesAttribute</span><span class="s2">(</span><span class="s1">AttributeTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">ArrayCTypes</span>
+
+    <span class="s0">def </span><span class="s1">resolve_data</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ctinfo</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uintp</span>
+
+
+<span class="s2">@</span><span class="s1">infer_getattr</span>
+<span class="s0">class </span><span class="s1">ArrayFlagsAttribute</span><span class="s2">(</span><span class="s1">AttributeTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">ArrayFlags</span>
+
+    <span class="s0">def </span><span class="s1">resolve_contiguous</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ctflags</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">boolean</span>
+
+    <span class="s0">def </span><span class="s1">resolve_c_contiguous</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ctflags</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">boolean</span>
+
+    <span class="s0">def </span><span class="s1">resolve_f_contiguous</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ctflags</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">boolean</span>
+
+
+<span class="s2">@</span><span class="s1">infer_getattr</span>
+<span class="s0">class </span><span class="s1">NestedArrayAttribute</span><span class="s2">(</span><span class="s1">ArrayAttribute</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">NestedArray</span>
+
+
+<span class="s0">def </span><span class="s1">_expand_integer</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    If *ty* is an integer, expand it to a machine int (like Numpy). 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Integer</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">ty</span><span class="s2">.</span><span class="s1">signed</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">max</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">, </span><span class="s1">ty</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">max</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uintp</span><span class="s2">, </span><span class="s1">ty</span><span class="s2">)</span>
+    <span class="s0">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Boolean</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">ty</span>
+
+
+<span class="s0">def </span><span class="s1">generic_homog</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+    <span class="s0">if </span><span class="s1">args</span><span class="s2">:</span>
+        <span class="s0">raise </span><span class="s1">NumbaAssertionError</span><span class="s2">(</span><span class="s4">&quot;args not supported&quot;</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">kws</span><span class="s2">:</span>
+        <span class="s0">raise </span><span class="s1">NumbaAssertionError</span><span class="s2">(</span><span class="s4">&quot;kws not supported&quot;</span><span class="s2">)</span>
+
+    <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">recvr</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">generic_expand</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+    <span class="s0">assert not </span><span class="s1">args</span>
+    <span class="s0">assert not </span><span class="s1">kws</span>
+    <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">_expand_integer</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">), </span><span class="s1">recvr</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">sum_expand</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    sum can be called with or without an axis parameter, and with or without 
+    a dtype parameter 
+    &quot;&quot;&quot;</span>
+    <span class="s1">pysig </span><span class="s2">= </span><span class="s0">None</span>
+    <span class="s0">if </span><span class="s4">'axis' </span><span class="s0">in </span><span class="s1">kws </span><span class="s0">and </span><span class="s4">'dtype' </span><span class="s0">not in </span><span class="s1">kws</span><span class="s2">:</span>
+        <span class="s0">def </span><span class="s1">sum_stub</span><span class="s2">(</span><span class="s1">axis</span><span class="s2">):</span>
+            <span class="s0">pass</span>
+        <span class="s1">pysig </span><span class="s2">= </span><span class="s1">utils</span><span class="s2">.</span><span class="s1">pysignature</span><span class="s2">(</span><span class="s1">sum_stub</span><span class="s2">)</span>
+        <span class="s3"># rewrite args</span>
+        <span class="s1">args </span><span class="s2">= </span><span class="s1">list</span><span class="s2">(</span><span class="s1">args</span><span class="s2">) + [</span><span class="s1">kws</span><span class="s2">[</span><span class="s4">'axis'</span><span class="s2">]]</span>
+    <span class="s0">elif </span><span class="s4">'dtype' </span><span class="s0">in </span><span class="s1">kws </span><span class="s0">and </span><span class="s4">'axis' </span><span class="s0">not in </span><span class="s1">kws</span><span class="s2">:</span>
+        <span class="s0">def </span><span class="s1">sum_stub</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">):</span>
+            <span class="s0">pass</span>
+        <span class="s1">pysig </span><span class="s2">= </span><span class="s1">utils</span><span class="s2">.</span><span class="s1">pysignature</span><span class="s2">(</span><span class="s1">sum_stub</span><span class="s2">)</span>
+        <span class="s3"># rewrite args</span>
+        <span class="s1">args </span><span class="s2">= </span><span class="s1">list</span><span class="s2">(</span><span class="s1">args</span><span class="s2">) + [</span><span class="s1">kws</span><span class="s2">[</span><span class="s4">'dtype'</span><span class="s2">]]</span>
+    <span class="s0">elif </span><span class="s4">'dtype' </span><span class="s0">in </span><span class="s1">kws </span><span class="s0">and </span><span class="s4">'axis' </span><span class="s0">in </span><span class="s1">kws</span><span class="s2">:</span>
+        <span class="s0">def </span><span class="s1">sum_stub</span><span class="s2">(</span><span class="s1">axis</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">):</span>
+            <span class="s0">pass</span>
+        <span class="s1">pysig </span><span class="s2">= </span><span class="s1">utils</span><span class="s2">.</span><span class="s1">pysignature</span><span class="s2">(</span><span class="s1">sum_stub</span><span class="s2">)</span>
+        <span class="s3"># rewrite args</span>
+        <span class="s1">args </span><span class="s2">= </span><span class="s1">list</span><span class="s2">(</span><span class="s1">args</span><span class="s2">) + [</span><span class="s1">kws</span><span class="s2">[</span><span class="s4">'axis'</span><span class="s2">], </span><span class="s1">kws</span><span class="s2">[</span><span class="s4">'dtype'</span><span class="s2">]]</span>
+
+    <span class="s1">args_len </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">args</span><span class="s2">)</span>
+    <span class="s0">assert </span><span class="s1">args_len </span><span class="s2">&lt;= </span><span class="s5">2</span>
+    <span class="s0">if </span><span class="s1">args_len </span><span class="s2">== </span><span class="s5">0</span><span class="s2">:</span>
+        <span class="s3"># No axis or dtype parameter so the return type of the summation is a scalar</span>
+        <span class="s3"># of the type of the array.</span>
+        <span class="s1">out </span><span class="s2">= </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">_expand_integer</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">), *</span><span class="s1">args</span><span class="s2">,</span>
+                        <span class="s1">recvr</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">)</span>
+    <span class="s0">elif </span><span class="s1">args_len </span><span class="s2">== </span><span class="s5">1 </span><span class="s0">and </span><span class="s4">'dtype' </span><span class="s0">not in </span><span class="s1">kws</span><span class="s2">:</span>
+        <span class="s3"># There is an axis parameter, either arg or kwarg</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">== </span><span class="s5">1</span><span class="s2">:</span>
+            <span class="s3"># 1d reduces to a scalar</span>
+            <span class="s1">return_type </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">.</span><span class="s1">dtype</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s3"># the return type of this summation is  an array of dimension one</span>
+            <span class="s3"># less than the input array.</span>
+            <span class="s1">return_type </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">_expand_integer</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">),</span>
+                                    <span class="s1">ndim</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">.</span><span class="s1">ndim</span><span class="s2">-</span><span class="s5">1</span><span class="s2">, </span><span class="s1">layout</span><span class="s2">=</span><span class="s4">'C'</span><span class="s2">)</span>
+        <span class="s1">out </span><span class="s2">= </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">return_type</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, </span><span class="s1">recvr</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">)</span>
+
+    <span class="s0">elif </span><span class="s1">args_len </span><span class="s2">== </span><span class="s5">1 </span><span class="s0">and </span><span class="s4">'dtype' </span><span class="s0">in </span><span class="s1">kws</span><span class="s2">:</span>
+        <span class="s3"># No axis parameter so the return type of the summation is a scalar</span>
+        <span class="s3"># of the dtype parameter.</span>
+        <span class="s0">from </span><span class="s2">.</span><span class="s1">npydecl </span><span class="s0">import </span><span class="s1">parse_dtype</span>
+        <span class="s1">dtype</span><span class="s2">, = </span><span class="s1">args</span>
+        <span class="s1">dtype </span><span class="s2">= </span><span class="s1">parse_dtype</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">)</span>
+        <span class="s1">out </span><span class="s2">= </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, </span><span class="s1">recvr</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">)</span>
+
+    <span class="s0">elif </span><span class="s1">args_len </span><span class="s2">== </span><span class="s5">2</span><span class="s2">:</span>
+        <span class="s3"># There is an axis and dtype parameter, either arg or kwarg</span>
+        <span class="s0">from </span><span class="s2">.</span><span class="s1">npydecl </span><span class="s0">import </span><span class="s1">parse_dtype</span>
+        <span class="s1">dtype </span><span class="s2">= </span><span class="s1">parse_dtype</span><span class="s2">(</span><span class="s1">args</span><span class="s2">[</span><span class="s5">1</span><span class="s2">])</span>
+        <span class="s1">return_type </span><span class="s2">= </span><span class="s1">dtype</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">!= </span><span class="s5">1</span><span class="s2">:</span>
+            <span class="s3"># 1d reduces to a scalar, 2d and above reduce dim by 1</span>
+            <span class="s3"># the return type of this summation is  an array of dimension one</span>
+            <span class="s3"># less than the input array.</span>
+            <span class="s1">return_type </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">return_type</span><span class="s2">,</span>
+                                    <span class="s1">ndim</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">.</span><span class="s1">ndim</span><span class="s2">-</span><span class="s5">1</span><span class="s2">, </span><span class="s1">layout</span><span class="s2">=</span><span class="s4">'C'</span><span class="s2">)</span>
+        <span class="s1">out </span><span class="s2">= </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">return_type</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, </span><span class="s1">recvr</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">)</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s0">pass</span>
+    <span class="s0">return </span><span class="s1">out</span><span class="s2">.</span><span class="s1">replace</span><span class="s2">(</span><span class="s1">pysig</span><span class="s2">=</span><span class="s1">pysig</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">generic_expand_cumulative</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+    <span class="s0">if </span><span class="s1">args</span><span class="s2">:</span>
+        <span class="s0">raise </span><span class="s1">NumbaAssertionError</span><span class="s2">(</span><span class="s4">&quot;args unsupported&quot;</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">kws</span><span class="s2">:</span>
+        <span class="s0">raise </span><span class="s1">NumbaAssertionError</span><span class="s2">(</span><span class="s4">&quot;kwargs unsupported&quot;</span><span class="s2">)</span>
+    <span class="s0">assert </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">)</span>
+    <span class="s1">return_type </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">_expand_integer</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">),</span>
+                              <span class="s1">ndim</span><span class="s2">=</span><span class="s5">1</span><span class="s2">, </span><span class="s1">layout</span><span class="s2">=</span><span class="s4">'C'</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">return_type</span><span class="s2">, </span><span class="s1">recvr</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">generic_hetero_real</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+    <span class="s0">assert not </span><span class="s1">args</span>
+    <span class="s0">assert not </span><span class="s1">kws</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, (</span><span class="s1">types</span><span class="s2">.</span><span class="s1">Integer</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Boolean</span><span class="s2">)):</span>
+        <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">, </span><span class="s1">recvr</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">recvr</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">generic_hetero_always_real</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+    <span class="s0">assert not </span><span class="s1">args</span>
+    <span class="s0">assert not </span><span class="s1">kws</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, (</span><span class="s1">types</span><span class="s2">.</span><span class="s1">Integer</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Boolean</span><span class="s2">)):</span>
+        <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">, </span><span class="s1">recvr</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Complex</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">underlying_float</span><span class="s2">, </span><span class="s1">recvr</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">recvr</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">generic_index</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+    <span class="s0">assert not </span><span class="s1">args</span>
+    <span class="s0">assert not </span><span class="s1">kws</span>
+    <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">, </span><span class="s1">recvr</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">install_array_method</span><span class="s2">(</span><span class="s1">name</span><span class="s2">, </span><span class="s1">generic</span><span class="s2">, </span><span class="s1">prefer_literal</span><span class="s2">=</span><span class="s0">True</span><span class="s2">):</span>
+    <span class="s1">my_attr </span><span class="s2">= {</span><span class="s4">&quot;key&quot;</span><span class="s2">: </span><span class="s4">&quot;array.&quot; </span><span class="s2">+ </span><span class="s1">name</span><span class="s2">, </span><span class="s4">&quot;generic&quot;</span><span class="s2">: </span><span class="s1">generic</span><span class="s2">,</span>
+               <span class="s4">&quot;prefer_literal&quot;</span><span class="s2">: </span><span class="s1">prefer_literal</span><span class="s2">}</span>
+    <span class="s1">temp_class </span><span class="s2">= </span><span class="s1">type</span><span class="s2">(</span><span class="s4">&quot;Array_&quot; </span><span class="s2">+ </span><span class="s1">name</span><span class="s2">, (</span><span class="s1">AbstractTemplate</span><span class="s2">,), </span><span class="s1">my_attr</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">array_attribute_attachment</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">BoundFunction</span><span class="s2">(</span><span class="s1">temp_class</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">)</span>
+
+    <span class="s1">setattr</span><span class="s2">(</span><span class="s1">ArrayAttribute</span><span class="s2">, </span><span class="s4">&quot;resolve_&quot; </span><span class="s2">+ </span><span class="s1">name</span><span class="s2">, </span><span class="s1">array_attribute_attachment</span><span class="s2">)</span>
+
+
+<span class="s3"># Functions that return a machine-width type, to avoid overflows</span>
+<span class="s1">install_array_method</span><span class="s2">(</span><span class="s4">&quot;sum&quot;</span><span class="s2">, </span><span class="s1">sum_expand</span><span class="s2">, </span><span class="s1">prefer_literal</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">infer_global</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">eq</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">CmpOpEqArray</span><span class="s2">(</span><span class="s1">AbstractTemplate</span><span class="s2">):</span>
+    <span class="s3">#key = operator.eq</span>
+
+    <span class="s0">def </span><span class="s1">generic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s0">assert not </span><span class="s1">kws</span>
+        <span class="s2">[</span><span class="s1">va</span><span class="s2">, </span><span class="s1">vb</span><span class="s2">] = </span><span class="s1">args</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">va</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">) </span><span class="s0">and </span><span class="s1">va </span><span class="s2">== </span><span class="s1">vb</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">va</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">types</span><span class="s2">.</span><span class="s1">boolean</span><span class="s2">), </span><span class="s1">va</span><span class="s2">, </span><span class="s1">vb</span><span class="s2">)</span>
+</pre>
+</body>
+</html>

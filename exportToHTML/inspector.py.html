@@ -1,0 +1,456 @@
+<html>
+<head>
+<title>inspector.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+inspector.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+This file contains `__main__` so that it can be run as a commandline tool. 
+ 
+This file contains functions to inspect Numba's support for a given Python 
+module or a Python package. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">argparse</span>
+<span class="s2">import </span><span class="s1">pkgutil</span>
+<span class="s2">import </span><span class="s1">warnings</span>
+<span class="s2">import </span><span class="s1">types </span><span class="s2">as </span><span class="s1">pytypes</span>
+
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">errors</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">_version </span><span class="s2">import </span><span class="s1">get_versions</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">registry </span><span class="s2">import </span><span class="s1">cpu_target</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">tests</span><span class="s3">.</span><span class="s1">support </span><span class="s2">import </span><span class="s1">captured_stdout</span>
+
+
+<span class="s2">def </span><span class="s1">_get_commit</span><span class="s3">():</span>
+    <span class="s1">full </span><span class="s3">= </span><span class="s1">get_versions</span><span class="s3">()[</span><span class="s4">'full-revisionid'</span><span class="s3">]</span>
+    <span class="s2">if not </span><span class="s1">full</span><span class="s3">:</span>
+        <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span>
+            <span class="s4">&quot;Cannot find git commit hash. Source links could be inaccurate.&quot;</span><span class="s3">,</span>
+            <span class="s1">category</span><span class="s3">=</span><span class="s1">errors</span><span class="s3">.</span><span class="s1">NumbaWarning</span><span class="s3">,</span>
+        <span class="s3">)</span>
+        <span class="s2">return </span><span class="s4">'main'</span>
+    <span class="s2">return </span><span class="s1">full</span>
+
+
+<span class="s1">commit </span><span class="s3">= </span><span class="s1">_get_commit</span><span class="s3">()</span>
+<span class="s1">github_url </span><span class="s3">= </span><span class="s4">'https://github.com/numba/numba/blob/{commit}/{path}#L{firstline}-L{lastline}'    </span><span class="s5"># noqa: E501</span>
+
+
+<span class="s2">def </span><span class="s1">inspect_function</span><span class="s3">(</span><span class="s1">function</span><span class="s3">, </span><span class="s1">target</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Return information about the support of a function. 
+ 
+    Returns 
+    ------- 
+    info : dict 
+        Defined keys: 
+        - &quot;numba_type&quot;: str or None 
+            The numba type object of the function if supported. 
+        - &quot;explained&quot;: str 
+            A textual description of the support. 
+        - &quot;source_infos&quot;: dict 
+            A dictionary containing the source location of each definition. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">target </span><span class="s3">= </span><span class="s1">target </span><span class="s2">or </span><span class="s1">cpu_target</span>
+    <span class="s1">tyct </span><span class="s3">= </span><span class="s1">target</span><span class="s3">.</span><span class="s1">typing_context</span>
+    <span class="s5"># Make sure we have loaded all extensions</span>
+    <span class="s1">tyct</span><span class="s3">.</span><span class="s1">refresh</span><span class="s3">()</span>
+    <span class="s1">target</span><span class="s3">.</span><span class="s1">target_context</span><span class="s3">.</span><span class="s1">refresh</span><span class="s3">()</span>
+
+    <span class="s1">info </span><span class="s3">= {}</span>
+    <span class="s5"># Try getting the function type</span>
+    <span class="s1">source_infos </span><span class="s3">= {}</span>
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s1">nbty </span><span class="s3">= </span><span class="s1">tyct</span><span class="s3">.</span><span class="s1">resolve_value_type</span><span class="s3">(</span><span class="s1">function</span><span class="s3">)</span>
+    <span class="s2">except </span><span class="s1">ValueError</span><span class="s3">:</span>
+        <span class="s1">nbty </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s1">explained </span><span class="s3">= </span><span class="s4">'not supported'</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s5"># Make a longer explanation of the type</span>
+        <span class="s1">explained </span><span class="s3">= </span><span class="s1">tyct</span><span class="s3">.</span><span class="s1">explain_function_type</span><span class="s3">(</span><span class="s1">nbty</span><span class="s3">)</span>
+        <span class="s2">for </span><span class="s1">temp </span><span class="s2">in </span><span class="s1">nbty</span><span class="s3">.</span><span class="s1">templates</span><span class="s3">:</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s1">source_infos</span><span class="s3">[</span><span class="s1">temp</span><span class="s3">] = </span><span class="s1">temp</span><span class="s3">.</span><span class="s1">get_source_info</span><span class="s3">()</span>
+            <span class="s2">except </span><span class="s1">AttributeError</span><span class="s3">:</span>
+                <span class="s1">source_infos</span><span class="s3">[</span><span class="s1">temp</span><span class="s3">] = </span><span class="s2">None</span>
+
+    <span class="s1">info</span><span class="s3">[</span><span class="s4">'numba_type'</span><span class="s3">] = </span><span class="s1">nbty</span>
+    <span class="s1">info</span><span class="s3">[</span><span class="s4">'explained'</span><span class="s3">] = </span><span class="s1">explained</span>
+    <span class="s1">info</span><span class="s3">[</span><span class="s4">'source_infos'</span><span class="s3">] = </span><span class="s1">source_infos</span>
+    <span class="s2">return </span><span class="s1">info</span>
+
+
+<span class="s2">def </span><span class="s1">inspect_module</span><span class="s3">(</span><span class="s1">module</span><span class="s3">, </span><span class="s1">target</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">alias</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Inspect a module object and yielding results from `inspect_function()` 
+    for each function object in the module. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">alias </span><span class="s3">= {} </span><span class="s2">if </span><span class="s1">alias </span><span class="s2">is None else </span><span class="s1">alias</span>
+    <span class="s5"># Walk the module</span>
+    <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">dir</span><span class="s3">(</span><span class="s1">module</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">name</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s4">'_'</span><span class="s3">):</span>
+            <span class="s5"># Skip</span>
+            <span class="s2">continue</span>
+        <span class="s1">obj </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">module</span><span class="s3">, </span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s1">supported_types </span><span class="s3">= (</span><span class="s1">pytypes</span><span class="s3">.</span><span class="s1">FunctionType</span><span class="s3">, </span><span class="s1">pytypes</span><span class="s3">.</span><span class="s1">BuiltinFunctionType</span><span class="s3">)</span>
+
+        <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">supported_types</span><span class="s3">):</span>
+            <span class="s5"># Skip if it's not a function</span>
+            <span class="s2">continue</span>
+
+        <span class="s1">info </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">module</span><span class="s3">=</span><span class="s1">module</span><span class="s3">, </span><span class="s1">name</span><span class="s3">=</span><span class="s1">name</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">=</span><span class="s1">obj</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">obj </span><span class="s2">in </span><span class="s1">alias</span><span class="s3">:</span>
+            <span class="s1">info</span><span class="s3">[</span><span class="s4">'alias'</span><span class="s3">] = </span><span class="s1">alias</span><span class="s3">[</span><span class="s1">obj</span><span class="s3">]</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">alias</span><span class="s3">[</span><span class="s1">obj</span><span class="s3">] = </span><span class="s4">&quot;{module}.{name}&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">module</span><span class="s3">=</span><span class="s1">module</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">,</span>
+                                                  <span class="s1">name</span><span class="s3">=</span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s1">info</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">inspect_function</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">target</span><span class="s3">=</span><span class="s1">target</span><span class="s3">))</span>
+        <span class="s2">yield </span><span class="s1">info</span>
+
+
+<span class="s2">class </span><span class="s1">_Stat</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;For gathering simple statistic of (un)supported functions&quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">supported </span><span class="s3">= </span><span class="s6">0</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">unsupported </span><span class="s3">= </span><span class="s6">0</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">total</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">total </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">supported </span><span class="s3">+ </span><span class="s1">self</span><span class="s3">.</span><span class="s1">unsupported</span>
+        <span class="s2">return </span><span class="s1">total</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">ratio</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">ratio </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">supported </span><span class="s3">/ </span><span class="s1">self</span><span class="s3">.</span><span class="s1">total </span><span class="s3">* </span><span class="s6">100</span>
+        <span class="s2">return </span><span class="s1">ratio</span>
+
+    <span class="s2">def </span><span class="s1">describe</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">total </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s4">&quot;empty&quot;</span>
+        <span class="s2">return </span><span class="s4">&quot;supported = {supported} / {total} = {ratio:.2f}%&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span>
+            <span class="s1">supported</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">supported</span><span class="s3">,</span>
+            <span class="s1">total</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">total</span><span class="s3">,</span>
+            <span class="s1">ratio</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">ratio</span><span class="s3">,</span>
+        <span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s4">&quot;{clsname}({describe})&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span>
+            <span class="s1">clsname</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">,</span>
+            <span class="s1">describe</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">describe</span><span class="s3">(),</span>
+        <span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">filter_private_module</span><span class="s3">(</span><span class="s1">module_components</span><span class="s3">):</span>
+    <span class="s2">return not </span><span class="s1">any</span><span class="s3">(</span><span class="s1">x</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s4">'_'</span><span class="s3">) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">module_components</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">filter_tests_module</span><span class="s3">(</span><span class="s1">module_components</span><span class="s3">):</span>
+    <span class="s2">return not </span><span class="s1">any</span><span class="s3">(</span><span class="s1">x </span><span class="s3">== </span><span class="s4">'tests' </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">module_components</span><span class="s3">)</span>
+
+
+<span class="s1">_default_module_filters </span><span class="s3">= (</span>
+    <span class="s1">filter_private_module</span><span class="s3">,</span>
+    <span class="s1">filter_tests_module</span><span class="s3">,</span>
+<span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">list_modules_in_package</span><span class="s3">(</span><span class="s1">package</span><span class="s3">, </span><span class="s1">module_filters</span><span class="s3">=</span><span class="s1">_default_module_filters</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Yield all modules in a given package. 
+ 
+    Recursively walks the package tree. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">onerror_ignore </span><span class="s3">= </span><span class="s2">lambda </span><span class="s1">_</span><span class="s3">: </span><span class="s2">None</span>
+
+    <span class="s1">prefix </span><span class="s3">= </span><span class="s1">package</span><span class="s3">.</span><span class="s1">__name__ </span><span class="s3">+ </span><span class="s4">&quot;.&quot;</span>
+    <span class="s1">package_walker </span><span class="s3">= </span><span class="s1">pkgutil</span><span class="s3">.</span><span class="s1">walk_packages</span><span class="s3">(</span>
+        <span class="s1">package</span><span class="s3">.</span><span class="s1">__path__</span><span class="s3">,</span>
+        <span class="s1">prefix</span><span class="s3">,</span>
+        <span class="s1">onerror</span><span class="s3">=</span><span class="s1">onerror_ignore</span><span class="s3">,</span>
+    <span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">check_filter</span><span class="s3">(</span><span class="s1">modname</span><span class="s3">):</span>
+        <span class="s1">module_components </span><span class="s3">= </span><span class="s1">modname</span><span class="s3">.</span><span class="s1">split</span><span class="s3">(</span><span class="s4">'.'</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">any</span><span class="s3">(</span><span class="s2">not </span><span class="s1">filter_fn</span><span class="s3">(</span><span class="s1">module_components</span><span class="s3">)</span>
+                   <span class="s2">for </span><span class="s1">filter_fn </span><span class="s2">in </span><span class="s1">module_filters</span><span class="s3">)</span>
+
+    <span class="s1">modname </span><span class="s3">= </span><span class="s1">package</span><span class="s3">.</span><span class="s1">__name__</span>
+    <span class="s2">if not </span><span class="s1">check_filter</span><span class="s3">(</span><span class="s1">modname</span><span class="s3">):</span>
+        <span class="s2">yield </span><span class="s1">package</span>
+
+    <span class="s2">for </span><span class="s1">pkginfo </span><span class="s2">in </span><span class="s1">package_walker</span><span class="s3">:</span>
+        <span class="s1">modname </span><span class="s3">= </span><span class="s1">pkginfo</span><span class="s3">[</span><span class="s6">1</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">check_filter</span><span class="s3">(</span><span class="s1">modname</span><span class="s3">):</span>
+            <span class="s2">continue</span>
+        <span class="s5"># In case importing of the module print to stdout</span>
+        <span class="s2">with </span><span class="s1">captured_stdout</span><span class="s3">():</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s5"># Import the module</span>
+                <span class="s1">mod </span><span class="s3">= </span><span class="s1">__import__</span><span class="s3">(</span><span class="s1">modname</span><span class="s3">)</span>
+            <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+                <span class="s2">continue</span>
+
+            <span class="s5"># Extract the module</span>
+            <span class="s2">for </span><span class="s1">part </span><span class="s2">in </span><span class="s1">modname</span><span class="s3">.</span><span class="s1">split</span><span class="s3">(</span><span class="s4">'.'</span><span class="s3">)[</span><span class="s6">1</span><span class="s3">:]:</span>
+                <span class="s2">try</span><span class="s3">:</span>
+                    <span class="s1">mod </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">mod</span><span class="s3">, </span><span class="s1">part</span><span class="s3">)</span>
+                <span class="s2">except </span><span class="s1">AttributeError</span><span class="s3">:</span>
+                    <span class="s5"># Suppress error in getting the attribute</span>
+                    <span class="s1">mod </span><span class="s3">= </span><span class="s2">None</span>
+                    <span class="s2">break</span>
+
+        <span class="s5"># Ignore if mod is not a module</span>
+        <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">mod</span><span class="s3">, </span><span class="s1">pytypes</span><span class="s3">.</span><span class="s1">ModuleType</span><span class="s3">):</span>
+            <span class="s5"># Skip non-module</span>
+            <span class="s2">continue</span>
+
+        <span class="s2">yield </span><span class="s1">mod</span>
+
+
+<span class="s2">class </span><span class="s1">Formatter</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Base class for formatters. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">fileobj</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_fileobj </span><span class="s3">= </span><span class="s1">fileobj</span>
+
+    <span class="s2">def </span><span class="s1">print</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, *</span><span class="s1">args</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">):</span>
+        <span class="s1">kwargs</span><span class="s3">.</span><span class="s1">setdefault</span><span class="s3">(</span><span class="s4">'file'</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fileobj</span><span class="s3">)</span>
+        <span class="s1">print</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">HTMLFormatter</span><span class="s3">(</span><span class="s1">Formatter</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Formatter that outputs HTML 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">escape</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">text</span><span class="s3">):</span>
+        <span class="s2">import </span><span class="s1">html</span>
+        <span class="s2">return </span><span class="s1">html</span><span class="s3">.</span><span class="s1">escape</span><span class="s3">(</span><span class="s1">text</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">title</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">text</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">'&lt;h1&gt;'</span><span class="s3">, </span><span class="s1">text</span><span class="s3">, </span><span class="s4">'&lt;/h2&gt;'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">begin_module_section</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">modname</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">'&lt;h2&gt;'</span><span class="s3">, </span><span class="s1">modname</span><span class="s3">, </span><span class="s4">'&lt;/h2&gt;'</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">'&lt;ul&gt;'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">end_module_section</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">'&lt;/ul&gt;'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">write_supported_item</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">modname</span><span class="s3">, </span><span class="s1">itemname</span><span class="s3">, </span><span class="s1">typename</span><span class="s3">, </span><span class="s1">explained</span><span class="s3">,</span>
+                             <span class="s1">sources</span><span class="s3">, </span><span class="s1">alias</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">'&lt;li&gt;'</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">'{}.&lt;b&gt;{}&lt;/b&gt;'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span>
+            <span class="s1">modname</span><span class="s3">,</span>
+            <span class="s1">itemname</span><span class="s3">,</span>
+        <span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">': &lt;b&gt;{}&lt;/b&gt;'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">typename</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">'&lt;div&gt;&lt;pre&gt;'</span><span class="s3">, </span><span class="s1">explained</span><span class="s3">, </span><span class="s4">'&lt;/pre&gt;&lt;/div&gt;'</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;&lt;ul&gt;&quot;</span><span class="s3">)</span>
+        <span class="s2">for </span><span class="s1">tcls</span><span class="s3">, </span><span class="s1">source </span><span class="s2">in </span><span class="s1">sources</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+            <span class="s2">if </span><span class="s1">source</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;&lt;li&gt;&quot;</span><span class="s3">)</span>
+                <span class="s1">impl </span><span class="s3">= </span><span class="s1">source</span><span class="s3">[</span><span class="s4">'name'</span><span class="s3">]</span>
+                <span class="s1">sig </span><span class="s3">= </span><span class="s1">source</span><span class="s3">[</span><span class="s4">'sig'</span><span class="s3">]</span>
+                <span class="s1">filename </span><span class="s3">= </span><span class="s1">source</span><span class="s3">[</span><span class="s4">'filename'</span><span class="s3">]</span>
+                <span class="s1">lines </span><span class="s3">= </span><span class="s1">source</span><span class="s3">[</span><span class="s4">'lines'</span><span class="s3">]</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span>
+                    <span class="s4">&quot;&lt;p&gt;defined by &lt;b&gt;{}&lt;/b&gt;{} at {}:{}-{}&lt;/p&gt;&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span>
+                        <span class="s1">self</span><span class="s3">.</span><span class="s1">escape</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">), </span><span class="s1">self</span><span class="s3">.</span><span class="s1">escape</span><span class="s3">(</span><span class="s1">sig</span><span class="s3">),</span>
+                        <span class="s1">self</span><span class="s3">.</span><span class="s1">escape</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">), </span><span class="s1">lines</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">lines</span><span class="s3">[</span><span class="s6">1</span><span class="s3">],</span>
+                    <span class="s3">),</span>
+                <span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">'&lt;p&gt;{}&lt;/p&gt;'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">escape</span><span class="s3">(</span><span class="s1">source</span><span class="s3">[</span><span class="s4">'docstring'</span><span class="s3">] </span><span class="s2">or </span><span class="s4">''</span><span class="s3">)</span>
+                <span class="s3">))</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;&lt;li&gt;{}&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">escape</span><span class="s3">(</span><span class="s1">str</span><span class="s3">(</span><span class="s1">tcls</span><span class="s3">))))</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;&lt;/li&gt;&quot;</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;&lt;/ul&gt;&quot;</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">'&lt;/li&gt;'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">write_unsupported_item</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">modname</span><span class="s3">, </span><span class="s1">itemname</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">'&lt;li&gt;'</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">'{}.&lt;b&gt;{}&lt;/b&gt;: UNSUPPORTED'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span>
+            <span class="s1">modname</span><span class="s3">,</span>
+            <span class="s1">itemname</span><span class="s3">,</span>
+        <span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">'&lt;/li&gt;'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">write_statistic</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">stats</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">'&lt;p&gt;{}&lt;/p&gt;'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">stats</span><span class="s3">.</span><span class="s1">describe</span><span class="s3">()))</span>
+
+
+<span class="s2">class </span><span class="s1">ReSTFormatter</span><span class="s3">(</span><span class="s1">Formatter</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Formatter that output ReSTructured text format for Sphinx docs. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">escape</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">text</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">text</span>
+
+    <span class="s2">def </span><span class="s1">title</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">text</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s1">text</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">'=' </span><span class="s3">* </span><span class="s1">len</span><span class="s3">(</span><span class="s1">text</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">begin_module_section</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">modname</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s1">modname</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">'-' </span><span class="s3">* </span><span class="s1">len</span><span class="s3">(</span><span class="s1">modname</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">end_module_section</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">write_supported_item</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">modname</span><span class="s3">, </span><span class="s1">itemname</span><span class="s3">, </span><span class="s1">typename</span><span class="s3">, </span><span class="s1">explained</span><span class="s3">,</span>
+                             <span class="s1">sources</span><span class="s3">, </span><span class="s1">alias</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">'.. function:: {}.{}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">modname</span><span class="s3">, </span><span class="s1">itemname</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">'   :noindex:'</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">()</span>
+
+        <span class="s2">if </span><span class="s1">alias</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;   Alias to: ``{}``&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">alias</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">()</span>
+
+        <span class="s2">for </span><span class="s1">tcls</span><span class="s3">, </span><span class="s1">source </span><span class="s2">in </span><span class="s1">sources</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+            <span class="s2">if </span><span class="s1">source</span><span class="s3">:</span>
+                <span class="s1">impl </span><span class="s3">= </span><span class="s1">source</span><span class="s3">[</span><span class="s4">'name'</span><span class="s3">]</span>
+                <span class="s1">sig </span><span class="s3">= </span><span class="s1">source</span><span class="s3">[</span><span class="s4">'sig'</span><span class="s3">]</span>
+                <span class="s1">filename </span><span class="s3">= </span><span class="s1">source</span><span class="s3">[</span><span class="s4">'filename'</span><span class="s3">]</span>
+                <span class="s1">lines </span><span class="s3">= </span><span class="s1">source</span><span class="s3">[</span><span class="s4">'lines'</span><span class="s3">]</span>
+                <span class="s1">source_link </span><span class="s3">= </span><span class="s1">github_url</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span>
+                    <span class="s1">commit</span><span class="s3">=</span><span class="s1">commit</span><span class="s3">,</span>
+                    <span class="s1">path</span><span class="s3">=</span><span class="s1">filename</span><span class="s3">,</span>
+                    <span class="s1">firstline</span><span class="s3">=</span><span class="s1">lines</span><span class="s3">[</span><span class="s6">0</span><span class="s3">],</span>
+                    <span class="s1">lastline</span><span class="s3">=</span><span class="s1">lines</span><span class="s3">[</span><span class="s6">1</span><span class="s3">],</span>
+                <span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span>
+                    <span class="s4">&quot;   - defined by ``{}{}`` at `{}:{}-{} &lt;{}&gt;`_&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span>
+                        <span class="s1">impl</span><span class="s3">, </span><span class="s1">sig</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">lines</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">lines</span><span class="s3">[</span><span class="s6">1</span><span class="s3">], </span><span class="s1">source_link</span><span class="s3">,</span>
+                    <span class="s3">),</span>
+                <span class="s3">)</span>
+
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;   - defined by ``{}``&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">str</span><span class="s3">(</span><span class="s1">tcls</span><span class="s3">)))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">write_unsupported_item</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">modname</span><span class="s3">, </span><span class="s1">itemname</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">write_statistic</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">stat</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">stat</span><span class="s3">.</span><span class="s1">supported </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;This module is not supported.&quot;</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">msg </span><span class="s3">= </span><span class="s4">&quot;Not showing {} unsupported functions.&quot;</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">stat</span><span class="s3">.</span><span class="s1">unsupported</span><span class="s3">))</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">()</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">(</span><span class="s1">stat</span><span class="s3">.</span><span class="s1">describe</span><span class="s3">())</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">print</span><span class="s3">()</span>
+
+
+<span class="s2">def </span><span class="s1">_format_module_infos</span><span class="s3">(</span><span class="s1">formatter</span><span class="s3">, </span><span class="s1">package_name</span><span class="s3">, </span><span class="s1">mod_sequence</span><span class="s3">, </span><span class="s1">target</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Format modules. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">formatter</span><span class="s3">.</span><span class="s1">title</span><span class="s3">(</span><span class="s4">'Listings for {}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">package_name</span><span class="s3">))</span>
+    <span class="s1">alias_map </span><span class="s3">= {}  </span><span class="s5"># remember object seen to track alias</span>
+    <span class="s2">for </span><span class="s1">mod </span><span class="s2">in </span><span class="s1">mod_sequence</span><span class="s3">:</span>
+        <span class="s1">stat </span><span class="s3">= </span><span class="s1">_Stat</span><span class="s3">()</span>
+        <span class="s1">modname </span><span class="s3">= </span><span class="s1">mod</span><span class="s3">.</span><span class="s1">__name__</span>
+        <span class="s1">formatter</span><span class="s3">.</span><span class="s1">begin_module_section</span><span class="s3">(</span><span class="s1">formatter</span><span class="s3">.</span><span class="s1">escape</span><span class="s3">(</span><span class="s1">modname</span><span class="s3">))</span>
+        <span class="s2">for </span><span class="s1">info </span><span class="s2">in </span><span class="s1">inspect_module</span><span class="s3">(</span><span class="s1">mod</span><span class="s3">, </span><span class="s1">target</span><span class="s3">=</span><span class="s1">target</span><span class="s3">, </span><span class="s1">alias</span><span class="s3">=</span><span class="s1">alias_map</span><span class="s3">):</span>
+            <span class="s1">nbtype </span><span class="s3">= </span><span class="s1">info</span><span class="s3">[</span><span class="s4">'numba_type'</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">nbtype </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">stat</span><span class="s3">.</span><span class="s1">supported </span><span class="s3">+= </span><span class="s6">1</span>
+                <span class="s1">formatter</span><span class="s3">.</span><span class="s1">write_supported_item</span><span class="s3">(</span>
+                    <span class="s1">modname</span><span class="s3">=</span><span class="s1">formatter</span><span class="s3">.</span><span class="s1">escape</span><span class="s3">(</span><span class="s1">info</span><span class="s3">[</span><span class="s4">'module'</span><span class="s3">].</span><span class="s1">__name__</span><span class="s3">),</span>
+                    <span class="s1">itemname</span><span class="s3">=</span><span class="s1">formatter</span><span class="s3">.</span><span class="s1">escape</span><span class="s3">(</span><span class="s1">info</span><span class="s3">[</span><span class="s4">'name'</span><span class="s3">]),</span>
+                    <span class="s1">typename</span><span class="s3">=</span><span class="s1">formatter</span><span class="s3">.</span><span class="s1">escape</span><span class="s3">(</span><span class="s1">str</span><span class="s3">(</span><span class="s1">nbtype</span><span class="s3">)),</span>
+                    <span class="s1">explained</span><span class="s3">=</span><span class="s1">formatter</span><span class="s3">.</span><span class="s1">escape</span><span class="s3">(</span><span class="s1">info</span><span class="s3">[</span><span class="s4">'explained'</span><span class="s3">]),</span>
+                    <span class="s1">sources</span><span class="s3">=</span><span class="s1">info</span><span class="s3">[</span><span class="s4">'source_infos'</span><span class="s3">],</span>
+                    <span class="s1">alias</span><span class="s3">=</span><span class="s1">info</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s4">'alias'</span><span class="s3">),</span>
+                <span class="s3">)</span>
+
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">stat</span><span class="s3">.</span><span class="s1">unsupported </span><span class="s3">+= </span><span class="s6">1</span>
+                <span class="s1">formatter</span><span class="s3">.</span><span class="s1">write_unsupported_item</span><span class="s3">(</span>
+                    <span class="s1">modname</span><span class="s3">=</span><span class="s1">formatter</span><span class="s3">.</span><span class="s1">escape</span><span class="s3">(</span><span class="s1">info</span><span class="s3">[</span><span class="s4">'module'</span><span class="s3">].</span><span class="s1">__name__</span><span class="s3">),</span>
+                    <span class="s1">itemname</span><span class="s3">=</span><span class="s1">formatter</span><span class="s3">.</span><span class="s1">escape</span><span class="s3">(</span><span class="s1">info</span><span class="s3">[</span><span class="s4">'name'</span><span class="s3">]),</span>
+                <span class="s3">)</span>
+
+        <span class="s1">formatter</span><span class="s3">.</span><span class="s1">write_statistic</span><span class="s3">(</span><span class="s1">stat</span><span class="s3">)</span>
+        <span class="s1">formatter</span><span class="s3">.</span><span class="s1">end_module_section</span><span class="s3">()</span>
+
+
+<span class="s2">def </span><span class="s1">write_listings</span><span class="s3">(</span><span class="s1">package_name</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">output_format</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Write listing information into a file. 
+ 
+    Parameters 
+    ---------- 
+    package_name : str 
+        Name of the package to inspect. 
+    filename : str 
+        Output filename. Always overwrite. 
+    output_format : str 
+        Support formats are &quot;html&quot; and &quot;rst&quot;. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">package </span><span class="s3">= </span><span class="s1">__import__</span><span class="s3">(</span><span class="s1">package_name</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">package</span><span class="s3">, </span><span class="s4">'__path__'</span><span class="s3">):</span>
+        <span class="s1">mods </span><span class="s3">= </span><span class="s1">list_modules_in_package</span><span class="s3">(</span><span class="s1">package</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">mods </span><span class="s3">= [</span><span class="s1">package</span><span class="s3">]</span>
+
+    <span class="s2">if </span><span class="s1">output_format </span><span class="s3">== </span><span class="s4">'html'</span><span class="s3">:</span>
+        <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">filename </span><span class="s3">+ </span><span class="s4">'.html'</span><span class="s3">, </span><span class="s4">'w'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">fout</span><span class="s3">:</span>
+            <span class="s1">fmtr </span><span class="s3">= </span><span class="s1">HTMLFormatter</span><span class="s3">(</span><span class="s1">fileobj</span><span class="s3">=</span><span class="s1">fout</span><span class="s3">)</span>
+            <span class="s1">_format_module_infos</span><span class="s3">(</span><span class="s1">fmtr</span><span class="s3">, </span><span class="s1">package_name</span><span class="s3">, </span><span class="s1">mods</span><span class="s3">)</span>
+    <span class="s2">elif </span><span class="s1">output_format </span><span class="s3">== </span><span class="s4">'rst'</span><span class="s3">:</span>
+        <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">filename </span><span class="s3">+ </span><span class="s4">'.rst'</span><span class="s3">, </span><span class="s4">'w'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">fout</span><span class="s3">:</span>
+            <span class="s1">fmtr </span><span class="s3">= </span><span class="s1">ReSTFormatter</span><span class="s3">(</span><span class="s1">fileobj</span><span class="s3">=</span><span class="s1">fout</span><span class="s3">)</span>
+            <span class="s1">_format_module_infos</span><span class="s3">(</span><span class="s1">fmtr</span><span class="s3">, </span><span class="s1">package_name</span><span class="s3">, </span><span class="s1">mods</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+            <span class="s4">&quot;Output format '{}' is not supported&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">output_format</span><span class="s3">))</span>
+
+
+<span class="s1">program_description </span><span class="s3">= </span><span class="s4">&quot;&quot;&quot; 
+Inspect Numba support for a given top-level package. 
+&quot;&quot;&quot;</span><span class="s3">.</span><span class="s1">strip</span><span class="s3">()</span>
+
+
+<span class="s2">def </span><span class="s1">main</span><span class="s3">():</span>
+    <span class="s1">parser </span><span class="s3">= </span><span class="s1">argparse</span><span class="s3">.</span><span class="s1">ArgumentParser</span><span class="s3">(</span><span class="s1">description</span><span class="s3">=</span><span class="s1">program_description</span><span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span>
+        <span class="s4">'package'</span><span class="s3">, </span><span class="s1">metavar</span><span class="s3">=</span><span class="s4">'package'</span><span class="s3">, </span><span class="s1">type</span><span class="s3">=</span><span class="s1">str</span><span class="s3">,</span>
+        <span class="s1">help</span><span class="s3">=</span><span class="s4">'Package to inspect'</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span>
+        <span class="s4">'--format'</span><span class="s3">, </span><span class="s1">dest</span><span class="s3">=</span><span class="s4">'format'</span><span class="s3">, </span><span class="s1">default</span><span class="s3">=</span><span class="s4">'html'</span><span class="s3">,</span>
+        <span class="s1">help</span><span class="s3">=</span><span class="s4">'Output format; i.e. &quot;html&quot;, &quot;rst&quot;'</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span>
+        <span class="s4">'--file'</span><span class="s3">, </span><span class="s1">dest</span><span class="s3">=</span><span class="s4">'file'</span><span class="s3">, </span><span class="s1">default</span><span class="s3">=</span><span class="s4">'inspector_output'</span><span class="s3">,</span>
+        <span class="s1">help</span><span class="s3">=</span><span class="s4">'Output filename. Defaults to &quot;inspector_output.&lt;format&gt;&quot;'</span><span class="s3">,</span>
+    <span class="s3">)</span>
+
+    <span class="s1">args </span><span class="s3">= </span><span class="s1">parser</span><span class="s3">.</span><span class="s1">parse_args</span><span class="s3">()</span>
+    <span class="s1">package_name </span><span class="s3">= </span><span class="s1">args</span><span class="s3">.</span><span class="s1">package</span>
+    <span class="s1">output_format </span><span class="s3">= </span><span class="s1">args</span><span class="s3">.</span><span class="s1">format</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">args</span><span class="s3">.</span><span class="s1">file</span>
+    <span class="s1">write_listings</span><span class="s3">(</span><span class="s1">package_name</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">output_format</span><span class="s3">)</span>
+
+
+<span class="s2">if </span><span class="s1">__name__ </span><span class="s3">== </span><span class="s4">'__main__'</span><span class="s3">:</span>
+    <span class="s1">main</span><span class="s3">()</span>
+</pre>
+</body>
+</html>

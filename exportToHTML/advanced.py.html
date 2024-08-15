@@ -1,0 +1,241 @@
+<html>
+<head>
+<title>advanced.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+.s6 { color: #5f826b; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+advanced.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># This extension demonstrates some advanced features of the Python ISAPI</span>
+<span class="s0"># framework.</span>
+<span class="s0"># We demonstrate:</span>
+<span class="s0"># * Reloading your Python module without shutting down IIS (eg, when your</span>
+<span class="s0">#   .py implementation file changes.)</span>
+<span class="s0"># * Custom command-line handling - both additional options and commands.</span>
+<span class="s0"># * Using a query string - any part of the URL after a '?' is assumed to</span>
+<span class="s0">#   be &quot;variable names&quot; separated by '&amp;' - we will print the values of</span>
+<span class="s0">#   these server variables.</span>
+<span class="s0"># * If the tail portion of the URL is &quot;ReportUnhealthy&quot;, IIS will be</span>
+<span class="s0">#   notified we are unhealthy via a HSE_REQ_REPORT_UNHEALTHY request.</span>
+<span class="s0">#   Whether this is acted upon depends on if the IIS health-checking</span>
+<span class="s0">#   tools are installed, but you should always see the reason written</span>
+<span class="s0">#   to the Windows event log - see the IIS documentation for more.</span>
+
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">stat</span>
+<span class="s2">import </span><span class="s1">sys</span>
+
+<span class="s2">from </span><span class="s1">isapi </span><span class="s2">import </span><span class="s1">isapicon</span>
+<span class="s2">from </span><span class="s1">isapi</span><span class="s3">.</span><span class="s1">simple </span><span class="s2">import </span><span class="s1">SimpleExtension</span>
+
+<span class="s2">if </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">sys</span><span class="s3">, </span><span class="s4">&quot;isapidllhandle&quot;</span><span class="s3">):</span>
+    <span class="s2">import </span><span class="s1">win32traceutil</span>
+
+<span class="s0"># Notes on reloading</span>
+<span class="s0"># If your HttpFilterProc or HttpExtensionProc functions raises</span>
+<span class="s0"># 'isapi.InternalReloadException', the framework will not treat it</span>
+<span class="s0"># as an error but instead will terminate your extension, reload your</span>
+<span class="s0"># extension module, re-initialize the instance, and re-issue the request.</span>
+<span class="s0"># The Initialize functions are called with None as their param.  The</span>
+<span class="s0"># return code from the terminate function is ignored.</span>
+<span class="s0">#</span>
+<span class="s0"># This is all the framework does to help you.  It is up to your code</span>
+<span class="s0"># when you raise this exception.  This sample uses a Win32 &quot;find</span>
+<span class="s0"># notification&quot;.  Whenever windows tells us one of the files in the</span>
+<span class="s0"># directory has changed, we check if the time of our source-file has</span>
+<span class="s0"># changed, and set a flag.  Next imcoming request, we check the flag and</span>
+<span class="s0"># raise the special exception if set.</span>
+<span class="s0">#</span>
+<span class="s0"># The end result is that the module is automatically reloaded whenever</span>
+<span class="s0"># the source-file changes - you need take no further action to see your</span>
+<span class="s0"># changes reflected in the running server.</span>
+
+<span class="s0"># The framework only reloads your module - if you have libraries you</span>
+<span class="s0"># depend on and also want reloaded, you must arrange for this yourself.</span>
+<span class="s0"># One way of doing this would be to special case the import of these</span>
+<span class="s0"># modules.  Eg:</span>
+<span class="s0"># --</span>
+<span class="s0"># try:</span>
+<span class="s0">#    my_module = reload(my_module) # module already imported - reload it</span>
+<span class="s0"># except NameError:</span>
+<span class="s0">#    import my_module # first time around - import it.</span>
+<span class="s0"># --</span>
+<span class="s0"># When your module is imported for the first time, the NameError will</span>
+<span class="s0"># be raised, and the module imported.  When the ISAPI framework reloads</span>
+<span class="s0"># your module, the existing module will avoid the NameError, and allow</span>
+<span class="s0"># you to reload that module.</span>
+
+<span class="s2">import </span><span class="s1">threading</span>
+
+<span class="s2">import </span><span class="s1">win32con</span>
+<span class="s2">import </span><span class="s1">win32event</span>
+<span class="s2">import </span><span class="s1">win32file</span>
+<span class="s2">import </span><span class="s1">winerror</span>
+
+<span class="s2">from </span><span class="s1">isapi </span><span class="s2">import </span><span class="s1">InternalReloadException</span>
+
+<span class="s2">try</span><span class="s3">:</span>
+    <span class="s1">reload_counter </span><span class="s3">+= </span><span class="s5">1</span>
+<span class="s2">except </span><span class="s1">NameError</span><span class="s3">:</span>
+    <span class="s1">reload_counter </span><span class="s3">= </span><span class="s5">0</span>
+
+
+<span class="s0"># A watcher thread that checks for __file__ changing.</span>
+<span class="s0"># When it detects it, it simply sets &quot;change_detected&quot; to true.</span>
+<span class="s2">class </span><span class="s1">ReloadWatcherThread</span><span class="s3">(</span><span class="s1">threading</span><span class="s3">.</span><span class="s1">Thread</span><span class="s3">):</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">change_detected </span><span class="s3">= </span><span class="s2">False</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">filename </span><span class="s3">= </span><span class="s1">__file__</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">filename</span><span class="s3">.</span><span class="s1">endswith</span><span class="s3">(</span><span class="s4">&quot;c&quot;</span><span class="s3">) </span><span class="s2">or </span><span class="s1">self</span><span class="s3">.</span><span class="s1">filename</span><span class="s3">.</span><span class="s1">endswith</span><span class="s3">(</span><span class="s4">&quot;o&quot;</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">filename </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">filename</span><span class="s3">[:-</span><span class="s5">1</span><span class="s3">]</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">handle </span><span class="s3">= </span><span class="s1">win32file</span><span class="s3">.</span><span class="s1">FindFirstChangeNotification</span><span class="s3">(</span>
+            <span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">dirname</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">filename</span><span class="s3">),</span>
+            <span class="s2">False</span><span class="s3">,  </span><span class="s0"># watch tree?</span>
+            <span class="s1">win32con</span><span class="s3">.</span><span class="s1">FILE_NOTIFY_CHANGE_LAST_WRITE</span><span class="s3">,</span>
+        <span class="s3">)</span>
+        <span class="s1">threading</span><span class="s3">.</span><span class="s1">Thread</span><span class="s3">.</span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">run</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">last_time </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">stat</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">filename</span><span class="s3">)[</span><span class="s1">stat</span><span class="s3">.</span><span class="s1">ST_MTIME</span><span class="s3">]</span>
+        <span class="s2">while </span><span class="s5">1</span><span class="s3">:</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s1">rc </span><span class="s3">= </span><span class="s1">win32event</span><span class="s3">.</span><span class="s1">WaitForSingleObject</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">handle</span><span class="s3">, </span><span class="s1">win32event</span><span class="s3">.</span><span class="s1">INFINITE</span><span class="s3">)</span>
+                <span class="s1">win32file</span><span class="s3">.</span><span class="s1">FindNextChangeNotification</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">handle</span><span class="s3">)</span>
+            <span class="s2">except </span><span class="s1">win32event</span><span class="s3">.</span><span class="s1">error </span><span class="s2">as </span><span class="s1">details</span><span class="s3">:</span>
+                <span class="s0"># handle closed - thread should terminate.</span>
+                <span class="s2">if </span><span class="s1">details</span><span class="s3">.</span><span class="s1">winerror </span><span class="s3">!= </span><span class="s1">winerror</span><span class="s3">.</span><span class="s1">ERROR_INVALID_HANDLE</span><span class="s3">:</span>
+                    <span class="s2">raise</span>
+                <span class="s2">break</span>
+            <span class="s1">this_time </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">stat</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">filename</span><span class="s3">)[</span><span class="s1">stat</span><span class="s3">.</span><span class="s1">ST_MTIME</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">this_time </span><span class="s3">!= </span><span class="s1">last_time</span><span class="s3">:</span>
+                <span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;Detected file change - flagging for reload.&quot;</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">change_detected </span><span class="s3">= </span><span class="s2">True</span>
+                <span class="s1">last_time </span><span class="s3">= </span><span class="s1">this_time</span>
+
+    <span class="s2">def </span><span class="s1">stop</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">win32file</span><span class="s3">.</span><span class="s1">FindCloseChangeNotification</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">handle</span><span class="s3">)</span>
+
+
+<span class="s0"># The ISAPI extension - handles requests in our virtual dir, and sends the</span>
+<span class="s0"># response to the client.</span>
+<span class="s2">class </span><span class="s1">Extension</span><span class="s3">(</span><span class="s1">SimpleExtension</span><span class="s3">):</span>
+    <span class="s6">&quot;Python advanced sample Extension&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">reload_watcher </span><span class="s3">= </span><span class="s1">ReloadWatcherThread</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">reload_watcher</span><span class="s3">.</span><span class="s1">start</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">HttpExtensionProc</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">ecb</span><span class="s3">):</span>
+        <span class="s0"># NOTE: If you use a ThreadPoolExtension, you must still perform</span>
+        <span class="s0"># this check in HttpExtensionProc - raising the exception from</span>
+        <span class="s0"># The &quot;Dispatch&quot; method will just cause the exception to be</span>
+        <span class="s0"># rendered to the browser.</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">reload_watcher</span><span class="s3">.</span><span class="s1">change_detected</span><span class="s3">:</span>
+            <span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;Doing reload&quot;</span><span class="s3">)</span>
+            <span class="s2">raise </span><span class="s1">InternalReloadException</span>
+
+        <span class="s1">url </span><span class="s3">= </span><span class="s1">ecb</span><span class="s3">.</span><span class="s1">GetServerVariable</span><span class="s3">(</span><span class="s4">&quot;UNICODE_URL&quot;</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">url</span><span class="s3">.</span><span class="s1">endswith</span><span class="s3">(</span><span class="s4">&quot;ReportUnhealthy&quot;</span><span class="s3">):</span>
+            <span class="s1">ecb</span><span class="s3">.</span><span class="s1">ReportUnhealthy</span><span class="s3">(</span><span class="s4">&quot;I'm a little sick&quot;</span><span class="s3">)</span>
+
+        <span class="s1">ecb</span><span class="s3">.</span><span class="s1">SendResponseHeaders</span><span class="s3">(</span><span class="s4">&quot;200 OK&quot;</span><span class="s3">, </span><span class="s4">&quot;Content-Type: text/html</span><span class="s2">\r\n\r\n</span><span class="s4">&quot;</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+        <span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;&lt;HTML&gt;&lt;BODY&gt;&quot;</span><span class="s3">, </span><span class="s1">file</span><span class="s3">=</span><span class="s1">ecb</span><span class="s3">)</span>
+
+        <span class="s1">qs </span><span class="s3">= </span><span class="s1">ecb</span><span class="s3">.</span><span class="s1">GetServerVariable</span><span class="s3">(</span><span class="s4">&quot;QUERY_STRING&quot;</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">qs</span><span class="s3">:</span>
+            <span class="s1">queries </span><span class="s3">= </span><span class="s1">qs</span><span class="s3">.</span><span class="s1">split</span><span class="s3">(</span><span class="s4">&quot;&amp;&quot;</span><span class="s3">)</span>
+            <span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;&lt;PRE&gt;&quot;</span><span class="s3">, </span><span class="s1">file</span><span class="s3">=</span><span class="s1">ecb</span><span class="s3">)</span>
+            <span class="s2">for </span><span class="s1">q </span><span class="s2">in </span><span class="s1">queries</span><span class="s3">:</span>
+                <span class="s1">val </span><span class="s3">= </span><span class="s1">ecb</span><span class="s3">.</span><span class="s1">GetServerVariable</span><span class="s3">(</span><span class="s1">q</span><span class="s3">, </span><span class="s4">&quot;&amp;lt;no such variable&amp;gt;&quot;</span><span class="s3">)</span>
+                <span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;%s=%r&quot; </span><span class="s3">% (</span><span class="s1">q</span><span class="s3">, </span><span class="s1">val</span><span class="s3">), </span><span class="s1">file</span><span class="s3">=</span><span class="s1">ecb</span><span class="s3">)</span>
+            <span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;&lt;/PRE&gt;&lt;P/&gt;&quot;</span><span class="s3">, </span><span class="s1">file</span><span class="s3">=</span><span class="s1">ecb</span><span class="s3">)</span>
+
+        <span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;This module has been imported&quot;</span><span class="s3">, </span><span class="s1">file</span><span class="s3">=</span><span class="s1">ecb</span><span class="s3">)</span>
+        <span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;%d times&quot; </span><span class="s3">% (</span><span class="s1">reload_counter</span><span class="s3">,), </span><span class="s1">file</span><span class="s3">=</span><span class="s1">ecb</span><span class="s3">)</span>
+        <span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;&lt;/BODY&gt;&lt;/HTML&gt;&quot;</span><span class="s3">, </span><span class="s1">file</span><span class="s3">=</span><span class="s1">ecb</span><span class="s3">)</span>
+        <span class="s1">ecb</span><span class="s3">.</span><span class="s1">close</span><span class="s3">()</span>
+        <span class="s2">return </span><span class="s1">isapicon</span><span class="s3">.</span><span class="s1">HSE_STATUS_SUCCESS</span>
+
+    <span class="s2">def </span><span class="s1">TerminateExtension</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">status</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">reload_watcher</span><span class="s3">.</span><span class="s1">stop</span><span class="s3">()</span>
+
+
+<span class="s0"># The entry points for the ISAPI extension.</span>
+<span class="s2">def </span><span class="s1">__ExtensionFactory__</span><span class="s3">():</span>
+    <span class="s2">return </span><span class="s1">Extension</span><span class="s3">()</span>
+
+
+<span class="s0"># Our special command line customization.</span>
+<span class="s0"># Pre-install hook for our virtual directory.</span>
+<span class="s2">def </span><span class="s1">PreInstallDirectory</span><span class="s3">(</span><span class="s1">params</span><span class="s3">, </span><span class="s1">options</span><span class="s3">):</span>
+    <span class="s0"># If the user used our special '--description' option,</span>
+    <span class="s0"># then we override our default.</span>
+    <span class="s2">if </span><span class="s1">options</span><span class="s3">.</span><span class="s1">description</span><span class="s3">:</span>
+        <span class="s1">params</span><span class="s3">.</span><span class="s1">Description </span><span class="s3">= </span><span class="s1">options</span><span class="s3">.</span><span class="s1">description</span>
+
+
+<span class="s0"># Post install hook for our entire script</span>
+<span class="s2">def </span><span class="s1">PostInstall</span><span class="s3">(</span><span class="s1">params</span><span class="s3">, </span><span class="s1">options</span><span class="s3">):</span>
+    <span class="s1">print</span><span class="s3">()</span>
+    <span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;The sample has been installed.&quot;</span><span class="s3">)</span>
+    <span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;Point your browser to /AdvancedPythonSample&quot;</span><span class="s3">)</span>
+    <span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;If you modify the source file and reload the page,&quot;</span><span class="s3">)</span>
+    <span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;you should see the reload counter increment&quot;</span><span class="s3">)</span>
+
+
+<span class="s0"># Handler for our custom 'status' argument.</span>
+<span class="s2">def </span><span class="s1">status_handler</span><span class="s3">(</span><span class="s1">options</span><span class="s3">, </span><span class="s1">log</span><span class="s3">, </span><span class="s1">arg</span><span class="s3">):</span>
+    <span class="s6">&quot;Query the status of something&quot;</span>
+    <span class="s1">print</span><span class="s3">(</span><span class="s4">&quot;Everything seems to be fine!&quot;</span><span class="s3">)</span>
+
+
+<span class="s1">custom_arg_handlers </span><span class="s3">= {</span><span class="s4">&quot;status&quot;</span><span class="s3">: </span><span class="s1">status_handler</span><span class="s3">}</span>
+
+<span class="s2">if </span><span class="s1">__name__ </span><span class="s3">== </span><span class="s4">&quot;__main__&quot;</span><span class="s3">:</span>
+    <span class="s0"># If run from the command-line, install ourselves.</span>
+    <span class="s2">from </span><span class="s1">isapi</span><span class="s3">.</span><span class="s1">install </span><span class="s2">import </span><span class="s3">*</span>
+
+    <span class="s1">params </span><span class="s3">= </span><span class="s1">ISAPIParameters</span><span class="s3">(</span><span class="s1">PostInstall</span><span class="s3">=</span><span class="s1">PostInstall</span><span class="s3">)</span>
+    <span class="s0"># Setup the virtual directories - this is a list of directories our</span>
+    <span class="s0"># extension uses - in this case only 1.</span>
+    <span class="s0"># Each extension has a &quot;script map&quot; - this is the mapping of ISAPI</span>
+    <span class="s0"># extensions.</span>
+    <span class="s1">sm </span><span class="s3">= [</span><span class="s1">ScriptMapParams</span><span class="s3">(</span><span class="s1">Extension</span><span class="s3">=</span><span class="s4">&quot;*&quot;</span><span class="s3">, </span><span class="s1">Flags</span><span class="s3">=</span><span class="s5">0</span><span class="s3">)]</span>
+    <span class="s1">vd </span><span class="s3">= </span><span class="s1">VirtualDirParameters</span><span class="s3">(</span>
+        <span class="s1">Name</span><span class="s3">=</span><span class="s4">&quot;AdvancedPythonSample&quot;</span><span class="s3">,</span>
+        <span class="s1">Description</span><span class="s3">=</span><span class="s1">Extension</span><span class="s3">.</span><span class="s1">__doc__</span><span class="s3">,</span>
+        <span class="s1">ScriptMaps</span><span class="s3">=</span><span class="s1">sm</span><span class="s3">,</span>
+        <span class="s1">ScriptMapUpdate</span><span class="s3">=</span><span class="s4">&quot;replace&quot;</span><span class="s3">,</span>
+        <span class="s0"># specify the pre-install hook.</span>
+        <span class="s1">PreInstall</span><span class="s3">=</span><span class="s1">PreInstallDirectory</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">params</span><span class="s3">.</span><span class="s1">VirtualDirs </span><span class="s3">= [</span><span class="s1">vd</span><span class="s3">]</span>
+    <span class="s0"># Setup our custom option parser.</span>
+    <span class="s2">from </span><span class="s1">optparse </span><span class="s2">import </span><span class="s1">OptionParser</span>
+
+    <span class="s1">parser </span><span class="s3">= </span><span class="s1">OptionParser</span><span class="s3">(</span><span class="s4">&quot;&quot;</span><span class="s3">)  </span><span class="s0"># blank usage, so isapi sets it.</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_option</span><span class="s3">(</span>
+        <span class="s4">&quot;&quot;</span><span class="s3">,</span>
+        <span class="s4">&quot;--description&quot;</span><span class="s3">,</span>
+        <span class="s1">action</span><span class="s3">=</span><span class="s4">&quot;store&quot;</span><span class="s3">,</span>
+        <span class="s1">help</span><span class="s3">=</span><span class="s4">&quot;custom description to use for the virtual directory&quot;</span><span class="s3">,</span>
+    <span class="s3">)</span>
+
+    <span class="s1">HandleCommandLine</span><span class="s3">(</span>
+        <span class="s1">params</span><span class="s3">, </span><span class="s1">opt_parser</span><span class="s3">=</span><span class="s1">parser</span><span class="s3">, </span><span class="s1">custom_arg_handlers</span><span class="s3">=</span><span class="s1">custom_arg_handlers</span>
+    <span class="s3">)</span>
+</pre>
+</body>
+</html>

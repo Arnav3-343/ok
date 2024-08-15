@@ -1,0 +1,1968 @@
+<html>
+<head>
+<title>_lapack.c</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #6aab73;}
+.s4 { color: #2aacb8;}
+.s5 { color: #cf8e6d;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_lapack.c</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * This file contains wrappers of BLAS and LAPACK functions 
+ */</span>
+<span class="s0">/* 
+ * BLAS calling helpers.  The helpers can be called without the GIL held. 
+ * The caller is responsible for checking arguments (especially dimensions). 
+ */</span>
+
+<span class="s0">/* Fast getters caching the value of a function's address after 
+   the first call to import_cblas_function(). */</span>
+
+<span class="s2">#define </span><span class="s1">EMIT_GET_CBLAS_FUNC(name)                                 \</span>
+    <span class="s2">static void </span><span class="s1">*cblas_ ## name = NULL;                           \</span>
+    <span class="s2">static void </span><span class="s1">*get_cblas_ ## name(</span><span class="s2">void</span><span class="s1">) {                       \</span>
+        <span class="s2">if </span><span class="s1">(cblas_ ## name == NULL) {                             \</span>
+            <span class="s1">PyGILState_STATE st = PyGILState_Ensure();            \</span>
+            <span class="s2">const char </span><span class="s1">*mod = </span><span class="s3">&quot;scipy.linalg.cython_blas&quot;</span><span class="s1">;         \</span>
+            <span class="s1">cblas_ ## name = import_cython_function(mod, # name); \</span>
+            <span class="s1">PyGILState_Release(st);                               \</span>
+        <span class="s1">}                                                         \</span>
+        <span class="s2">return </span><span class="s1">cblas_ ## name;                                    \</span>
+    <span class="s1">}</span>
+
+<span class="s1">EMIT_GET_CBLAS_FUNC(dgemm)</span>
+<span class="s1">EMIT_GET_CBLAS_FUNC(sgemm)</span>
+<span class="s1">EMIT_GET_CBLAS_FUNC(cgemm)</span>
+<span class="s1">EMIT_GET_CBLAS_FUNC(zgemm)</span>
+<span class="s1">EMIT_GET_CBLAS_FUNC(dgemv)</span>
+<span class="s1">EMIT_GET_CBLAS_FUNC(sgemv)</span>
+<span class="s1">EMIT_GET_CBLAS_FUNC(cgemv)</span>
+<span class="s1">EMIT_GET_CBLAS_FUNC(zgemv)</span>
+<span class="s1">EMIT_GET_CBLAS_FUNC(ddot)</span>
+<span class="s1">EMIT_GET_CBLAS_FUNC(sdot)</span>
+<span class="s1">EMIT_GET_CBLAS_FUNC(cdotu)</span>
+<span class="s1">EMIT_GET_CBLAS_FUNC(zdotu)</span>
+<span class="s1">EMIT_GET_CBLAS_FUNC(cdotc)</span>
+<span class="s1">EMIT_GET_CBLAS_FUNC(zdotc)</span>
+<span class="s1">EMIT_GET_CBLAS_FUNC(snrm2)</span>
+<span class="s1">EMIT_GET_CBLAS_FUNC(dnrm2)</span>
+<span class="s1">EMIT_GET_CBLAS_FUNC(scnrm2)</span>
+<span class="s1">EMIT_GET_CBLAS_FUNC(dznrm2)</span>
+
+
+<span class="s2">#undef </span><span class="s1">EMIT_GET_CBLAS_FUNC</span>
+
+<span class="s0">/* 
+ * NOTE: On return value convention. 
+ * For LAPACK wrapper development the following conventions are followed: 
+ * Publicly exposed wrapper functions must return:- 
+ * STATUS_ERROR  : For an unrecoverable error e.g. caught by xerbla, this is so 
+ *                 a Py_FatalError can be raised. 
+ * STATUS_SUCCESS: For successful execution 
+ * +n            : Where n is an integer for a routine specific error 
+ *                 (typically derived from an `info` argument). 
+ * 
+ * The caller is responsible for checking and handling the error status. 
+ */</span>
+
+<span class="s0">/* return STATUS_SUCCESS if everything went ok */</span>
+<span class="s2">#define </span><span class="s1">STATUS_SUCCESS  (</span><span class="s4">0</span><span class="s1">)</span>
+
+<span class="s0">/* return STATUS_ERROR if an unrecoverable error is encountered */</span>
+<span class="s2">#define </span><span class="s1">STATUS_ERROR  (-</span><span class="s4">1</span><span class="s1">)</span>
+
+<span class="s0">/* 
+ * A union of all the types accepted by BLAS/LAPACK for use in cases where 
+ * stack based allocation is needed (typically for work space query args length 
+ * 1). 
+ */</span>
+<span class="s2">typedef union </span><span class="s1">all_dtypes_</span>
+<span class="s1">{</span>
+    <span class="s2">float  </span><span class="s1">s;</span>
+    <span class="s2">double </span><span class="s1">d;</span>
+    <span class="s1">npy_complex64 c;</span>
+    <span class="s1">npy_complex128 z;</span>
+<span class="s1">} all_dtypes;</span>
+
+<span class="s0">/* 
+ * A checked PyMem_RawMalloc, ensures that the var is either NULL 
+ * and an exception is raised, or that the allocation was successful. 
+ * Returns zero on success for status checking. 
+ */</span>
+<span class="s2">static int </span><span class="s1">checked_PyMem_RawMalloc(</span><span class="s2">void</span><span class="s1">** var, size_t bytes)</span>
+<span class="s1">{</span>
+    <span class="s1">*var = NULL;</span>
+    <span class="s1">*var = PyMem_RawMalloc(bytes);</span>
+    <span class="s2">if </span><span class="s1">(!(*var))</span>
+    <span class="s1">{</span>
+        <span class="s1">{</span>
+            <span class="s1">PyGILState_STATE st = PyGILState_Ensure();</span>
+
+            <span class="s1">PyErr_SetString(PyExc_MemoryError,</span>
+                            <span class="s3">&quot;Insufficient memory for buffer allocation</span><span class="s5">\</span>
+                             <span class="s1">required by LAPACK.</span><span class="s3">&quot;);</span>
+            <span class="s1">PyGILState_Release(st);</span>
+        <span class="s1">}</span>
+        <span class="s2">return </span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Checks that the char kind is valid (one of [s,d,c,z]) for use in blas/lapack. 
+ * Returns zero on success for status checking. 
+ */</span>
+<span class="s2">static int </span><span class="s1">check_kind(</span><span class="s2">char </span><span class="s1">kind)</span>
+<span class="s1">{</span>
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">default</span><span class="s1">:</span>
+        <span class="s1">{</span>
+            <span class="s1">PyGILState_STATE st = PyGILState_Ensure();</span>
+            <span class="s1">PyErr_SetString(PyExc_ValueError,</span>
+                            <span class="s3">&quot;invalid data type (kind) found&quot;</span><span class="s1">);</span>
+            <span class="s1">PyGILState_Release(st);</span>
+        <span class="s1">}</span>
+        <span class="s2">return </span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Guard macro for ensuring a valid data &quot;kind&quot; is being used. 
+ * Place at the top of all routines with switches on &quot;kind&quot; that accept 
+ * one of [s,d,c,z]. 
+ */</span>
+<span class="s2">#define </span><span class="s1">ENSURE_VALID_KIND(__KIND) \</span>
+<span class="s2">if </span><span class="s1">(check_kind( __KIND ))         \</span>
+<span class="s1">{                                 \</span>
+    <span class="s2">return </span><span class="s1">STATUS_ERROR;          \</span>
+<span class="s1">}                                 \</span>
+
+<span class="s0">/* 
+ * Checks that the char kind is valid for the real domain (one of [s,d]) 
+ * for use in blas/lapack. 
+ * Returns zero on success for status checking. 
+ */</span>
+<span class="s2">static int </span><span class="s1">check_real_kind(</span><span class="s2">char </span><span class="s1">kind)</span>
+<span class="s1">{</span>
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">default</span><span class="s1">:</span>
+        <span class="s1">{</span>
+            <span class="s1">PyGILState_STATE st = PyGILState_Ensure();</span>
+            <span class="s1">PyErr_SetString(PyExc_ValueError,</span>
+                            <span class="s3">&quot;invalid data type (kind) found&quot;</span><span class="s1">);</span>
+            <span class="s1">PyGILState_Release(st);</span>
+        <span class="s1">}</span>
+        <span class="s2">return </span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Guard macro for ensuring a valid data &quot;kind&quot; is being used for the 
+ * real domain routines. 
+ * Place at the top of all routines with switches on &quot;kind&quot; that accept 
+ * one of [s,d]. 
+ */</span>
+<span class="s2">#define </span><span class="s1">ENSURE_VALID_REAL_KIND(__KIND) \</span>
+<span class="s2">if </span><span class="s1">(check_real_kind( __KIND ))         \</span>
+<span class="s1">{                                      \</span>
+    <span class="s2">return </span><span class="s1">STATUS_ERROR;               \</span>
+<span class="s1">}                                      \</span>
+
+
+<span class="s0">/* 
+ * Checks that the char kind is valid for the complex domain (one of [c,z]) 
+ * for use in blas/lapack. 
+ * Returns zero on success for status checking. 
+ */</span>
+<span class="s2">static int </span><span class="s1">check_complex_kind(</span><span class="s2">char </span><span class="s1">kind)</span>
+<span class="s1">{</span>
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">default</span><span class="s1">:</span>
+        <span class="s1">{</span>
+            <span class="s1">PyGILState_STATE st = PyGILState_Ensure();</span>
+            <span class="s1">PyErr_SetString(PyExc_ValueError,</span>
+                            <span class="s3">&quot;invalid data type (kind) found&quot;</span><span class="s1">);</span>
+            <span class="s1">PyGILState_Release(st);</span>
+        <span class="s1">}</span>
+        <span class="s2">return </span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Guard macro for ensuring a valid data &quot;kind&quot; is being used for the 
+ * real domain routines. 
+ * Place at the top of all routines with switches on &quot;kind&quot; that accept 
+ * one of [c,z]. 
+ */</span>
+<span class="s2">#define </span><span class="s1">ENSURE_VALID_COMPLEX_KIND(__KIND) \</span>
+<span class="s2">if </span><span class="s1">(check_complex_kind( __KIND ))         \</span>
+<span class="s1">{                                         \</span>
+    <span class="s2">return </span><span class="s1">STATUS_ERROR;                  \</span>
+<span class="s1">}                                         \</span>
+
+
+<span class="s0">/* 
+ * Checks that a function is found (i.e. not null) 
+ * Returns zero on success for status checking. 
+ */</span>
+<span class="s2">static int </span><span class="s1">check_func(</span><span class="s2">void </span><span class="s1">*func)</span>
+<span class="s1">{</span>
+    <span class="s2">if </span><span class="s1">(func == NULL)</span>
+    <span class="s1">{</span>
+        <span class="s1">PyGILState_STATE st = PyGILState_Ensure();</span>
+        <span class="s1">PyErr_SetString(PyExc_RuntimeError,</span>
+                        <span class="s3">&quot;Specified LAPACK function could not be found.&quot;</span><span class="s1">);</span>
+        <span class="s1">PyGILState_Release(st);</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">STATUS_SUCCESS;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* 
+ * Guard macro for ensuring a valid function is found. 
+ */</span>
+<span class="s2">#define </span><span class="s1">ENSURE_VALID_FUNC(__FUNC)         \</span>
+<span class="s2">if </span><span class="s1">(check_func(__FUNC))                   \</span>
+<span class="s1">{                                         \</span>
+    <span class="s2">return </span><span class="s1">STATUS_ERROR;                  \</span>
+<span class="s1">}                                         \</span>
+
+
+<span class="s0">/* 
+ * Define what a Fortran &quot;int&quot; is, some LAPACKs have 64 bit integer support 
+ * numba presently opts for a 32 bit C int. 
+ * This definition allows scope for later configuration time magic to adjust 
+ * the size of int at all the call sites. 
+ */</span>
+<span class="s2">#define </span><span class="s1">F_INT </span><span class="s2">int</span>
+
+
+<span class="s2">typedef float </span><span class="s1">(*sdot_t)(F_INT *n, </span><span class="s2">void </span><span class="s1">*dx, F_INT *incx, </span><span class="s2">void </span><span class="s1">*dy, F_INT *incy);</span>
+<span class="s2">typedef double </span><span class="s1">(*ddot_t)(F_INT *n, </span><span class="s2">void </span><span class="s1">*dx, F_INT *incx, </span><span class="s2">void </span><span class="s1">*dy, F_INT</span>
+                         <span class="s1">*incy);</span>
+<span class="s2">typedef </span><span class="s1">npy_complex64 (*cdot_t)(F_INT *n, </span><span class="s2">void </span><span class="s1">*dx, F_INT *incx, </span><span class="s2">void </span><span class="s1">*dy,</span>
+                                <span class="s1">F_INT *incy);</span>
+<span class="s2">typedef </span><span class="s1">npy_complex128 (*zdot_t)(F_INT *n, </span><span class="s2">void </span><span class="s1">*dx, F_INT *incx, </span><span class="s2">void </span><span class="s1">*dy,</span>
+                                 <span class="s1">F_INT *incy);</span>
+
+<span class="s2">typedef void </span><span class="s1">(*xxgemv_t)(</span><span class="s2">char </span><span class="s1">*trans, F_INT *m, F_INT *n,</span>
+                         <span class="s2">void </span><span class="s1">*alpha, </span><span class="s2">void </span><span class="s1">*a, F_INT *lda,</span>
+                         <span class="s2">void </span><span class="s1">*x, F_INT *incx, </span><span class="s2">void </span><span class="s1">*beta,</span>
+                         <span class="s2">void </span><span class="s1">*y, F_INT *incy);</span>
+
+<span class="s2">typedef void </span><span class="s1">(*xxgemm_t)(</span><span class="s2">char </span><span class="s1">*transa, </span><span class="s2">char </span><span class="s1">*transb,</span>
+                         <span class="s1">F_INT *m, F_INT *n, F_INT *k,</span>
+                         <span class="s2">void </span><span class="s1">*alpha, </span><span class="s2">void </span><span class="s1">*a, F_INT *lda,</span>
+                         <span class="s2">void </span><span class="s1">*b, F_INT *ldb, </span><span class="s2">void </span><span class="s1">*beta,</span>
+                         <span class="s2">void </span><span class="s1">*c, F_INT *ldc);</span>
+
+<span class="s2">typedef float </span><span class="s1">(*sxnrm2_t) (F_INT *n, </span><span class="s2">void </span><span class="s1">*x, F_INT *incx);</span>
+<span class="s2">typedef double </span><span class="s1">(*dxnrm2_t) (F_INT *n, </span><span class="s2">void </span><span class="s1">*x, F_INT *incx);</span>
+
+<span class="s0">/* Vector * vector: result = dx * dy */</span>
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">int</span><span class="s1">)</span>
+<span class="s1">numba_xxdot(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">char </span><span class="s1">conjugate, Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*dx, </span><span class="s2">void </span><span class="s1">*dy,</span>
+            <span class="s2">void </span><span class="s1">*result)</span>
+<span class="s1">{</span>
+    <span class="s2">void </span><span class="s1">*raw_func = NULL;</span>
+    <span class="s1">F_INT _n;</span>
+    <span class="s1">F_INT inc = </span><span class="s4">1</span><span class="s1">;</span>
+
+    <span class="s1">ENSURE_VALID_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_cblas_sdot();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_cblas_ddot();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">raw_func = conjugate ? get_cblas_cdotc() : get_cblas_cdotu();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">raw_func = conjugate ? get_cblas_zdotc() : get_cblas_zdotu();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">ENSURE_VALID_FUNC(raw_func)</span>
+
+    <span class="s1">_n = (F_INT) n;</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s1">*(</span><span class="s2">float </span><span class="s1">*) result = (*(sdot_t) raw_func)(&amp;_n, dx, &amp;inc, dy, &amp;inc);;</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s1">*(</span><span class="s2">double </span><span class="s1">*) result = (*(ddot_t) raw_func)(&amp;_n, dx, &amp;inc, dy, &amp;inc);;</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">*(npy_complex64 *) result = (*(cdot_t) raw_func)(&amp;_n, dx, &amp;inc, dy,\</span>
+                                        <span class="s1">&amp;inc);;</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">*(npy_complex128 *) result = (*(zdot_t) raw_func)(&amp;_n, dx, &amp;inc,\</span>
+                                         <span class="s1">dy, &amp;inc);;</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* Matrix * vector: y = alpha * a * x + beta * y */</span>
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">int</span><span class="s1">)</span>
+<span class="s1">numba_xxgemv(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">char </span><span class="s1">trans, Py_ssize_t m, Py_ssize_t n,</span>
+             <span class="s2">void </span><span class="s1">*alpha, </span><span class="s2">void </span><span class="s1">*a, Py_ssize_t lda,</span>
+             <span class="s2">void </span><span class="s1">*x, </span><span class="s2">void </span><span class="s1">*beta, </span><span class="s2">void </span><span class="s1">*y)</span>
+<span class="s1">{</span>
+    <span class="s2">void </span><span class="s1">*raw_func = NULL;</span>
+    <span class="s1">F_INT _m, _n;</span>
+    <span class="s1">F_INT _lda;</span>
+    <span class="s1">F_INT inc = </span><span class="s4">1</span><span class="s1">;</span>
+
+    <span class="s1">ENSURE_VALID_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_cblas_sgemv();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_cblas_dgemv();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_cblas_cgemv();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_cblas_zgemv();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">ENSURE_VALID_FUNC(raw_func)</span>
+
+    <span class="s1">_m = (F_INT) m;</span>
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+
+    <span class="s1">(*(xxgemv_t) raw_func)(&amp;trans, &amp;_m, &amp;_n, alpha, a, &amp;_lda,</span>
+                           <span class="s1">x, &amp;inc, beta, y, &amp;inc);</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* Matrix * matrix: c = alpha * a * b + beta * c */</span>
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">int</span><span class="s1">)</span>
+<span class="s1">numba_xxgemm(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">char </span><span class="s1">transa, </span><span class="s2">char </span><span class="s1">transb,</span>
+             <span class="s1">Py_ssize_t m, Py_ssize_t n, Py_ssize_t k,</span>
+             <span class="s2">void </span><span class="s1">*alpha, </span><span class="s2">void </span><span class="s1">*a, Py_ssize_t lda,</span>
+             <span class="s2">void </span><span class="s1">*b, Py_ssize_t ldb, </span><span class="s2">void </span><span class="s1">*beta,</span>
+             <span class="s2">void </span><span class="s1">*c, Py_ssize_t ldc)</span>
+<span class="s1">{</span>
+    <span class="s2">void </span><span class="s1">*raw_func = NULL;</span>
+    <span class="s1">F_INT _m, _n, _k;</span>
+    <span class="s1">F_INT _lda, _ldb, _ldc;</span>
+
+    <span class="s1">ENSURE_VALID_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_cblas_sgemm();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_cblas_dgemm();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_cblas_cgemm();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_cblas_zgemm();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">ENSURE_VALID_FUNC(raw_func)</span>
+
+    <span class="s1">_m = (F_INT) m;</span>
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_k = (F_INT) k;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+    <span class="s1">_ldb = (F_INT) ldb;</span>
+    <span class="s1">_ldc = (F_INT) ldc;</span>
+
+    <span class="s1">(*(xxgemm_t) raw_func)(&amp;transa, &amp;transb, &amp;_m, &amp;_n, &amp;_k, alpha, a, &amp;_lda,</span>
+                           <span class="s1">b, &amp;_ldb, beta, c, &amp;_ldc);</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* L2-norms */</span>
+<span class="s1">NUMBA_EXPORT_FUNC(F_INT)</span>
+<span class="s1">numba_xxnrm2(</span><span class="s2">char </span><span class="s1">kind, Py_ssize_t n, </span><span class="s2">void </span><span class="s1">* x, Py_ssize_t incx, </span><span class="s2">void </span><span class="s1">* result)</span>
+<span class="s1">{</span>
+    <span class="s2">void </span><span class="s1">*raw_func = NULL;</span>
+    <span class="s1">F_INT _incx;</span>
+    <span class="s1">F_INT _n;</span>
+
+    <span class="s1">ENSURE_VALID_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_cblas_snrm2();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_cblas_dnrm2();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_cblas_scnrm2();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_cblas_dznrm2();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">ENSURE_VALID_FUNC(raw_func)</span>
+
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_incx = (F_INT) incx;</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s1">*(</span><span class="s2">float </span><span class="s1">*) result = (*(sxnrm2_t) raw_func)(&amp;_n, x, &amp;_incx);;</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s1">*(</span><span class="s2">double </span><span class="s1">*) result = (*(dxnrm2_t) raw_func)(&amp;_n, x, &amp;_incx);;</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">*(</span><span class="s2">float </span><span class="s1">*) result = (*(sxnrm2_t) raw_func)(&amp;_n, x, &amp;_incx);;</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">*(</span><span class="s2">double </span><span class="s1">*) result = (*(dxnrm2_t) raw_func)(&amp;_n, x, &amp;_incx);;</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* 
+ * LAPACK calling helpers.  The helpers can be called without the GIL held. 
+ * The caller is responsible for checking arguments (especially dimensions). 
+ */</span>
+
+<span class="s0">/* Fast getters caching the value of a function's address after 
+   the first call to import_clapack_function(). */</span>
+
+<span class="s2">#define </span><span class="s1">EMIT_GET_CLAPACK_FUNC(name)                                 \</span>
+    <span class="s2">static void </span><span class="s1">*clapack_ ## name = NULL;                           \</span>
+    <span class="s2">static void </span><span class="s1">*get_clapack_ ## name(</span><span class="s2">void</span><span class="s1">) {                       \</span>
+        <span class="s2">if </span><span class="s1">(clapack_ ## name == NULL) {                             \</span>
+            <span class="s1">PyGILState_STATE st = PyGILState_Ensure();              \</span>
+            <span class="s2">const char </span><span class="s1">*mod = </span><span class="s3">&quot;scipy.linalg.cython_lapack&quot;</span><span class="s1">;         \</span>
+            <span class="s1">clapack_ ## name = import_cython_function(mod, # name); \</span>
+            <span class="s1">PyGILState_Release(st);                                 \</span>
+        <span class="s1">}                                                           \</span>
+        <span class="s2">return </span><span class="s1">clapack_ ## name;                                    \</span>
+    <span class="s1">}</span>
+
+<span class="s0">/* Computes an LU factorization of a general M-by-N matrix A 
+ * using partial pivoting with row interchanges. 
+ */</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(sgetrf)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(dgetrf)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(cgetrf)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(zgetrf)</span>
+
+<span class="s0">/* Computes the inverse of a matrix using the LU factorization 
+ * computed by xGETRF. 
+ */</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(sgetri)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(dgetri)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(cgetri)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(zgetri)</span>
+
+<span class="s0">/* Compute Cholesky factorizations */</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(spotrf)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(dpotrf)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(cpotrf)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(zpotrf)</span>
+
+<span class="s0">/* Computes for an N-by-N real nonsymmetric matrix A, the 
+ * eigenvalues and, optionally, the left and/or right eigenvectors. 
+ */</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(sgeev)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(dgeev)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(cgeev)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(zgeev)</span>
+
+<span class="s0">/* Computes for an N-by-N Hermitian matrix A, the 
+ * eigenvalues and, optionally, the left and/or right eigenvectors. 
+ */</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(ssyevd)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(dsyevd)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(cheevd)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(zheevd)</span>
+
+<span class="s0">/* Computes generalised SVD */</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(sgesdd)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(dgesdd)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(cgesdd)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(zgesdd)</span>
+
+<span class="s0">/* Computes QR decompositions */</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(sgeqrf)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(dgeqrf)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(cgeqrf)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(zgeqrf)</span>
+
+<span class="s0">/* Computes columns of Q from elementary reflectors produced by xgeqrf() (QR). 
+ */</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(sorgqr)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(dorgqr)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(cungqr)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(zungqr)</span>
+
+<span class="s0">/* Computes the minimum norm solution to linear least squares problems */</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(sgelsd)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(dgelsd)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(cgelsd)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(zgelsd)</span>
+
+<span class="s0">// Computes the solution to a system of linear equations</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(sgesv)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(dgesv)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(cgesv)</span>
+<span class="s1">EMIT_GET_CLAPACK_FUNC(zgesv)</span>
+
+
+<span class="s2">#undef </span><span class="s1">EMIT_GET_CLAPACK_FUNC</span>
+
+<span class="s2">typedef void </span><span class="s1">(*xxgetrf_t)(F_INT *m, F_INT *n, </span><span class="s2">void </span><span class="s1">*a, F_INT *lda, F_INT *ipiv,</span>
+                          <span class="s1">F_INT *info);</span>
+
+<span class="s2">typedef void </span><span class="s1">(*xxgetri_t)(F_INT *n, </span><span class="s2">void </span><span class="s1">*a, F_INT *lda, F_INT *ipiv, </span><span class="s2">void</span>
+                          <span class="s1">*work, F_INT *lwork, F_INT *info);</span>
+
+<span class="s2">typedef void </span><span class="s1">(*xxpotrf_t)(</span><span class="s2">char </span><span class="s1">*uplo, F_INT *n, </span><span class="s2">void </span><span class="s1">*a, F_INT *lda, F_INT</span>
+                          <span class="s1">*info);</span>
+
+<span class="s2">typedef void </span><span class="s1">(*rgeev_t)(</span><span class="s2">char </span><span class="s1">*jobvl, </span><span class="s2">char </span><span class="s1">*jobvr, F_INT *n, </span><span class="s2">void </span><span class="s1">*a, F_INT *lda,</span>
+                        <span class="s2">void </span><span class="s1">*wr, </span><span class="s2">void </span><span class="s1">*wi, </span><span class="s2">void </span><span class="s1">*vl, F_INT *ldvl, </span><span class="s2">void </span><span class="s1">*vr,</span>
+                        <span class="s1">F_INT *ldvr, </span><span class="s2">void </span><span class="s1">*work, F_INT *lwork, F_INT *info);</span>
+
+<span class="s2">typedef void </span><span class="s1">(*cgeev_t)(</span><span class="s2">char </span><span class="s1">*jobvl, </span><span class="s2">char </span><span class="s1">*jobvr, F_INT *n, </span><span class="s2">void </span><span class="s1">*a, F_INT</span>
+                        <span class="s1">*lda, </span><span class="s2">void </span><span class="s1">*w, </span><span class="s2">void </span><span class="s1">*vl, F_INT *ldvl, </span><span class="s2">void </span><span class="s1">*vr,</span>
+                        <span class="s1">F_INT *ldvr, </span><span class="s2">void </span><span class="s1">*work, F_INT *lwork, </span><span class="s2">void </span><span class="s1">*rwork,</span>
+                        <span class="s1">F_INT *info);</span>
+
+<span class="s2">typedef void </span><span class="s1">(*rgesdd_t)(</span><span class="s2">char </span><span class="s1">*jobz, F_INT *m, F_INT *n, </span><span class="s2">void </span><span class="s1">*a, F_INT *lda,</span>
+                         <span class="s2">void </span><span class="s1">*s, </span><span class="s2">void </span><span class="s1">*u, F_INT *ldu, </span><span class="s2">void </span><span class="s1">*vt, F_INT *ldvt,</span>
+                         <span class="s2">void </span><span class="s1">*work, F_INT *lwork, F_INT *iwork, F_INT *info);</span>
+
+<span class="s2">typedef void </span><span class="s1">(*cgesdd_t)(</span><span class="s2">char </span><span class="s1">*jobz, F_INT *m, F_INT *n, </span><span class="s2">void </span><span class="s1">*a, F_INT *lda,</span>
+                         <span class="s2">void </span><span class="s1">*s, </span><span class="s2">void </span><span class="s1">* u, F_INT *ldu, </span><span class="s2">void </span><span class="s1">* vt, F_INT *ldvt,</span>
+                         <span class="s2">void </span><span class="s1">*work, F_INT *lwork, </span><span class="s2">void </span><span class="s1">*rwork, F_INT *iwork,</span>
+                         <span class="s1">F_INT *info);</span>
+
+<span class="s2">typedef void </span><span class="s1">(*xsyevd_t)(</span><span class="s2">char </span><span class="s1">*jobz, </span><span class="s2">char </span><span class="s1">*uplo, F_INT *n, </span><span class="s2">void </span><span class="s1">*a, F_INT *lda,</span>
+                         <span class="s2">void </span><span class="s1">*w, </span><span class="s2">void </span><span class="s1">*work, F_INT *lwork, F_INT *iwork,</span>
+                         <span class="s1">F_INT *liwork, F_INT *info);</span>
+
+<span class="s2">typedef void </span><span class="s1">(*xheevd_t)(</span><span class="s2">char </span><span class="s1">*jobz, </span><span class="s2">char </span><span class="s1">*uplo, F_INT *n, </span><span class="s2">void </span><span class="s1">*a, F_INT *lda,</span>
+                         <span class="s2">void </span><span class="s1">*w, </span><span class="s2">void </span><span class="s1">*work, F_INT *lwork, </span><span class="s2">void </span><span class="s1">*rwork,</span>
+                         <span class="s1">F_INT *lrwork, F_INT *iwork, F_INT *liwork,</span>
+                         <span class="s1">F_INT *info);</span>
+
+<span class="s2">typedef void </span><span class="s1">(*xgeqrf_t)(F_INT *m, F_INT *n, </span><span class="s2">void </span><span class="s1">*a, F_INT *lda, </span><span class="s2">void </span><span class="s1">*tau,</span>
+                         <span class="s2">void </span><span class="s1">*work, F_INT *lwork, F_INT *info);</span>
+
+<span class="s2">typedef void </span><span class="s1">(*xxxgqr_t)(F_INT *m, F_INT *n, F_INT *k, </span><span class="s2">void </span><span class="s1">*a, F_INT *lda,</span>
+                         <span class="s2">void </span><span class="s1">*tau, </span><span class="s2">void </span><span class="s1">*work, F_INT *lwork, F_INT *info);</span>
+
+<span class="s2">typedef void </span><span class="s1">(*rgelsd_t)(F_INT *m, F_INT *n, F_INT *nrhs, </span><span class="s2">void </span><span class="s1">*a, F_INT *lda,</span>
+                         <span class="s2">void </span><span class="s1">*b, F_INT *ldb, </span><span class="s2">void </span><span class="s1">*s, </span><span class="s2">void </span><span class="s1">*rcond, F_INT *rank,</span>
+                         <span class="s2">void </span><span class="s1">*work, F_INT *lwork, F_INT *iwork, F_INT *info);</span>
+
+<span class="s2">typedef void </span><span class="s1">(*cgelsd_t)(F_INT *m, F_INT *n, F_INT *nrhs, </span><span class="s2">void </span><span class="s1">*a, F_INT *lda,</span>
+                         <span class="s2">void </span><span class="s1">*b, F_INT *ldb, </span><span class="s2">void </span><span class="s1">*s, </span><span class="s2">void </span><span class="s1">*rcond, F_INT *rank,</span>
+                         <span class="s2">void </span><span class="s1">*work, F_INT *lwork, </span><span class="s2">void </span><span class="s1">*rwork, F_INT *iwork,</span>
+                         <span class="s1">F_INT *info);</span>
+
+<span class="s2">typedef void </span><span class="s1">(*xgesv_t)(F_INT *n, F_INT *nrhs, </span><span class="s2">void </span><span class="s1">*a, F_INT *lda, F_INT *ipiv,</span>
+                        <span class="s2">void </span><span class="s1">*b, F_INT *ldb, F_INT *info);</span>
+
+
+
+<span class="s0">/* 
+ * kind_size() 
+ * gets the data size appropriate for a specified kind. 
+ * 
+ * Input: 
+ * kind - the kind, one of: 
+ *         (s, d, c, z) = (float, double, complex, double complex). 
+ * 
+ * Returns: 
+ * data_size - the appropriate data size. 
+ * 
+ */</span>
+<span class="s2">static </span><span class="s1">size_t kind_size(</span><span class="s2">char </span><span class="s1">kind)</span>
+<span class="s1">{</span>
+    <span class="s1">size_t data_size = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s1">data_size  = </span><span class="s2">sizeof</span><span class="s1">(</span><span class="s2">float</span><span class="s1">);</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s1">data_size  = </span><span class="s2">sizeof</span><span class="s1">(</span><span class="s2">double</span><span class="s1">);</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">data_size  = </span><span class="s2">sizeof</span><span class="s1">(npy_complex64);</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">data_size  = </span><span class="s2">sizeof</span><span class="s1">(npy_complex128);</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">data_size;</span>
+
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * underlying_float_kind() 
+ * gets the underlying float kind for a given kind. 
+ * 
+ * Input: 
+ * kind - the kind, one of: 
+ *         (s, d, c, z) = (float, double, complex, double complex). 
+ * 
+ * Returns: 
+ * underlying_float_kind - the underlying float kind, one of: 
+ *         (s, d) = (float, double). 
+ * 
+ * This function essentially provides a map between the char kind 
+ * of a type and the char kind of the underlying float used in the 
+ * type. Essentially: 
+ * --------------- 
+ * Input -&gt; Output 
+ * --------------- 
+ *     s -&gt; s 
+ *     d -&gt; d 
+ *     c -&gt; s 
+ *     z -&gt; d 
+ * --------------- 
+ * 
+ */</span>
+<span class="s2">static char </span><span class="s1">underlying_float_kind(</span><span class="s2">char </span><span class="s1">kind)</span>
+<span class="s1">{</span>
+    <span class="s2">switch</span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s3">'s'</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s3">'d'</span><span class="s1">;</span>
+        <span class="s2">default</span><span class="s1">:</span>
+        <span class="s1">{</span>
+            <span class="s1">PyGILState_STATE st = PyGILState_Ensure();</span>
+            <span class="s1">PyErr_SetString(PyExc_ValueError,</span>
+                            <span class="s3">&quot;invalid kind in underlying_float_kind()&quot;</span><span class="s1">);</span>
+            <span class="s1">PyGILState_Release(st);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">-</span><span class="s4">1</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * cast_from_X() 
+ * cast from a kind (s, d, c, z) = (float, double, complex, double complex) 
+ * to a Fortran integer. 
+ * 
+ * Parameters: 
+ * kind the kind of val 
+ * val  a pointer to the value to cast 
+ * 
+ * Returns: 
+ * A Fortran int from a cast of val (in complex case, takes the real part). 
+ * 
+ * Struct access via non c99 (python only) cmplx types, used for compatibility. 
+ */</span>
+<span class="s2">static </span><span class="s1">F_INT</span>
+<span class="s1">cast_from_X(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">void </span><span class="s1">*val)</span>
+<span class="s1">{</span>
+    <span class="s2">switch</span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">(F_INT)(*((</span><span class="s2">float </span><span class="s1">*) val));</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">(F_INT)(*((</span><span class="s2">double </span><span class="s1">*) val));</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">(F_INT)crealf(*((_complex_float_t *)val));</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">(F_INT)creal(*((_complex_double_t *)val));</span>
+        <span class="s2">default</span><span class="s1">:</span>
+        <span class="s1">{</span>
+            <span class="s1">PyGILState_STATE st = PyGILState_Ensure();</span>
+            <span class="s1">PyErr_SetString(PyExc_ValueError,</span>
+                            <span class="s3">&quot;invalid kind in cast&quot;</span><span class="s1">);</span>
+            <span class="s1">PyGILState_Release(st);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">-</span><span class="s4">1</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+
+<span class="s2">#define </span><span class="s1">CATCH_LAPACK_INVALID_ARG(__routine, info)                      \</span>
+    <span class="s2">do </span><span class="s1">{                                                               \</span>
+        <span class="s2">if </span><span class="s1">(info &lt; </span><span class="s4">0</span><span class="s1">) {                                                \</span>
+            <span class="s1">PyGILState_STATE st = PyGILState_Ensure();                 \</span>
+            <span class="s1">PyErr_Format(PyExc_RuntimeError,                           \</span>
+                 <span class="s3">&quot;LAPACK Error: Routine &quot; </span><span class="s1">#__routine </span><span class="s3">&quot;. On input %d</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">,\</span>
+                  <span class="s1">-(</span><span class="s2">int</span><span class="s1">) info);                                        \</span>
+            <span class="s1">PyGILState_Release(st);                                    \</span>
+            <span class="s2">return </span><span class="s1">STATUS_ERROR;                                       \</span>
+        <span class="s1">}                                                              \</span>
+    <span class="s1">} </span><span class="s2">while</span><span class="s1">(</span><span class="s4">0</span><span class="s1">)</span>
+
+<span class="s0">/* Compute LU decomposition of A 
+ * NOTE: ipiv is an array of Fortran integers allocated by the caller, 
+ * which is therefore expected to use the right dtype. 
+ */</span>
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">int</span><span class="s1">)</span>
+<span class="s1">numba_xxgetrf(</span><span class="s2">char </span><span class="s1">kind, Py_ssize_t m, Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a, Py_ssize_t lda,</span>
+              <span class="s1">F_INT *ipiv)</span>
+<span class="s1">{</span>
+    <span class="s2">void </span><span class="s1">*raw_func = NULL;</span>
+    <span class="s1">F_INT _m, _n, _lda, info;</span>
+
+    <span class="s1">ENSURE_VALID_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_sgetrf();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_dgetrf();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_cgetrf();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_zgetrf();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">ENSURE_VALID_FUNC(raw_func)</span>
+
+    <span class="s1">_m = (F_INT) m;</span>
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+
+    <span class="s1">(*(xxgetrf_t) raw_func)(&amp;_m, &amp;_n, a, &amp;_lda, ipiv, &amp;info);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;xxgetrf&quot;</span><span class="s1">, info);</span>
+
+    <span class="s2">return </span><span class="s1">(</span><span class="s2">int</span><span class="s1">)info;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* Compute the inverse of a matrix given its LU decomposition 
+ * Args are as per LAPACK. 
+ */</span>
+<span class="s2">static int</span>
+<span class="s1">numba_raw_xxgetri(</span><span class="s2">char </span><span class="s1">kind, F_INT n, </span><span class="s2">void </span><span class="s1">*a, F_INT lda,</span>
+                  <span class="s1">F_INT *ipiv, </span><span class="s2">void </span><span class="s1">*work, F_INT *lwork, F_INT *info)</span>
+<span class="s1">{</span>
+    <span class="s2">void </span><span class="s1">*raw_func = NULL;</span>
+
+    <span class="s1">ENSURE_VALID_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_sgetri();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_dgetri();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_cgetri();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_zgetri();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">ENSURE_VALID_FUNC(raw_func)</span>
+
+    <span class="s1">(*(xxgetri_t) raw_func)(&amp;n, a, &amp;lda, ipiv, work, lwork, info);</span>
+
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* Compute the inverse of a matrix from the factorization provided by 
+ * xxgetrf. (see numba_xxgetrf() about ipiv) 
+ * Args are as per LAPACK. 
+ */</span>
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">int</span><span class="s1">)</span>
+<span class="s1">numba_ez_xxgetri(</span><span class="s2">char </span><span class="s1">kind, Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a, Py_ssize_t lda,</span>
+                 <span class="s1">F_INT *ipiv)</span>
+<span class="s1">{</span>
+    <span class="s1">F_INT _n, _lda;</span>
+    <span class="s1">F_INT lwork = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">F_INT info = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">size_t base_size = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s2">void </span><span class="s1">* work = NULL;</span>
+    <span class="s1">all_dtypes stack_slot;</span>
+
+    <span class="s1">ENSURE_VALID_KIND(kind)</span>
+
+    <span class="s1">_n = (F_INT)n;</span>
+    <span class="s1">_lda = (F_INT)lda;</span>
+
+    <span class="s1">base_size = kind_size(kind);</span>
+
+    <span class="s1">work = &amp;stack_slot;</span>
+
+    <span class="s1">numba_raw_xxgetri(kind, _n, a, _lda, ipiv, work, &amp;lwork, &amp;info);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;xxgetri&quot;</span><span class="s1">, info);</span>
+
+    <span class="s1">lwork = cast_from_X(kind, work);</span>
+
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc(&amp;work, base_size * lwork))</span>
+    <span class="s1">{</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">numba_raw_xxgetri(kind, _n, a, _lda, ipiv, work, &amp;lwork, &amp;info);</span>
+    <span class="s1">PyMem_RawFree(work);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;xxgetri&quot;</span><span class="s1">, info);</span>
+
+    <span class="s2">return </span><span class="s1">(</span><span class="s2">int</span><span class="s1">)info;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* Compute the Cholesky factorization of a matrix. */</span>
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">int</span><span class="s1">)</span>
+<span class="s1">numba_xxpotrf(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">char </span><span class="s1">uplo, Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a, Py_ssize_t lda)</span>
+<span class="s1">{</span>
+    <span class="s2">void </span><span class="s1">*raw_func = NULL;</span>
+    <span class="s1">F_INT _n, _lda, info;</span>
+
+    <span class="s1">ENSURE_VALID_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_spotrf();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_dpotrf();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_cpotrf();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_zpotrf();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">ENSURE_VALID_FUNC(raw_func)</span>
+
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+
+    <span class="s1">(*(xxpotrf_t) raw_func)(&amp;uplo, &amp;_n, a, &amp;_lda, &amp;info);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;xxpotrf&quot;</span><span class="s1">, info);</span>
+    <span class="s2">return </span><span class="s1">(</span><span class="s2">int</span><span class="s1">)info;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* real space eigen systems info from dgeev/sgeev */</span>
+<span class="s2">static int</span>
+<span class="s1">numba_raw_rgeev(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">char </span><span class="s1">jobvl, </span><span class="s2">char </span><span class="s1">jobvr,</span>
+                <span class="s1">Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a, Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*wr, </span><span class="s2">void </span><span class="s1">*wi,</span>
+                <span class="s2">void </span><span class="s1">*vl, Py_ssize_t ldvl, </span><span class="s2">void </span><span class="s1">*vr, Py_ssize_t ldvr,</span>
+                <span class="s2">void </span><span class="s1">*work, Py_ssize_t lwork, F_INT *info)</span>
+<span class="s1">{</span>
+    <span class="s2">void </span><span class="s1">*raw_func = NULL;</span>
+    <span class="s1">F_INT _n, _lda, _ldvl, _ldvr, _lwork;</span>
+
+    <span class="s1">ENSURE_VALID_REAL_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_sgeev();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_dgeev();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">ENSURE_VALID_FUNC(raw_func)</span>
+
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+    <span class="s1">_ldvl = (F_INT) ldvl;</span>
+    <span class="s1">_ldvr = (F_INT) ldvr;</span>
+    <span class="s1">_lwork = (F_INT) lwork;</span>
+
+    <span class="s1">(*(rgeev_t) raw_func)(&amp;jobvl, &amp;jobvr, &amp;_n, a, &amp;_lda, wr, wi, vl, &amp;_ldvl, vr,</span>
+                          <span class="s1">&amp;_ldvr, work, &amp;_lwork, info);</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* Real space eigen systems info from dgeev/sgeev 
+ * as numba_raw_rgeev but the allocation and error handling is done for the user. 
+ * Args are as per LAPACK. 
+ */</span>
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">int</span><span class="s1">)</span>
+<span class="s1">numba_ez_rgeev(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">char </span><span class="s1">jobvl, </span><span class="s2">char </span><span class="s1">jobvr, Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a,</span>
+               <span class="s1">Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*wr, </span><span class="s2">void </span><span class="s1">*wi, </span><span class="s2">void </span><span class="s1">*vl, Py_ssize_t ldvl,</span>
+               <span class="s2">void </span><span class="s1">*vr, Py_ssize_t ldvr)</span>
+<span class="s1">{</span>
+    <span class="s1">F_INT info = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">F_INT lwork = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">F_INT _n, _lda, _ldvl, _ldvr;</span>
+    <span class="s1">size_t base_size = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s2">void </span><span class="s1">* work = NULL;</span>
+    <span class="s1">all_dtypes stack_slot;</span>
+
+    <span class="s1">ENSURE_VALID_REAL_KIND(kind)</span>
+
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+    <span class="s1">_ldvl = (F_INT) ldvl;</span>
+    <span class="s1">_ldvr = (F_INT) ldvr;</span>
+
+    <span class="s1">base_size = kind_size(kind);</span>
+
+    <span class="s1">work = &amp;stack_slot;</span>
+    <span class="s1">numba_raw_rgeev(kind, jobvl, jobvr, _n, a, _lda, wr, wi, vl, _ldvl,</span>
+                    <span class="s1">vr, _ldvr, work, lwork, &amp;info);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_rgeev&quot;</span><span class="s1">, info);</span>
+
+    <span class="s1">lwork = cast_from_X(kind, work);</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc(&amp;work, base_size * lwork))</span>
+    <span class="s1">{</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+    <span class="s1">}</span>
+    <span class="s1">numba_raw_rgeev(kind, jobvl, jobvr, _n, a, _lda, wr, wi, vl, _ldvl,</span>
+                    <span class="s1">vr, _ldvr, work, lwork, &amp;info);</span>
+    <span class="s1">PyMem_RawFree(work);</span>
+
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_rgeev&quot;</span><span class="s1">, info);</span>
+
+    <span class="s2">return </span><span class="s1">(</span><span class="s2">int</span><span class="s1">)info;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* Complex space eigen systems info from cgeev/zgeev 
+ * Args are as per LAPACK. 
+ */</span>
+<span class="s2">static int</span>
+<span class="s1">numba_raw_cgeev(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">char </span><span class="s1">jobvl, </span><span class="s2">char </span><span class="s1">jobvr,</span>
+                <span class="s1">Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a, Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*w, </span><span class="s2">void </span><span class="s1">*vl,</span>
+                <span class="s1">Py_ssize_t ldvl, </span><span class="s2">void </span><span class="s1">*vr, Py_ssize_t ldvr, </span><span class="s2">void </span><span class="s1">*work,</span>
+                <span class="s1">Py_ssize_t lwork, </span><span class="s2">void </span><span class="s1">*rwork, F_INT *info)</span>
+<span class="s1">{</span>
+    <span class="s2">void </span><span class="s1">*raw_func = NULL;</span>
+    <span class="s1">F_INT _n, _lda, _ldvl, _ldvr, _lwork;</span>
+
+    <span class="s1">ENSURE_VALID_COMPLEX_KIND(kind)</span>
+
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+    <span class="s1">_ldvl = (F_INT) ldvl;</span>
+    <span class="s1">_ldvr = (F_INT) ldvr;</span>
+    <span class="s1">_lwork = (F_INT) lwork;</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_cgeev();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_zgeev();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">ENSURE_VALID_FUNC(raw_func)</span>
+
+    <span class="s1">(*(cgeev_t) raw_func)(&amp;jobvl, &amp;jobvr, &amp;_n, a, &amp;_lda, w, vl, &amp;_ldvl, vr,</span>
+                          <span class="s1">&amp;_ldvr, work, &amp;_lwork, rwork, info);</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* Complex space eigen systems info from cgeev/zgeev 
+ * as numba_raw_cgeev but the allocation and error handling is done for the user. 
+ * Args are as per LAPACK. 
+ */</span>
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">int</span><span class="s1">)</span>
+<span class="s1">numba_ez_cgeev(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">char </span><span class="s1">jobvl, </span><span class="s2">char </span><span class="s1">jobvr,  Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a,</span>
+               <span class="s1">Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*w, </span><span class="s2">void </span><span class="s1">*vl, Py_ssize_t ldvl, </span><span class="s2">void </span><span class="s1">*vr,</span>
+               <span class="s1">Py_ssize_t ldvr)</span>
+<span class="s1">{</span>
+    <span class="s1">F_INT info = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">F_INT lwork = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">F_INT _n, _lda, _ldvl, _ldvr;</span>
+    <span class="s1">size_t base_size = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">all_dtypes stack_slot, wk;</span>
+    <span class="s2">void </span><span class="s1">* work = NULL;</span>
+    <span class="s2">void </span><span class="s1">* rwork = (</span><span class="s2">void </span><span class="s1">*)&amp;wk;</span>
+
+    <span class="s1">ENSURE_VALID_COMPLEX_KIND(kind)</span>
+
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+    <span class="s1">_ldvl = (F_INT) ldvl;</span>
+    <span class="s1">_ldvr = (F_INT) ldvr;</span>
+
+    <span class="s1">base_size = kind_size(kind);</span>
+
+    <span class="s1">work = &amp;stack_slot;</span>
+    <span class="s1">numba_raw_cgeev(kind, jobvl, jobvr, n, a, lda, w, vl, ldvl,</span>
+                    <span class="s1">vr, ldvr, work, lwork, rwork, &amp;info);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_cgeev&quot;</span><span class="s1">, info);</span>
+
+    <span class="s1">lwork = cast_from_X(kind, work);</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc((</span><span class="s2">void</span><span class="s1">**)&amp;rwork, </span><span class="s4">2</span><span class="s1">*n*base_size))</span>
+    <span class="s1">{</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc(&amp;work, base_size * lwork))</span>
+    <span class="s1">{</span>
+        <span class="s1">PyMem_RawFree(rwork);</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+    <span class="s1">}</span>
+    <span class="s1">numba_raw_cgeev(kind, jobvl, jobvr, _n, a, _lda, w, vl, _ldvl,</span>
+                    <span class="s1">vr, _ldvr, work, lwork, rwork, &amp;info);</span>
+    <span class="s1">PyMem_RawFree(work);</span>
+    <span class="s1">PyMem_RawFree(rwork);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_cgeev&quot;</span><span class="s1">, info);</span>
+
+    <span class="s2">return </span><span class="s1">(</span><span class="s2">int</span><span class="s1">)info;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* real space symmetric eigen systems info from ssyevd/dsyevd */</span>
+<span class="s2">static int</span>
+<span class="s1">numba_raw_rsyevd(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">char </span><span class="s1">jobz, </span><span class="s2">char </span><span class="s1">uplo, Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a,</span>
+                 <span class="s1">Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*w, </span><span class="s2">void </span><span class="s1">*work, Py_ssize_t lwork,</span>
+                 <span class="s1">F_INT *iwork, Py_ssize_t liwork, F_INT *info)</span>
+<span class="s1">{</span>
+    <span class="s2">void </span><span class="s1">*raw_func = NULL;</span>
+    <span class="s1">F_INT _n, _lda, _lwork, _liwork;</span>
+
+    <span class="s1">ENSURE_VALID_REAL_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_ssyevd();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_dsyevd();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">ENSURE_VALID_FUNC(raw_func)</span>
+
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+    <span class="s1">_lwork = (F_INT) lwork;</span>
+    <span class="s1">_liwork = (F_INT) liwork;</span>
+
+    <span class="s1">(*(xsyevd_t) raw_func)(&amp;jobz, &amp;uplo, &amp;_n, a, &amp;_lda, w, work, &amp;_lwork, iwork, &amp;_liwork, info);</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* Real space eigen systems info from dsyevd/ssyevd 
+ * as numba_raw_rsyevd but the allocation and error handling is done for the user. 
+ * Args are as per LAPACK. 
+ */</span>
+<span class="s2">static int</span>
+<span class="s1">numba_ez_rsyevd(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">char </span><span class="s1">jobz, </span><span class="s2">char </span><span class="s1">uplo, Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a, Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*w)</span>
+<span class="s1">{</span>
+    <span class="s1">F_INT info = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">F_INT lwork = -</span><span class="s4">1</span><span class="s1">, liwork=-</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">F_INT _n, _lda;</span>
+    <span class="s1">size_t base_size = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s2">void </span><span class="s1">*work = NULL;</span>
+    <span class="s1">F_INT *iwork = NULL;</span>
+    <span class="s1">all_dtypes stack_slot;</span>
+    <span class="s2">int </span><span class="s1">stack_int = -</span><span class="s4">1</span><span class="s1">;</span>
+
+    <span class="s1">ENSURE_VALID_REAL_KIND(kind)</span>
+
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+
+    <span class="s1">base_size = kind_size(kind);</span>
+
+    <span class="s1">work = &amp;stack_slot;</span>
+    <span class="s1">iwork = &amp;stack_int;</span>
+    <span class="s1">numba_raw_rsyevd(kind, jobz, uplo, _n, a, _lda, w, work, lwork, iwork, liwork, &amp;info);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_rsyevd&quot;</span><span class="s1">, info);</span>
+
+    <span class="s1">lwork = cast_from_X(kind, work);</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc(&amp;work, base_size * lwork))</span>
+    <span class="s1">{</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+    <span class="s1">}</span>
+    <span class="s1">liwork = *iwork;</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc((</span><span class="s2">void</span><span class="s1">**)&amp;iwork, base_size * liwork))</span>
+    <span class="s1">{</span>
+        <span class="s1">PyMem_RawFree(work);</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+    <span class="s1">}</span>
+    <span class="s1">numba_raw_rsyevd(kind, jobz, uplo, _n, a, _lda, w, work, lwork, iwork, liwork, &amp;info);</span>
+    <span class="s1">PyMem_RawFree(work);</span>
+    <span class="s1">PyMem_RawFree(iwork);</span>
+
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_rsyevd&quot;</span><span class="s1">, info);</span>
+
+    <span class="s2">return </span><span class="s1">(</span><span class="s2">int</span><span class="s1">)info;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* complex space symmetric eigen systems info from cheevd/zheevd*/</span>
+<span class="s2">static int</span>
+<span class="s1">numba_raw_cheevd(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">char </span><span class="s1">jobz, </span><span class="s2">char </span><span class="s1">uplo, Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a,</span>
+                 <span class="s1">Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*w, </span><span class="s2">void </span><span class="s1">*work, Py_ssize_t lwork,</span>
+                 <span class="s2">void </span><span class="s1">*rwork, Py_ssize_t lrwork, F_INT *iwork,</span>
+                 <span class="s1">Py_ssize_t liwork, F_INT *info)</span>
+<span class="s1">{</span>
+    <span class="s2">void </span><span class="s1">*raw_func = NULL;</span>
+    <span class="s1">F_INT _n, _lda, _lwork, _lrwork, _liwork;</span>
+
+    <span class="s1">ENSURE_VALID_COMPLEX_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_cheevd();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_zheevd();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">ENSURE_VALID_FUNC(raw_func)</span>
+
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+    <span class="s1">_lwork = (F_INT) lwork;</span>
+    <span class="s1">_lrwork = (F_INT) lrwork;</span>
+    <span class="s1">_liwork = (F_INT) liwork;</span>
+
+    <span class="s1">(*(xheevd_t) raw_func)(&amp;jobz, &amp;uplo, &amp;_n, a, &amp;_lda, w, work, &amp;_lwork, rwork, &amp;_lrwork, iwork, &amp;_liwork, info);</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* complex space eigen systems info from cheevd/zheevd 
+ * as numba_raw_cheevd but the allocation and error handling is done for the user. 
+ * Args are as per LAPACK. 
+ */</span>
+<span class="s2">static int</span>
+<span class="s1">numba_ez_cheevd(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">char </span><span class="s1">jobz, </span><span class="s2">char </span><span class="s1">uplo, Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a, Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*w)</span>
+<span class="s1">{</span>
+    <span class="s1">F_INT info = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">F_INT lwork = -</span><span class="s4">1</span><span class="s1">, lrwork = -</span><span class="s4">1</span><span class="s1">, liwork=-</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">F_INT _n, _lda;</span>
+    <span class="s1">size_t base_size = -</span><span class="s4">1</span><span class="s1">, underlying_float_size = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s2">void </span><span class="s1">*work = NULL, *rwork = NULL;</span>
+    <span class="s1">F_INT *iwork = NULL;</span>
+    <span class="s1">all_dtypes stack_slot1, stack_slot2;</span>
+    <span class="s2">char </span><span class="s1">uf_kind;</span>
+    <span class="s2">int </span><span class="s1">stack_int = -</span><span class="s4">1</span><span class="s1">;</span>
+
+    <span class="s1">ENSURE_VALID_COMPLEX_KIND(kind)</span>
+
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+
+    <span class="s1">base_size = kind_size(kind);</span>
+    <span class="s1">uf_kind = underlying_float_kind(kind);</span>
+    <span class="s1">underlying_float_size = kind_size(uf_kind);</span>
+
+    <span class="s1">work = &amp;stack_slot1;</span>
+    <span class="s1">rwork = &amp;stack_slot2;</span>
+    <span class="s1">iwork = &amp;stack_int;</span>
+    <span class="s1">numba_raw_cheevd(kind, jobz, uplo, _n, a, _lda, w, work, lwork, rwork, lrwork, iwork, liwork, &amp;info);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_cheevd&quot;</span><span class="s1">, info);</span>
+
+    <span class="s1">lwork = cast_from_X(uf_kind, work);</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc(&amp;work, base_size * lwork))</span>
+    <span class="s1">{</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">lrwork = cast_from_X(uf_kind, rwork);</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc(&amp;rwork, underlying_float_size * lrwork))</span>
+    <span class="s1">{</span>
+        <span class="s1">PyMem_RawFree(work);</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">liwork = *iwork;</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc((</span><span class="s2">void</span><span class="s1">**)&amp;iwork, base_size * liwork))</span>
+    <span class="s1">{</span>
+        <span class="s1">PyMem_RawFree(work);</span>
+        <span class="s1">PyMem_RawFree(rwork);</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+    <span class="s1">}</span>
+    <span class="s1">numba_raw_cheevd(kind, jobz, uplo, _n, a, _lda, w, work, lwork, rwork, lrwork, iwork, liwork, &amp;info);</span>
+    <span class="s1">PyMem_RawFree(work);</span>
+    <span class="s1">PyMem_RawFree(rwork);</span>
+    <span class="s1">PyMem_RawFree(iwork);</span>
+
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_cheevd&quot;</span><span class="s1">, info);</span>
+
+    <span class="s2">return </span><span class="s1">(</span><span class="s2">int</span><span class="s1">)info;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* Hermitian eigenvalue systems info from *syevd and *heevd. 
+ * This routine hides the type and general complexity involved with making the 
+ * calls. The work space computation and error handling etc is hidden. 
+ * Args are as per LAPACK. 
+ */</span>
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">int</span><span class="s1">)</span>
+<span class="s1">numba_ez_xxxevd(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">char </span><span class="s1">jobz, </span><span class="s2">char </span><span class="s1">uplo, Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a, Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*w)</span>
+<span class="s1">{</span>
+    <span class="s1">ENSURE_VALID_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">numba_ez_rsyevd(kind, jobz, uplo, n, a, lda, w);</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">numba_ez_cheevd(kind, jobz, uplo, n, a, lda, w);</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">STATUS_ERROR; </span><span class="s0">/* unreachable */</span>
+<span class="s1">}</span>
+
+<span class="s0">/* Real space svd systems info from dgesdd/sgesdd 
+ * Args are as per LAPACK. 
+ */</span>
+<span class="s2">static int</span>
+<span class="s1">numba_raw_rgesdd(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">char </span><span class="s1">jobz, Py_ssize_t m, Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a,</span>
+                 <span class="s1">Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*s, </span><span class="s2">void </span><span class="s1">*u, Py_ssize_t ldu, </span><span class="s2">void </span><span class="s1">*vt,</span>
+                 <span class="s1">Py_ssize_t ldvt, </span><span class="s2">void </span><span class="s1">*work, Py_ssize_t lwork,</span>
+                 <span class="s1">F_INT *iwork, F_INT *info)</span>
+<span class="s1">{</span>
+    <span class="s2">void </span><span class="s1">*raw_func = NULL;</span>
+    <span class="s1">F_INT _m, _n, _lda, _ldu, _ldvt, _lwork;</span>
+
+    <span class="s1">ENSURE_VALID_REAL_KIND(kind)</span>
+
+    <span class="s1">_m = (F_INT) m;</span>
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+    <span class="s1">_ldu = (F_INT) ldu;</span>
+    <span class="s1">_ldvt = (F_INT) ldvt;</span>
+    <span class="s1">_lwork = (F_INT) lwork;</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_sgesdd();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_dgesdd();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">ENSURE_VALID_FUNC(raw_func)</span>
+
+    <span class="s1">(*(rgesdd_t) raw_func)(&amp;jobz, &amp;_m, &amp;_n, a, &amp;_lda, s, u, &amp;_ldu, vt, &amp;_ldvt,</span>
+                           <span class="s1">work, &amp;_lwork, iwork, info);</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* Real space svd info from dgesdd/sgesdd. 
+ * As numba_raw_rgesdd but the allocation and error handling is done for the 
+ * user. 
+ * Args are as per LAPACK. 
+ */</span>
+<span class="s2">static int</span>
+<span class="s1">numba_ez_rgesdd(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">char </span><span class="s1">jobz, Py_ssize_t m, Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a,</span>
+                <span class="s1">Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*s, </span><span class="s2">void </span><span class="s1">*u, Py_ssize_t ldu, </span><span class="s2">void </span><span class="s1">*vt,</span>
+                <span class="s1">Py_ssize_t ldvt)</span>
+<span class="s1">{</span>
+    <span class="s1">F_INT info = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">Py_ssize_t minmn = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">Py_ssize_t lwork = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">all_dtypes stack_slot, wk;</span>
+    <span class="s1">size_t base_size = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">F_INT *iwork = (F_INT *)&amp;wk;</span>
+    <span class="s2">void </span><span class="s1">*work = NULL;</span>
+
+    <span class="s1">ENSURE_VALID_REAL_KIND(kind)</span>
+
+    <span class="s1">base_size = kind_size(kind);</span>
+
+    <span class="s1">work = &amp;stack_slot;</span>
+
+    <span class="s0">/* Compute optimal work size (lwork) */</span>
+    <span class="s1">numba_raw_rgesdd(kind, jobz, m, n, a, lda, s, u, ldu, vt, ldvt, work,</span>
+                     <span class="s1">lwork, iwork, &amp;info);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_rgesdd&quot;</span><span class="s1">, info);</span>
+
+    <span class="s0">/* Allocate work array */</span>
+    <span class="s1">lwork = cast_from_X(kind, work);</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc(&amp;work, base_size * lwork))</span>
+        <span class="s2">return </span><span class="s1">-</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">minmn = m &gt; n ? n : m;</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc((</span><span class="s2">void</span><span class="s1">**) &amp;iwork, </span><span class="s4">8 </span><span class="s1">* minmn * </span><span class="s2">sizeof</span><span class="s1">(F_INT)))</span>
+    <span class="s1">{</span>
+        <span class="s1">PyMem_RawFree(work);</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+    <span class="s1">}</span>
+    <span class="s1">numba_raw_rgesdd(kind, jobz, m, n, a, lda, s, u ,ldu, vt, ldvt, work, lwork,</span>
+                     <span class="s1">iwork, &amp;info);</span>
+    <span class="s1">PyMem_RawFree(work);</span>
+    <span class="s1">PyMem_RawFree(iwork);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_rgesdd&quot;</span><span class="s1">, info);</span>
+
+    <span class="s2">return </span><span class="s1">(</span><span class="s2">int</span><span class="s1">)info;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* Complex space svd systems info from cgesdd/zgesdd 
+ * Args are as per LAPACK. 
+ */</span>
+<span class="s2">static int</span>
+<span class="s1">numba_raw_cgesdd(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">char </span><span class="s1">jobz, Py_ssize_t m, Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a,</span>
+                 <span class="s1">Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*s, </span><span class="s2">void </span><span class="s1">*u, Py_ssize_t ldu, </span><span class="s2">void </span><span class="s1">*vt,</span>
+                 <span class="s1">Py_ssize_t ldvt, </span><span class="s2">void </span><span class="s1">*work, Py_ssize_t lwork, </span><span class="s2">void </span><span class="s1">*rwork,</span>
+                 <span class="s1">F_INT *iwork, F_INT *info)</span>
+<span class="s1">{</span>
+    <span class="s2">void </span><span class="s1">*raw_func = NULL;</span>
+    <span class="s1">F_INT _m, _n, _lda, _ldu, _ldvt, _lwork;</span>
+
+    <span class="s1">ENSURE_VALID_COMPLEX_KIND(kind)</span>
+
+    <span class="s1">_m = (F_INT) m;</span>
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+    <span class="s1">_ldu = (F_INT) ldu;</span>
+    <span class="s1">_ldvt = (F_INT) ldvt;</span>
+    <span class="s1">_lwork = (F_INT) lwork;</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_cgesdd();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_zgesdd();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">ENSURE_VALID_FUNC(raw_func)</span>
+
+    <span class="s1">(*(cgesdd_t) raw_func)(&amp;jobz, &amp;_m, &amp;_n, a, &amp;_lda, s, u, &amp;_ldu, vt, &amp;_ldvt,</span>
+                           <span class="s1">work, &amp;_lwork, rwork, iwork, info);</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* complex space svd info from cgesdd/zgesdd. 
+ * As numba_raw_cgesdd but the allocation and error handling is done for the 
+ * user. 
+ * Args are as per LAPACK. 
+ */</span>
+<span class="s2">static int</span>
+<span class="s1">numba_ez_cgesdd(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">char </span><span class="s1">jobz, Py_ssize_t m, Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a,</span>
+                <span class="s1">Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*s, </span><span class="s2">void </span><span class="s1">*u, Py_ssize_t ldu, </span><span class="s2">void </span><span class="s1">*vt,</span>
+                <span class="s1">Py_ssize_t ldvt)</span>
+<span class="s1">{</span>
+    <span class="s1">F_INT info = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">Py_ssize_t lwork = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">Py_ssize_t lrwork = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">Py_ssize_t minmn = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">Py_ssize_t tmp1, tmp2;</span>
+    <span class="s1">Py_ssize_t maxmn = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">size_t real_base_size = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">size_t complex_base_size = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">all_dtypes stack_slot, wk1, wk2;</span>
+    <span class="s2">void </span><span class="s1">*work = NULL;</span>
+    <span class="s2">void </span><span class="s1">*rwork = (</span><span class="s2">void </span><span class="s1">*)&amp;wk1;</span>
+    <span class="s1">F_INT *iwork = (F_INT *)&amp;wk2;</span>
+
+    <span class="s1">ENSURE_VALID_COMPLEX_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">real_base_size = </span><span class="s2">sizeof</span><span class="s1">(</span><span class="s2">float</span><span class="s1">);</span>
+            <span class="s1">complex_base_size = </span><span class="s2">sizeof</span><span class="s1">(npy_complex64);</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">real_base_size = </span><span class="s2">sizeof</span><span class="s1">(</span><span class="s2">double</span><span class="s1">);</span>
+            <span class="s1">complex_base_size = </span><span class="s2">sizeof</span><span class="s1">(npy_complex128);</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">default</span><span class="s1">:</span>
+        <span class="s1">{</span>
+            <span class="s1">PyGILState_STATE st = PyGILState_Ensure();</span>
+            <span class="s1">PyErr_SetString(PyExc_ValueError,\</span>
+                            <span class="s3">&quot;Invalid kind in numba_ez_rgesdd&quot;</span><span class="s1">);</span>
+            <span class="s1">PyGILState_Release(st);</span>
+        <span class="s1">}</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">work = &amp;stack_slot;</span>
+
+    <span class="s0">/* Compute optimal work size (lwork) */</span>
+    <span class="s1">numba_raw_cgesdd(kind, jobz, m, n, a, lda, s, u ,ldu, vt, ldvt, work, lwork,</span>
+                     <span class="s1">rwork, iwork, &amp;info);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_cgesdd&quot;</span><span class="s1">, info);</span>
+
+    <span class="s0">/* Allocate work array */</span>
+    <span class="s1">lwork = cast_from_X(kind, work);</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc(&amp;work, complex_base_size * lwork))</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+
+    <span class="s1">minmn = m &gt; n ? n : m;</span>
+    <span class="s2">if </span><span class="s1">(jobz == </span><span class="s3">'n'</span><span class="s1">)</span>
+    <span class="s1">{</span>
+        <span class="s1">lrwork = </span><span class="s4">7 </span><span class="s1">* minmn;</span>
+    <span class="s1">}</span>
+    <span class="s2">else</span>
+    <span class="s1">{</span>
+        <span class="s1">maxmn = m &gt; n ? m : n;</span>
+        <span class="s1">tmp1 = </span><span class="s4">5 </span><span class="s1">* minmn + </span><span class="s4">7</span><span class="s1">;</span>
+        <span class="s1">tmp2 = </span><span class="s4">2 </span><span class="s1">* maxmn + </span><span class="s4">2 </span><span class="s1">* minmn + </span><span class="s4">1</span><span class="s1">;</span>
+        <span class="s1">lrwork = minmn * (tmp1 &gt; tmp2 ? tmp1: tmp2);</span>
+    <span class="s1">}</span>
+
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc(&amp;rwork,</span>
+                                <span class="s1">real_base_size * (lrwork &gt; </span><span class="s4">1 </span><span class="s1">? lrwork : </span><span class="s4">1</span><span class="s1">)))</span>
+    <span class="s1">{</span>
+        <span class="s1">PyMem_RawFree(work);</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc((</span><span class="s2">void </span><span class="s1">**) &amp;iwork,</span>
+                                <span class="s4">8 </span><span class="s1">* minmn * </span><span class="s2">sizeof</span><span class="s1">(F_INT)))</span>
+    <span class="s1">{</span>
+        <span class="s1">PyMem_RawFree(work);</span>
+        <span class="s1">PyMem_RawFree(rwork);</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+    <span class="s1">}</span>
+    <span class="s1">numba_raw_cgesdd(kind, jobz, m, n, a, lda, s, u ,ldu, vt, ldvt, work, lwork,</span>
+                     <span class="s1">rwork, iwork, &amp;info);</span>
+    <span class="s1">PyMem_RawFree(work);</span>
+    <span class="s1">PyMem_RawFree(rwork);</span>
+    <span class="s1">PyMem_RawFree(iwork);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_cgesdd&quot;</span><span class="s1">, info);</span>
+
+    <span class="s2">return </span><span class="s1">(</span><span class="s2">int</span><span class="s1">)info;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* SVD systems info from *gesdd. 
+ * This routine hides the type and general complexity involved with making the 
+ * calls to *gesdd. The work space computation and error handling etc is hidden. 
+ * Args are as per LAPACK. 
+ */</span>
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">int</span><span class="s1">)</span>
+<span class="s1">numba_ez_gesdd(</span><span class="s2">char </span><span class="s1">kind, </span><span class="s2">char </span><span class="s1">jobz, Py_ssize_t m, Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a,</span>
+               <span class="s1">Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*s, </span><span class="s2">void </span><span class="s1">*u, Py_ssize_t ldu, </span><span class="s2">void </span><span class="s1">*vt,</span>
+               <span class="s1">Py_ssize_t ldvt)</span>
+<span class="s1">{</span>
+    <span class="s1">ENSURE_VALID_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">numba_ez_rgesdd(kind, jobz, m, n, a, lda, s, u, ldu, vt,</span>
+                                   <span class="s1">ldvt);</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">numba_ez_cgesdd(kind, jobz, m, n, a, lda, s, u, ldu, vt,</span>
+                                   <span class="s1">ldvt);</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">STATUS_ERROR; </span><span class="s0">/* unreachable */</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* 
+ * Compute the QR factorization of a matrix. 
+ * Return -1 on internal error, 0 on success, &gt; 0 on failure. 
+ */</span>
+<span class="s2">static int</span>
+<span class="s1">numba_raw_xgeqrf(</span><span class="s2">char </span><span class="s1">kind, Py_ssize_t m, Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a, Py_ssize_t</span>
+                 <span class="s1">lda, </span><span class="s2">void </span><span class="s1">*tau, </span><span class="s2">void </span><span class="s1">*work, Py_ssize_t lwork, F_INT *info)</span>
+<span class="s1">{</span>
+    <span class="s2">void </span><span class="s1">*raw_func = NULL;</span>
+    <span class="s1">F_INT _m, _n, _lda, _lwork;</span>
+
+    <span class="s1">ENSURE_VALID_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_sgeqrf();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_dgeqrf();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_cgeqrf();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_zgeqrf();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">ENSURE_VALID_FUNC(raw_func)</span>
+
+    <span class="s1">_m = (F_INT) m;</span>
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+    <span class="s1">_lwork = (F_INT) lwork;</span>
+
+    <span class="s1">(*(xgeqrf_t) raw_func)(&amp;_m, &amp;_n, a, &amp;_lda, tau, work, &amp;_lwork, info);</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Compute the QR factorization of a matrix. 
+ * This routine hides the type and general complexity involved with making the 
+ * xgeqrf calls. The work space computation and error handling etc is hidden. 
+ * Args are as per LAPACK. 
+ */</span>
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">int</span><span class="s1">)</span>
+<span class="s1">numba_ez_geqrf(</span><span class="s2">char </span><span class="s1">kind, Py_ssize_t m, Py_ssize_t n, </span><span class="s2">void </span><span class="s1">*a, Py_ssize_t</span>
+               <span class="s1">lda, </span><span class="s2">void </span><span class="s1">*tau)</span>
+<span class="s1">{</span>
+    <span class="s1">F_INT info = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">Py_ssize_t lwork = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">size_t base_size = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">all_dtypes stack_slot;</span>
+    <span class="s2">void </span><span class="s1">*work = NULL;</span>
+
+    <span class="s1">base_size = kind_size(kind);</span>
+
+    <span class="s1">work = &amp;stack_slot;</span>
+
+    <span class="s0">/* Compute optimal work size (lwork) */</span>
+    <span class="s1">numba_raw_xgeqrf(kind, m, n, a, lda, tau, work, lwork, &amp;info);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_xgeqrf&quot;</span><span class="s1">, info);</span>
+
+    <span class="s0">/* Allocate work array */</span>
+    <span class="s1">lwork = cast_from_X(kind, work);</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc(&amp;work, base_size * lwork))</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+
+    <span class="s1">numba_raw_xgeqrf(kind, m, n, a, lda, tau, work, lwork, &amp;info);</span>
+    <span class="s1">PyMem_RawFree(work);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_xgeqrf&quot;</span><span class="s1">, info);</span>
+
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">; </span><span class="s0">/* info cannot be &gt;0 */</span>
+
+<span class="s1">}</span>
+
+
+<span class="s0">/* 
+ * Compute the orthogonal Q matrix (in QR) from elementary relectors. 
+ */</span>
+<span class="s2">static int</span>
+<span class="s1">numba_raw_xxxgqr(</span><span class="s2">char </span><span class="s1">kind, Py_ssize_t m, Py_ssize_t n, Py_ssize_t k, </span><span class="s2">void </span><span class="s1">*a,</span>
+                 <span class="s1">Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*tau, </span><span class="s2">void </span><span class="s1">* work, Py_ssize_t lwork, F_INT *info)</span>
+<span class="s1">{</span>
+    <span class="s2">void </span><span class="s1">*raw_func = NULL;</span>
+    <span class="s1">F_INT _m, _n, _k, _lda, _lwork;</span>
+
+    <span class="s1">ENSURE_VALID_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_sorgqr();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_dorgqr();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_cungqr();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_zungqr();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">ENSURE_VALID_FUNC(raw_func)</span>
+
+    <span class="s1">_m = (F_INT) m;</span>
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_k = (F_INT) k;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+    <span class="s1">_lwork = (F_INT) lwork;</span>
+
+    <span class="s1">(*(xxxgqr_t) raw_func)(&amp;_m, &amp;_n, &amp;_k, a, &amp;_lda, tau, work, &amp;_lwork, info);</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* 
+ * Compute the orthogonal Q matrix (in QR) from elementary reflectors. 
+ * This routine hides the type and general complexity involved with making the 
+ * x{or,un}qrf calls. The work space computation and error handling etc is 
+ * hidden. Args are as per LAPACK. 
+ */</span>
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">int</span><span class="s1">)</span>
+<span class="s1">numba_ez_xxgqr(</span><span class="s2">char </span><span class="s1">kind, Py_ssize_t m, Py_ssize_t n, Py_ssize_t k, </span><span class="s2">void </span><span class="s1">*a,</span>
+               <span class="s1">Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*tau)</span>
+<span class="s1">{</span>
+    <span class="s1">F_INT info = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">Py_ssize_t lwork = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">size_t base_size = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">all_dtypes stack_slot;</span>
+    <span class="s2">void </span><span class="s1">*work = NULL;</span>
+
+    <span class="s1">work = &amp;stack_slot;</span>
+
+    <span class="s0">/* Compute optimal work size (lwork) */</span>
+    <span class="s1">numba_raw_xxxgqr(kind, m, n, k, a, lda, tau, work, lwork, &amp;info);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_xxxgqr&quot;</span><span class="s1">, info);</span>
+
+    <span class="s1">base_size = kind_size(kind);</span>
+
+    <span class="s0">/* Allocate work array */</span>
+    <span class="s1">lwork = cast_from_X(kind, work);</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc(&amp;work, base_size * lwork))</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+
+    <span class="s1">numba_raw_xxxgqr(kind, m, n, k, a, lda, tau, work, lwork, &amp;info);</span>
+    <span class="s1">PyMem_RawFree(work);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_xxxgqr&quot;</span><span class="s1">, info);</span>
+
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;  </span><span class="s0">/* info cannot be &gt;0 */</span>
+
+<span class="s1">}</span>
+
+
+<span class="s0">/* 
+ * Compute the minimum-norm solution to a real linear least squares problem. 
+ */</span>
+<span class="s2">static int</span>
+<span class="s1">numba_raw_rgelsd(</span><span class="s2">char </span><span class="s1">kind, Py_ssize_t m, Py_ssize_t n, Py_ssize_t nrhs,</span>
+                 <span class="s2">void </span><span class="s1">*a, Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*b, Py_ssize_t ldb, </span><span class="s2">void </span><span class="s1">*S,</span>
+                 <span class="s2">void </span><span class="s1">* rcond, Py_ssize_t * rank, </span><span class="s2">void </span><span class="s1">* work,</span>
+                 <span class="s1">Py_ssize_t lwork, F_INT *iwork, F_INT *info)</span>
+<span class="s1">{</span>
+    <span class="s2">void </span><span class="s1">*raw_func = NULL;</span>
+    <span class="s1">F_INT _m, _n, _nrhs, _lda, _ldb, _rank, _lwork;</span>
+
+    <span class="s1">ENSURE_VALID_REAL_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_sgelsd();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_dgelsd();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">ENSURE_VALID_FUNC(raw_func)</span>
+
+    <span class="s1">_m = (F_INT) m;</span>
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_nrhs = (F_INT) nrhs;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+    <span class="s1">_ldb = (F_INT) ldb;</span>
+    <span class="s1">_lwork = (F_INT) lwork;</span>
+
+    <span class="s1">(*(rgelsd_t) raw_func)(&amp;_m, &amp;_n, &amp;_nrhs, a, &amp;_lda, b, &amp;_ldb, S, rcond,</span>
+                           <span class="s1">&amp;_rank, work, &amp;_lwork, iwork, info);</span>
+    <span class="s1">*rank = (Py_ssize_t) _rank;</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Compute the minimum-norm solution to a real linear least squares problem. 
+ * This routine hides the type and general complexity involved with making the 
+ * {s,d}gelsd calls. The work space computation and error handling etc is 
+ * hidden. Args are as per LAPACK. 
+ */</span>
+<span class="s2">static int</span>
+<span class="s1">numba_ez_rgelsd(</span><span class="s2">char </span><span class="s1">kind, Py_ssize_t m, Py_ssize_t n, Py_ssize_t nrhs,</span>
+                <span class="s2">void </span><span class="s1">*a, Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*b, Py_ssize_t ldb, </span><span class="s2">void </span><span class="s1">*S,</span>
+                <span class="s2">double </span><span class="s1">rcond, Py_ssize_t * rank)</span>
+<span class="s1">{</span>
+    <span class="s1">F_INT info = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">Py_ssize_t lwork = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">size_t base_size = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">all_dtypes stack_slot;</span>
+    <span class="s2">void </span><span class="s1">*work = NULL, *rcond_cast = NULL;</span>
+    <span class="s1">F_INT *iwork = NULL;</span>
+    <span class="s1">F_INT iwork_tmp;</span>
+    <span class="s2">float </span><span class="s1">tmpf;</span>
+
+    <span class="s1">ENSURE_VALID_REAL_KIND(kind)</span>
+
+    <span class="s1">base_size = kind_size(kind);</span>
+
+    <span class="s1">work = &amp;stack_slot;</span>
+    <span class="s1">rcond_cast = work; </span><span class="s0">/* stop checks on null ptr complaining */</span>
+
+    <span class="s0">/* Compute optimal work size (lwork) */</span>
+    <span class="s1">numba_raw_rgelsd(kind, m, n, nrhs, a, lda, b, ldb, S, rcond_cast, rank,</span>
+                     <span class="s1">work, lwork, &amp;iwork_tmp, &amp;info);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_rgelsd&quot;</span><span class="s1">, info);</span>
+
+    <span class="s0">/* Allocate work array */</span>
+    <span class="s1">lwork = cast_from_X(kind, work);</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc(&amp;work, base_size * lwork))</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+
+    <span class="s0">/* Allocate iwork array */</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc((</span><span class="s2">void </span><span class="s1">**)&amp;iwork, </span><span class="s2">sizeof</span><span class="s1">(F_INT) * iwork_tmp))</span>
+    <span class="s1">{</span>
+        <span class="s1">PyMem_RawFree(work);</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/* cast rcond to the right type */</span>
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s1">tmpf = (</span><span class="s2">float</span><span class="s1">)rcond;</span>
+            <span class="s1">rcond_cast = (</span><span class="s2">void </span><span class="s1">* )&amp;tmpf;</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s1">rcond_cast = (</span><span class="s2">void </span><span class="s1">* )&amp;rcond;</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">numba_raw_rgelsd(kind, m, n, nrhs, a, lda, b, ldb, S, rcond_cast, rank,</span>
+                     <span class="s1">work, lwork, iwork, &amp;info);</span>
+    <span class="s1">PyMem_RawFree(work);</span>
+    <span class="s1">PyMem_RawFree(iwork);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_rgelsd&quot;</span><span class="s1">, info);</span>
+
+    <span class="s2">return </span><span class="s1">(</span><span class="s2">int</span><span class="s1">)info;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* 
+ * Compute the minimum-norm solution to a complex linear least squares problem. 
+ */</span>
+<span class="s2">static int</span>
+<span class="s1">numba_raw_cgelsd(</span><span class="s2">char </span><span class="s1">kind, Py_ssize_t m, Py_ssize_t n, Py_ssize_t nrhs,</span>
+                 <span class="s2">void </span><span class="s1">*a, Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*b, Py_ssize_t ldb, </span><span class="s2">void </span><span class="s1">*S,</span>
+                 <span class="s2">void </span><span class="s1">*rcond, Py_ssize_t * rank, </span><span class="s2">void </span><span class="s1">* work,</span>
+                 <span class="s1">Py_ssize_t lwork, </span><span class="s2">void </span><span class="s1">* rwork, F_INT *iwork, F_INT *info)</span>
+<span class="s1">{</span>
+    <span class="s2">void </span><span class="s1">*raw_func = NULL;</span>
+    <span class="s1">F_INT _m, _n, _nrhs, _lda, _ldb, _rank, _lwork;</span>
+
+    <span class="s1">ENSURE_VALID_COMPLEX_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_cgelsd();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_zgelsd();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">ENSURE_VALID_FUNC(raw_func)</span>
+
+    <span class="s1">_m = (F_INT) m;</span>
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_nrhs = (F_INT) nrhs;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+    <span class="s1">_ldb = (F_INT) ldb;</span>
+    <span class="s1">_lwork = (F_INT) lwork;</span>
+
+    <span class="s1">(*(cgelsd_t) raw_func)(&amp;_m, &amp;_n, &amp;_nrhs, a, &amp;_lda, b, &amp;_ldb, S, rcond,</span>
+                           <span class="s1">&amp;_rank, work, &amp;_lwork, rwork, iwork, info);</span>
+    <span class="s1">*rank = (Py_ssize_t) _rank;</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* 
+ * Compute the minimum-norm solution to a complex linear least squares problem. 
+ * This routine hides the type and general complexity involved with making the 
+ * {c,z}gelsd calls. The work space computation and error handling etc is 
+ * hidden. Args are as per LAPACK. 
+ */</span>
+<span class="s2">static int</span>
+<span class="s1">numba_ez_cgelsd(</span><span class="s2">char </span><span class="s1">kind, Py_ssize_t m, Py_ssize_t n, Py_ssize_t nrhs,</span>
+                <span class="s2">void </span><span class="s1">*a, Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*b, Py_ssize_t ldb, </span><span class="s2">void </span><span class="s1">*S,</span>
+                <span class="s2">double </span><span class="s1">rcond, Py_ssize_t * rank)</span>
+<span class="s1">{</span>
+    <span class="s1">F_INT info = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">Py_ssize_t lwork = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">size_t base_size = -</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">all_dtypes stack_slot1, stack_slot2;</span>
+    <span class="s1">size_t real_base_size = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s2">void </span><span class="s1">*work = NULL, *rwork = NULL, *rcond_cast = NULL;</span>
+    <span class="s1">Py_ssize_t lrwork;</span>
+    <span class="s1">F_INT *iwork = NULL;</span>
+    <span class="s1">F_INT iwork_tmp;</span>
+    <span class="s2">char </span><span class="s1">real_kind = </span><span class="s3">'-'</span><span class="s1">;</span>
+    <span class="s2">float </span><span class="s1">tmpf;</span>
+
+    <span class="s1">ENSURE_VALID_COMPLEX_KIND(kind)</span>
+
+    <span class="s1">base_size = kind_size(kind);</span>
+
+    <span class="s1">work = &amp;stack_slot1;</span>
+    <span class="s1">rwork = &amp;stack_slot2;</span>
+    <span class="s1">rcond_cast = work; </span><span class="s0">/* stop checks on null ptr complaining */</span>
+
+    <span class="s0">/* Compute optimal work size */</span>
+    <span class="s1">numba_raw_cgelsd(kind, m, n, nrhs, a, lda, b, ldb, S, rcond_cast, rank,</span>
+                     <span class="s1">work, lwork, rwork, &amp;iwork_tmp, &amp;info);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_cgelsd&quot;</span><span class="s1">, info);</span>
+
+    <span class="s0">/* Allocate work array */</span>
+    <span class="s1">lwork = cast_from_X(kind, work);</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc(&amp;work, base_size * lwork))</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+
+    <span class="s0">/* Allocate iwork array */</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc((</span><span class="s2">void </span><span class="s1">**)&amp;iwork, </span><span class="s2">sizeof</span><span class="s1">(F_INT) * iwork_tmp))</span>
+    <span class="s1">{</span>
+        <span class="s1">PyMem_RawFree(work);</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">real_kind = </span><span class="s3">'s'</span><span class="s1">;</span>
+            <span class="s1">tmpf = (</span><span class="s2">float</span><span class="s1">)rcond;</span>
+            <span class="s1">rcond_cast = (</span><span class="s2">void </span><span class="s1">* )&amp;tmpf;</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">real_kind = </span><span class="s3">'d'</span><span class="s1">;</span>
+            <span class="s1">rcond_cast = (</span><span class="s2">void </span><span class="s1">* )&amp;rcond;</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">real_base_size = kind_size(real_kind);</span>
+
+    <span class="s1">lrwork = cast_from_X(real_kind, rwork);</span>
+    <span class="s2">if </span><span class="s1">(checked_PyMem_RawMalloc((</span><span class="s2">void </span><span class="s1">**)&amp;rwork, real_base_size * lrwork))</span>
+    <span class="s1">{</span>
+        <span class="s1">PyMem_RawFree(work);</span>
+        <span class="s1">PyMem_RawFree(iwork);</span>
+        <span class="s2">return </span><span class="s1">STATUS_ERROR;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">numba_raw_cgelsd(kind, m, n, nrhs, a, lda, b, ldb, S, rcond_cast, rank,</span>
+                     <span class="s1">work, lwork, rwork, iwork, &amp;info);</span>
+    <span class="s1">PyMem_RawFree(work);</span>
+    <span class="s1">PyMem_RawFree(rwork);</span>
+    <span class="s1">PyMem_RawFree(iwork);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;numba_raw_cgelsd&quot;</span><span class="s1">, info);</span>
+
+    <span class="s2">return </span><span class="s1">(</span><span class="s2">int</span><span class="s1">)info;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* 
+ * Compute the minimum-norm solution to a linear least squares problems. 
+ * This routine hides the type and general complexity involved with making the 
+ * calls to *gelsd. The work space computation and error handling etc is hidden. 
+ * Args are as per LAPACK. 
+ */</span>
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">int</span><span class="s1">)</span>
+<span class="s1">numba_ez_gelsd(</span><span class="s2">char </span><span class="s1">kind, Py_ssize_t m, Py_ssize_t n, Py_ssize_t nrhs,</span>
+               <span class="s2">void </span><span class="s1">*a, Py_ssize_t lda, </span><span class="s2">void </span><span class="s1">*b, Py_ssize_t ldb, </span><span class="s2">void </span><span class="s1">*S,</span>
+               <span class="s2">double </span><span class="s1">rcond, Py_ssize_t * rank)</span>
+<span class="s1">{</span>
+    <span class="s1">ENSURE_VALID_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">numba_ez_rgelsd(kind, m, n, nrhs, a, lda, b, ldb, S, rcond,</span>
+                                   <span class="s1">rank);</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">numba_ez_cgelsd(kind, m, n, nrhs, a, lda, b, ldb, S, rcond,</span>
+                                   <span class="s1">rank);</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">STATUS_ERROR; </span><span class="s0">/* unreachable */</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* 
+ * Compute the solution to a system of linear equations 
+ */</span>
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">int</span><span class="s1">)</span>
+<span class="s1">numba_xgesv(</span><span class="s2">char </span><span class="s1">kind, Py_ssize_t n, Py_ssize_t nrhs, </span><span class="s2">void </span><span class="s1">*a, Py_ssize_t lda,</span>
+            <span class="s1">F_INT *ipiv, </span><span class="s2">void </span><span class="s1">*b, Py_ssize_t ldb)</span>
+<span class="s1">{</span>
+    <span class="s2">void </span><span class="s1">*raw_func = NULL;</span>
+    <span class="s1">F_INT _n, _nrhs, _lda, _ldb, info;</span>
+
+    <span class="s1">ENSURE_VALID_KIND(kind)</span>
+
+    <span class="s2">switch </span><span class="s1">(kind)</span>
+    <span class="s1">{</span>
+        <span class="s2">case </span><span class="s3">'s'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_sgesv();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'d'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_dgesv();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_cgesv();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s3">'z'</span><span class="s1">:</span>
+            <span class="s1">raw_func = get_clapack_zgesv();</span>
+            <span class="s2">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">ENSURE_VALID_FUNC(raw_func)</span>
+
+    <span class="s1">_n = (F_INT) n;</span>
+    <span class="s1">_nrhs = (F_INT) nrhs;</span>
+    <span class="s1">_lda = (F_INT) lda;</span>
+    <span class="s1">_ldb = (F_INT) ldb;</span>
+
+    <span class="s1">(*(xgesv_t) raw_func)(&amp;_n, &amp;_nrhs, a, &amp;_lda, ipiv, b, &amp;_ldb, &amp;info);</span>
+    <span class="s1">CATCH_LAPACK_INVALID_ARG(</span><span class="s3">&quot;xgesv&quot;</span><span class="s1">, info);</span>
+
+    <span class="s2">return </span><span class="s1">(</span><span class="s2">int</span><span class="s1">)info;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* undef defines and macros */</span>
+<span class="s2">#undef </span><span class="s1">STATUS_SUCCESS</span>
+<span class="s2">#undef </span><span class="s1">STATUS_ERROR</span>
+<span class="s2">#undef </span><span class="s1">ENSURE_VALID_KIND</span>
+<span class="s2">#undef </span><span class="s1">ENSURE_VALID_REAL_KIND</span>
+<span class="s2">#undef </span><span class="s1">ENSURE_VALID_COMPLEX_KIND</span>
+<span class="s2">#undef </span><span class="s1">ENSURE_VALID_FUNC</span>
+<span class="s2">#undef </span><span class="s1">F_INT</span>
+<span class="s2">#undef </span><span class="s1">EMIT_GET_CLAPACK_FUNC</span>
+<span class="s2">#undef </span><span class="s1">CATCH_LAPACK_INVALID_ARG</span>
+</pre>
+</body>
+</html>

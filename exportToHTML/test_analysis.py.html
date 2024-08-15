@@ -1,0 +1,1034 @@
+<html>
+<head>
+<title>test_analysis.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #2aacb8;}
+.s5 { color: #6aab73;}
+.s6 { color: #5f826b; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_analysis.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Tests numba.analysis functions</span>
+<span class="s2">import </span><span class="s1">collections</span>
+<span class="s2">import </span><span class="s1">types </span><span class="s2">as </span><span class="s1">pytypes</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">compiler </span><span class="s2">import </span><span class="s1">run_frontend</span><span class="s3">, </span><span class="s1">Flags</span><span class="s3">, </span><span class="s1">StateDict</span>
+<span class="s2">from </span><span class="s1">numba </span><span class="s2">import </span><span class="s1">jit</span><span class="s3">, </span><span class="s1">njit</span><span class="s3">, </span><span class="s1">literal_unroll</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">types</span><span class="s3">, </span><span class="s1">errors</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">, </span><span class="s1">rewrites</span><span class="s3">, </span><span class="s1">ir_utils</span><span class="s3">, </span><span class="s1">utils</span><span class="s3">, </span><span class="s1">cpu</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">postproc</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">inline_closurecall </span><span class="s2">import </span><span class="s1">InlineClosureCallPass</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">tests</span><span class="s3">.</span><span class="s1">support </span><span class="s2">import </span><span class="s3">(</span><span class="s1">TestCase</span><span class="s3">, </span><span class="s1">MemoryLeakMixin</span><span class="s3">, </span><span class="s1">SerialMixin</span><span class="s3">,</span>
+                                 <span class="s1">IRPreservingTestPipeline</span><span class="s3">)</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">analysis </span><span class="s2">import </span><span class="s1">dead_branch_prune</span><span class="s3">, </span><span class="s1">rewrite_semantic_constants</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">untyped_passes </span><span class="s2">import </span><span class="s3">(</span><span class="s1">ReconstructSSA</span><span class="s3">, </span><span class="s1">TranslateByteCode</span><span class="s3">,</span>
+                                       <span class="s1">IRProcessing</span><span class="s3">, </span><span class="s1">DeadBranchPrune</span><span class="s3">,</span>
+                                       <span class="s1">PreserveIR</span><span class="s3">)</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">compiler </span><span class="s2">import </span><span class="s1">DefaultPassBuilder</span><span class="s3">, </span><span class="s1">CompilerBase</span><span class="s3">, </span><span class="s1">PassManager</span>
+
+
+<span class="s1">_GLOBAL </span><span class="s3">= </span><span class="s4">123</span>
+
+<span class="s1">enable_pyobj_flags </span><span class="s3">= </span><span class="s1">Flags</span><span class="s3">()</span>
+<span class="s1">enable_pyobj_flags</span><span class="s3">.</span><span class="s1">enable_pyobject </span><span class="s3">= </span><span class="s2">True</span>
+
+
+<span class="s2">def </span><span class="s1">compile_to_ir</span><span class="s3">(</span><span class="s1">func</span><span class="s3">):</span>
+    <span class="s1">func_ir </span><span class="s3">= </span><span class="s1">run_frontend</span><span class="s3">(</span><span class="s1">func</span><span class="s3">)</span>
+    <span class="s1">state </span><span class="s3">= </span><span class="s1">StateDict</span><span class="s3">()</span>
+    <span class="s1">state</span><span class="s3">.</span><span class="s1">func_ir </span><span class="s3">= </span><span class="s1">func_ir</span>
+    <span class="s1">state</span><span class="s3">.</span><span class="s1">typemap </span><span class="s3">= </span><span class="s2">None</span>
+    <span class="s1">state</span><span class="s3">.</span><span class="s1">calltypes </span><span class="s3">= </span><span class="s2">None</span>
+    <span class="s0"># Transform to SSA</span>
+    <span class="s1">ReconstructSSA</span><span class="s3">().</span><span class="s1">run_pass</span><span class="s3">(</span><span class="s1">state</span><span class="s3">)</span>
+    <span class="s0"># call this to get print etc rewrites</span>
+    <span class="s1">rewrites</span><span class="s3">.</span><span class="s1">rewrite_registry</span><span class="s3">.</span><span class="s1">apply</span><span class="s3">(</span><span class="s5">'before-inference'</span><span class="s3">, </span><span class="s1">state</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">func_ir</span>
+
+
+<span class="s2">class </span><span class="s1">TestBranchPruneBase</span><span class="s3">(</span><span class="s1">MemoryLeakMixin</span><span class="s3">, </span><span class="s1">TestCase</span><span class="s3">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    Tests branch pruning 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_DEBUG </span><span class="s3">= </span><span class="s2">False</span>
+
+    <span class="s0"># find *all* branches</span>
+    <span class="s2">def </span><span class="s1">find_branches</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">the_ir</span><span class="s3">):</span>
+        <span class="s1">branches </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">blk </span><span class="s2">in </span><span class="s1">the_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">values</span><span class="s3">():</span>
+            <span class="s1">tmp </span><span class="s3">= [</span><span class="s1">_ </span><span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">find_insts</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">=</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Branch</span><span class="s3">)]</span>
+            <span class="s1">branches</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">(</span><span class="s1">tmp</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">branches</span>
+
+    <span class="s2">def </span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">func</span><span class="s3">, </span><span class="s1">args_tys</span><span class="s3">, </span><span class="s1">prune</span><span class="s3">, *</span><span class="s1">args</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">):</span>
+        <span class="s0"># This checks that the expected pruned branches have indeed been pruned.</span>
+        <span class="s0"># func is a python function to assess</span>
+        <span class="s0"># args_tys is the numba types arguments tuple</span>
+        <span class="s0"># prune arg is a list, one entry per branch. The value in the entry is</span>
+        <span class="s0"># encoded as follows:</span>
+        <span class="s0"># True: using constant inference only, the True branch will be pruned</span>
+        <span class="s0"># False: using constant inference only, the False branch will be pruned</span>
+        <span class="s0"># None: under no circumstances should this branch be pruned</span>
+        <span class="s0"># *args: the argument instances to pass to the function to check</span>
+        <span class="s0">#        execution is still valid post transform</span>
+        <span class="s0"># **kwargs:</span>
+        <span class="s0">#        - flags: args to pass to `jit` default is `nopython=True`,</span>
+        <span class="s0">#          e.g. permits use of e.g. object mode.</span>
+
+        <span class="s1">func_ir </span><span class="s3">= </span><span class="s1">compile_to_ir</span><span class="s3">(</span><span class="s1">func</span><span class="s3">)</span>
+        <span class="s1">before </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_DEBUG</span><span class="s3">:</span>
+            <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;=&quot; </span><span class="s3">* </span><span class="s4">80</span><span class="s3">)</span>
+            <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;before inline&quot;</span><span class="s3">)</span>
+            <span class="s1">func_ir</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">()</span>
+
+        <span class="s0"># run closure inlining to ensure that nonlocals in closures are visible</span>
+        <span class="s1">inline_pass </span><span class="s3">= </span><span class="s1">InlineClosureCallPass</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">,</span>
+                                            <span class="s1">cpu</span><span class="s3">.</span><span class="s1">ParallelOptions</span><span class="s3">(</span><span class="s2">False</span><span class="s3">),)</span>
+        <span class="s1">inline_pass</span><span class="s3">.</span><span class="s1">run</span><span class="s3">()</span>
+
+        <span class="s0"># Remove all Dels, and re-run postproc</span>
+        <span class="s1">post_proc </span><span class="s3">= </span><span class="s1">postproc</span><span class="s3">.</span><span class="s1">PostProcessor</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">)</span>
+        <span class="s1">post_proc</span><span class="s3">.</span><span class="s1">run</span><span class="s3">()</span>
+
+        <span class="s1">rewrite_semantic_constants</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">args_tys</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_DEBUG</span><span class="s3">:</span>
+            <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;=&quot; </span><span class="s3">* </span><span class="s4">80</span><span class="s3">)</span>
+            <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;before prune&quot;</span><span class="s3">)</span>
+            <span class="s1">func_ir</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">()</span>
+
+        <span class="s1">dead_branch_prune</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">args_tys</span><span class="s3">)</span>
+
+        <span class="s1">after </span><span class="s3">= </span><span class="s1">func_ir</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_DEBUG</span><span class="s3">:</span>
+            <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;after prune&quot;</span><span class="s3">)</span>
+            <span class="s1">func_ir</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">()</span>
+
+        <span class="s1">before_branches </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">find_branches</span><span class="s3">(</span><span class="s1">before</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">before_branches</span><span class="s3">), </span><span class="s1">len</span><span class="s3">(</span><span class="s1">prune</span><span class="s3">))</span>
+
+        <span class="s0"># what is expected to be pruned</span>
+        <span class="s1">expect_removed </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">idx</span><span class="s3">, </span><span class="s1">prune </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">prune</span><span class="s3">):</span>
+            <span class="s1">branch </span><span class="s3">= </span><span class="s1">before_branches</span><span class="s3">[</span><span class="s1">idx</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">prune </span><span class="s2">is True</span><span class="s3">:</span>
+                <span class="s1">expect_removed</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">branch</span><span class="s3">.</span><span class="s1">truebr</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">prune </span><span class="s2">is False</span><span class="s3">:</span>
+                <span class="s1">expect_removed</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">branch</span><span class="s3">.</span><span class="s1">falsebr</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">prune </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s2">pass  </span><span class="s0"># nothing should be removed!</span>
+            <span class="s2">elif </span><span class="s1">prune </span><span class="s3">== </span><span class="s5">'both'</span><span class="s3">:</span>
+                <span class="s1">expect_removed</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">branch</span><span class="s3">.</span><span class="s1">falsebr</span><span class="s3">)</span>
+                <span class="s1">expect_removed</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">branch</span><span class="s3">.</span><span class="s1">truebr</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">assert </span><span class="s4">0</span><span class="s3">, </span><span class="s5">&quot;unreachable&quot;</span>
+
+        <span class="s0"># compare labels</span>
+        <span class="s1">original_labels </span><span class="s3">= </span><span class="s1">set</span><span class="s3">([</span><span class="s1">_ </span><span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">before</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">()])</span>
+        <span class="s1">new_labels </span><span class="s3">= </span><span class="s1">set</span><span class="s3">([</span><span class="s1">_ </span><span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">after</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">()])</span>
+        <span class="s0"># assert that the new labels are precisely the original less the</span>
+        <span class="s0"># expected pruned labels</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">new_labels</span><span class="s3">, </span><span class="s1">original_labels </span><span class="s3">- </span><span class="s1">set</span><span class="s3">(</span><span class="s1">expect_removed</span><span class="s3">))</span>
+        <span class="s2">except </span><span class="s1">AssertionError </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+            <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;new_labels&quot;</span><span class="s3">, </span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">new_labels</span><span class="s3">))</span>
+            <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;original_labels&quot;</span><span class="s3">, </span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">original_labels</span><span class="s3">))</span>
+            <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;expect_removed&quot;</span><span class="s3">, </span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">expect_removed</span><span class="s3">))</span>
+            <span class="s2">raise </span><span class="s1">e</span>
+
+        <span class="s1">supplied_flags </span><span class="s3">= </span><span class="s1">kwargs</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s5">'flags'</span><span class="s3">, {</span><span class="s5">'nopython'</span><span class="s3">: </span><span class="s2">True</span><span class="s3">})</span>
+        <span class="s0"># NOTE: original testing used `compile_isolated` hence use of `cres`.</span>
+        <span class="s1">cres </span><span class="s3">= </span><span class="s1">jit</span><span class="s3">(</span><span class="s1">args_tys</span><span class="s3">, **</span><span class="s1">supplied_flags</span><span class="s3">)(</span><span class="s1">func</span><span class="s3">).</span><span class="s1">overloads</span><span class="s3">[</span><span class="s1">args_tys</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">args </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">cres</span><span class="s3">.</span><span class="s1">entry_point</span><span class="s3">()</span>
+            <span class="s1">expected </span><span class="s3">= </span><span class="s1">func</span><span class="s3">()</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">cres</span><span class="s3">.</span><span class="s1">entry_point</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">)</span>
+            <span class="s1">expected </span><span class="s3">= </span><span class="s1">func</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">res</span><span class="s3">, </span><span class="s1">expected</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestBranchPrune</span><span class="s3">(</span><span class="s1">TestBranchPruneBase</span><span class="s3">, </span><span class="s1">SerialMixin</span><span class="s3">):</span>
+
+    <span class="s2">def </span><span class="s1">test_single_if</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s4">1 </span><span class="s3">== </span><span class="s4">0</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">3.14159</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">], </span><span class="s2">None</span><span class="s3">)</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s4">1 </span><span class="s3">== </span><span class="s4">1</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">3.14159</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s2">False</span><span class="s3">], </span><span class="s2">None</span><span class="s3">)</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">3.14159</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s2">False</span><span class="s3">], </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">10</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">], </span><span class="s4">10</span><span class="s3">)</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s3">== </span><span class="s4">10</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">3.14159</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">], </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">10</span><span class="s3">),), [</span><span class="s2">None</span><span class="s3">], </span><span class="s4">10</span><span class="s3">)</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s3">== </span><span class="s4">10</span><span class="s3">:</span>
+                <span class="s1">z </span><span class="s3">= </span><span class="s4">3.14159  </span><span class="s0"># noqa: F841 # no effect</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">], </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">10</span><span class="s3">),), [</span><span class="s2">None</span><span class="s3">], </span><span class="s4">10</span><span class="s3">)</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s1">z </span><span class="s3">= </span><span class="s2">None</span>
+            <span class="s1">y </span><span class="s3">= </span><span class="s1">z</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s3">== </span><span class="s1">y</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">100</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s2">False</span><span class="s3">], </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">10</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">], </span><span class="s4">10</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_single_if_else</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">3.14159</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">1.61803</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s2">False</span><span class="s3">], </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">10</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">], </span><span class="s4">10</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_single_if_const_val</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s3">== </span><span class="s4">100</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">3.14159</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">], </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">100</span><span class="s3">),), [</span><span class="s2">None</span><span class="s3">], </span><span class="s4">100</span><span class="s3">)</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s0"># switch the condition order</span>
+            <span class="s2">if </span><span class="s4">100 </span><span class="s3">== </span><span class="s1">x</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">3.14159</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">], </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">100</span><span class="s3">),), [</span><span class="s2">None</span><span class="s3">], </span><span class="s4">100</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_single_if_else_two_const_val</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s3">== </span><span class="s1">y</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">3.14159</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">1.61803</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">100</span><span class="s3">),) * </span><span class="s4">2</span><span class="s3">, [</span><span class="s2">None</span><span class="s3">], </span><span class="s4">100</span><span class="s3">,</span>
+                          <span class="s4">100</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),) * </span><span class="s4">2</span><span class="s3">, [</span><span class="s2">False</span><span class="s3">], </span><span class="s2">None</span><span class="s3">,</span>
+                          <span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">100</span><span class="s3">),</span>
+                                 <span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">], </span><span class="s4">100</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">100</span><span class="s3">),</span>
+                                 <span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">1000</span><span class="s3">)), [</span><span class="s2">None</span><span class="s3">], </span><span class="s4">100</span><span class="s3">, </span><span class="s4">1000</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_single_if_else_w_following_undetermined</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s1">x_is_none_work </span><span class="s3">= </span><span class="s2">False</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s1">x_is_none_work </span><span class="s3">= </span><span class="s2">True</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">dead </span><span class="s3">= </span><span class="s4">7  </span><span class="s0"># noqa: F841 # no effect</span>
+
+            <span class="s2">if </span><span class="s1">x_is_none_work</span><span class="s3">:</span>
+                <span class="s1">y </span><span class="s3">= </span><span class="s4">10</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">y </span><span class="s3">= -</span><span class="s4">3</span>
+            <span class="s2">return </span><span class="s1">y</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s2">False</span><span class="s3">, </span><span class="s2">None</span><span class="s3">], </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">10</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">, </span><span class="s2">None</span><span class="s3">], </span><span class="s4">10</span><span class="s3">)</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s1">x_is_none_work </span><span class="s3">= </span><span class="s2">False</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s1">x_is_none_work </span><span class="s3">= </span><span class="s2">True</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">pass</span>
+
+            <span class="s2">if </span><span class="s1">x_is_none_work</span><span class="s3">:</span>
+                <span class="s1">y </span><span class="s3">= </span><span class="s4">10</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">y </span><span class="s3">= -</span><span class="s4">3</span>
+            <span class="s2">return </span><span class="s1">y</span>
+
+        <span class="s2">if </span><span class="s1">utils</span><span class="s3">.</span><span class="s1">PYVERSION </span><span class="s3">&gt;= (</span><span class="s4">3</span><span class="s3">, </span><span class="s4">10</span><span class="s3">):</span>
+            <span class="s0"># Python 3.10 creates a block with a NOP in it for the `pass` which</span>
+            <span class="s0"># means it gets pruned.</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s2">False</span><span class="s3">, </span><span class="s2">None</span><span class="s3">],</span>
+                              <span class="s2">None</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">],</span>
+                              <span class="s2">None</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">10</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">, </span><span class="s2">None</span><span class="s3">], </span><span class="s4">10</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_double_if_else_rt_const</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s1">one_hundred </span><span class="s3">= </span><span class="s4">100</span>
+            <span class="s1">x_is_none_work </span><span class="s3">= </span><span class="s4">4</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s1">x_is_none_work </span><span class="s3">= </span><span class="s4">100</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">dead </span><span class="s3">= </span><span class="s4">7  </span><span class="s0"># noqa: F841 # no effect</span>
+
+            <span class="s2">if </span><span class="s1">x_is_none_work </span><span class="s3">== </span><span class="s1">one_hundred</span><span class="s3">:</span>
+                <span class="s1">y </span><span class="s3">= </span><span class="s4">10</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">y </span><span class="s3">= -</span><span class="s4">3</span>
+
+            <span class="s2">return </span><span class="s1">y</span><span class="s3">, </span><span class="s1">x_is_none_work</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s2">False</span><span class="s3">, </span><span class="s2">None</span><span class="s3">], </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">10</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">, </span><span class="s2">None</span><span class="s3">], </span><span class="s4">10</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_double_if_else_non_literal_const</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s1">one_hundred </span><span class="s3">= </span><span class="s4">100</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s3">== </span><span class="s1">one_hundred</span><span class="s3">:</span>
+                <span class="s1">y </span><span class="s3">= </span><span class="s4">3.14159</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">y </span><span class="s3">= </span><span class="s4">1.61803</span>
+            <span class="s2">return </span><span class="s1">y</span>
+
+        <span class="s0"># no prune as compilation specialization on literal value not permitted</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">10</span><span class="s3">),), [</span><span class="s2">None</span><span class="s3">], </span><span class="s4">10</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">100</span><span class="s3">),), [</span><span class="s2">None</span><span class="s3">], </span><span class="s4">100</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_single_two_branches_same_cond</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s1">y </span><span class="s3">= </span><span class="s4">10</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">y </span><span class="s3">= </span><span class="s4">40</span>
+
+            <span class="s2">if </span><span class="s1">x </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">z </span><span class="s3">= </span><span class="s4">100</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">z </span><span class="s3">= </span><span class="s4">400</span>
+
+            <span class="s2">return </span><span class="s1">z</span><span class="s3">, </span><span class="s1">y</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s2">False</span><span class="s3">, </span><span class="s2">True</span><span class="s3">], </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">10</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">, </span><span class="s2">False</span><span class="s3">], </span><span class="s4">10</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_cond_is_kwarg_none</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s1">y </span><span class="s3">= </span><span class="s4">10</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">y </span><span class="s3">= </span><span class="s4">40</span>
+
+            <span class="s2">if </span><span class="s1">x </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">z </span><span class="s3">= </span><span class="s4">100</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">z </span><span class="s3">= </span><span class="s4">400</span>
+
+            <span class="s2">return </span><span class="s1">z</span><span class="s3">, </span><span class="s1">y</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">Omitted</span><span class="s3">(</span><span class="s2">None</span><span class="s3">),),</span>
+                          <span class="s3">[</span><span class="s2">False</span><span class="s3">, </span><span class="s2">True</span><span class="s3">], </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s2">False</span><span class="s3">, </span><span class="s2">True</span><span class="s3">], </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">10</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">, </span><span class="s2">False</span><span class="s3">], </span><span class="s4">10</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_cond_is_kwarg_value</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">=</span><span class="s4">1000</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s3">== </span><span class="s4">1000</span><span class="s3">:</span>
+                <span class="s1">y </span><span class="s3">= </span><span class="s4">10</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">y </span><span class="s3">= </span><span class="s4">40</span>
+
+            <span class="s2">if </span><span class="s1">x </span><span class="s3">!= </span><span class="s4">1000</span><span class="s3">:</span>
+                <span class="s1">z </span><span class="s3">= </span><span class="s4">100</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">z </span><span class="s3">= </span><span class="s4">400</span>
+
+            <span class="s2">return </span><span class="s1">z</span><span class="s3">, </span><span class="s1">y</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">Omitted</span><span class="s3">(</span><span class="s4">1000</span><span class="s3">),), [</span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">], </span><span class="s4">1000</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">1000</span><span class="s3">),), [</span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">],</span>
+                          <span class="s4">1000</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">0</span><span class="s3">),), [</span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">], </span><span class="s4">0</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">, </span><span class="s2">False</span><span class="s3">], </span><span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_cond_rewrite_is_correct</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0"># this checks that when a condition is replaced, it is replace by a</span>
+        <span class="s0"># true/false bit that correctly represents the evaluated condition</span>
+        <span class="s2">def </span><span class="s1">fn</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">10</span>
+            <span class="s2">return </span><span class="s4">12</span>
+
+        <span class="s2">def </span><span class="s1">check</span><span class="s3">(</span><span class="s1">func</span><span class="s3">, </span><span class="s1">arg_tys</span><span class="s3">, </span><span class="s1">bit_val</span><span class="s3">):</span>
+            <span class="s1">func_ir </span><span class="s3">= </span><span class="s1">compile_to_ir</span><span class="s3">(</span><span class="s1">func</span><span class="s3">)</span>
+
+            <span class="s0"># check there is 1 branch</span>
+            <span class="s1">before_branches </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">find_branches</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">before_branches</span><span class="s3">), </span><span class="s4">1</span><span class="s3">)</span>
+
+            <span class="s0"># check the condition in the branch is a binop</span>
+            <span class="s1">pred_var </span><span class="s3">= </span><span class="s1">before_branches</span><span class="s3">[</span><span class="s4">0</span><span class="s3">].</span><span class="s1">cond</span>
+            <span class="s1">pred_defn </span><span class="s3">= </span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">get_definition</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">pred_var</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">pred_defn</span><span class="s3">.</span><span class="s1">op</span><span class="s3">, </span><span class="s5">'call'</span><span class="s3">)</span>
+            <span class="s1">condition_var </span><span class="s3">= </span><span class="s1">pred_defn</span><span class="s3">.</span><span class="s1">args</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]</span>
+            <span class="s1">condition_op </span><span class="s3">= </span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">get_definition</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">condition_var</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">condition_op</span><span class="s3">.</span><span class="s1">op</span><span class="s3">, </span><span class="s5">'binop'</span><span class="s3">)</span>
+
+            <span class="s0"># do the prune, this should kill the dead branch and rewrite the</span>
+            <span class="s0">#'condition to a true/false const bit</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_DEBUG</span><span class="s3">:</span>
+                <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;=&quot; </span><span class="s3">* </span><span class="s4">80</span><span class="s3">)</span>
+                <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;before prune&quot;</span><span class="s3">)</span>
+                <span class="s1">func_ir</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">()</span>
+            <span class="s1">dead_branch_prune</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">arg_tys</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_DEBUG</span><span class="s3">:</span>
+                <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;=&quot; </span><span class="s3">* </span><span class="s4">80</span><span class="s3">)</span>
+                <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;after prune&quot;</span><span class="s3">)</span>
+                <span class="s1">func_ir</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">()</span>
+
+            <span class="s0"># after mutation, the condition should be a const value `bit_val`</span>
+            <span class="s1">new_condition_defn </span><span class="s3">= </span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">get_definition</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">condition_var</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assertTrue</span><span class="s3">(</span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">new_condition_defn</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Const</span><span class="s3">))</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">new_condition_defn</span><span class="s3">.</span><span class="s1">value</span><span class="s3">, </span><span class="s1">bit_val</span><span class="s3">)</span>
+
+        <span class="s1">check</span><span class="s3">(</span><span class="s1">fn</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), </span><span class="s4">1</span><span class="s3">)</span>
+        <span class="s1">check</span><span class="s3">(</span><span class="s1">fn</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">10</span><span class="s3">),), </span><span class="s4">0</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_global_bake_in</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">_GLOBAL </span><span class="s3">== </span><span class="s4">123</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">x</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">x </span><span class="s3">+ </span><span class="s4">10</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">1</span><span class="s3">),), [</span><span class="s2">False</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+        <span class="s2">global </span><span class="s1">_GLOBAL</span>
+        <span class="s1">tmp </span><span class="s3">= </span><span class="s1">_GLOBAL</span>
+
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">_GLOBAL </span><span class="s3">= </span><span class="s4">5</span>
+
+            <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+                <span class="s2">if </span><span class="s1">_GLOBAL </span><span class="s3">== </span><span class="s4">123</span><span class="s3">:</span>
+                    <span class="s2">return </span><span class="s1">x</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s2">return </span><span class="s1">x </span><span class="s3">+ </span><span class="s4">10</span>
+
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">1</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+        <span class="s2">finally</span><span class="s3">:</span>
+            <span class="s1">_GLOBAL </span><span class="s3">= </span><span class="s1">tmp</span>
+
+    <span class="s2">def </span><span class="s1">test_freevar_bake_in</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s1">_FREEVAR </span><span class="s3">= </span><span class="s4">123</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">_FREEVAR </span><span class="s3">== </span><span class="s4">123</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">x</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">x </span><span class="s3">+ </span><span class="s4">10</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">1</span><span class="s3">),), [</span><span class="s2">False</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+        <span class="s1">_FREEVAR </span><span class="s3">= </span><span class="s4">12</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">_FREEVAR </span><span class="s3">== </span><span class="s4">123</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">x</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">x </span><span class="s3">+ </span><span class="s4">10</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">IntegerLiteral</span><span class="s3">(</span><span class="s4">1</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_redefined_variables_are_not_considered_in_prune</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0"># see issue #4163, checks that if a variable that is an argument is</span>
+        <span class="s0"># redefined in the user code it is not considered const</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">array</span><span class="s3">, </span><span class="s1">a</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">a </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s1">a </span><span class="s3">= </span><span class="s4">0</span>
+            <span class="s2">if </span><span class="s1">a </span><span class="s3">&lt; </span><span class="s4">0</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">10</span>
+            <span class="s2">return </span><span class="s4">30</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">,</span>
+                          <span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">Array</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s5">'C'</span><span class="s3">),</span>
+                           <span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),),</span>
+                          <span class="s3">[</span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">],</span>
+                          <span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">)), </span><span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_comparison_operators</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0"># see issue #4163, checks that a variable that is an argument and has</span>
+        <span class="s0"># value None survives TypeError from invalid comparison which should be</span>
+        <span class="s0"># dead</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">array</span><span class="s3">, </span><span class="s1">a</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+            <span class="s1">x </span><span class="s3">= </span><span class="s4">0</span>
+            <span class="s2">if </span><span class="s1">a </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">10 </span><span class="s0"># dynamic exec would return here</span>
+            <span class="s0"># static analysis requires that this is executed with a=None,</span>
+            <span class="s0"># hence TypeError</span>
+            <span class="s2">if </span><span class="s1">a </span><span class="s3">&lt; </span><span class="s4">0</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">20</span>
+            <span class="s2">return </span><span class="s1">x</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">,</span>
+                          <span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">Array</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s5">'C'</span><span class="s3">),</span>
+                           <span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),),</span>
+                          <span class="s3">[</span><span class="s2">False</span><span class="s3">, </span><span class="s5">'both'</span><span class="s3">],</span>
+                          <span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">)), </span><span class="s2">None</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">,</span>
+                          <span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">Array</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s5">'C'</span><span class="s3">),</span>
+                           <span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">,),</span>
+                          <span class="s3">[</span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">],</span>
+                          <span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">)), </span><span class="s4">12.</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_redefinition_analysis_same_block</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0"># checks that a redefinition in a block with prunable potential doesn't</span>
+        <span class="s0"># break</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">array</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">a</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+            <span class="s1">b </span><span class="s3">= </span><span class="s4">2</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s3">&lt; </span><span class="s4">4</span><span class="s3">:</span>
+                <span class="s1">b </span><span class="s3">= </span><span class="s4">12</span>
+            <span class="s2">if </span><span class="s1">a </span><span class="s2">is None</span><span class="s3">: </span><span class="s0"># known true</span>
+                <span class="s1">a </span><span class="s3">= </span><span class="s4">7 </span><span class="s0"># live</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">b </span><span class="s3">= </span><span class="s4">15 </span><span class="s0"># dead</span>
+            <span class="s2">if </span><span class="s1">a </span><span class="s3">&lt; </span><span class="s4">0</span><span class="s3">: </span><span class="s0"># valid as a result of the redefinition of 'a'</span>
+                <span class="s2">return </span><span class="s4">10</span>
+            <span class="s2">return </span><span class="s4">30 </span><span class="s3">+ </span><span class="s1">b </span><span class="s3">+ </span><span class="s1">a</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">,</span>
+                          <span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">Array</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s5">'C'</span><span class="s3">),</span>
+                           <span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),),</span>
+                          <span class="s3">[</span><span class="s2">None</span><span class="s3">, </span><span class="s2">False</span><span class="s3">, </span><span class="s2">None</span><span class="s3">],</span>
+                          <span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">)), </span><span class="s4">1.</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_redefinition_analysis_different_block_can_exec</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0"># checks that a redefinition in a block that may be executed prevents</span>
+        <span class="s0"># pruning</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">array</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">a</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+            <span class="s1">b </span><span class="s3">= </span><span class="s4">0</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s3">&gt; </span><span class="s4">5</span><span class="s3">:</span>
+                <span class="s1">a </span><span class="s3">= </span><span class="s4">11 </span><span class="s0"># a redefined, cannot tell statically if this will exec</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s3">&lt; </span><span class="s4">4</span><span class="s3">:</span>
+                <span class="s1">b </span><span class="s3">= </span><span class="s4">12</span>
+            <span class="s2">if </span><span class="s1">a </span><span class="s2">is None</span><span class="s3">: </span><span class="s0"># cannot prune, cannot determine if re-defn occurred</span>
+                <span class="s1">b </span><span class="s3">+= </span><span class="s4">5</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">b </span><span class="s3">+= </span><span class="s4">7</span>
+                <span class="s2">if </span><span class="s1">a </span><span class="s3">&lt; </span><span class="s4">0</span><span class="s3">:</span>
+                    <span class="s2">return </span><span class="s4">10</span>
+            <span class="s2">return </span><span class="s4">30 </span><span class="s3">+ </span><span class="s1">b</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">,</span>
+                          <span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">Array</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s5">'C'</span><span class="s3">),</span>
+                           <span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),),</span>
+                          <span class="s3">[</span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">],</span>
+                          <span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">)), </span><span class="s4">1.</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_redefinition_analysis_different_block_cannot_exec</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0"># checks that a redefinition in a block guarded by something that</span>
+        <span class="s0"># has prune potential</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">array</span><span class="s3">, </span><span class="s1">x</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">a</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+            <span class="s1">b </span><span class="s3">= </span><span class="s4">0</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">a </span><span class="s3">= </span><span class="s4">11</span>
+            <span class="s2">if </span><span class="s1">a </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s1">b </span><span class="s3">+= </span><span class="s4">5</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">b </span><span class="s3">+= </span><span class="s4">7</span>
+            <span class="s2">return </span><span class="s4">30 </span><span class="s3">+ </span><span class="s1">b</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">,</span>
+                          <span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">Array</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s5">'C'</span><span class="s3">),</span>
+                           <span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">), </span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">)),</span>
+                          <span class="s3">[</span><span class="s2">True</span><span class="s3">, </span><span class="s2">None</span><span class="s3">],</span>
+                          <span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">)), </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">,</span>
+                          <span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">Array</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s5">'C'</span><span class="s3">),</span>
+                           <span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">), </span><span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">),</span>
+                          <span class="s3">[</span><span class="s2">True</span><span class="s3">, </span><span class="s2">None</span><span class="s3">],</span>
+                          <span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">)), </span><span class="s2">None</span><span class="s3">, </span><span class="s4">1.2</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">,</span>
+                          <span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">Array</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s5">'C'</span><span class="s3">),</span>
+                           <span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">)),</span>
+                          <span class="s3">[</span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">],</span>
+                          <span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">)), </span><span class="s4">1.2</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_closure_and_nonlocal_can_prune</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0"># Closures must be inlined ahead of branch pruning in case nonlocal</span>
+        <span class="s0"># is used. See issue #6585.</span>
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">():</span>
+            <span class="s1">x </span><span class="s3">= </span><span class="s4">1000</span>
+
+            <span class="s2">def </span><span class="s1">closure</span><span class="s3">():</span>
+                <span class="s2">nonlocal </span><span class="s1">x</span>
+                <span class="s1">x </span><span class="s3">= </span><span class="s4">0</span>
+
+            <span class="s1">closure</span><span class="s3">()</span>
+
+            <span class="s2">if </span><span class="s1">x </span><span class="s3">== </span><span class="s4">0</span><span class="s3">:</span>
+                <span class="s2">return True</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">return False</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (), [</span><span class="s2">False</span><span class="s3">,],)</span>
+
+    <span class="s2">def </span><span class="s1">test_closure_and_nonlocal_cannot_prune</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0"># Closures must be inlined ahead of branch pruning in case nonlocal</span>
+        <span class="s0"># is used. See issue #6585.</span>
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">n</span><span class="s3">):</span>
+            <span class="s1">x </span><span class="s3">= </span><span class="s4">1000</span>
+
+            <span class="s2">def </span><span class="s1">closure</span><span class="s3">(</span><span class="s1">t</span><span class="s3">):</span>
+                <span class="s2">nonlocal </span><span class="s1">x</span>
+                <span class="s1">x </span><span class="s3">= </span><span class="s1">t</span>
+
+            <span class="s1">closure</span><span class="s3">(</span><span class="s1">n</span><span class="s3">)</span>
+
+            <span class="s2">if </span><span class="s1">x </span><span class="s3">== </span><span class="s4">0</span><span class="s3">:</span>
+                <span class="s2">return True</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">return False</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">int64</span><span class="s3">,), [</span><span class="s2">None</span><span class="s3">,], </span><span class="s4">1</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestBranchPrunePredicates</span><span class="s3">(</span><span class="s1">TestBranchPruneBase</span><span class="s3">, </span><span class="s1">SerialMixin</span><span class="s3">):</span>
+    <span class="s0"># Really important thing to remember... the branch on predicates end up as</span>
+    <span class="s0"># POP_JUMP_IF_&lt;bool&gt; and the targets are backwards compared to normal, i.e.</span>
+    <span class="s0"># the true condition is far jump and the false the near i.e. `if x` would</span>
+    <span class="s0"># end up in Numba IR as e.g. `branch x 10, 6`.</span>
+
+    <span class="s1">_TRUTHY </span><span class="s3">= (</span><span class="s4">1</span><span class="s3">, </span><span class="s5">&quot;String&quot;</span><span class="s3">, </span><span class="s2">True</span><span class="s3">, </span><span class="s4">7.4</span><span class="s3">, </span><span class="s4">3j</span><span class="s3">)</span>
+    <span class="s1">_FALSEY </span><span class="s3">= (</span><span class="s4">0</span><span class="s3">, </span><span class="s5">&quot;&quot;</span><span class="s3">, </span><span class="s2">False</span><span class="s3">, </span><span class="s4">0.0</span><span class="s3">, </span><span class="s4">0j</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_literal_const_sample_generator</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">pyfunc</span><span class="s3">, </span><span class="s1">consts</span><span class="s3">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        This takes a python function, pyfunc, and manipulates its co_const 
+        __code__ member to create a new function with different co_consts as 
+        supplied in argument consts. 
+ 
+        consts is a dict {index: value} of co_const tuple index to constant 
+        value used to update a pyfunc clone's co_const. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">pyfunc_code </span><span class="s3">= </span><span class="s1">pyfunc</span><span class="s3">.</span><span class="s1">__code__</span>
+
+        <span class="s0"># translate consts spec to update the constants</span>
+        <span class="s1">co_consts </span><span class="s3">= {</span><span class="s1">k</span><span class="s3">: </span><span class="s1">v </span><span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">pyfunc_code</span><span class="s3">.</span><span class="s1">co_consts</span><span class="s3">)}</span>
+        <span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">consts</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+            <span class="s1">co_consts</span><span class="s3">[</span><span class="s1">k</span><span class="s3">] = </span><span class="s1">v</span>
+        <span class="s1">new_consts </span><span class="s3">= </span><span class="s1">tuple</span><span class="s3">([</span><span class="s1">v </span><span class="s2">for </span><span class="s1">_</span><span class="s3">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">co_consts</span><span class="s3">.</span><span class="s1">items</span><span class="s3">())])</span>
+
+        <span class="s0"># create code object with mutation</span>
+        <span class="s1">new_code </span><span class="s3">= </span><span class="s1">pyfunc_code</span><span class="s3">.</span><span class="s1">replace</span><span class="s3">(</span><span class="s1">co_consts</span><span class="s3">=</span><span class="s1">new_consts</span><span class="s3">)</span>
+
+        <span class="s0"># get function</span>
+        <span class="s2">return </span><span class="s1">pytypes</span><span class="s3">.</span><span class="s1">FunctionType</span><span class="s3">(</span><span class="s1">new_code</span><span class="s3">, </span><span class="s1">globals</span><span class="s3">())</span>
+
+    <span class="s2">def </span><span class="s1">test_literal_const_code_gen</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s1">_CONST1 </span><span class="s3">= </span><span class="s5">&quot;PLACEHOLDER1&quot;</span>
+            <span class="s2">if </span><span class="s1">_CONST1</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">3.14159</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">_CONST2 </span><span class="s3">= </span><span class="s5">&quot;PLACEHOLDER2&quot;</span>
+            <span class="s2">return </span><span class="s1">_CONST2 </span><span class="s3">+ </span><span class="s4">4</span>
+
+        <span class="s1">new </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_literal_const_sample_generator</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, {</span><span class="s4">1</span><span class="s3">:</span><span class="s4">0</span><span class="s3">, </span><span class="s4">3</span><span class="s3">:</span><span class="s4">20</span><span class="s3">})</span>
+        <span class="s1">iconst </span><span class="s3">= </span><span class="s1">impl</span><span class="s3">.</span><span class="s1">__code__</span><span class="s3">.</span><span class="s1">co_consts</span>
+        <span class="s1">nconst </span><span class="s3">= </span><span class="s1">new</span><span class="s3">.</span><span class="s1">__code__</span><span class="s3">.</span><span class="s1">co_consts</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">iconst</span><span class="s3">, (</span><span class="s2">None</span><span class="s3">, </span><span class="s5">&quot;PLACEHOLDER1&quot;</span><span class="s3">, </span><span class="s4">3.14159</span><span class="s3">,</span>
+                                  <span class="s5">&quot;PLACEHOLDER2&quot;</span><span class="s3">, </span><span class="s4">4</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">nconst</span><span class="s3">, (</span><span class="s2">None</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, </span><span class="s4">3.14159</span><span class="s3">,  </span><span class="s4">20</span><span class="s3">, </span><span class="s4">4</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">(</span><span class="s2">None</span><span class="s3">), </span><span class="s4">3.14159</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">new</span><span class="s3">(</span><span class="s2">None</span><span class="s3">), </span><span class="s4">24</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_single_if_const</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s1">_CONST1 </span><span class="s3">= </span><span class="s5">&quot;PLACEHOLDER1&quot;</span>
+            <span class="s2">if </span><span class="s1">_CONST1</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">3.14159</span>
+
+        <span class="s2">for </span><span class="s1">c_inp</span><span class="s3">, </span><span class="s1">prune </span><span class="s2">in </span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_TRUTHY</span><span class="s3">, </span><span class="s2">False</span><span class="s3">), (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_FALSEY</span><span class="s3">, </span><span class="s2">True</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">const </span><span class="s2">in </span><span class="s1">c_inp</span><span class="s3">:</span>
+                <span class="s1">func </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_literal_const_sample_generator</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, {</span><span class="s4">1</span><span class="s3">: </span><span class="s1">const</span><span class="s3">})</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">func</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s1">prune</span><span class="s3">],</span>
+                                  <span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_single_if_negate_const</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s1">_CONST1 </span><span class="s3">= </span><span class="s5">&quot;PLACEHOLDER1&quot;</span>
+            <span class="s2">if not </span><span class="s1">_CONST1</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">3.14159</span>
+
+        <span class="s2">for </span><span class="s1">c_inp</span><span class="s3">, </span><span class="s1">prune </span><span class="s2">in </span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_TRUTHY</span><span class="s3">, </span><span class="s2">False</span><span class="s3">), (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_FALSEY</span><span class="s3">, </span><span class="s2">True</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">const </span><span class="s2">in </span><span class="s1">c_inp</span><span class="s3">:</span>
+                <span class="s1">func </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_literal_const_sample_generator</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, {</span><span class="s4">1</span><span class="s3">: </span><span class="s1">const</span><span class="s3">})</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">func</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s1">prune</span><span class="s3">],</span>
+                                  <span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_single_if_else_const</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s1">_CONST1 </span><span class="s3">= </span><span class="s5">&quot;PLACEHOLDER1&quot;</span>
+            <span class="s2">if </span><span class="s1">_CONST1</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">3.14159</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">1.61803</span>
+
+        <span class="s2">for </span><span class="s1">c_inp</span><span class="s3">, </span><span class="s1">prune </span><span class="s2">in </span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_TRUTHY</span><span class="s3">, </span><span class="s2">False</span><span class="s3">), (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_FALSEY</span><span class="s3">, </span><span class="s2">True</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">const </span><span class="s2">in </span><span class="s1">c_inp</span><span class="s3">:</span>
+                <span class="s1">func </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_literal_const_sample_generator</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, {</span><span class="s4">1</span><span class="s3">: </span><span class="s1">const</span><span class="s3">})</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">func</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s1">prune</span><span class="s3">],</span>
+                                  <span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_single_if_else_negate_const</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s1">_CONST1 </span><span class="s3">= </span><span class="s5">&quot;PLACEHOLDER1&quot;</span>
+            <span class="s2">if not </span><span class="s1">_CONST1</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">3.14159</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">1.61803</span>
+
+        <span class="s2">for </span><span class="s1">c_inp</span><span class="s3">, </span><span class="s1">prune </span><span class="s2">in </span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_TRUTHY</span><span class="s3">, </span><span class="s2">False</span><span class="s3">), (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_FALSEY</span><span class="s3">, </span><span class="s2">True</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">const </span><span class="s2">in </span><span class="s1">c_inp</span><span class="s3">:</span>
+                <span class="s1">func </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_literal_const_sample_generator</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, {</span><span class="s4">1</span><span class="s3">: </span><span class="s1">const</span><span class="s3">})</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">func</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s1">prune</span><span class="s3">],</span>
+                                  <span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_single_if_freevar</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">for </span><span class="s1">c_inp</span><span class="s3">, </span><span class="s1">prune </span><span class="s2">in </span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_TRUTHY</span><span class="s3">, </span><span class="s2">False</span><span class="s3">), (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_FALSEY</span><span class="s3">, </span><span class="s2">True</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">const </span><span class="s2">in </span><span class="s1">c_inp</span><span class="s3">:</span>
+
+                <span class="s2">def </span><span class="s1">func</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+                    <span class="s2">if </span><span class="s1">const</span><span class="s3">:</span>
+                        <span class="s2">return </span><span class="s4">3.14159</span><span class="s3">, </span><span class="s1">const</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">func</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s1">prune</span><span class="s3">],</span>
+                                  <span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_single_if_negate_freevar</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">for </span><span class="s1">c_inp</span><span class="s3">, </span><span class="s1">prune </span><span class="s2">in </span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_TRUTHY</span><span class="s3">, </span><span class="s2">False</span><span class="s3">), (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_FALSEY</span><span class="s3">, </span><span class="s2">True</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">const </span><span class="s2">in </span><span class="s1">c_inp</span><span class="s3">:</span>
+
+                <span class="s2">def </span><span class="s1">func</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+                    <span class="s2">if not </span><span class="s1">const</span><span class="s3">:</span>
+                        <span class="s2">return </span><span class="s4">3.14159</span><span class="s3">, </span><span class="s1">const</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">func</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s1">prune</span><span class="s3">],</span>
+                                  <span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_single_if_else_freevar</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">for </span><span class="s1">c_inp</span><span class="s3">, </span><span class="s1">prune </span><span class="s2">in </span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_TRUTHY</span><span class="s3">, </span><span class="s2">False</span><span class="s3">), (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_FALSEY</span><span class="s3">, </span><span class="s2">True</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">const </span><span class="s2">in </span><span class="s1">c_inp</span><span class="s3">:</span>
+
+                <span class="s2">def </span><span class="s1">func</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+                    <span class="s2">if </span><span class="s1">const</span><span class="s3">:</span>
+                        <span class="s2">return </span><span class="s4">3.14159</span><span class="s3">, </span><span class="s1">const</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s2">return </span><span class="s4">1.61803</span><span class="s3">, </span><span class="s1">const</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">func</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s1">prune</span><span class="s3">],</span>
+                                  <span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_single_if_else_negate_freevar</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">for </span><span class="s1">c_inp</span><span class="s3">, </span><span class="s1">prune </span><span class="s2">in </span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_TRUTHY</span><span class="s3">, </span><span class="s2">False</span><span class="s3">), (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_FALSEY</span><span class="s3">, </span><span class="s2">True</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">const </span><span class="s2">in </span><span class="s1">c_inp</span><span class="s3">:</span>
+
+                <span class="s2">def </span><span class="s1">func</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+                    <span class="s2">if not </span><span class="s1">const</span><span class="s3">:</span>
+                        <span class="s2">return </span><span class="s4">3.14159</span><span class="s3">, </span><span class="s1">const</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s2">return </span><span class="s4">1.61803</span><span class="s3">, </span><span class="s1">const</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">func</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s1">prune</span><span class="s3">],</span>
+                                  <span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s0"># globals in this section have absurd names after their test usecase names</span>
+    <span class="s0"># so as to prevent collisions and permit tests to run in parallel</span>
+    <span class="s2">def </span><span class="s1">test_single_if_global</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">global </span><span class="s1">c_test_single_if_global</span>
+
+        <span class="s2">for </span><span class="s1">c_inp</span><span class="s3">, </span><span class="s1">prune </span><span class="s2">in </span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_TRUTHY</span><span class="s3">, </span><span class="s2">False</span><span class="s3">), (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_FALSEY</span><span class="s3">, </span><span class="s2">True</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">c_inp</span><span class="s3">:</span>
+                <span class="s1">c_test_single_if_global </span><span class="s3">= </span><span class="s1">c</span>
+
+                <span class="s2">def </span><span class="s1">func</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+                    <span class="s2">if </span><span class="s1">c_test_single_if_global</span><span class="s3">:</span>
+                        <span class="s2">return </span><span class="s4">3.14159</span><span class="s3">, </span><span class="s1">c_test_single_if_global</span>
+
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">func</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s1">prune</span><span class="s3">],</span>
+                                  <span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_single_if_negate_global</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">global </span><span class="s1">c_test_single_if_negate_global</span>
+
+        <span class="s2">for </span><span class="s1">c_inp</span><span class="s3">, </span><span class="s1">prune </span><span class="s2">in </span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_TRUTHY</span><span class="s3">, </span><span class="s2">False</span><span class="s3">), (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_FALSEY</span><span class="s3">, </span><span class="s2">True</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">c_inp</span><span class="s3">:</span>
+                <span class="s1">c_test_single_if_negate_global </span><span class="s3">= </span><span class="s1">c</span>
+
+                <span class="s2">def </span><span class="s1">func</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+                    <span class="s2">if </span><span class="s1">c_test_single_if_negate_global</span><span class="s3">:</span>
+                        <span class="s2">return </span><span class="s4">3.14159</span><span class="s3">, </span><span class="s1">c_test_single_if_negate_global</span>
+
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">func</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s1">prune</span><span class="s3">],</span>
+                                  <span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_single_if_else_global</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">global </span><span class="s1">c_test_single_if_else_global</span>
+
+        <span class="s2">for </span><span class="s1">c_inp</span><span class="s3">, </span><span class="s1">prune </span><span class="s2">in </span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_TRUTHY</span><span class="s3">, </span><span class="s2">False</span><span class="s3">), (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_FALSEY</span><span class="s3">, </span><span class="s2">True</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">c_inp</span><span class="s3">:</span>
+                <span class="s1">c_test_single_if_else_global </span><span class="s3">= </span><span class="s1">c</span>
+
+                <span class="s2">def </span><span class="s1">func</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+                    <span class="s2">if </span><span class="s1">c_test_single_if_else_global</span><span class="s3">:</span>
+                        <span class="s2">return </span><span class="s4">3.14159</span><span class="s3">, </span><span class="s1">c_test_single_if_else_global</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s2">return </span><span class="s4">1.61803</span><span class="s3">, </span><span class="s1">c_test_single_if_else_global</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">func</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s1">prune</span><span class="s3">],</span>
+                                  <span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_single_if_else_negate_global</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">global </span><span class="s1">c_test_single_if_else_negate_global</span>
+
+        <span class="s2">for </span><span class="s1">c_inp</span><span class="s3">, </span><span class="s1">prune </span><span class="s2">in </span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_TRUTHY</span><span class="s3">, </span><span class="s2">False</span><span class="s3">), (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_FALSEY</span><span class="s3">, </span><span class="s2">True</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">c_inp</span><span class="s3">:</span>
+                <span class="s1">c_test_single_if_else_negate_global </span><span class="s3">= </span><span class="s1">c</span>
+
+                <span class="s2">def </span><span class="s1">func</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+                    <span class="s2">if not </span><span class="s1">c_test_single_if_else_negate_global</span><span class="s3">:</span>
+                        <span class="s2">return </span><span class="s4">3.14159</span><span class="s3">, </span><span class="s1">c_test_single_if_else_negate_global</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s2">return </span><span class="s4">1.61803</span><span class="s3">, </span><span class="s1">c_test_single_if_else_negate_global</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">func</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">),), [</span><span class="s1">prune</span><span class="s3">],</span>
+                                  <span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_issue_5618</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">():</span>
+            <span class="s1">values </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s4">1</span><span class="s3">)</span>
+            <span class="s1">tmp </span><span class="s3">= </span><span class="s4">666</span>
+            <span class="s2">if </span><span class="s1">tmp</span><span class="s3">:</span>
+                <span class="s1">values</span><span class="s3">[</span><span class="s4">0</span><span class="s3">] = </span><span class="s1">tmp</span>
+            <span class="s2">return </span><span class="s1">values</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertPreciseEqual</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">.</span><span class="s1">py_func</span><span class="s3">()[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">666.</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertPreciseEqual</span><span class="s3">(</span><span class="s1">foo</span><span class="s3">()[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">666.</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestBranchPruneSSA</span><span class="s3">(</span><span class="s1">MemoryLeakMixin</span><span class="s3">, </span><span class="s1">TestCase</span><span class="s3">):</span>
+    <span class="s0"># Tests SSA rewiring of phi nodes after branch pruning.</span>
+
+    <span class="s2">class </span><span class="s1">SSAPrunerCompiler</span><span class="s3">(</span><span class="s1">CompilerBase</span><span class="s3">):</span>
+        <span class="s2">def </span><span class="s1">define_pipelines</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+            <span class="s0"># This is a simple pipeline that does branch pruning on IR in SSA</span>
+            <span class="s0"># form, then types and lowers as per the standard nopython pipeline.</span>
+            <span class="s1">pm </span><span class="s3">= </span><span class="s1">PassManager</span><span class="s3">(</span><span class="s5">&quot;testing pm&quot;</span><span class="s3">)</span>
+            <span class="s1">pm</span><span class="s3">.</span><span class="s1">add_pass</span><span class="s3">(</span><span class="s1">TranslateByteCode</span><span class="s3">, </span><span class="s5">&quot;analyzing bytecode&quot;</span><span class="s3">)</span>
+            <span class="s1">pm</span><span class="s3">.</span><span class="s1">add_pass</span><span class="s3">(</span><span class="s1">IRProcessing</span><span class="s3">, </span><span class="s5">&quot;processing IR&quot;</span><span class="s3">)</span>
+            <span class="s0"># SSA early</span>
+            <span class="s1">pm</span><span class="s3">.</span><span class="s1">add_pass</span><span class="s3">(</span><span class="s1">ReconstructSSA</span><span class="s3">, </span><span class="s5">&quot;ssa&quot;</span><span class="s3">)</span>
+            <span class="s1">pm</span><span class="s3">.</span><span class="s1">add_pass</span><span class="s3">(</span><span class="s1">DeadBranchPrune</span><span class="s3">, </span><span class="s5">&quot;dead branch pruning&quot;</span><span class="s3">)</span>
+            <span class="s0"># type and then lower as usual</span>
+            <span class="s1">pm</span><span class="s3">.</span><span class="s1">add_pass</span><span class="s3">(</span><span class="s1">PreserveIR</span><span class="s3">, </span><span class="s5">&quot;preserves the IR as metadata&quot;</span><span class="s3">)</span>
+            <span class="s1">dpb </span><span class="s3">= </span><span class="s1">DefaultPassBuilder</span>
+            <span class="s1">typed_passes </span><span class="s3">= </span><span class="s1">dpb</span><span class="s3">.</span><span class="s1">define_typed_pipeline</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">state</span><span class="s3">)</span>
+            <span class="s1">pm</span><span class="s3">.</span><span class="s1">passes</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">(</span><span class="s1">typed_passes</span><span class="s3">.</span><span class="s1">passes</span><span class="s3">)</span>
+            <span class="s1">lowering_passes </span><span class="s3">= </span><span class="s1">dpb</span><span class="s3">.</span><span class="s1">define_nopython_lowering_pipeline</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">state</span><span class="s3">)</span>
+            <span class="s1">pm</span><span class="s3">.</span><span class="s1">passes</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">(</span><span class="s1">lowering_passes</span><span class="s3">.</span><span class="s1">passes</span><span class="s3">)</span>
+            <span class="s1">pm</span><span class="s3">.</span><span class="s1">finalize</span><span class="s3">()</span>
+            <span class="s2">return </span><span class="s3">[</span><span class="s1">pm</span><span class="s3">]</span>
+
+    <span class="s2">def </span><span class="s1">test_ssa_update_phi</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0"># This checks that dead branch pruning is rewiring phi nodes correctly</span>
+        <span class="s0"># after a block containing an incoming for a phi is removed.</span>
+
+        <span class="s3">@</span><span class="s1">njit</span><span class="s3">(</span><span class="s1">pipeline_class</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">SSAPrunerCompiler</span><span class="s3">)</span>
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">p</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">q</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+            <span class="s1">z </span><span class="s3">= </span><span class="s4">1</span>
+            <span class="s1">r </span><span class="s3">= </span><span class="s2">False</span>
+            <span class="s2">if </span><span class="s1">p </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s1">r </span><span class="s3">= </span><span class="s2">True </span><span class="s0"># live</span>
+
+            <span class="s2">if </span><span class="s1">r </span><span class="s2">and </span><span class="s1">q </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">z </span><span class="s3">= </span><span class="s4">20 </span><span class="s0"># dead</span>
+
+            <span class="s0"># one of the incoming blocks for z is dead, the phi needs an update</span>
+            <span class="s0"># were this not done, it would refer to variables that do not exist</span>
+            <span class="s0"># and result in a lowering error.</span>
+            <span class="s2">return </span><span class="s1">z</span><span class="s3">, </span><span class="s1">r</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertPreciseEqual</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">(), </span><span class="s1">impl</span><span class="s3">.</span><span class="s1">py_func</span><span class="s3">())</span>
+
+    <span class="s2">def </span><span class="s1">test_ssa_replace_phi</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0"># This checks that when a phi only has one incoming, because the other</span>
+        <span class="s0"># has been pruned, that a direct assignment is used instead.</span>
+
+        <span class="s3">@</span><span class="s1">njit</span><span class="s3">(</span><span class="s1">pipeline_class</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">SSAPrunerCompiler</span><span class="s3">)</span>
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">p</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+            <span class="s1">z </span><span class="s3">= </span><span class="s4">0</span>
+            <span class="s2">if </span><span class="s1">p </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s1">z </span><span class="s3">= </span><span class="s4">10</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">z </span><span class="s3">= </span><span class="s4">20</span>
+
+            <span class="s2">return </span><span class="s1">z</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertPreciseEqual</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">(), </span><span class="s1">impl</span><span class="s3">.</span><span class="s1">py_func</span><span class="s3">())</span>
+        <span class="s1">func_ir </span><span class="s3">= </span><span class="s1">impl</span><span class="s3">.</span><span class="s1">overloads</span><span class="s3">[</span><span class="s1">impl</span><span class="s3">.</span><span class="s1">signatures</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]].</span><span class="s1">metadata</span><span class="s3">[</span><span class="s5">'preserved_ir'</span><span class="s3">]</span>
+
+        <span class="s0"># check the func_ir, make sure there's no phi nodes</span>
+        <span class="s2">for </span><span class="s1">blk </span><span class="s2">in </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">values</span><span class="s3">():</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assertFalse</span><span class="s3">([*</span><span class="s1">blk</span><span class="s3">.</span><span class="s1">find_exprs</span><span class="s3">(</span><span class="s5">'phi'</span><span class="s3">)])</span>
+
+
+<span class="s2">class </span><span class="s1">TestBranchPrunePostSemanticConstRewrites</span><span class="s3">(</span><span class="s1">TestBranchPruneBase</span><span class="s3">):</span>
+    <span class="s0"># Tests that semantic constants rewriting works by virtue of branch pruning</span>
+
+    <span class="s2">def </span><span class="s1">test_array_ndim_attr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">array</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">array</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">== </span><span class="s4">2</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">array</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">1</span><span class="s3">] == </span><span class="s4">2</span><span class="s3">:</span>
+                    <span class="s2">return </span><span class="s4">1</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">10</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">Array</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s5">'C'</span><span class="s3">),), [</span><span class="s2">False</span><span class="s3">,</span>
+                                                                        <span class="s2">None</span><span class="s3">],</span>
+                          <span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">)))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">Array</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, </span><span class="s5">'C'</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">,</span>
+                                                                        <span class="s5">'both'</span><span class="s3">],</span>
+                          <span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s4">2</span><span class="s3">,)))</span>
+
+    <span class="s2">def </span><span class="s1">test_tuple_len</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">tup</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">tup</span><span class="s3">) == </span><span class="s4">3</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">tup</span><span class="s3">[</span><span class="s4">2</span><span class="s3">] == </span><span class="s4">2</span><span class="s3">:</span>
+                    <span class="s2">return </span><span class="s4">1</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s4">0</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">UniTuple</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">int64</span><span class="s3">, </span><span class="s4">3</span><span class="s3">),), [</span><span class="s2">False</span><span class="s3">,</span>
+                                                                    <span class="s2">None</span><span class="s3">],</span>
+                          <span class="s1">tuple</span><span class="s3">([</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">]))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">UniTuple</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">int64</span><span class="s3">, </span><span class="s4">2</span><span class="s3">),), [</span><span class="s2">True</span><span class="s3">,</span>
+                                                                    <span class="s5">'both'</span><span class="s3">],</span>
+                          <span class="s1">tuple</span><span class="s3">([</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s3">]))</span>
+
+    <span class="s2">def </span><span class="s1">test_attr_not_len</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0"># The purpose of this test is to make sure that the conditions guarding</span>
+        <span class="s0"># the rewrite part do not themselves raise exceptions.</span>
+        <span class="s0"># This produces an `ir.Expr` call node for `float.as_integer_ratio`,</span>
+        <span class="s0"># which is a getattr() on `float`.</span>
+
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">test</span><span class="s3">():</span>
+            <span class="s1">float</span><span class="s3">.</span><span class="s1">as_integer_ratio</span><span class="s3">(</span><span class="s4">1.23</span><span class="s3">)</span>
+
+        <span class="s0"># this should raise a TypingError</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">assertRaises</span><span class="s3">(</span><span class="s1">errors</span><span class="s3">.</span><span class="s1">TypingError</span><span class="s3">) </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+            <span class="s1">test</span><span class="s3">()</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIn</span><span class="s3">(</span><span class="s5">&quot;Unknown attribute 'as_integer_ratio'&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">(</span><span class="s1">e</span><span class="s3">.</span><span class="s1">exception</span><span class="s3">))</span>
+
+    <span class="s2">def </span><span class="s1">test_ndim_not_on_array</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+
+        <span class="s1">FakeArray </span><span class="s3">= </span><span class="s1">collections</span><span class="s3">.</span><span class="s1">namedtuple</span><span class="s3">(</span><span class="s5">'FakeArray'</span><span class="s3">, [</span><span class="s5">'ndim'</span><span class="s3">])</span>
+        <span class="s1">fa </span><span class="s3">= </span><span class="s1">FakeArray</span><span class="s3">(</span><span class="s1">ndim</span><span class="s3">=</span><span class="s4">2</span><span class="s3">)</span>
+
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">fa</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">fa</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">== </span><span class="s4">2</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">fa</span><span class="s3">.</span><span class="s1">ndim</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">object</span><span class="s3">()</span>
+
+        <span class="s0"># check prune works for array ndim</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">Array</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s5">'C'</span><span class="s3">),), [</span><span class="s2">False</span><span class="s3">],</span>
+                          <span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">)))</span>
+
+        <span class="s0"># check prune fails for something with `ndim` attr that is not array</span>
+        <span class="s1">FakeArrayType </span><span class="s3">= </span><span class="s1">types</span><span class="s3">.</span><span class="s1">NamedUniTuple</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">int64</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, </span><span class="s1">FakeArray</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_prune</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">, (</span><span class="s1">FakeArrayType</span><span class="s3">,), [</span><span class="s2">None</span><span class="s3">], </span><span class="s1">fa</span><span class="s3">,</span>
+                          <span class="s1">flags</span><span class="s3">={</span><span class="s5">'nopython'</span><span class="s3">:</span><span class="s2">False</span><span class="s3">, </span><span class="s5">'forceobj'</span><span class="s3">:</span><span class="s2">True</span><span class="s3">})</span>
+
+    <span class="s2">def </span><span class="s1">test_semantic_const_propagates_before_static_rewrites</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0"># see issue #5015, the ndim needs writing in as a const before</span>
+        <span class="s0"># the rewrite passes run to make e.g. getitems static where possible</span>
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">a</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[:</span><span class="s1">b</span><span class="s3">.</span><span class="s1">ndim</span><span class="s3">]</span>
+
+        <span class="s1">args </span><span class="s3">= (</span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s4">5</span><span class="s3">, </span><span class="s4">4</span><span class="s3">, </span><span class="s4">3</span><span class="s3">, </span><span class="s4">2</span><span class="s3">)), </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s4">1</span><span class="s3">, </span><span class="s4">1</span><span class="s3">)))</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertPreciseEqual</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">), </span><span class="s1">impl</span><span class="s3">.</span><span class="s1">py_func</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">))</span>
+
+    <span class="s2">def </span><span class="s1">test_tuple_const_propagation</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s3">@</span><span class="s1">njit</span><span class="s3">(</span><span class="s1">pipeline_class</span><span class="s3">=</span><span class="s1">IRPreservingTestPipeline</span><span class="s3">)</span>
+        <span class="s2">def </span><span class="s1">impl</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">):</span>
+            <span class="s1">s </span><span class="s3">= </span><span class="s4">0</span>
+            <span class="s2">for </span><span class="s1">arg </span><span class="s2">in </span><span class="s1">literal_unroll</span><span class="s3">(</span><span class="s1">args</span><span class="s3">):</span>
+                <span class="s1">s </span><span class="s3">+= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">arg</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">s</span>
+
+        <span class="s1">inp </span><span class="s3">= ((), (</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">), ())</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertPreciseEqual</span><span class="s3">(</span><span class="s1">impl</span><span class="s3">(*</span><span class="s1">inp</span><span class="s3">), </span><span class="s1">impl</span><span class="s3">.</span><span class="s1">py_func</span><span class="s3">(*</span><span class="s1">inp</span><span class="s3">))</span>
+
+        <span class="s1">ol </span><span class="s3">= </span><span class="s1">impl</span><span class="s3">.</span><span class="s1">overloads</span><span class="s3">[</span><span class="s1">impl</span><span class="s3">.</span><span class="s1">signatures</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]]</span>
+        <span class="s1">func_ir </span><span class="s3">= </span><span class="s1">ol</span><span class="s3">.</span><span class="s1">metadata</span><span class="s3">[</span><span class="s5">'preserved_ir'</span><span class="s3">]</span>
+        <span class="s0"># make sure one of the inplace binop args is a Const</span>
+        <span class="s1">binop_consts </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+        <span class="s2">for </span><span class="s1">blk </span><span class="s2">in </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">values</span><span class="s3">():</span>
+            <span class="s2">for </span><span class="s1">expr </span><span class="s2">in </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">find_exprs</span><span class="s3">(</span><span class="s5">'inplace_binop'</span><span class="s3">):</span>
+                <span class="s1">inst </span><span class="s3">= </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">find_variable_assignment</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">rhs</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIsInstance</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">value</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Const</span><span class="s3">)</span>
+                <span class="s1">binop_consts</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">value</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">binop_consts</span><span class="s3">, {</span><span class="s1">len</span><span class="s3">(</span><span class="s1">x</span><span class="s3">) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">inp</span><span class="s3">})</span>
+</pre>
+</body>
+</html>

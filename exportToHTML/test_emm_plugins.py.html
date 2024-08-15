@@ -1,0 +1,215 @@
+<html>
+<head>
+<title>test_emm_plugins.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #5f826b; font-style: italic;}
+.s4 { color: #7a7e85;}
+.s5 { color: #2aacb8;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_emm_plugins.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">ctypes</span>
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">import </span><span class="s1">weakref</span>
+
+<span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">cuda</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">config</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">testing </span><span class="s0">import </span><span class="s1">unittest</span><span class="s2">, </span><span class="s1">CUDATestCase</span><span class="s2">, </span><span class="s1">skip_on_cudasim</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">tests</span><span class="s2">.</span><span class="s1">support </span><span class="s0">import </span><span class="s1">linux_only</span>
+
+<span class="s0">if not </span><span class="s1">config</span><span class="s2">.</span><span class="s1">ENABLE_CUDASIM</span><span class="s2">:</span>
+    <span class="s0">class </span><span class="s1">DeviceOnlyEMMPlugin</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">HostOnlyCUDAMemoryManager</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Dummy EMM Plugin implementation for testing. It memorises which plugin 
+        API methods have been called so that the tests can check that Numba 
+        called into the plugin as expected. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+            <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">)</span>
+
+            <span class="s4"># For tracking our dummy allocations</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">allocations </span><span class="s2">= {}</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">count </span><span class="s2">= </span><span class="s5">0</span>
+
+            <span class="s4"># For tracking which methods have been called</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">initialized </span><span class="s2">= </span><span class="s0">False</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">memalloc_called </span><span class="s2">= </span><span class="s0">False</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">reset_called </span><span class="s2">= </span><span class="s0">False</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">get_memory_info_called </span><span class="s2">= </span><span class="s0">False</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">get_ipc_handle_called </span><span class="s2">= </span><span class="s0">False</span>
+
+        <span class="s0">def </span><span class="s1">memalloc</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">size</span><span class="s2">):</span>
+            <span class="s4"># We maintain a list of allocations and keep track of them, so that</span>
+            <span class="s4"># we can test that the finalizers of objects returned by memalloc</span>
+            <span class="s4"># get called.</span>
+
+            <span class="s4"># Numba should have initialized the memory manager when preparing</span>
+            <span class="s4"># the context for use, prior to any memalloc call.</span>
+            <span class="s0">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">initialized</span><span class="s2">:</span>
+                <span class="s0">raise </span><span class="s1">RuntimeError</span><span class="s2">(</span><span class="s6">&quot;memalloc called before initialize&quot;</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">memalloc_called </span><span class="s2">= </span><span class="s0">True</span>
+
+            <span class="s4"># Create an allocation and record it</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">count </span><span class="s2">+= </span><span class="s5">1</span>
+            <span class="s1">alloc_count </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">count</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">allocations</span><span class="s2">[</span><span class="s1">alloc_count</span><span class="s2">] = </span><span class="s1">size</span>
+
+            <span class="s4"># The finalizer deletes the record from our internal dict of</span>
+            <span class="s4"># allocations.</span>
+            <span class="s1">finalizer_allocs </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">allocations</span>
+
+            <span class="s0">def </span><span class="s1">finalizer</span><span class="s2">():</span>
+                <span class="s0">del </span><span class="s1">finalizer_allocs</span><span class="s2">[</span><span class="s1">alloc_count</span><span class="s2">]</span>
+
+            <span class="s4"># We use an AutoFreePointer so that the finalizer will be run when</span>
+            <span class="s4"># the reference count drops to zero.</span>
+            <span class="s1">ctx </span><span class="s2">= </span><span class="s1">weakref</span><span class="s2">.</span><span class="s1">proxy</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">)</span>
+            <span class="s1">ptr </span><span class="s2">= </span><span class="s1">ctypes</span><span class="s2">.</span><span class="s1">c_void_p</span><span class="s2">(</span><span class="s1">alloc_count</span><span class="s2">)</span>
+            <span class="s0">return </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">cudadrv</span><span class="s2">.</span><span class="s1">driver</span><span class="s2">.</span><span class="s1">AutoFreePointer</span><span class="s2">(</span><span class="s1">ctx</span><span class="s2">, </span><span class="s1">ptr</span><span class="s2">, </span><span class="s1">size</span><span class="s2">,</span>
+                                                       <span class="s1">finalizer</span><span class="s2">=</span><span class="s1">finalizer</span><span class="s2">)</span>
+
+        <span class="s0">def </span><span class="s1">initialize</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+            <span class="s4"># No special initialization needed.</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">initialized </span><span class="s2">= </span><span class="s0">True</span>
+
+        <span class="s0">def </span><span class="s1">reset</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+            <span class="s4"># We remove all allocations on reset, just as a real EMM Plugin</span>
+            <span class="s4"># would do. Note that our finalizers in memalloc don't check</span>
+            <span class="s4"># whether the allocations are still alive, so running them after</span>
+            <span class="s4"># reset will detect any allocations that are floating around at</span>
+            <span class="s4"># exit time; however, the atexit finalizer for weakref will only</span>
+            <span class="s4"># print a traceback, not terminate the interpreter abnormally.</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">reset_called </span><span class="s2">= </span><span class="s0">True</span>
+
+        <span class="s0">def </span><span class="s1">get_memory_info</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+            <span class="s4"># Return some dummy memory information</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">get_memory_info_called </span><span class="s2">= </span><span class="s0">True</span>
+            <span class="s0">return </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">MemoryInfo</span><span class="s2">(</span><span class="s1">free</span><span class="s2">=</span><span class="s5">32</span><span class="s2">, </span><span class="s1">total</span><span class="s2">=</span><span class="s5">64</span><span class="s2">)</span>
+
+        <span class="s0">def </span><span class="s1">get_ipc_handle</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">memory</span><span class="s2">):</span>
+            <span class="s4"># The dummy IPC handle is only a string, so it is important that</span>
+            <span class="s4"># the tests don't try to do too much with it (e.g. open / close</span>
+            <span class="s4"># it).</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">get_ipc_handle_called </span><span class="s2">= </span><span class="s0">True</span>
+            <span class="s0">return </span><span class="s6">&quot;Dummy IPC handle for alloc %s&quot; </span><span class="s2">% </span><span class="s1">memory</span><span class="s2">.</span><span class="s1">device_pointer</span><span class="s2">.</span><span class="s1">value</span>
+
+        <span class="s2">@</span><span class="s1">property</span>
+        <span class="s0">def </span><span class="s1">interface_version</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+            <span class="s4"># The expected version for an EMM Plugin.</span>
+            <span class="s0">return </span><span class="s5">1</span>
+
+    <span class="s0">class </span><span class="s1">BadVersionEMMPlugin</span><span class="s2">(</span><span class="s1">DeviceOnlyEMMPlugin</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;A plugin that claims to implement a different interface version&quot;&quot;&quot;</span>
+
+        <span class="s2">@</span><span class="s1">property</span>
+        <span class="s0">def </span><span class="s1">interface_version</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s5">2</span>
+
+
+<span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s6">'EMM Plugins not supported on CUDA simulator'</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">TestDeviceOnlyEMMPlugin</span><span class="s2">(</span><span class="s1">CUDATestCase</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Tests that the API of an EMM Plugin that implements device allocations 
+    only is used correctly by Numba. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">setUp</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">setUp</span><span class="s2">()</span>
+        <span class="s4"># Always start afresh with a new context and memory manager</span>
+        <span class="s1">cuda</span><span class="s2">.</span><span class="s1">close</span><span class="s2">()</span>
+        <span class="s1">cuda</span><span class="s2">.</span><span class="s1">set_memory_manager</span><span class="s2">(</span><span class="s1">DeviceOnlyEMMPlugin</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">tearDown</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">tearDown</span><span class="s2">()</span>
+        <span class="s4"># Unset the memory manager for subsequent tests</span>
+        <span class="s1">cuda</span><span class="s2">.</span><span class="s1">close</span><span class="s2">()</span>
+        <span class="s1">cuda</span><span class="s2">.</span><span class="s1">cudadrv</span><span class="s2">.</span><span class="s1">driver</span><span class="s2">.</span><span class="s1">_memory_manager </span><span class="s2">= </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">test_memalloc</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">mgr </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">current_context</span><span class="s2">().</span><span class="s1">memory_manager</span>
+
+        <span class="s4"># Allocate an array and check that memalloc was called with the correct</span>
+        <span class="s4"># size.</span>
+        <span class="s1">arr_1 </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s5">10</span><span class="s2">)</span>
+        <span class="s1">d_arr_1 </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">device_array_like</span><span class="s2">(</span><span class="s1">arr_1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">mgr</span><span class="s2">.</span><span class="s1">memalloc_called</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">mgr</span><span class="s2">.</span><span class="s1">count</span><span class="s2">, </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">mgr</span><span class="s2">.</span><span class="s1">allocations</span><span class="s2">[</span><span class="s5">1</span><span class="s2">], </span><span class="s1">arr_1</span><span class="s2">.</span><span class="s1">nbytes</span><span class="s2">)</span>
+
+        <span class="s4"># Allocate again, with a different size, and check that it is also</span>
+        <span class="s4"># correct.</span>
+        <span class="s1">arr_2 </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s5">5</span><span class="s2">)</span>
+        <span class="s1">d_arr_2 </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">device_array_like</span><span class="s2">(</span><span class="s1">arr_2</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">mgr</span><span class="s2">.</span><span class="s1">count</span><span class="s2">, </span><span class="s5">2</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">mgr</span><span class="s2">.</span><span class="s1">allocations</span><span class="s2">[</span><span class="s5">2</span><span class="s2">], </span><span class="s1">arr_2</span><span class="s2">.</span><span class="s1">nbytes</span><span class="s2">)</span>
+
+        <span class="s4"># Remove the first array, and check that our finalizer was called for</span>
+        <span class="s4"># the first array only.</span>
+        <span class="s0">del </span><span class="s1">d_arr_1</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertNotIn</span><span class="s2">(</span><span class="s5">1</span><span class="s2">, </span><span class="s1">mgr</span><span class="s2">.</span><span class="s1">allocations</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s1">mgr</span><span class="s2">.</span><span class="s1">allocations</span><span class="s2">)</span>
+
+        <span class="s4"># Remove the second array and check that its finalizer was also</span>
+        <span class="s4"># called.</span>
+        <span class="s0">del </span><span class="s1">d_arr_2</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertNotIn</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s1">mgr</span><span class="s2">.</span><span class="s1">allocations</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_initialized_in_context</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4"># If we have a CUDA context, it should already have initialized its</span>
+        <span class="s4"># memory manager.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">current_context</span><span class="s2">().</span><span class="s1">memory_manager</span><span class="s2">.</span><span class="s1">initialized</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_reset</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">ctx </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">current_context</span><span class="s2">()</span>
+        <span class="s1">ctx</span><span class="s2">.</span><span class="s1">reset</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">memory_manager</span><span class="s2">.</span><span class="s1">reset_called</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_get_memory_info</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">ctx </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">current_context</span><span class="s2">()</span>
+        <span class="s1">meminfo </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">get_memory_info</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">memory_manager</span><span class="s2">.</span><span class="s1">get_memory_info_called</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">meminfo</span><span class="s2">.</span><span class="s1">free</span><span class="s2">, </span><span class="s5">32</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">meminfo</span><span class="s2">.</span><span class="s1">total</span><span class="s2">, </span><span class="s5">64</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">linux_only</span>
+    <span class="s0">def </span><span class="s1">test_get_ipc_handle</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4"># We don't attempt to close the IPC handle in this test because Numba</span>
+        <span class="s4"># will be expecting a real IpcHandle object to have been returned from</span>
+        <span class="s4"># get_ipc_handle, and it would cause problems to do so.</span>
+        <span class="s1">arr </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s5">2</span><span class="s2">)</span>
+        <span class="s1">d_arr </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">device_array_like</span><span class="s2">(</span><span class="s1">arr</span><span class="s2">)</span>
+        <span class="s1">ipch </span><span class="s2">= </span><span class="s1">d_arr</span><span class="s2">.</span><span class="s1">get_ipc_handle</span><span class="s2">()</span>
+        <span class="s1">ctx </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">current_context</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">memory_manager</span><span class="s2">.</span><span class="s1">get_ipc_handle_called</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s6">&quot;Dummy IPC handle for alloc 1&quot;</span><span class="s2">, </span><span class="s1">ipch</span><span class="s2">.</span><span class="s1">_ipc_handle</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s6">'EMM Plugins not supported on CUDA simulator'</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">TestBadEMMPluginVersion</span><span class="s2">(</span><span class="s1">CUDATestCase</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Ensure that Numba rejects EMM Plugins with incompatible version 
+    numbers. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">test_bad_plugin_version</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaises</span><span class="s2">(</span><span class="s1">RuntimeError</span><span class="s2">) </span><span class="s0">as </span><span class="s1">raises</span><span class="s2">:</span>
+            <span class="s1">cuda</span><span class="s2">.</span><span class="s1">set_memory_manager</span><span class="s2">(</span><span class="s1">BadVersionEMMPlugin</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s6">'version 1 required'</span><span class="s2">, </span><span class="s1">str</span><span class="s2">(</span><span class="s1">raises</span><span class="s2">.</span><span class="s1">exception</span><span class="s2">))</span>
+
+
+<span class="s0">if </span><span class="s1">__name__ </span><span class="s2">== </span><span class="s6">'__main__'</span><span class="s2">:</span>
+    <span class="s1">unittest</span><span class="s2">.</span><span class="s1">main</span><span class="s2">()</span>
+</pre>
+</body>
+</html>

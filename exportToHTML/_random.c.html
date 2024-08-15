@@ -1,0 +1,514 @@
+<html>
+<head>
+<title>_random.c</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #2aacb8;}
+.s4 { color: #0da19e;}
+.s5 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_random.c</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * PRNG support. 
+ */</span>
+
+<span class="s2">#ifdef </span><span class="s1">_MSC_VER</span>
+<span class="s2">#define </span><span class="s1">HAVE_PTHREAD_ATFORK </span><span class="s3">0</span>
+<span class="s2">#else</span>
+<span class="s2">#define </span><span class="s1">HAVE_PTHREAD_ATFORK </span><span class="s3">1</span>
+<span class="s2">#include </span><span class="s1">&lt;pthread.h&gt;</span>
+<span class="s2">#endif</span>
+
+
+<span class="s0">/* Magic Mersenne Twister constants */</span>
+<span class="s2">#define </span><span class="s1">MT_N </span><span class="s3">624</span>
+<span class="s2">#define </span><span class="s1">MT_M </span><span class="s3">397</span>
+<span class="s2">#define </span><span class="s1">MT_MATRIX_A </span><span class="s3">0x9908b0df</span><span class="s1">U</span>
+<span class="s2">#define </span><span class="s1">MT_UPPER_MASK </span><span class="s3">0x80000000</span><span class="s1">U</span>
+<span class="s2">#define </span><span class="s1">MT_LOWER_MASK </span><span class="s3">0x7fffffff</span><span class="s1">U</span>
+
+<span class="s0">/* 
+ * Note this structure is accessed in numba.targets.randomimpl, 
+ * any changes here should be reflected there too. 
+ */</span>
+<span class="s2">typedef struct </span><span class="s1">{</span>
+    <span class="s2">int </span><span class="s1">index;</span>
+    <span class="s0">/* unsigned int is sufficient on modern machines as we only need 32 bits */</span>
+    <span class="s2">unsigned int </span><span class="s1">mt[MT_N];</span>
+    <span class="s2">int </span><span class="s1">has_gauss;</span>
+    <span class="s2">double </span><span class="s1">gauss;</span>
+    <span class="s2">int </span><span class="s1">is_initialized;</span>
+<span class="s1">} rnd_state_t;</span>
+
+<span class="s0">/* Some code portions below from CPython's _randommodule.c, some others 
+   from Numpy's and Jean-Sebastien Roy's randomkit.c. */</span>
+
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">void</span><span class="s1">)</span>
+<span class="s1">numba_rnd_shuffle(rnd_state_t *state)</span>
+<span class="s1">{</span>
+    <span class="s2">int </span><span class="s1">i;</span>
+    <span class="s2">unsigned int </span><span class="s1">y;</span>
+
+    <span class="s2">for </span><span class="s1">(i = </span><span class="s3">0</span><span class="s1">; i &lt; MT_N - MT_M; i++) {</span>
+        <span class="s1">y = (state</span><span class="s4">-&gt;</span><span class="s1">mt[i] &amp; MT_UPPER_MASK) | (state</span><span class="s4">-&gt;</span><span class="s1">mt[i+</span><span class="s3">1</span><span class="s1">] &amp; MT_LOWER_MASK);</span>
+        <span class="s1">state</span><span class="s4">-&gt;</span><span class="s1">mt[i] = state</span><span class="s4">-&gt;</span><span class="s1">mt[i+MT_M] ^ (y &gt;&gt; </span><span class="s3">1</span><span class="s1">) ^</span>
+                       <span class="s1">(-(</span><span class="s2">int</span><span class="s1">) (y &amp; </span><span class="s3">1</span><span class="s1">) &amp; MT_MATRIX_A);</span>
+    <span class="s1">}</span>
+    <span class="s2">for </span><span class="s1">(; i &lt; MT_N - </span><span class="s3">1</span><span class="s1">; i++) {</span>
+        <span class="s1">y = (state</span><span class="s4">-&gt;</span><span class="s1">mt[i] &amp; MT_UPPER_MASK) | (state</span><span class="s4">-&gt;</span><span class="s1">mt[i+</span><span class="s3">1</span><span class="s1">] &amp; MT_LOWER_MASK);</span>
+        <span class="s1">state</span><span class="s4">-&gt;</span><span class="s1">mt[i] = state</span><span class="s4">-&gt;</span><span class="s1">mt[i+(MT_M-MT_N)] ^ (y &gt;&gt; </span><span class="s3">1</span><span class="s1">) ^</span>
+                       <span class="s1">(-(</span><span class="s2">int</span><span class="s1">) (y &amp; </span><span class="s3">1</span><span class="s1">) &amp; MT_MATRIX_A);</span>
+    <span class="s1">}</span>
+    <span class="s1">y = (state</span><span class="s4">-&gt;</span><span class="s1">mt[MT_N - </span><span class="s3">1</span><span class="s1">] &amp; MT_UPPER_MASK) | (state</span><span class="s4">-&gt;</span><span class="s1">mt[</span><span class="s3">0</span><span class="s1">] &amp; MT_LOWER_MASK);</span>
+    <span class="s1">state</span><span class="s4">-&gt;</span><span class="s1">mt[MT_N - </span><span class="s3">1</span><span class="s1">] = state</span><span class="s4">-&gt;</span><span class="s1">mt[MT_M - </span><span class="s3">1</span><span class="s1">] ^ (y &gt;&gt; </span><span class="s3">1</span><span class="s1">) ^</span>
+                          <span class="s1">(-(</span><span class="s2">int</span><span class="s1">) (y &amp; </span><span class="s3">1</span><span class="s1">) &amp; MT_MATRIX_A);</span>
+<span class="s1">}</span>
+
+<span class="s0">/* Initialize mt[] with an integer seed */</span>
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">void</span><span class="s1">)</span>
+<span class="s1">numba_rnd_init(rnd_state_t *state, </span><span class="s2">unsigned int </span><span class="s1">seed)</span>
+<span class="s1">{</span>
+    <span class="s2">unsigned int </span><span class="s1">pos;</span>
+    <span class="s1">seed &amp;= </span><span class="s3">0xffffffff</span><span class="s1">U;</span>
+
+    <span class="s0">/* Knuth's PRNG as used in the Mersenne Twister reference implementation */</span>
+    <span class="s2">for </span><span class="s1">(pos = </span><span class="s3">0</span><span class="s1">; pos &lt; MT_N; pos++) {</span>
+        <span class="s1">state</span><span class="s4">-&gt;</span><span class="s1">mt[pos] = seed;</span>
+        <span class="s1">seed = (</span><span class="s3">1812433253</span><span class="s1">U * (seed ^ (seed &gt;&gt; </span><span class="s3">30</span><span class="s1">)) + pos + </span><span class="s3">1</span><span class="s1">) &amp; </span><span class="s3">0xffffffff</span><span class="s1">U;</span>
+    <span class="s1">}</span>
+    <span class="s1">state</span><span class="s4">-&gt;</span><span class="s1">index = MT_N;</span>
+    <span class="s1">state</span><span class="s4">-&gt;</span><span class="s1">has_gauss = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">state</span><span class="s4">-&gt;</span><span class="s1">gauss = </span><span class="s3">0.0</span><span class="s1">;</span>
+    <span class="s1">state</span><span class="s4">-&gt;</span><span class="s1">is_initialized = </span><span class="s3">1</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* Perturb mt[] with a key array */</span>
+<span class="s2">static void</span>
+<span class="s1">rnd_init_by_array(rnd_state_t *state, </span><span class="s2">unsigned int </span><span class="s1">init_key[], size_t key_length)</span>
+<span class="s1">{</span>
+    <span class="s1">size_t i, j, k;</span>
+    <span class="s2">unsigned int </span><span class="s1">*mt = state</span><span class="s4">-&gt;</span><span class="s1">mt;</span>
+
+    <span class="s1">numba_rnd_init(state, </span><span class="s3">19650218</span><span class="s1">U);</span>
+    <span class="s1">i = </span><span class="s3">1</span><span class="s1">; j = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">k = (MT_N &gt; key_length ? MT_N : key_length);</span>
+    <span class="s2">for </span><span class="s1">(; k; k--) {</span>
+        <span class="s1">mt[i] = (mt[i] ^ ((mt[i-1] ^ (mt[i-1] &gt;&gt; </span><span class="s3">30</span><span class="s1">)) * </span><span class="s3">1664525</span><span class="s1">U))</span>
+                 <span class="s1">+ init_key[j] + (</span><span class="s2">unsigned int</span><span class="s1">) j; </span><span class="s0">/* non linear */</span>
+        <span class="s1">mt[i] &amp;= </span><span class="s3">0xffffffff</span><span class="s1">U;</span>
+        <span class="s1">i++; j++;</span>
+        <span class="s2">if </span><span class="s1">(i &gt;= MT_N) { mt[</span><span class="s3">0</span><span class="s1">] = mt[MT_N - </span><span class="s3">1</span><span class="s1">]; i = </span><span class="s3">1</span><span class="s1">; }</span>
+        <span class="s2">if </span><span class="s1">(j &gt;= key_length) j = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">for </span><span class="s1">(k = MT_N - </span><span class="s3">1</span><span class="s1">; k; k--) {</span>
+        <span class="s1">mt[i] = (mt[i] ^ ((mt[i-1] ^ (mt[i-1] &gt;&gt; </span><span class="s3">30</span><span class="s1">)) * </span><span class="s3">1566083941</span><span class="s1">U))</span>
+                 <span class="s1">- (</span><span class="s2">unsigned int</span><span class="s1">) i; </span><span class="s0">/* non linear */</span>
+        <span class="s1">mt[i] &amp;= </span><span class="s3">0xffffffff</span><span class="s1">U;</span>
+        <span class="s1">i++;</span>
+        <span class="s2">if </span><span class="s1">(i &gt;= MT_N) { mt[</span><span class="s3">0</span><span class="s1">] = mt[MT_N - </span><span class="s3">1</span><span class="s1">]; i=</span><span class="s3">1</span><span class="s1">; }</span>
+    <span class="s1">}</span>
+
+    <span class="s1">mt[</span><span class="s3">0</span><span class="s1">] = </span><span class="s3">0x80000000</span><span class="s1">U; </span><span class="s0">/* MSB is 1; ensuring non-zero initial array */</span>
+    <span class="s1">state</span><span class="s4">-&gt;</span><span class="s1">index = MT_N;</span>
+    <span class="s1">state</span><span class="s4">-&gt;</span><span class="s1">has_gauss = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">state</span><span class="s4">-&gt;</span><span class="s1">gauss = </span><span class="s3">0.0</span><span class="s1">;</span>
+    <span class="s1">state</span><span class="s4">-&gt;</span><span class="s1">is_initialized = </span><span class="s3">1</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Management of thread-local random state. 
+ */</span>
+
+<span class="s2">static int </span><span class="s1">rnd_globally_initialized;</span>
+
+<span class="s2">#ifdef </span><span class="s1">_MSC_VER</span>
+<span class="s2">#define </span><span class="s1">THREAD_LOCAL(ty) __declspec(thread) ty</span>
+<span class="s2">#else</span>
+<span class="s0">/* Non-standard C99 extension that's understood by gcc and clang */</span>
+<span class="s2">#define </span><span class="s1">THREAD_LOCAL(ty) __thread ty</span>
+<span class="s2">#endif</span>
+
+<span class="s2">static </span><span class="s1">THREAD_LOCAL(rnd_state_t) numba_py_random_state;</span>
+<span class="s2">static </span><span class="s1">THREAD_LOCAL(rnd_state_t) numba_np_random_state;</span>
+<span class="s2">static </span><span class="s1">THREAD_LOCAL(rnd_state_t) numba_internal_random_state;</span>
+
+<span class="s0">/* Seed the state with random bytes */</span>
+<span class="s2">static int</span>
+<span class="s1">rnd_seed_with_bytes(rnd_state_t *state, Py_buffer *buf)</span>
+<span class="s1">{</span>
+    <span class="s2">unsigned int </span><span class="s1">*keys;</span>
+    <span class="s2">unsigned char </span><span class="s1">*bytes;</span>
+    <span class="s1">size_t i, nkeys;</span>
+
+    <span class="s1">nkeys = buf</span><span class="s4">-&gt;</span><span class="s1">len / </span><span class="s2">sizeof</span><span class="s1">(</span><span class="s2">unsigned int</span><span class="s1">);</span>
+    <span class="s1">keys = (</span><span class="s2">unsigned int </span><span class="s1">*) PyMem_Malloc(nkeys * </span><span class="s2">sizeof</span><span class="s1">(</span><span class="s2">unsigned int</span><span class="s1">));</span>
+    <span class="s2">if </span><span class="s1">(keys == NULL) {</span>
+        <span class="s1">PyBuffer_Release(buf);</span>
+        <span class="s2">return </span><span class="s1">-</span><span class="s3">1</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">bytes = (</span><span class="s2">unsigned char </span><span class="s1">*) buf</span><span class="s4">-&gt;</span><span class="s1">buf;</span>
+    <span class="s0">/* Convert input bytes to int32 keys, without violating alignment 
+     * constraints. 
+     */</span>
+    <span class="s2">for </span><span class="s1">(i = </span><span class="s3">0</span><span class="s1">; i &lt; nkeys; i++, bytes += </span><span class="s3">4</span><span class="s1">) {</span>
+        <span class="s1">keys[i] =</span>
+            <span class="s1">((</span><span class="s2">unsigned int</span><span class="s1">)bytes[</span><span class="s3">3</span><span class="s1">] &lt;&lt; </span><span class="s3">24</span><span class="s1">) +</span>
+            <span class="s1">((</span><span class="s2">unsigned int</span><span class="s1">)bytes[</span><span class="s3">2</span><span class="s1">] &lt;&lt; </span><span class="s3">16</span><span class="s1">) +</span>
+            <span class="s1">((</span><span class="s2">unsigned int</span><span class="s1">)bytes[</span><span class="s3">1</span><span class="s1">] &lt;&lt; </span><span class="s3">8</span><span class="s1">) +</span>
+            <span class="s1">((</span><span class="s2">unsigned int</span><span class="s1">)bytes[</span><span class="s3">0</span><span class="s1">] &lt;&lt; </span><span class="s3">0</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s1">PyBuffer_Release(buf);</span>
+    <span class="s1">rnd_init_by_array(state, keys, nkeys);</span>
+    <span class="s1">PyMem_Free(keys);</span>
+    <span class="s2">return </span><span class="s3">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#if </span><span class="s1">HAVE_PTHREAD_ATFORK</span>
+<span class="s0">/* After a fork(), the child should reseed its random states. 
+ * Since only the main thread survives in the child, it's enough to mark 
+ * the current thread-local states as uninitialized. 
+ */</span>
+<span class="s2">static void</span>
+<span class="s1">rnd_atfork_child(</span><span class="s2">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+    <span class="s1">numba_py_random_state.is_initialized = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">numba_np_random_state.is_initialized = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">numba_internal_random_state.is_initialized = </span><span class="s3">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+<span class="s2">#endif</span>
+
+<span class="s0">/* Global initialization routine.  It must be called as early as possible. 
+ */</span>
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">void</span><span class="s1">)</span>
+<span class="s1">numba_rnd_ensure_global_init(</span><span class="s2">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+    <span class="s2">if </span><span class="s1">(!rnd_globally_initialized) {</span>
+<span class="s2">#if </span><span class="s1">HAVE_PTHREAD_ATFORK</span>
+        <span class="s1">pthread_atfork(NULL, NULL, rnd_atfork_child);</span>
+<span class="s2">#endif</span>
+        <span class="s1">numba_py_random_state.is_initialized = </span><span class="s3">0</span><span class="s1">;</span>
+        <span class="s1">numba_np_random_state.is_initialized = </span><span class="s3">0</span><span class="s1">;</span>
+        <span class="s1">numba_internal_random_state.is_initialized = </span><span class="s3">0</span><span class="s1">;</span>
+        <span class="s1">rnd_globally_initialized = </span><span class="s3">1</span><span class="s1">;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/* First-time init a random state */</span>
+<span class="s2">static void</span>
+<span class="s1">rnd_implicit_init(rnd_state_t *state)</span>
+<span class="s1">{</span>
+    <span class="s0">/* Initialize with random bytes.  The easiest way to get good-quality 
+     * cross-platform random bytes is still to call os.urandom() 
+     * using the Python interpreter... 
+     */</span>
+    <span class="s1">PyObject *module, *bufobj;</span>
+    <span class="s1">Py_buffer buf;</span>
+    <span class="s1">PyGILState_STATE gilstate = PyGILState_Ensure();</span>
+
+    <span class="s1">module = PyImport_ImportModuleNoBlock(</span><span class="s5">&quot;os&quot;</span><span class="s1">);</span>
+    <span class="s2">if </span><span class="s1">(module == NULL)</span>
+        <span class="s2">goto </span><span class="s1">error;</span>
+    <span class="s0">/* Read as many bytes as necessary to get the full entropy 
+     * exploitable by the MT generator. 
+     */</span>
+    <span class="s1">bufobj = PyObject_CallMethod(module, </span><span class="s5">&quot;urandom&quot;</span><span class="s1">, </span><span class="s5">&quot;i&quot;</span><span class="s1">,</span>
+                                 <span class="s1">(</span><span class="s2">int</span><span class="s1">) (MT_N * </span><span class="s2">sizeof</span><span class="s1">(</span><span class="s2">unsigned int</span><span class="s1">)));</span>
+    <span class="s1">Py_DECREF(module);</span>
+    <span class="s2">if </span><span class="s1">(bufobj == NULL)</span>
+        <span class="s2">goto </span><span class="s1">error;</span>
+    <span class="s2">if </span><span class="s1">(PyObject_GetBuffer(bufobj, &amp;buf, PyBUF_SIMPLE))</span>
+        <span class="s2">goto </span><span class="s1">error;</span>
+    <span class="s1">Py_DECREF(bufobj);</span>
+    <span class="s2">if </span><span class="s1">(rnd_seed_with_bytes(state, &amp;buf))</span>
+        <span class="s2">goto </span><span class="s1">error;</span>
+    <span class="s0">/* state-&gt;is_initialized is set now */</span>
+
+    <span class="s1">PyGILState_Release(gilstate);</span>
+    <span class="s2">return</span><span class="s1">;</span>
+
+<span class="s1">error:</span>
+    <span class="s0">/* In normal conditions, os.urandom() and PyMem_Malloc() shouldn't fail, 
+     * and we don't want the caller to deal with errors, so just bail out. 
+     */</span>
+    <span class="s2">if </span><span class="s1">(PyErr_Occurred())</span>
+        <span class="s1">PyErr_Print();</span>
+    <span class="s1">Py_FatalError(NULL);</span>
+<span class="s1">}</span>
+
+<span class="s0">/* Functions returning the thread-local random state pointer. 
+ * The LLVM JIT doesn't support thread-local variables so we rely 
+ * on the C compiler instead. 
+ */</span>
+
+<span class="s1">NUMBA_EXPORT_FUNC(rnd_state_t *)</span>
+<span class="s1">numba_get_py_random_state(</span><span class="s2">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+    <span class="s1">rnd_state_t *state = &amp;numba_py_random_state;</span>
+    <span class="s2">if </span><span class="s1">(!state</span><span class="s4">-&gt;</span><span class="s1">is_initialized)</span>
+        <span class="s1">rnd_implicit_init(state);</span>
+    <span class="s2">return </span><span class="s1">state;</span>
+<span class="s1">}</span>
+
+<span class="s1">NUMBA_EXPORT_FUNC(rnd_state_t *)</span>
+<span class="s1">numba_get_np_random_state(</span><span class="s2">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+    <span class="s1">rnd_state_t *state = &amp;numba_np_random_state;</span>
+    <span class="s2">if </span><span class="s1">(!state</span><span class="s4">-&gt;</span><span class="s1">is_initialized)</span>
+        <span class="s1">rnd_implicit_init(state);</span>
+    <span class="s2">return </span><span class="s1">state;</span>
+<span class="s1">}</span>
+
+<span class="s1">NUMBA_EXPORT_FUNC(rnd_state_t *)</span>
+<span class="s1">numba_get_internal_random_state(</span><span class="s2">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+    <span class="s1">rnd_state_t *state = &amp;numba_internal_random_state;</span>
+    <span class="s2">if </span><span class="s1">(!state</span><span class="s4">-&gt;</span><span class="s1">is_initialized)</span>
+        <span class="s1">rnd_implicit_init(state);</span>
+    <span class="s2">return </span><span class="s1">state;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Python-exposed helpers for state management and testing. 
+ */</span>
+<span class="s2">static int</span>
+<span class="s1">rnd_state_converter(PyObject *obj, rnd_state_t **state)</span>
+<span class="s1">{</span>
+    <span class="s1">*state = (rnd_state_t *) PyLong_AsVoidPtr(obj);</span>
+    <span class="s2">return </span><span class="s1">(*state != NULL || !PyErr_Occurred());</span>
+<span class="s1">}</span>
+
+<span class="s1">NUMBA_EXPORT_FUNC(PyObject *)</span>
+<span class="s1">_numba_rnd_get_py_state_ptr(PyObject *self)</span>
+<span class="s1">{</span>
+    <span class="s2">return </span><span class="s1">PyLong_FromVoidPtr(numba_get_py_random_state());</span>
+<span class="s1">}</span>
+
+<span class="s1">NUMBA_EXPORT_FUNC(PyObject *)</span>
+<span class="s1">_numba_rnd_get_np_state_ptr(PyObject *self)</span>
+<span class="s1">{</span>
+    <span class="s2">return </span><span class="s1">PyLong_FromVoidPtr(numba_get_np_random_state());</span>
+<span class="s1">}</span>
+
+<span class="s1">NUMBA_EXPORT_FUNC(PyObject *)</span>
+<span class="s1">_numba_rnd_shuffle(PyObject *self, PyObject *arg)</span>
+<span class="s1">{</span>
+    <span class="s1">rnd_state_t *state;</span>
+    <span class="s2">if </span><span class="s1">(!rnd_state_converter(arg, &amp;state))</span>
+        <span class="s2">return </span><span class="s1">NULL;</span>
+    <span class="s1">numba_rnd_shuffle(state);</span>
+    <span class="s1">Py_RETURN_NONE;</span>
+<span class="s1">}</span>
+
+<span class="s1">NUMBA_EXPORT_FUNC(PyObject *)</span>
+<span class="s1">_numba_rnd_set_state(PyObject *self, PyObject *args)</span>
+<span class="s1">{</span>
+    <span class="s2">int </span><span class="s1">i, index;</span>
+    <span class="s1">rnd_state_t *state;</span>
+    <span class="s1">PyObject *tuplearg, *intlist;</span>
+
+    <span class="s2">if </span><span class="s1">(!PyArg_ParseTuple(args, </span><span class="s5">&quot;O&amp;O!:rnd_set_state&quot;</span><span class="s1">,</span>
+                          <span class="s1">rnd_state_converter, &amp;state,</span>
+                          <span class="s1">&amp;PyTuple_Type, &amp;tuplearg))</span>
+        <span class="s2">return </span><span class="s1">NULL;</span>
+    <span class="s2">if </span><span class="s1">(!PyArg_ParseTuple(tuplearg, </span><span class="s5">&quot;iO!&quot;</span><span class="s1">, &amp;index, &amp;PyList_Type, &amp;intlist))</span>
+        <span class="s2">return </span><span class="s1">NULL;</span>
+    <span class="s2">if </span><span class="s1">(PyList_GET_SIZE(intlist) != MT_N) {</span>
+        <span class="s1">PyErr_SetString(PyExc_ValueError, </span><span class="s5">&quot;list object has wrong size&quot;</span><span class="s1">);</span>
+        <span class="s2">return </span><span class="s1">NULL;</span>
+    <span class="s1">}</span>
+    <span class="s1">state</span><span class="s4">-&gt;</span><span class="s1">index = index;</span>
+    <span class="s2">for </span><span class="s1">(i = </span><span class="s3">0</span><span class="s1">; i &lt; MT_N; i++) {</span>
+        <span class="s1">PyObject *v = PyList_GET_ITEM(intlist, i);</span>
+        <span class="s2">unsigned long </span><span class="s1">x = PyLong_AsUnsignedLong(v);</span>
+        <span class="s2">if </span><span class="s1">(x == (</span><span class="s2">unsigned long</span><span class="s1">) -</span><span class="s3">1 </span><span class="s1">&amp;&amp; PyErr_Occurred())</span>
+            <span class="s2">return </span><span class="s1">NULL;</span>
+        <span class="s1">state</span><span class="s4">-&gt;</span><span class="s1">mt[i] = (</span><span class="s2">unsigned int</span><span class="s1">) x;</span>
+    <span class="s1">}</span>
+    <span class="s1">state</span><span class="s4">-&gt;</span><span class="s1">has_gauss = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">state</span><span class="s4">-&gt;</span><span class="s1">gauss = </span><span class="s3">0.0</span><span class="s1">;</span>
+    <span class="s1">state</span><span class="s4">-&gt;</span><span class="s1">is_initialized = </span><span class="s3">1</span><span class="s1">;</span>
+    <span class="s1">Py_RETURN_NONE;</span>
+<span class="s1">}</span>
+
+<span class="s1">NUMBA_EXPORT_FUNC(PyObject *)</span>
+<span class="s1">_numba_rnd_get_state(PyObject *self, PyObject *arg)</span>
+<span class="s1">{</span>
+    <span class="s1">PyObject *intlist;</span>
+    <span class="s2">int </span><span class="s1">i;</span>
+    <span class="s1">rnd_state_t *state;</span>
+    <span class="s2">if </span><span class="s1">(!rnd_state_converter(arg, &amp;state))</span>
+        <span class="s2">return </span><span class="s1">NULL;</span>
+
+    <span class="s1">intlist = PyList_New(MT_N);</span>
+    <span class="s2">if </span><span class="s1">(intlist == NULL)</span>
+        <span class="s2">return </span><span class="s1">NULL;</span>
+    <span class="s2">for </span><span class="s1">(i = </span><span class="s3">0</span><span class="s1">; i &lt; MT_N; i++) {</span>
+        <span class="s1">PyObject *v = PyLong_FromUnsignedLong(state</span><span class="s4">-&gt;</span><span class="s1">mt[i]);</span>
+        <span class="s2">if </span><span class="s1">(v == NULL) {</span>
+            <span class="s1">Py_DECREF(intlist);</span>
+            <span class="s2">return </span><span class="s1">NULL;</span>
+        <span class="s1">}</span>
+        <span class="s1">PyList_SET_ITEM(intlist, i, v);</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">Py_BuildValue(</span><span class="s5">&quot;iN&quot;</span><span class="s1">, state</span><span class="s4">-&gt;</span><span class="s1">index, intlist);</span>
+<span class="s1">}</span>
+
+<span class="s1">NUMBA_EXPORT_FUNC(PyObject *)</span>
+<span class="s1">_numba_rnd_seed(PyObject *self, PyObject *args)</span>
+<span class="s1">{</span>
+    <span class="s2">unsigned int </span><span class="s1">seed;</span>
+    <span class="s1">rnd_state_t *state;</span>
+
+    <span class="s2">if </span><span class="s1">(!PyArg_ParseTuple(args, </span><span class="s5">&quot;O&amp;I:rnd_seed&quot;</span><span class="s1">,</span>
+                          <span class="s1">rnd_state_converter, &amp;state, &amp;seed)) {</span>
+        <span class="s0">/* rnd_seed_*(bytes-like object) */</span>
+        <span class="s1">Py_buffer buf;</span>
+
+        <span class="s1">PyErr_Clear();</span>
+        <span class="s2">if </span><span class="s1">(!PyArg_ParseTuple(args, </span><span class="s5">&quot;O&amp;s*:rnd_seed&quot;</span><span class="s1">,</span>
+                              <span class="s1">rnd_state_converter, &amp;state, &amp;buf))</span>
+            <span class="s2">return </span><span class="s1">NULL;</span>
+
+        <span class="s2">if </span><span class="s1">(rnd_seed_with_bytes(state, &amp;buf))</span>
+            <span class="s2">return </span><span class="s1">NULL;</span>
+        <span class="s2">else</span>
+            <span class="s1">Py_RETURN_NONE;</span>
+    <span class="s1">}</span>
+    <span class="s2">else </span><span class="s1">{</span>
+        <span class="s0">/* rnd_seed_*(int32) */</span>
+        <span class="s1">numba_rnd_init(state, seed);</span>
+        <span class="s1">Py_RETURN_NONE;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Random distribution helpers. 
+ * Most code straight from Numpy's distributions.c. 
+ */</span>
+
+<span class="s2">#ifndef </span><span class="s1">M_PI</span>
+<span class="s2">#define </span><span class="s1">M_PI </span><span class="s3">3.14159265358979323846264338328</span>
+<span class="s2">#endif</span>
+
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">unsigned int</span><span class="s1">)</span>
+<span class="s1">get_next_int32(rnd_state_t *state)</span>
+<span class="s1">{</span>
+    <span class="s2">unsigned int </span><span class="s1">y;</span>
+
+    <span class="s2">if </span><span class="s1">(state</span><span class="s4">-&gt;</span><span class="s1">index == MT_N) {</span>
+        <span class="s1">numba_rnd_shuffle(state);</span>
+        <span class="s1">state</span><span class="s4">-&gt;</span><span class="s1">index = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">y = state</span><span class="s4">-&gt;</span><span class="s1">mt[state</span><span class="s4">-&gt;</span><span class="s1">index++];</span>
+    <span class="s0">/* Tempering */</span>
+    <span class="s1">y ^= (y &gt;&gt; </span><span class="s3">11</span><span class="s1">);</span>
+    <span class="s1">y ^= (y &lt;&lt; </span><span class="s3">7</span><span class="s1">) &amp; </span><span class="s3">0x9d2c5680</span><span class="s1">U;</span>
+    <span class="s1">y ^= (y &lt;&lt; </span><span class="s3">15</span><span class="s1">) &amp; </span><span class="s3">0xefc60000</span><span class="s1">U;</span>
+    <span class="s1">y ^= (y &gt;&gt; </span><span class="s3">18</span><span class="s1">);</span>
+    <span class="s2">return </span><span class="s1">y;</span>
+<span class="s1">}</span>
+
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">double</span><span class="s1">)</span>
+<span class="s1">get_next_double(rnd_state_t *state)</span>
+<span class="s1">{</span>
+    <span class="s2">double </span><span class="s1">a = get_next_int32(state) &gt;&gt; </span><span class="s3">5</span><span class="s1">;</span>
+    <span class="s2">double </span><span class="s1">b = get_next_int32(state) &gt;&gt; </span><span class="s3">6</span><span class="s1">;</span>
+    <span class="s2">return </span><span class="s1">(a * </span><span class="s3">67108864.0 </span><span class="s1">+ b) / </span><span class="s3">9007199254740992.0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">double</span><span class="s1">)</span>
+<span class="s1">loggam(</span><span class="s2">double </span><span class="s1">x)</span>
+<span class="s1">{</span>
+    <span class="s2">double </span><span class="s1">x0, x2, xp, gl, gl0;</span>
+    <span class="s2">long </span><span class="s1">k, n;</span>
+
+    <span class="s2">static double </span><span class="s1">a[</span><span class="s3">10</span><span class="s1">] = {</span><span class="s3">8</span><span class="s1">.</span><span class="s3">333333333333333</span><span class="s1">e-02,-</span><span class="s3">2</span><span class="s1">.</span><span class="s3">777777777777778</span><span class="s1">e-03,</span>
+         <span class="s3">7</span><span class="s1">.</span><span class="s3">936507936507937</span><span class="s1">e-04,-</span><span class="s3">5</span><span class="s1">.</span><span class="s3">952380952380952</span><span class="s1">e-04,</span>
+         <span class="s3">8</span><span class="s1">.</span><span class="s3">417508417508418</span><span class="s1">e-04,-</span><span class="s3">1</span><span class="s1">.</span><span class="s3">917526917526918</span><span class="s1">e-03,</span>
+         <span class="s3">6</span><span class="s1">.</span><span class="s3">410256410256410</span><span class="s1">e-03,-</span><span class="s3">2</span><span class="s1">.</span><span class="s3">955065359477124</span><span class="s1">e-02,</span>
+         <span class="s3">1</span><span class="s1">.</span><span class="s3">796443723688307</span><span class="s1">e-01,-</span><span class="s3">1</span><span class="s1">.</span><span class="s3">39243221690590</span><span class="s1">e+</span><span class="s3">00</span><span class="s1">};</span>
+    <span class="s1">x0 = x;</span>
+    <span class="s1">n = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s2">if </span><span class="s1">((x == </span><span class="s3">1.0</span><span class="s1">) || (x == </span><span class="s3">2.0</span><span class="s1">))</span>
+    <span class="s1">{</span>
+        <span class="s2">return </span><span class="s3">0.0</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">else if </span><span class="s1">(x &lt;= </span><span class="s3">7.0</span><span class="s1">)</span>
+    <span class="s1">{</span>
+        <span class="s1">n = (</span><span class="s2">long</span><span class="s1">)(</span><span class="s3">7 </span><span class="s1">- x);</span>
+        <span class="s1">x0 = x + n;</span>
+    <span class="s1">}</span>
+    <span class="s1">x2 = </span><span class="s3">1.0</span><span class="s1">/(x0*x0);</span>
+    <span class="s1">xp = </span><span class="s3">2</span><span class="s1">*M_PI;</span>
+    <span class="s1">gl0 = a[</span><span class="s3">9</span><span class="s1">];</span>
+    <span class="s2">for </span><span class="s1">(k=</span><span class="s3">8</span><span class="s1">; k&gt;=</span><span class="s3">0</span><span class="s1">; k--)</span>
+    <span class="s1">{</span>
+        <span class="s1">gl0 *= x2;</span>
+        <span class="s1">gl0 += a[k];</span>
+    <span class="s1">}</span>
+    <span class="s1">gl = gl0/x0 + </span><span class="s3">0.5</span><span class="s1">*log(xp) + (x0-0.</span><span class="s3">5</span><span class="s1">)*log(x0) - x0;</span>
+    <span class="s2">if </span><span class="s1">(x &lt;= </span><span class="s3">7.0</span><span class="s1">)</span>
+    <span class="s1">{</span>
+        <span class="s2">for </span><span class="s1">(k=</span><span class="s3">1</span><span class="s1">; k&lt;=n; k++)</span>
+        <span class="s1">{</span>
+            <span class="s1">gl -= log(x0-1.</span><span class="s3">0</span><span class="s1">);</span>
+            <span class="s1">x0 -= </span><span class="s3">1.0</span><span class="s1">;</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">gl;</span>
+<span class="s1">}</span>
+
+
+<span class="s1">NUMBA_EXPORT_FUNC(int64_t)</span>
+<span class="s1">numba_poisson_ptrs(rnd_state_t *state, </span><span class="s2">double </span><span class="s1">lam)</span>
+<span class="s1">{</span>
+    <span class="s0">/* This method is invoked only if the parameter lambda of this 
+     * distribution is big enough ( &gt;= 10 ). The algorithm used is 
+     * described in &quot;Hörmann, W. 1992. 'The Transformed Rejection 
+     * Method for Generating Poisson Random Variables'. 
+     * The implementation comes straight from Numpy. 
+     */</span>
+    <span class="s1">int64_t k;</span>
+    <span class="s2">double </span><span class="s1">U, V, slam, loglam, a, b, invalpha, vr, us;</span>
+
+    <span class="s1">slam = sqrt(lam);</span>
+    <span class="s1">loglam = log(lam);</span>
+    <span class="s1">b = </span><span class="s3">0.931 </span><span class="s1">+ </span><span class="s3">2.53</span><span class="s1">*slam;</span>
+    <span class="s1">a = -</span><span class="s3">0.059 </span><span class="s1">+ </span><span class="s3">0.02483</span><span class="s1">*b;</span>
+    <span class="s1">invalpha = </span><span class="s3">1.1239 </span><span class="s1">+ </span><span class="s3">1.1328</span><span class="s1">/(b-3.</span><span class="s3">4</span><span class="s1">);</span>
+    <span class="s1">vr = </span><span class="s3">0.9277 </span><span class="s1">- </span><span class="s3">3.6224</span><span class="s1">/(b-2);</span>
+
+    <span class="s2">while </span><span class="s1">(</span><span class="s3">1</span><span class="s1">)</span>
+    <span class="s1">{</span>
+        <span class="s1">U = get_next_double(state) - </span><span class="s3">0.5</span><span class="s1">;</span>
+        <span class="s1">V = get_next_double(state);</span>
+        <span class="s1">us = </span><span class="s3">0.5 </span><span class="s1">- fabs(U);</span>
+        <span class="s1">k = (int64_t) floor((</span><span class="s3">2</span><span class="s1">*a/us + b)*U + lam + </span><span class="s3">0.43</span><span class="s1">);</span>
+        <span class="s2">if </span><span class="s1">((us &gt;= </span><span class="s3">0.07</span><span class="s1">) &amp;&amp; (V &lt;= vr))</span>
+        <span class="s1">{</span>
+            <span class="s2">return </span><span class="s1">k;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">((k &lt; </span><span class="s3">0</span><span class="s1">) ||</span>
+            <span class="s1">((us &lt; </span><span class="s3">0.013</span><span class="s1">) &amp;&amp; (V &gt; us)))</span>
+        <span class="s1">{</span>
+            <span class="s2">continue</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">((log(V) + log(invalpha) - log(a/(us*us)+b)) &lt;=</span>
+            <span class="s1">(-lam + (</span><span class="s2">double</span><span class="s1">) k*loglam - loggam((</span><span class="s2">double</span><span class="s1">) k+</span><span class="s3">1</span><span class="s1">)))</span>
+        <span class="s1">{</span>
+            <span class="s2">return </span><span class="s1">k;</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,479 @@
+<html>
+<head>
+<title>debuginfo.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #2aacb8;}
+.s5 { color: #6aab73;}
+.s6 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+debuginfo.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Implements helpers to build LLVM debuginfo. 
+&quot;&quot;&quot;</span>
+
+
+<span class="s2">import </span><span class="s1">abc</span>
+<span class="s2">import </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span>
+<span class="s2">from </span><span class="s1">contextlib </span><span class="s2">import </span><span class="s1">contextmanager</span>
+
+<span class="s2">from </span><span class="s1">llvmlite </span><span class="s2">import </span><span class="s1">ir</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">cgutils</span><span class="s3">, </span><span class="s1">types</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">datamodel</span><span class="s3">.</span><span class="s1">models </span><span class="s2">import </span><span class="s1">ComplexModel</span><span class="s3">, </span><span class="s1">UniTupleModel</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">config</span>
+
+
+<span class="s3">@</span><span class="s1">contextmanager</span>
+<span class="s2">def </span><span class="s1">suspend_emission</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Suspends the emission of debug_metadata for the duration of the context 
+    managed block.&quot;&quot;&quot;</span>
+    <span class="s1">ref </span><span class="s3">= </span><span class="s1">builder</span><span class="s3">.</span><span class="s1">debug_metadata</span>
+    <span class="s1">builder</span><span class="s3">.</span><span class="s1">debug_metadata </span><span class="s3">= </span><span class="s2">None</span>
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s2">yield</span>
+    <span class="s2">finally</span><span class="s3">:</span>
+        <span class="s1">builder</span><span class="s3">.</span><span class="s1">debug_metadata </span><span class="s3">= </span><span class="s1">ref</span>
+
+
+<span class="s2">class </span><span class="s1">AbstractDIBuilder</span><span class="s3">(</span><span class="s1">metaclass</span><span class="s3">=</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">ABCMeta</span><span class="s3">):</span>
+    <span class="s3">@</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">mark_variable</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">, </span><span class="s1">allocavalue</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">lltype</span><span class="s3">, </span><span class="s1">size</span><span class="s3">, </span><span class="s1">line</span><span class="s3">,</span>
+                      <span class="s1">datamodel</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">argidx</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Emit debug info for the variable. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">pass</span>
+
+    <span class="s3">@</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">mark_location</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">, </span><span class="s1">line</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Emit source location information to the given IRBuilder. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">pass</span>
+
+    <span class="s3">@</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">mark_subprogram</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">function</span><span class="s3">, </span><span class="s1">qualname</span><span class="s3">, </span><span class="s1">argnames</span><span class="s3">, </span><span class="s1">argtypes</span><span class="s3">, </span><span class="s1">line</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Emit source location information for the given function. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">pass</span>
+
+    <span class="s3">@</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">initialize</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Initialize the debug info. An opportunity for the debuginfo to 
+        prepare any necessary data structures. 
+        &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">finalize</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Finalize the debuginfo by emitting all necessary metadata. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">pass</span>
+
+
+<span class="s2">class </span><span class="s1">DummyDIBuilder</span><span class="s3">(</span><span class="s1">AbstractDIBuilder</span><span class="s3">):</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">module</span><span class="s3">, </span><span class="s1">filepath</span><span class="s3">, </span><span class="s1">cgctx</span><span class="s3">, </span><span class="s1">directives_only</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">mark_variable</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">, </span><span class="s1">allocavalue</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">lltype</span><span class="s3">, </span><span class="s1">size</span><span class="s3">, </span><span class="s1">line</span><span class="s3">,</span>
+                      <span class="s1">datamodel</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">argidx</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">mark_location</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">, </span><span class="s1">line</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">mark_subprogram</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">function</span><span class="s3">, </span><span class="s1">qualname</span><span class="s3">, </span><span class="s1">argnames</span><span class="s3">, </span><span class="s1">argtypes</span><span class="s3">, </span><span class="s1">line</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">initialize</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">finalize</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+
+<span class="s1">_BYTE_SIZE </span><span class="s3">= </span><span class="s4">8</span>
+
+
+<span class="s2">class </span><span class="s1">DIBuilder</span><span class="s3">(</span><span class="s1">AbstractDIBuilder</span><span class="s3">):</span>
+    <span class="s1">DWARF_VERSION </span><span class="s3">= </span><span class="s4">4</span>
+    <span class="s1">DEBUG_INFO_VERSION </span><span class="s3">= </span><span class="s4">3</span>
+    <span class="s1">DBG_CU_NAME </span><span class="s3">= </span><span class="s5">'llvm.dbg.cu'</span>
+    <span class="s1">_DEBUG </span><span class="s3">= </span><span class="s2">False</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">module</span><span class="s3">, </span><span class="s1">filepath</span><span class="s3">, </span><span class="s1">cgctx</span><span class="s3">, </span><span class="s1">directives_only</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">module </span><span class="s3">= </span><span class="s1">module</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">filepath </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">abspath</span><span class="s3">(</span><span class="s1">filepath</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">difile </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_di_file</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">subprograms </span><span class="s3">= []</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">cgctx </span><span class="s3">= </span><span class="s1">cgctx</span>
+
+        <span class="s2">if </span><span class="s1">directives_only</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">emission_kind </span><span class="s3">= </span><span class="s5">'DebugDirectivesOnly'</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">emission_kind </span><span class="s3">= </span><span class="s5">'FullDebug'</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">initialize</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">initialize</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s6"># Create the compile unit now because it is referenced when</span>
+        <span class="s6"># constructing subprograms</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">dicompileunit </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_di_compile_unit</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">_var_type</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">lltype</span><span class="s3">, </span><span class="s1">size</span><span class="s3">, </span><span class="s1">datamodel</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_DEBUG</span><span class="s3">:</span>
+            <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;--&gt;&quot;</span><span class="s3">, </span><span class="s1">lltype</span><span class="s3">, </span><span class="s1">size</span><span class="s3">, </span><span class="s1">datamodel</span><span class="s3">,</span>
+                  <span class="s1">getattr</span><span class="s3">(</span><span class="s1">datamodel</span><span class="s3">, </span><span class="s5">'fe_type'</span><span class="s3">, </span><span class="s5">'NO FE TYPE'</span><span class="s3">))</span>
+        <span class="s1">m </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">module</span>
+        <span class="s1">bitsize </span><span class="s3">= </span><span class="s1">_BYTE_SIZE </span><span class="s3">* </span><span class="s1">size</span>
+
+        <span class="s1">int_type </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">IntType</span><span class="s3">,</span>
+        <span class="s1">real_type </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">FloatType</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">DoubleType</span>
+        <span class="s6"># For simple numeric types, choose the closest encoding.</span>
+        <span class="s6"># We treat all integers as unsigned when there's no known datamodel.</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">, </span><span class="s1">int_type </span><span class="s3">+ </span><span class="s1">real_type</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">datamodel </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s6"># This is probably something like an `i8*` member of a struct</span>
+                <span class="s1">name </span><span class="s3">= </span><span class="s1">str</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">, </span><span class="s1">int_type</span><span class="s3">):</span>
+                    <span class="s1">ditok </span><span class="s3">= </span><span class="s5">'DW_ATE_unsigned'</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">ditok </span><span class="s3">= </span><span class="s5">'DW_ATE_float'</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s6"># This is probably a known int/float scalar type</span>
+                <span class="s1">name </span><span class="s3">= </span><span class="s1">str</span><span class="s3">(</span><span class="s1">datamodel</span><span class="s3">.</span><span class="s1">fe_type</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">datamodel</span><span class="s3">.</span><span class="s1">fe_type</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">Integer</span><span class="s3">):</span>
+                    <span class="s2">if </span><span class="s1">datamodel</span><span class="s3">.</span><span class="s1">fe_type</span><span class="s3">.</span><span class="s1">signed</span><span class="s3">:</span>
+                        <span class="s1">ditok </span><span class="s3">= </span><span class="s5">'DW_ATE_signed'</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s1">ditok </span><span class="s3">= </span><span class="s5">'DW_ATE_unsigned'</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">ditok </span><span class="s3">= </span><span class="s5">'DW_ATE_float'</span>
+            <span class="s1">mdtype </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DIBasicType'</span><span class="s3">, {</span>
+                <span class="s5">'name'</span><span class="s3">: </span><span class="s1">name</span><span class="s3">,</span>
+                <span class="s5">'size'</span><span class="s3">: </span><span class="s1">bitsize</span><span class="s3">,</span>
+                <span class="s5">'encoding'</span><span class="s3">: </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">DIToken</span><span class="s3">(</span><span class="s1">ditok</span><span class="s3">),</span>
+            <span class="s3">})</span>
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">datamodel</span><span class="s3">, </span><span class="s1">ComplexModel</span><span class="s3">):</span>
+            <span class="s6"># TODO: Is there a better way of determining &quot;this is a complex</span>
+            <span class="s6"># number&quot;?</span>
+            <span class="s6">#</span>
+            <span class="s6"># NOTE: Commented below is the way to generate the metadata for a</span>
+            <span class="s6"># C99 complex type that's directly supported by DWARF. Numba however</span>
+            <span class="s6"># generates a struct with real/imag cf. CPython to give a more</span>
+            <span class="s6"># pythonic feel to inspection.</span>
+            <span class="s6">#</span>
+            <span class="s6"># mdtype = m.add_debug_info('DIBasicType', {</span>
+            <span class="s6">#  'name': f&quot;{datamodel.fe_type} ({str(lltype)})&quot;,</span>
+            <span class="s6">#  'size': bitsize,</span>
+            <span class="s6"># 'encoding': ir.DIToken('DW_ATE_complex_float'),</span>
+            <span class="s6">#})</span>
+            <span class="s1">meta </span><span class="s3">= []</span>
+            <span class="s1">offset </span><span class="s3">= </span><span class="s4">0</span>
+            <span class="s2">for </span><span class="s1">ix</span><span class="s3">, </span><span class="s1">name </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">((</span><span class="s5">'real'</span><span class="s3">, </span><span class="s5">'imag'</span><span class="s3">)):</span>
+                <span class="s1">component </span><span class="s3">= </span><span class="s1">lltype</span><span class="s3">.</span><span class="s1">elements</span><span class="s3">[</span><span class="s1">ix</span><span class="s3">]</span>
+                <span class="s1">component_size </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">cgctx</span><span class="s3">.</span><span class="s1">get_abi_sizeof</span><span class="s3">(</span><span class="s1">component</span><span class="s3">)</span>
+                <span class="s1">component_basetype </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DIBasicType'</span><span class="s3">, {</span>
+                    <span class="s5">'name'</span><span class="s3">: </span><span class="s1">str</span><span class="s3">(</span><span class="s1">component</span><span class="s3">),</span>
+                    <span class="s5">'size'</span><span class="s3">: </span><span class="s1">_BYTE_SIZE </span><span class="s3">* </span><span class="s1">component_size</span><span class="s3">, </span><span class="s6"># bits</span>
+                    <span class="s5">'encoding'</span><span class="s3">: </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">DIToken</span><span class="s3">(</span><span class="s5">'DW_ATE_float'</span><span class="s3">),</span>
+                <span class="s3">})</span>
+                <span class="s1">derived_type </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DIDerivedType'</span><span class="s3">, {</span>
+                    <span class="s5">'tag'</span><span class="s3">: </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">DIToken</span><span class="s3">(</span><span class="s5">'DW_TAG_member'</span><span class="s3">),</span>
+                    <span class="s5">'name'</span><span class="s3">: </span><span class="s1">name</span><span class="s3">,</span>
+                    <span class="s5">'baseType'</span><span class="s3">: </span><span class="s1">component_basetype</span><span class="s3">,</span>
+                    <span class="s5">'size'</span><span class="s3">: </span><span class="s1">_BYTE_SIZE </span><span class="s3">* </span><span class="s1">component_size</span><span class="s3">, </span><span class="s6"># DW_TAG_member size is in bits</span>
+                    <span class="s5">'offset'</span><span class="s3">: </span><span class="s1">offset</span><span class="s3">,</span>
+                <span class="s3">})</span>
+                <span class="s1">meta</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">derived_type</span><span class="s3">)</span>
+                <span class="s1">offset </span><span class="s3">+= (</span><span class="s1">_BYTE_SIZE </span><span class="s3">* </span><span class="s1">component_size</span><span class="s3">) </span><span class="s6"># offset is in bits</span>
+            <span class="s1">mdtype </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DICompositeType'</span><span class="s3">, {</span>
+                <span class="s5">'tag'</span><span class="s3">: </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">DIToken</span><span class="s3">(</span><span class="s5">'DW_TAG_structure_type'</span><span class="s3">),</span>
+                <span class="s5">'name'</span><span class="s3">: </span><span class="s5">f&quot;</span><span class="s2">{</span><span class="s1">datamodel</span><span class="s3">.</span><span class="s1">fe_type</span><span class="s2">} </span><span class="s5">(</span><span class="s2">{</span><span class="s1">str</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">)</span><span class="s2">}</span><span class="s5">)&quot;</span><span class="s3">,</span>
+                <span class="s5">'identifier'</span><span class="s3">: </span><span class="s1">str</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">),</span>
+                <span class="s5">'elements'</span><span class="s3">: </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_metadata</span><span class="s3">(</span><span class="s1">meta</span><span class="s3">),</span>
+                <span class="s5">'size'</span><span class="s3">: </span><span class="s1">offset</span><span class="s3">,</span>
+            <span class="s3">}, </span><span class="s1">is_distinct</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">datamodel</span><span class="s3">, </span><span class="s1">UniTupleModel</span><span class="s3">):</span>
+            <span class="s1">element </span><span class="s3">= </span><span class="s1">lltype</span><span class="s3">.</span><span class="s1">element</span>
+            <span class="s1">el_size </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">cgctx</span><span class="s3">.</span><span class="s1">get_abi_sizeof</span><span class="s3">(</span><span class="s1">element</span><span class="s3">)</span>
+            <span class="s1">basetype </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_var_type</span><span class="s3">(</span><span class="s1">element</span><span class="s3">, </span><span class="s1">el_size</span><span class="s3">)</span>
+            <span class="s1">name </span><span class="s3">= </span><span class="s5">f&quot;</span><span class="s2">{</span><span class="s1">datamodel</span><span class="s3">.</span><span class="s1">fe_type</span><span class="s2">} </span><span class="s5">(</span><span class="s2">{</span><span class="s1">str</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">)</span><span class="s2">}</span><span class="s5">)&quot;</span>
+            <span class="s1">count </span><span class="s3">= </span><span class="s1">size </span><span class="s3">// </span><span class="s1">el_size</span>
+            <span class="s1">mdrange </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DISubrange'</span><span class="s3">, {</span>
+                <span class="s5">'count'</span><span class="s3">: </span><span class="s1">count</span><span class="s3">,</span>
+            <span class="s3">})</span>
+            <span class="s1">mdtype </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DICompositeType'</span><span class="s3">, {</span>
+                <span class="s5">'tag'</span><span class="s3">: </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">DIToken</span><span class="s3">(</span><span class="s5">'DW_TAG_array_type'</span><span class="s3">),</span>
+                <span class="s5">'baseType'</span><span class="s3">: </span><span class="s1">basetype</span><span class="s3">,</span>
+                <span class="s5">'name'</span><span class="s3">: </span><span class="s1">name</span><span class="s3">,</span>
+                <span class="s5">'size'</span><span class="s3">: </span><span class="s1">bitsize</span><span class="s3">,</span>
+                <span class="s5">'identifier'</span><span class="s3">: </span><span class="s1">str</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">),</span>
+                <span class="s5">'elements'</span><span class="s3">: </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_metadata</span><span class="s3">([</span><span class="s1">mdrange</span><span class="s3">]),</span>
+            <span class="s3">})</span>
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">PointerType</span><span class="s3">):</span>
+            <span class="s1">model </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">datamodel</span><span class="s3">, </span><span class="s5">'_pointee_model'</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+            <span class="s1">basetype </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_var_type</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">.</span><span class="s1">pointee</span><span class="s3">,</span>
+                                      <span class="s1">self</span><span class="s3">.</span><span class="s1">cgctx</span><span class="s3">.</span><span class="s1">get_abi_sizeof</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">.</span><span class="s1">pointee</span><span class="s3">),</span>
+                                      <span class="s1">model</span><span class="s3">)</span>
+            <span class="s1">mdtype </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DIDerivedType'</span><span class="s3">, {</span>
+                <span class="s5">'tag'</span><span class="s3">: </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">DIToken</span><span class="s3">(</span><span class="s5">'DW_TAG_pointer_type'</span><span class="s3">),</span>
+                <span class="s5">'baseType'</span><span class="s3">: </span><span class="s1">basetype</span><span class="s3">,</span>
+                <span class="s5">'size'</span><span class="s3">: </span><span class="s1">_BYTE_SIZE </span><span class="s3">* </span><span class="s1">self</span><span class="s3">.</span><span class="s1">cgctx</span><span class="s3">.</span><span class="s1">get_abi_sizeof</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">)</span>
+            <span class="s3">})</span>
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">LiteralStructType</span><span class="s3">):</span>
+            <span class="s6"># Struct type</span>
+            <span class="s1">meta </span><span class="s3">= []</span>
+            <span class="s1">offset </span><span class="s3">= </span><span class="s4">0</span>
+            <span class="s2">if </span><span class="s1">datamodel </span><span class="s2">is None or not </span><span class="s1">datamodel</span><span class="s3">.</span><span class="s1">inner_models</span><span class="s3">():</span>
+                <span class="s1">name </span><span class="s3">= </span><span class="s5">f&quot;Anonymous struct (</span><span class="s2">{</span><span class="s1">str</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">)</span><span class="s2">}</span><span class="s5">)&quot;</span>
+                <span class="s2">for </span><span class="s1">field_id</span><span class="s3">, </span><span class="s1">element </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">.</span><span class="s1">elements</span><span class="s3">):</span>
+                    <span class="s1">size </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">cgctx</span><span class="s3">.</span><span class="s1">get_abi_sizeof</span><span class="s3">(</span><span class="s1">element</span><span class="s3">)</span>
+                    <span class="s1">basetype </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_var_type</span><span class="s3">(</span><span class="s1">element</span><span class="s3">, </span><span class="s1">size</span><span class="s3">)</span>
+                    <span class="s1">derived_type </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DIDerivedType'</span><span class="s3">, {</span>
+                        <span class="s5">'tag'</span><span class="s3">: </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">DIToken</span><span class="s3">(</span><span class="s5">'DW_TAG_member'</span><span class="s3">),</span>
+                        <span class="s5">'name'</span><span class="s3">: </span><span class="s5">f'&lt;field </span><span class="s2">{</span><span class="s1">field_id</span><span class="s2">}</span><span class="s5">&gt;'</span><span class="s3">,</span>
+                        <span class="s5">'baseType'</span><span class="s3">: </span><span class="s1">basetype</span><span class="s3">,</span>
+                        <span class="s5">'size'</span><span class="s3">: </span><span class="s1">_BYTE_SIZE </span><span class="s3">* </span><span class="s1">size</span><span class="s3">, </span><span class="s6"># DW_TAG_member size is in bits</span>
+                        <span class="s5">'offset'</span><span class="s3">: </span><span class="s1">offset</span><span class="s3">,</span>
+                    <span class="s3">})</span>
+                    <span class="s1">meta</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">derived_type</span><span class="s3">)</span>
+                    <span class="s1">offset </span><span class="s3">+= (</span><span class="s1">_BYTE_SIZE </span><span class="s3">* </span><span class="s1">size</span><span class="s3">) </span><span class="s6"># offset is in bits</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">name </span><span class="s3">= </span><span class="s5">f&quot;</span><span class="s2">{</span><span class="s1">datamodel</span><span class="s3">.</span><span class="s1">fe_type</span><span class="s2">} </span><span class="s5">(</span><span class="s2">{</span><span class="s1">str</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">)</span><span class="s2">}</span><span class="s5">)&quot;</span>
+                <span class="s2">for </span><span class="s1">element</span><span class="s3">, </span><span class="s1">field</span><span class="s3">, </span><span class="s1">model </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">.</span><span class="s1">elements</span><span class="s3">,</span>
+                                                 <span class="s1">datamodel</span><span class="s3">.</span><span class="s1">_fields</span><span class="s3">,</span>
+                                                 <span class="s1">datamodel</span><span class="s3">.</span><span class="s1">inner_models</span><span class="s3">()):</span>
+                    <span class="s1">size </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">cgctx</span><span class="s3">.</span><span class="s1">get_abi_sizeof</span><span class="s3">(</span><span class="s1">element</span><span class="s3">)</span>
+                    <span class="s1">basetype </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_var_type</span><span class="s3">(</span><span class="s1">element</span><span class="s3">, </span><span class="s1">size</span><span class="s3">, </span><span class="s1">datamodel</span><span class="s3">=</span><span class="s1">model</span><span class="s3">)</span>
+                    <span class="s1">derived_type </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DIDerivedType'</span><span class="s3">, {</span>
+                        <span class="s5">'tag'</span><span class="s3">: </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">DIToken</span><span class="s3">(</span><span class="s5">'DW_TAG_member'</span><span class="s3">),</span>
+                        <span class="s5">'name'</span><span class="s3">: </span><span class="s1">field</span><span class="s3">,</span>
+                        <span class="s5">'baseType'</span><span class="s3">: </span><span class="s1">basetype</span><span class="s3">,</span>
+                        <span class="s5">'size'</span><span class="s3">: </span><span class="s1">_BYTE_SIZE </span><span class="s3">* </span><span class="s1">size</span><span class="s3">, </span><span class="s6"># DW_TAG_member size is in bits</span>
+                        <span class="s5">'offset'</span><span class="s3">: </span><span class="s1">offset</span><span class="s3">,</span>
+                    <span class="s3">})</span>
+                    <span class="s1">meta</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">derived_type</span><span class="s3">)</span>
+                    <span class="s1">offset </span><span class="s3">+= (</span><span class="s1">_BYTE_SIZE </span><span class="s3">* </span><span class="s1">size</span><span class="s3">) </span><span class="s6"># offset is in bits</span>
+
+            <span class="s1">mdtype </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DICompositeType'</span><span class="s3">, {</span>
+                <span class="s5">'tag'</span><span class="s3">: </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">DIToken</span><span class="s3">(</span><span class="s5">'DW_TAG_structure_type'</span><span class="s3">),</span>
+                <span class="s5">'name'</span><span class="s3">: </span><span class="s1">name</span><span class="s3">,</span>
+                <span class="s5">'identifier'</span><span class="s3">: </span><span class="s1">str</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">),</span>
+                <span class="s5">'elements'</span><span class="s3">: </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_metadata</span><span class="s3">(</span><span class="s1">meta</span><span class="s3">),</span>
+                <span class="s5">'size'</span><span class="s3">: </span><span class="s1">offset</span><span class="s3">,</span>
+            <span class="s3">}, </span><span class="s1">is_distinct</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">ArrayType</span><span class="s3">):</span>
+            <span class="s1">element </span><span class="s3">= </span><span class="s1">lltype</span><span class="s3">.</span><span class="s1">element</span>
+            <span class="s1">el_size </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">cgctx</span><span class="s3">.</span><span class="s1">get_abi_sizeof</span><span class="s3">(</span><span class="s1">element</span><span class="s3">)</span>
+            <span class="s1">basetype </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_var_type</span><span class="s3">(</span><span class="s1">element</span><span class="s3">, </span><span class="s1">el_size</span><span class="s3">)</span>
+            <span class="s1">count </span><span class="s3">= </span><span class="s1">size </span><span class="s3">// </span><span class="s1">el_size</span>
+            <span class="s1">mdrange </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DISubrange'</span><span class="s3">, {</span>
+                <span class="s5">'count'</span><span class="s3">: </span><span class="s1">count</span><span class="s3">,</span>
+            <span class="s3">})</span>
+            <span class="s1">mdtype </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DICompositeType'</span><span class="s3">, {</span>
+                <span class="s5">'tag'</span><span class="s3">: </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">DIToken</span><span class="s3">(</span><span class="s5">'DW_TAG_array_type'</span><span class="s3">),</span>
+                <span class="s5">'baseType'</span><span class="s3">: </span><span class="s1">basetype</span><span class="s3">,</span>
+                <span class="s5">'name'</span><span class="s3">: </span><span class="s1">str</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">),</span>
+                <span class="s5">'size'</span><span class="s3">: </span><span class="s1">bitsize</span><span class="s3">,</span>
+                <span class="s5">'identifier'</span><span class="s3">: </span><span class="s1">str</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">),</span>
+                <span class="s5">'elements'</span><span class="s3">: </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_metadata</span><span class="s3">([</span><span class="s1">mdrange</span><span class="s3">]),</span>
+            <span class="s3">})</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s6"># For all other types, describe it as sequence of bytes</span>
+            <span class="s1">count </span><span class="s3">= </span><span class="s1">size</span>
+            <span class="s1">mdrange </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DISubrange'</span><span class="s3">, {</span>
+                <span class="s5">'count'</span><span class="s3">: </span><span class="s1">count</span><span class="s3">,</span>
+            <span class="s3">})</span>
+            <span class="s1">mdbase </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DIBasicType'</span><span class="s3">, {</span>
+                <span class="s5">'name'</span><span class="s3">: </span><span class="s5">'byte'</span><span class="s3">,</span>
+                <span class="s5">'size'</span><span class="s3">: </span><span class="s1">_BYTE_SIZE</span><span class="s3">,</span>
+                <span class="s5">'encoding'</span><span class="s3">: </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">DIToken</span><span class="s3">(</span><span class="s5">'DW_ATE_unsigned_char'</span><span class="s3">),</span>
+            <span class="s3">})</span>
+            <span class="s1">mdtype </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DICompositeType'</span><span class="s3">, {</span>
+                <span class="s5">'tag'</span><span class="s3">: </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">DIToken</span><span class="s3">(</span><span class="s5">'DW_TAG_array_type'</span><span class="s3">),</span>
+                <span class="s5">'baseType'</span><span class="s3">: </span><span class="s1">mdbase</span><span class="s3">,</span>
+                <span class="s5">'name'</span><span class="s3">: </span><span class="s1">str</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">),</span>
+                <span class="s5">'size'</span><span class="s3">: </span><span class="s1">bitsize</span><span class="s3">,</span>
+                <span class="s5">'identifier'</span><span class="s3">: </span><span class="s1">str</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">),</span>
+                <span class="s5">'elements'</span><span class="s3">: </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_metadata</span><span class="s3">([</span><span class="s1">mdrange</span><span class="s3">]),</span>
+            <span class="s3">})</span>
+
+        <span class="s2">return </span><span class="s1">mdtype</span>
+
+    <span class="s2">def </span><span class="s1">mark_variable</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">, </span><span class="s1">allocavalue</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">lltype</span><span class="s3">, </span><span class="s1">size</span><span class="s3">, </span><span class="s1">line</span><span class="s3">,</span>
+                      <span class="s1">datamodel</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">argidx</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+
+        <span class="s1">arg_index </span><span class="s3">= </span><span class="s4">0 </span><span class="s2">if </span><span class="s1">argidx </span><span class="s2">is None else </span><span class="s1">argidx</span>
+        <span class="s1">m </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">module</span>
+        <span class="s1">fnty </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">FunctionType</span><span class="s3">(</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">VoidType</span><span class="s3">(), [</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">MetaDataType</span><span class="s3">()] * </span><span class="s4">3</span><span class="s3">)</span>
+        <span class="s1">decl </span><span class="s3">= </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">get_or_insert_function</span><span class="s3">(</span><span class="s1">m</span><span class="s3">, </span><span class="s1">fnty</span><span class="s3">, </span><span class="s5">'llvm.dbg.declare'</span><span class="s3">)</span>
+
+        <span class="s1">mdtype </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_var_type</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">, </span><span class="s1">size</span><span class="s3">, </span><span class="s1">datamodel</span><span class="s3">=</span><span class="s1">datamodel</span><span class="s3">)</span>
+        <span class="s1">name </span><span class="s3">= </span><span class="s1">name</span><span class="s3">.</span><span class="s1">replace</span><span class="s3">(</span><span class="s5">'.'</span><span class="s3">, </span><span class="s5">'$'</span><span class="s3">)    </span><span class="s6"># for gdb to work correctly</span>
+        <span class="s1">mdlocalvar </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DILocalVariable'</span><span class="s3">, {</span>
+            <span class="s5">'name'</span><span class="s3">: </span><span class="s1">name</span><span class="s3">,</span>
+            <span class="s5">'arg'</span><span class="s3">: </span><span class="s1">arg_index</span><span class="s3">,</span>
+            <span class="s5">'scope'</span><span class="s3">: </span><span class="s1">self</span><span class="s3">.</span><span class="s1">subprograms</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">],</span>
+            <span class="s5">'file'</span><span class="s3">: </span><span class="s1">self</span><span class="s3">.</span><span class="s1">difile</span><span class="s3">,</span>
+            <span class="s5">'line'</span><span class="s3">: </span><span class="s1">line</span><span class="s3">,</span>
+            <span class="s5">'type'</span><span class="s3">: </span><span class="s1">mdtype</span><span class="s3">,</span>
+        <span class="s3">})</span>
+        <span class="s1">mdexpr </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DIExpression'</span><span class="s3">, {})</span>
+
+        <span class="s2">return </span><span class="s1">builder</span><span class="s3">.</span><span class="s1">call</span><span class="s3">(</span><span class="s1">decl</span><span class="s3">, [</span><span class="s1">allocavalue</span><span class="s3">, </span><span class="s1">mdlocalvar</span><span class="s3">, </span><span class="s1">mdexpr</span><span class="s3">])</span>
+
+    <span class="s2">def </span><span class="s1">mark_location</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">, </span><span class="s1">line</span><span class="s3">):</span>
+        <span class="s1">builder</span><span class="s3">.</span><span class="s1">debug_metadata </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_add_location</span><span class="s3">(</span><span class="s1">line</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">mark_subprogram</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">function</span><span class="s3">, </span><span class="s1">qualname</span><span class="s3">, </span><span class="s1">argnames</span><span class="s3">, </span><span class="s1">argtypes</span><span class="s3">, </span><span class="s1">line</span><span class="s3">):</span>
+        <span class="s1">name </span><span class="s3">= </span><span class="s1">qualname</span>
+        <span class="s1">argmap </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">zip</span><span class="s3">(</span><span class="s1">argnames</span><span class="s3">, </span><span class="s1">argtypes</span><span class="s3">))</span>
+        <span class="s1">di_subp </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_add_subprogram</span><span class="s3">(</span><span class="s1">name</span><span class="s3">=</span><span class="s1">name</span><span class="s3">, </span><span class="s1">linkagename</span><span class="s3">=</span><span class="s1">function</span><span class="s3">.</span><span class="s1">name</span><span class="s3">,</span>
+                                       <span class="s1">line</span><span class="s3">=</span><span class="s1">line</span><span class="s3">, </span><span class="s1">function</span><span class="s3">=</span><span class="s1">function</span><span class="s3">,</span>
+                                       <span class="s1">argmap</span><span class="s3">=</span><span class="s1">argmap</span><span class="s3">)</span>
+        <span class="s1">function</span><span class="s3">.</span><span class="s1">set_metadata</span><span class="s3">(</span><span class="s5">&quot;dbg&quot;</span><span class="s3">, </span><span class="s1">di_subp</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">finalize</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">dbgcu </span><span class="s3">= </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">get_or_insert_named_metadata</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">module</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">DBG_CU_NAME</span><span class="s3">)</span>
+        <span class="s1">dbgcu</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">dicompileunit</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_set_module_flags</span><span class="s3">()</span>
+
+    <span class="s6">#</span>
+    <span class="s6"># Internal APIs</span>
+    <span class="s6">#</span>
+
+    <span class="s2">def </span><span class="s1">_set_module_flags</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Set the module flags metadata 
+        &quot;&quot;&quot;</span>
+        <span class="s1">module </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">module</span>
+        <span class="s1">mflags </span><span class="s3">= </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">get_or_insert_named_metadata</span><span class="s3">(</span><span class="s1">module</span><span class="s3">, </span><span class="s5">'llvm.module.flags'</span><span class="s3">)</span>
+        <span class="s6"># Set *require* behavior to warning</span>
+        <span class="s6"># See http://llvm.org/docs/LangRef.html#module-flags-metadata</span>
+        <span class="s1">require_warning_behavior </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_const_int</span><span class="s3">(</span><span class="s4">2</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">DWARF_VERSION </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">dwarf_version </span><span class="s3">= </span><span class="s1">module</span><span class="s3">.</span><span class="s1">add_metadata</span><span class="s3">([</span>
+                <span class="s1">require_warning_behavior</span><span class="s3">,</span>
+                <span class="s5">&quot;Dwarf Version&quot;</span><span class="s3">,</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_const_int</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">DWARF_VERSION</span><span class="s3">)</span>
+            <span class="s3">])</span>
+            <span class="s2">if </span><span class="s1">dwarf_version </span><span class="s2">not in </span><span class="s1">mflags</span><span class="s3">.</span><span class="s1">operands</span><span class="s3">:</span>
+                <span class="s1">mflags</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">dwarf_version</span><span class="s3">)</span>
+        <span class="s1">debuginfo_version </span><span class="s3">= </span><span class="s1">module</span><span class="s3">.</span><span class="s1">add_metadata</span><span class="s3">([</span>
+            <span class="s1">require_warning_behavior</span><span class="s3">,</span>
+            <span class="s5">&quot;Debug Info Version&quot;</span><span class="s3">,</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_const_int</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">DEBUG_INFO_VERSION</span><span class="s3">)</span>
+        <span class="s3">])</span>
+        <span class="s2">if </span><span class="s1">debuginfo_version </span><span class="s2">not in </span><span class="s1">mflags</span><span class="s3">.</span><span class="s1">operands</span><span class="s3">:</span>
+            <span class="s1">mflags</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">debuginfo_version</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_add_subprogram</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">linkagename</span><span class="s3">, </span><span class="s1">line</span><span class="s3">, </span><span class="s1">function</span><span class="s3">, </span><span class="s1">argmap</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Emit subprogram metadata 
+        &quot;&quot;&quot;</span>
+        <span class="s1">subp </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_di_subprogram</span><span class="s3">(</span><span class="s1">name</span><span class="s3">, </span><span class="s1">linkagename</span><span class="s3">, </span><span class="s1">line</span><span class="s3">, </span><span class="s1">function</span><span class="s3">, </span><span class="s1">argmap</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">subprograms</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">subp</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">subp</span>
+
+    <span class="s2">def </span><span class="s1">_add_location</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">line</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Emit location metatdaa 
+        &quot;&quot;&quot;</span>
+        <span class="s1">loc </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_di_location</span><span class="s3">(</span><span class="s1">line</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">loc</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">_const_int</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">num</span><span class="s3">, </span><span class="s1">bits</span><span class="s3">=</span><span class="s4">32</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Util to create constant int in metadata 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">IntType</span><span class="s3">(</span><span class="s1">bits</span><span class="s3">)(</span><span class="s1">num</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">_const_bool</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">boolean</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Util to create constant boolean in metadata 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">IntType</span><span class="s3">(</span><span class="s4">1</span><span class="s3">)(</span><span class="s1">boolean</span><span class="s3">)</span>
+
+    <span class="s6">#</span>
+    <span class="s6"># Helpers to emit the metadata nodes</span>
+    <span class="s6">#</span>
+
+    <span class="s2">def </span><span class="s1">_di_file</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">module</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DIFile'</span><span class="s3">, {</span>
+            <span class="s5">'directory'</span><span class="s3">: </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">dirname</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">filepath</span><span class="s3">),</span>
+            <span class="s5">'filename'</span><span class="s3">: </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">basename</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">filepath</span><span class="s3">),</span>
+        <span class="s3">})</span>
+
+    <span class="s2">def </span><span class="s1">_di_compile_unit</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">module</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DICompileUnit'</span><span class="s3">, {</span>
+            <span class="s5">'language'</span><span class="s3">: </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">DIToken</span><span class="s3">(</span><span class="s5">'DW_LANG_C_plus_plus'</span><span class="s3">),</span>
+            <span class="s5">'file'</span><span class="s3">: </span><span class="s1">self</span><span class="s3">.</span><span class="s1">difile</span><span class="s3">,</span>
+            <span class="s6"># Numba has to pretend to be clang to ensure the prologue is skipped</span>
+            <span class="s6"># correctly in gdb. See:</span>
+            <span class="s6"># https://sourceware.org/git/?p=binutils-gdb.git;a=blob;f=gdb/amd64-tdep.c;h=e563d369d8cb3eb3c2f732c2fa850ec70ba8d63b;hb=a4b0231e179607e47b1cdf1fe15c5dc25e482fad#l2521</span>
+            <span class="s6"># Note the &quot;producer_is_llvm&quot; call to specialise the prologue</span>
+            <span class="s6"># handling, this is defined here:</span>
+            <span class="s6"># https://sourceware.org/git/?p=binutils-gdb.git;a=blob;f=gdb/producer.c;h=cdfd80d904c09394febd18749bb90359b2d128cc;hb=a4b0231e179607e47b1cdf1fe15c5dc25e482fad#l124</span>
+            <span class="s6"># and to get a match for this condition the 'producer' must start</span>
+            <span class="s6"># with &quot;clang &quot;, hence the following...</span>
+            <span class="s5">'producer'</span><span class="s3">: </span><span class="s5">'clang (Numba)'</span><span class="s3">,</span>
+            <span class="s5">'runtimeVersion'</span><span class="s3">: </span><span class="s4">0</span><span class="s3">,</span>
+            <span class="s5">'isOptimized'</span><span class="s3">: </span><span class="s1">config</span><span class="s3">.</span><span class="s1">OPT </span><span class="s3">!= </span><span class="s4">0</span><span class="s3">,</span>
+            <span class="s5">'emissionKind'</span><span class="s3">: </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">DIToken</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">emission_kind</span><span class="s3">),</span>
+        <span class="s3">}, </span><span class="s1">is_distinct</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_di_subroutine_type</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">line</span><span class="s3">, </span><span class="s1">function</span><span class="s3">, </span><span class="s1">argmap</span><span class="s3">):</span>
+        <span class="s6"># The function call conv needs encoding.</span>
+        <span class="s1">llfunc </span><span class="s3">= </span><span class="s1">function</span>
+        <span class="s1">md </span><span class="s3">= []</span>
+
+        <span class="s2">for </span><span class="s1">idx</span><span class="s3">, </span><span class="s1">llarg </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">llfunc</span><span class="s3">.</span><span class="s1">args</span><span class="s3">):</span>
+            <span class="s2">if not </span><span class="s1">llarg</span><span class="s3">.</span><span class="s1">name</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s5">'arg.'</span><span class="s3">):</span>
+                <span class="s1">name </span><span class="s3">= </span><span class="s1">llarg</span><span class="s3">.</span><span class="s1">name</span><span class="s3">.</span><span class="s1">replace</span><span class="s3">(</span><span class="s5">'.'</span><span class="s3">, </span><span class="s5">'$'</span><span class="s3">)    </span><span class="s6"># for gdb to work correctly</span>
+                <span class="s1">lltype </span><span class="s3">= </span><span class="s1">llarg</span><span class="s3">.</span><span class="s1">type</span>
+                <span class="s1">size </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">cgctx</span><span class="s3">.</span><span class="s1">get_abi_sizeof</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">)</span>
+                <span class="s1">mdtype </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_var_type</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">, </span><span class="s1">size</span><span class="s3">, </span><span class="s1">datamodel</span><span class="s3">=</span><span class="s2">None</span><span class="s3">)</span>
+                <span class="s1">md</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">mdtype</span><span class="s3">)</span>
+
+        <span class="s2">for </span><span class="s1">idx</span><span class="s3">, (</span><span class="s1">name</span><span class="s3">, </span><span class="s1">nbtype</span><span class="s3">) </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">argmap</span><span class="s3">.</span><span class="s1">items</span><span class="s3">()):</span>
+            <span class="s1">name </span><span class="s3">= </span><span class="s1">name</span><span class="s3">.</span><span class="s1">replace</span><span class="s3">(</span><span class="s5">'.'</span><span class="s3">, </span><span class="s5">'$'</span><span class="s3">)    </span><span class="s6"># for gdb to work correctly</span>
+            <span class="s1">datamodel </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">cgctx</span><span class="s3">.</span><span class="s1">data_model_manager</span><span class="s3">[</span><span class="s1">nbtype</span><span class="s3">]</span>
+            <span class="s1">lltype </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">cgctx</span><span class="s3">.</span><span class="s1">get_value_type</span><span class="s3">(</span><span class="s1">nbtype</span><span class="s3">)</span>
+            <span class="s1">size </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">cgctx</span><span class="s3">.</span><span class="s1">get_abi_sizeof</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">)</span>
+            <span class="s1">mdtype </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_var_type</span><span class="s3">(</span><span class="s1">lltype</span><span class="s3">, </span><span class="s1">size</span><span class="s3">, </span><span class="s1">datamodel</span><span class="s3">=</span><span class="s1">datamodel</span><span class="s3">)</span>
+            <span class="s1">md</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">mdtype</span><span class="s3">)</span>
+
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">module</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DISubroutineType'</span><span class="s3">, {</span>
+            <span class="s5">'types'</span><span class="s3">: </span><span class="s1">self</span><span class="s3">.</span><span class="s1">module</span><span class="s3">.</span><span class="s1">add_metadata</span><span class="s3">(</span><span class="s1">md</span><span class="s3">),</span>
+        <span class="s3">})</span>
+
+    <span class="s2">def </span><span class="s1">_di_subprogram</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">linkagename</span><span class="s3">, </span><span class="s1">line</span><span class="s3">, </span><span class="s1">function</span><span class="s3">, </span><span class="s1">argmap</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">module</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DISubprogram'</span><span class="s3">, {</span>
+            <span class="s5">'name'</span><span class="s3">: </span><span class="s1">name</span><span class="s3">,</span>
+            <span class="s5">'linkageName'</span><span class="s3">: </span><span class="s1">linkagename</span><span class="s3">,</span>
+            <span class="s5">'scope'</span><span class="s3">: </span><span class="s1">self</span><span class="s3">.</span><span class="s1">difile</span><span class="s3">,</span>
+            <span class="s5">'file'</span><span class="s3">: </span><span class="s1">self</span><span class="s3">.</span><span class="s1">difile</span><span class="s3">,</span>
+            <span class="s5">'line'</span><span class="s3">: </span><span class="s1">line</span><span class="s3">,</span>
+            <span class="s5">'type'</span><span class="s3">: </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_di_subroutine_type</span><span class="s3">(</span><span class="s1">line</span><span class="s3">, </span><span class="s1">function</span><span class="s3">, </span><span class="s1">argmap</span><span class="s3">),</span>
+            <span class="s5">'isLocal'</span><span class="s3">: </span><span class="s2">False</span><span class="s3">,</span>
+            <span class="s5">'isDefinition'</span><span class="s3">: </span><span class="s2">True</span><span class="s3">,</span>
+            <span class="s5">'scopeLine'</span><span class="s3">: </span><span class="s1">line</span><span class="s3">,</span>
+            <span class="s5">'isOptimized'</span><span class="s3">: </span><span class="s1">config</span><span class="s3">.</span><span class="s1">OPT </span><span class="s3">!= </span><span class="s4">0</span><span class="s3">,</span>
+            <span class="s5">'unit'</span><span class="s3">: </span><span class="s1">self</span><span class="s3">.</span><span class="s1">dicompileunit</span><span class="s3">,</span>
+        <span class="s3">}, </span><span class="s1">is_distinct</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_di_location</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">line</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">module</span><span class="s3">.</span><span class="s1">add_debug_info</span><span class="s3">(</span><span class="s5">'DILocation'</span><span class="s3">, {</span>
+            <span class="s5">'line'</span><span class="s3">: </span><span class="s1">line</span><span class="s3">,</span>
+            <span class="s5">'column'</span><span class="s3">: </span><span class="s4">1</span><span class="s3">,</span>
+            <span class="s5">'scope'</span><span class="s3">: </span><span class="s1">self</span><span class="s3">.</span><span class="s1">subprograms</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">],</span>
+        <span class="s3">})</span>
+</pre>
+</body>
+</html>

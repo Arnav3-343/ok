@@ -1,0 +1,999 @@
+<html>
+<head>
+<title>listobject.c</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #6aab73;}
+.s3 { color: #7a7e85;}
+.s4 { color: #2aacb8;}
+.s5 { color: #0da19e;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+listobject.c</font>
+</center></td></tr></table>
+<pre><span class="s0">#include </span><span class="s2">&quot;listobject.h&quot;</span>
+
+<span class="s3">/* This implements the C component of the Numba typed list. It is loosely 
+ * inspired by the list implementation of the cpython list with some parts 
+ * taken from the cpython slice implementation. The exact commit-id of the 
+ * relevant files are: 
+ * 
+ * https://github.com/python/cpython/blob/51ddab8dae056867f3595ab3400bffc93f67c8d4/Objects/listobject.c 
+ * https://github.com/python/cpython/blob/51ddab8dae056867f3595ab3400bffc93f67c8d4/Objects/sliceobject.c 
+ * 
+ * Algorithmically, this list is very similar to the cpython implementation so 
+ * it should have the same performance (Big-O) characteristics for accessing, 
+ * adding and removing elements/items. Specifically, it implements the same 
+ * algorithms for list overallocation and growth. However, it never deals with 
+ * PyObject types and instead must be typed with a type-size.  As a result, the 
+ * typed-list is type homogeneous and in contrast to the cpython version can 
+ * not store a mixture of arbitrarily typed objects. Reference counting via the 
+ * Numba Runtime (NRT) is supported and incrementing and decrementing functions 
+ * are store as part of the struct and can be setup from the compiler level. 
+ * 
+ * Importantly, only a very limited subset of the cpython c functions have been 
+ * ported over and the rest have been implemented (in Python) at the compiler 
+ * level using the c functions provided. Additionally, initialization of, and 
+ * iteration over, a ListIter is provided 
+ * 
+ * The following functions are implemented for the list: 
+ * 
+ * - Check valid index        valid_index 
+ * - Creation                 numba_list_new 
+ * - Deletion                 numba_list_free 
+ * - Accessing the length     numba_list_length 
+ * - Appending to the list    numba_list_append 
+ * - Getting an item          numba_list_setitem 
+ * - Setting an item          numba_list_getitem 
+ * - Resizing the list        numba_list_resize 
+ * - Deleting an item         numba_list_delitem 
+ * - Deleting a slice         numba_list_delete_slice 
+ * 
+ * As you can see, only a single function for slices is implemented. The rest 
+ * is all done entirely at the compiler level which then calls the c functions 
+ * to mutate the list accordingly. Since slicing allows for replace, insert and 
+ * delete operations over multiple items, we can simply implement those using 
+ * the basic functions above. 
+ * 
+ * The following additional functions are implemented for the list, these are 
+ * needed to make the list work within Numba. 
+ * 
+ * - Accessing the allocation numba_list_allocated 
+ * - Copying an item          copy_item 
+ * - Calling incref on item   list_incref_item 
+ * - Calling decref on item   list_decref_item 
+ * - Set method table         numba_list_set_method_table 
+ * 
+ * The following functions are implemented for the iterator: 
+ * 
+ * - Size of the iterator     numba_list_iter_size 
+ * - Initialization of iter   numba_list_iter 
+ * - Get next item from iter  numba_list_iter_next 
+ * 
+ * Two methods are provided to query and set the 'is_mutable': 
+ * 
+ * - Query                    numba_list_is_mutable 
+ * - Set                      numba_list_set_is_mutable 
+ * 
+ * Lastly a set of pure C level tests are provided which come in handy when 
+ * needing to use valgrind and friends. 
+ * 
+ */</span>
+
+
+<span class="s3">/* Return status for the list functions. 
+ */</span>
+<span class="s0">typedef enum </span><span class="s1">{</span>
+    <span class="s1">LIST_OK = </span><span class="s4">0</span><span class="s1">,</span>
+    <span class="s1">LIST_ERR_INDEX = -</span><span class="s4">1</span><span class="s1">,</span>
+    <span class="s1">LIST_ERR_NO_MEMORY = -</span><span class="s4">2</span><span class="s1">,</span>
+    <span class="s1">LIST_ERR_MUTATED = -</span><span class="s4">3</span><span class="s1">,</span>
+    <span class="s1">LIST_ERR_ITER_EXHAUSTED = -</span><span class="s4">4</span><span class="s1">,</span>
+    <span class="s1">LIST_ERR_IMMUTABLE = -</span><span class="s4">5</span><span class="s1">,</span>
+<span class="s1">} ListStatus;</span>
+
+<span class="s3">/* Copy an item from a list. 
+ * 
+ * lp: a list 
+ * dst: destination pointer 
+ * src: source pointer 
+ */</span>
+<span class="s0">static void</span>
+<span class="s1">copy_item(NB_List *lp, </span><span class="s0">char </span><span class="s1">*dst, </span><span class="s0">const char </span><span class="s1">*src){</span>
+    <span class="s1">memcpy(dst, src, lp</span><span class="s5">-&gt;</span><span class="s1">item_size);</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Increment a reference to an item in a list. 
+ * 
+ * lp: a list 
+ * item: the item to increment the reference for 
+ */</span>
+<span class="s0">static void</span>
+<span class="s1">list_incref_item(NB_List *lp, </span><span class="s0">const char </span><span class="s1">*item){</span>
+    <span class="s0">if </span><span class="s1">(lp</span><span class="s5">-&gt;</span><span class="s1">methods.item_incref) {</span>
+        <span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">methods.item_incref(item);</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Decrement a reference to an item in a list. 
+ * 
+ * lp: a list 
+ * item: the item to decrement the reference for 
+ */</span>
+<span class="s0">static void</span>
+<span class="s1">list_decref_item(NB_List *lp, </span><span class="s0">const char </span><span class="s1">*item){</span>
+    <span class="s0">if </span><span class="s1">(lp</span><span class="s5">-&gt;</span><span class="s1">methods.item_decref) {</span>
+        <span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">methods.item_decref(item);</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Setup the method table for a list. 
+ * 
+ * This function is used from the compiler level to initialize the internal 
+ * method table. 
+ * 
+ * lp: a list 
+ * methods: the methods table to set up 
+ */</span>
+<span class="s0">void</span>
+<span class="s1">numba_list_set_method_table(NB_List *lp, list_type_based_methods_table *methods)</span>
+<span class="s1">{</span>
+    <span class="s1">memcpy(&amp;lp</span><span class="s5">-&gt;</span><span class="s1">methods, methods, </span><span class="s0">sizeof</span><span class="s1">(list_type_based_methods_table));</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Check if a list index is valid. 
+ * 
+ * i: the index to check 
+ * limit: the size of a list 
+ * 
+ * Adapted from CPython's valid_index(). 
+ * 
+ * FIXME: need to find a way to inline this, even for Python 2.7 on Windows 
+ */</span>
+<span class="s0">static int</span>
+<span class="s1">valid_index(Py_ssize_t i, Py_ssize_t limit){</span>
+    <span class="s3">/* The cast to size_t lets us use just a single comparison 
+       to check whether i is in the range: 0 &lt;= i &lt; limit. 
+ 
+       See:  Section 14.2 &quot;Bounds Checking&quot; in the Agner Fog 
+       optimization manual found at: 
+       https://www.agner.org/optimize/optimizing_cpp.pdf 
+    */</span>
+    <span class="s0">return </span><span class="s1">(size_t) i &lt; (size_t) limit;</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Initialize a new list. 
+ * 
+ * out: pointer to hold an initialized list 
+ * item_size: the size in bytes of the items in the list 
+ * allocated: preallocation of the list in items 
+ * 
+ * This will allocate sufficient memory to hold the list structure and any 
+ * items if requested (allocated != 0). See _listobject.h for more information 
+ * on the NB_List struct. 
+ */</span>
+<span class="s0">int</span>
+<span class="s1">numba_list_new(NB_List **out, Py_ssize_t item_size, Py_ssize_t allocated){</span>
+    <span class="s1">NB_List *lp;</span>
+    <span class="s0">char </span><span class="s1">*items;</span>
+    <span class="s3">// allocate memory to hold the struct</span>
+    <span class="s1">lp = malloc(aligned_size(</span><span class="s0">sizeof</span><span class="s1">(NB_List)));</span>
+    <span class="s0">if </span><span class="s1">(lp == NULL) {</span>
+        <span class="s0">return </span><span class="s1">LIST_ERR_NO_MEMORY;</span>
+    <span class="s1">}</span>
+    <span class="s3">// set up members</span>
+    <span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">size = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">item_size = item_size;</span>
+    <span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">allocated = allocated;</span>
+    <span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">is_mutable = </span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s3">// set method table to zero */</span>
+    <span class="s1">memset(&amp;lp</span><span class="s5">-&gt;</span><span class="s1">methods, </span><span class="s4">0x00</span><span class="s1">, </span><span class="s0">sizeof</span><span class="s1">(list_type_based_methods_table));</span>
+    <span class="s3">// allocate memory to hold items, if requested</span>
+    <span class="s0">if </span><span class="s1">(allocated != </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s1">items = malloc(aligned_size(lp</span><span class="s5">-&gt;</span><span class="s1">item_size * allocated));</span>
+        <span class="s3">// allocated was definitely not zero, if malloc returns NULL</span>
+        <span class="s3">// this is definitely an error</span>
+        <span class="s0">if </span><span class="s1">(items == NULL) {</span>
+            <span class="s3">// free previously allocated struct to avoid leaking memory</span>
+            <span class="s1">free(lp);</span>
+            <span class="s0">return </span><span class="s1">LIST_ERR_NO_MEMORY;</span>
+        <span class="s1">}</span>
+        <span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">items = items;</span>
+    <span class="s1">}</span>
+    <span class="s0">else </span><span class="s1">{</span>
+        <span class="s3">// be explicit</span>
+        <span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">items = NULL;</span>
+    <span class="s1">}</span>
+    <span class="s1">*out = lp;</span>
+    <span class="s0">return </span><span class="s1">LIST_OK;</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Free the memory associated with a list. 
+ * 
+ * lp: a list 
+ */</span>
+<span class="s0">void</span>
+<span class="s1">numba_list_free(NB_List *lp) {</span>
+    <span class="s3">// decref all items, if needed</span>
+    <span class="s1">Py_ssize_t i;</span>
+    <span class="s0">if </span><span class="s1">(lp</span><span class="s5">-&gt;</span><span class="s1">methods.item_decref) {</span>
+        <span class="s0">for </span><span class="s1">(i = </span><span class="s4">0</span><span class="s1">; i &lt; lp</span><span class="s5">-&gt;</span><span class="s1">size; i++) {</span>
+            <span class="s0">char </span><span class="s1">*item = lp</span><span class="s5">-&gt;</span><span class="s1">items + lp</span><span class="s5">-&gt;</span><span class="s1">item_size * i;</span>
+            <span class="s1">list_decref_item(lp, item);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s3">// free items and list</span>
+    <span class="s0">if </span><span class="s1">(lp</span><span class="s5">-&gt;</span><span class="s1">items != NULL) {</span>
+        <span class="s1">free(lp</span><span class="s5">-&gt;</span><span class="s1">items);</span>
+    <span class="s1">}</span>
+    <span class="s1">free(lp);</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Return the base pointer of the list items. 
+ */</span>
+<span class="s0">char </span><span class="s1">*</span>
+<span class="s1">numba_list_base_ptr(NB_List *lp)</span>
+<span class="s1">{</span>
+    <span class="s0">return </span><span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">items;</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Return the address of the list size. 
+ */</span>
+<span class="s1">Py_ssize_t</span>
+<span class="s1">numba_list_size_address(NB_List *lp)</span>
+<span class="s1">{</span>
+    <span class="s0">return </span><span class="s1">(Py_ssize_t)&amp;lp</span><span class="s5">-&gt;</span><span class="s1">size;</span>
+<span class="s1">}</span>
+
+
+<span class="s3">/* Return the length of a list. 
+ * 
+ * lp: a list 
+ */</span>
+<span class="s1">Py_ssize_t</span>
+<span class="s1">numba_list_length(NB_List *lp) {</span>
+    <span class="s0">return </span><span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">size;</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Return the current allocation of a list. 
+ * 
+ * lp: a list 
+ */</span>
+<span class="s1">Py_ssize_t</span>
+<span class="s1">numba_list_allocated(NB_List *lp) {</span>
+    <span class="s0">return </span><span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">allocated;</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Return the mutability status of the list 
+ * 
+ * lp: a list 
+ * 
+ */</span>
+<span class="s0">int</span>
+<span class="s1">numba_list_is_mutable(NB_List *lp){</span>
+    <span class="s0">return </span><span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">is_mutable;</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Set the is_mutable attribute 
+ * 
+ * lp: a list 
+ * is_mutable: an int, 0(False) or 1(True) 
+ * 
+ */</span>
+<span class="s0">void</span>
+<span class="s1">numba_list_set_is_mutable(NB_List *lp, </span><span class="s0">int </span><span class="s1">is_mutable){</span>
+    <span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">is_mutable = is_mutable;</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Set an item in a list. 
+ * 
+ * lp: a list 
+ * index: the index of the item to set (must be in range 0 &lt;= index &lt; len(list)) 
+ * item: the item to set 
+ * 
+ * This assume there is already an element at the given index that will be 
+ * overwritten and thereby have its reference decremented.  DO NOT use this to 
+ * write to an unassigned location. 
+ */</span>
+<span class="s0">int</span>
+<span class="s1">numba_list_setitem(NB_List *lp, Py_ssize_t index, </span><span class="s0">const char </span><span class="s1">*item) {</span>
+    <span class="s0">char </span><span class="s1">*loc;</span>
+    <span class="s3">// check for mutability</span>
+    <span class="s0">if </span><span class="s1">(!lp</span><span class="s5">-&gt;</span><span class="s1">is_mutable) {</span>
+        <span class="s0">return </span><span class="s1">LIST_ERR_IMMUTABLE;</span>
+    <span class="s1">}</span>
+    <span class="s3">// check index is valid</span>
+    <span class="s3">// FIXME: this can be (and probably is) checked at the compiler level</span>
+    <span class="s0">if </span><span class="s1">(!valid_index(index, lp</span><span class="s5">-&gt;</span><span class="s1">size)) {</span>
+        <span class="s0">return </span><span class="s1">LIST_ERR_INDEX;</span>
+    <span class="s1">}</span>
+    <span class="s3">// set item at desired location</span>
+    <span class="s1">loc = lp</span><span class="s5">-&gt;</span><span class="s1">items + lp</span><span class="s5">-&gt; </span><span class="s1">item_size * index;</span>
+    <span class="s1">list_decref_item(lp, loc);</span>
+    <span class="s1">copy_item(lp, loc, item);</span>
+    <span class="s1">list_incref_item(lp, loc);</span>
+    <span class="s0">return </span><span class="s1">LIST_OK;</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Get an item from a list. 
+ * 
+ * lp: a list 
+ * index: the index of the item to get (must be in range 0 &lt;= index &lt; len(list)) 
+ * out: a pointer to hold the item 
+ */</span>
+<span class="s0">int</span>
+<span class="s1">numba_list_getitem(NB_List *lp, Py_ssize_t index, </span><span class="s0">char </span><span class="s1">*out) {</span>
+    <span class="s0">char </span><span class="s1">*loc;</span>
+    <span class="s3">// check index is valid</span>
+    <span class="s3">// FIXME: this can be (and probably is) checked at the compiler level</span>
+    <span class="s0">if </span><span class="s1">(!valid_index(index, lp</span><span class="s5">-&gt;</span><span class="s1">size)) {</span>
+        <span class="s0">return </span><span class="s1">LIST_ERR_INDEX;</span>
+    <span class="s1">}</span>
+    <span class="s3">// get item at desired location</span>
+    <span class="s1">loc = lp</span><span class="s5">-&gt;</span><span class="s1">items + lp</span><span class="s5">-&gt;</span><span class="s1">item_size * index;</span>
+    <span class="s1">copy_item(lp, out, loc);</span>
+    <span class="s0">return </span><span class="s1">LIST_OK;</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Append an item to the end of a list. 
+ * 
+ * lp: a list 
+ * item: the item to append. 
+ */</span>
+<span class="s0">int</span>
+<span class="s1">numba_list_append(NB_List *lp, </span><span class="s0">const char </span><span class="s1">*item) {</span>
+    <span class="s0">char </span><span class="s1">*loc;</span>
+    <span class="s3">// check for mutability</span>
+    <span class="s0">if </span><span class="s1">(!lp</span><span class="s5">-&gt;</span><span class="s1">is_mutable) {</span>
+        <span class="s0">return </span><span class="s1">LIST_ERR_IMMUTABLE;</span>
+    <span class="s1">}</span>
+    <span class="s3">// resize by one, will change list size</span>
+    <span class="s0">int </span><span class="s1">result = numba_list_resize(lp, lp</span><span class="s5">-&gt;</span><span class="s1">size + </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s0">if</span><span class="s1">(result &lt; LIST_OK) {</span>
+        <span class="s0">return </span><span class="s1">result;</span>
+    <span class="s1">}</span>
+    <span class="s3">// insert item at index: original size before resize</span>
+    <span class="s1">loc = lp</span><span class="s5">-&gt;</span><span class="s1">items + lp</span><span class="s5">-&gt;</span><span class="s1">item_size * (lp</span><span class="s5">-&gt;</span><span class="s1">size - </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">copy_item(lp, loc, item);</span>
+    <span class="s1">list_incref_item(lp, loc);</span>
+    <span class="s0">return </span><span class="s1">LIST_OK;</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Resize a list. 
+ * 
+ * lp: a list 
+ * newsize: the desired new size of the list. 
+ * 
+ * This will increase or decrease the size of the list, including reallocating 
+ * the required memory and increasing the total allocation (additional free 
+ * space to hold new items). 
+ * 
+ * 
+ * Adapted from CPython's list_resize(). 
+ * 
+ * Ensure lp-&gt;items has room for at least newsize elements, and set 
+ * lp-&gt;size to newsize.  If newsize &gt; lp-&gt;size on entry, the content 
+ * of the new slots at exit is undefined heap trash; it's the caller's 
+ * responsibility to overwrite them with sane values. 
+ * The number of allocated elements may grow, shrink, or stay the same. 
+ * Failure is impossible if newsize &lt;= lp-&gt;allocated on entry, although 
+ * that partly relies on an assumption that the system realloc() never 
+ * fails when passed a number of bytes &lt;= the number of bytes last 
+ * allocated (the C standard doesn't guarantee this, but it's hard to 
+ * imagine a realloc implementation where it wouldn't be true). 
+ * Note that lp-&gt;items may change, and even if newsize is less 
+ * than lp-&gt;size on entry. 
+ */</span>
+<span class="s0">int</span>
+<span class="s1">numba_list_resize(NB_List *lp, Py_ssize_t newsize) {</span>
+    <span class="s0">char </span><span class="s1">* items;</span>
+    <span class="s3">// check for mutability</span>
+    <span class="s0">if </span><span class="s1">(!lp</span><span class="s5">-&gt;</span><span class="s1">is_mutable) {</span>
+        <span class="s0">return </span><span class="s1">LIST_ERR_IMMUTABLE;</span>
+    <span class="s1">}</span>
+    <span class="s1">size_t new_allocated, num_allocated_bytes;</span>
+    <span class="s3">/* Bypass realloc() when a previous overallocation is large enough 
+       to accommodate the newsize.  If the newsize falls lower than half 
+       the allocated size, then proceed with the realloc() to shrink the list. 
+    */</span>
+    <span class="s0">if </span><span class="s1">(lp</span><span class="s5">-&gt;</span><span class="s1">allocated &gt;= newsize &amp;&amp; newsize &gt;= (lp</span><span class="s5">-&gt;</span><span class="s1">allocated &gt;&gt; </span><span class="s4">1</span><span class="s1">)) {</span>
+        <span class="s1">assert(lp</span><span class="s5">-&gt;</span><span class="s1">items != NULL || newsize == </span><span class="s4">0</span><span class="s1">);</span>
+        <span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">size = newsize;</span>
+        <span class="s0">return </span><span class="s1">LIST_OK;</span>
+    <span class="s1">}</span>
+    <span class="s3">/* This over-allocates proportional to the list size, making room 
+     * for additional growth.  The over-allocation is mild, but is 
+     * enough to give linear-time amortized behavior over a long 
+     * sequence of appends() in the presence of a poorly-performing 
+     * system realloc(). 
+     * The growth pattern is:  0, 4, 8, 16, 25, 35, 46, 58, 72, 88, ... 
+     * Note: new_allocated won't overflow because the largest possible value 
+     *       is PY_SSIZE_T_MAX * (9 / 8) + 6 which always fits in a size_t. 
+     */</span>
+    <span class="s1">new_allocated = (size_t)newsize + (newsize &gt;&gt; </span><span class="s4">3</span><span class="s1">) + (newsize &lt; </span><span class="s4">9 </span><span class="s1">? </span><span class="s4">3 </span><span class="s1">: </span><span class="s4">6</span><span class="s1">);</span>
+    <span class="s0">if </span><span class="s1">(new_allocated &gt; (size_t)PY_SSIZE_T_MAX / lp</span><span class="s5">-&gt;</span><span class="s1">item_size) {</span>
+        <span class="s0">return </span><span class="s1">LIST_ERR_NO_MEMORY;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">if </span><span class="s1">(newsize == </span><span class="s4">0</span><span class="s1">)</span>
+        <span class="s1">new_allocated = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">num_allocated_bytes = new_allocated * lp</span><span class="s5">-&gt;</span><span class="s1">item_size;</span>
+    <span class="s1">items = realloc(lp</span><span class="s5">-&gt;</span><span class="s1">items, aligned_size(num_allocated_bytes));</span>
+    <span class="s3">// realloc may return NULL if requested size is 0</span>
+    <span class="s0">if </span><span class="s1">(num_allocated_bytes != </span><span class="s4">0 </span><span class="s1">&amp;&amp; items == NULL) {</span>
+        <span class="s0">return </span><span class="s1">LIST_ERR_NO_MEMORY;</span>
+    <span class="s1">}</span>
+    <span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">items = items;</span>
+    <span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">size = newsize;</span>
+    <span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">allocated = (Py_ssize_t)new_allocated;</span>
+    <span class="s0">return </span><span class="s1">LIST_OK;</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Delete a single item. 
+ * 
+ * lp: a list 
+ * index: the index of the item to delete 
+ *        (must be in range 0 &lt;= index &lt; len(list)) 
+ * 
+ * */</span>
+<span class="s0">int</span>
+<span class="s1">numba_list_delitem(NB_List *lp, Py_ssize_t index) {</span>
+    <span class="s0">int </span><span class="s1">result;</span>
+    <span class="s0">char </span><span class="s1">*loc, *new_loc;</span>
+    <span class="s1">Py_ssize_t leftover_bytes;</span>
+    <span class="s3">// check for mutability</span>
+    <span class="s0">if </span><span class="s1">(!lp</span><span class="s5">-&gt;</span><span class="s1">is_mutable) {</span>
+        <span class="s0">return </span><span class="s1">LIST_ERR_IMMUTABLE;</span>
+    <span class="s1">}</span>
+    <span class="s3">// check index is valid</span>
+    <span class="s3">// FIXME: this can be (and probably is) checked at the compiler level</span>
+    <span class="s0">if </span><span class="s1">(!valid_index(index, lp</span><span class="s5">-&gt;</span><span class="s1">size)) {</span>
+        <span class="s0">return </span><span class="s1">LIST_ERR_INDEX;</span>
+    <span class="s1">}</span>
+    <span class="s3">// obtain item and decref if needed</span>
+    <span class="s1">loc = lp</span><span class="s5">-&gt;</span><span class="s1">items + lp</span><span class="s5">-&gt;</span><span class="s1">item_size * index;</span>
+    <span class="s1">list_decref_item(lp, loc);</span>
+    <span class="s0">if </span><span class="s1">(index != lp</span><span class="s5">-&gt;</span><span class="s1">size - </span><span class="s4">1</span><span class="s1">) {</span>
+        <span class="s3">// delitem from somewhere other than the end, incur the memory copy</span>
+        <span class="s1">leftover_bytes = (lp</span><span class="s5">-&gt;</span><span class="s1">size - </span><span class="s4">1 </span><span class="s1">- index) * lp</span><span class="s5">-&gt;</span><span class="s1">item_size;</span>
+        <span class="s1">new_loc = lp</span><span class="s5">-&gt;</span><span class="s1">items + (lp</span><span class="s5">-&gt;</span><span class="s1">item_size * (index + </span><span class="s4">1</span><span class="s1">));</span>
+        <span class="s3">// use memmove instead of memcpy since we may be dealing with</span>
+        <span class="s3">// overlapping regions of memory and the behaviour of memcpy is</span>
+        <span class="s3">// undefined in such situation (C99).</span>
+        <span class="s1">memmove(loc, new_loc, leftover_bytes);</span>
+    <span class="s1">}</span>
+    <span class="s3">// finally, shrink list by one</span>
+    <span class="s1">result = numba_list_resize(lp, lp</span><span class="s5">-&gt;</span><span class="s1">size - </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s0">if</span><span class="s1">(result &lt; LIST_OK) {</span>
+         <span class="s3">// Since we are decreasing the size, this should never happen</span>
+        <span class="s0">return </span><span class="s1">result;</span>
+    <span class="s1">}</span>
+    <span class="s0">return </span><span class="s1">LIST_OK;</span>
+
+<span class="s1">}</span>
+
+<span class="s3">/* Delete a slice 
+ * 
+ * start: the start index of ths slice 
+ * stop: the stop index of the slice (not included) 
+ * step: the step to take 
+ * 
+ * This function assumes that the start and stop were clipped appropriately. 
+ * I.e. if step &gt; 0 start &gt;= 0 and stop &lt;= len(l) and 
+ *      if step &lt; 0 start &lt;= length and stop &gt;= -1 
+ *      step != 0 and no Python negative indexing allowed. 
+ * 
+ * This code was copied and edited from the relevant section in 
+ * list_ass_subscript from the cpython implementation, see the top of this file 
+ * for the exact source 
+ */</span>
+<span class="s0">int</span>
+<span class="s1">numba_list_delete_slice(NB_List *lp,</span>
+                        <span class="s1">Py_ssize_t start, Py_ssize_t stop, Py_ssize_t step) {</span>
+    <span class="s0">int </span><span class="s1">result, i, slicelength, new_length;</span>
+    <span class="s0">char </span><span class="s1">*loc, *new_loc;</span>
+    <span class="s1">Py_ssize_t leftover_bytes, cur, lim;</span>
+    <span class="s3">// check for mutability</span>
+    <span class="s0">if </span><span class="s1">(!lp</span><span class="s5">-&gt;</span><span class="s1">is_mutable) {</span>
+        <span class="s0">return </span><span class="s1">LIST_ERR_IMMUTABLE;</span>
+    <span class="s1">}</span>
+    <span class="s3">// calculate the slicelength, taken from PySlice_AdjustIndices, see the top</span>
+    <span class="s3">// of this file for the exact source</span>
+    <span class="s0">if </span><span class="s1">(step &gt; </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s1">slicelength = start &lt; stop ? (stop - start - </span><span class="s4">1</span><span class="s1">) / step + </span><span class="s4">1 </span><span class="s1">: </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">} </span><span class="s0">else </span><span class="s1">{</span>
+        <span class="s1">slicelength = stop &lt; start ? (start - stop - </span><span class="s4">1</span><span class="s1">) / -step + </span><span class="s4">1 </span><span class="s1">: </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s0">if </span><span class="s1">(slicelength &lt;= </span><span class="s4">0</span><span class="s1">){</span>
+        <span class="s0">return </span><span class="s1">LIST_OK;</span>
+    <span class="s1">}</span>
+    <span class="s1">new_length = lp</span><span class="s5">-&gt;</span><span class="s1">size - slicelength;</span>
+    <span class="s3">// reverse step and indices</span>
+    <span class="s0">if </span><span class="s1">(step &lt; </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s1">stop = start + </span><span class="s4">1</span><span class="s1">;</span>
+        <span class="s1">start = stop + step * (slicelength - </span><span class="s4">1</span><span class="s1">) - </span><span class="s4">1</span><span class="s1">;</span>
+        <span class="s1">step = -step;</span>
+    <span class="s1">}</span>
+    <span class="s0">if </span><span class="s1">(step == </span><span class="s4">1</span><span class="s1">) {</span>
+        <span class="s3">// decref if needed</span>
+        <span class="s0">if </span><span class="s1">(lp</span><span class="s5">-&gt;</span><span class="s1">methods.item_decref) {</span>
+            <span class="s0">for </span><span class="s1">(i = start ; i &lt; stop ; i++){</span>
+                <span class="s1">loc = lp</span><span class="s5">-&gt;</span><span class="s1">items + lp</span><span class="s5">-&gt;</span><span class="s1">item_size * i;</span>
+                <span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">methods.item_decref(loc);</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+        <span class="s3">// memmove items into place</span>
+        <span class="s1">leftover_bytes = (lp</span><span class="s5">-&gt;</span><span class="s1">size - stop) * lp</span><span class="s5">-&gt;</span><span class="s1">item_size;</span>
+        <span class="s1">loc = lp</span><span class="s5">-&gt;</span><span class="s1">items + lp</span><span class="s5">-&gt;</span><span class="s1">item_size * start;</span>
+        <span class="s1">new_loc = lp</span><span class="s5">-&gt;</span><span class="s1">items + lp</span><span class="s5">-&gt;</span><span class="s1">item_size * stop;</span>
+        <span class="s1">memmove(loc, new_loc, leftover_bytes);</span>
+    <span class="s1">}</span>
+    <span class="s0">else </span><span class="s1">{ </span><span class="s3">// step != 1</span>
+        <span class="s3">/* drawing pictures might help understand these for 
+         * loops. Basically, we memmove the parts of the 
+         * list that are *not* part of the slice: step-1 
+         * items for each item that is part of the slice, 
+         * and then tail end of the list that was not 
+         * covered by the slice 
+         * 
+         * */</span>
+        <span class="s0">for </span><span class="s1">(cur = start,   </span><span class="s3">// index of item to be deleted</span>
+             <span class="s1">i = </span><span class="s4">0</span><span class="s1">;         </span><span class="s3">// counter of total items deleted so far</span>
+             <span class="s1">cur &lt; stop;</span>
+             <span class="s1">cur += step,</span>
+             <span class="s1">i++) {</span>
+            <span class="s1">lim = step - </span><span class="s4">1</span><span class="s1">; </span><span class="s3">// number of leftover items after deletion of item</span>
+            <span class="s3">// clip limit, in case we are at the end of the slice, and there</span>
+            <span class="s3">// are now less than step-1 items to be moved</span>
+            <span class="s0">if </span><span class="s1">(cur + step &gt;= lp</span><span class="s5">-&gt;</span><span class="s1">size) {</span>
+                <span class="s1">lim = lp</span><span class="s5">-&gt;</span><span class="s1">size - cur - </span><span class="s4">1</span><span class="s1">;</span>
+            <span class="s1">}</span>
+            <span class="s3">// decref item being removed</span>
+            <span class="s1">loc = lp</span><span class="s5">-&gt;</span><span class="s1">items + lp</span><span class="s5">-&gt;</span><span class="s1">item_size * cur;</span>
+            <span class="s1">list_decref_item(lp, loc);</span>
+            <span class="s3">/* memmove the aforementioned step-1 (or less) items 
+             * dst : index of deleted item minus total deleted sofar 
+             * src : index of deleted item plus one (next item) 
+             */</span>
+            <span class="s1">memmove(lp</span><span class="s5">-&gt;</span><span class="s1">items + lp</span><span class="s5">-&gt;</span><span class="s1">item_size * (cur - i),</span>
+                    <span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">items + lp</span><span class="s5">-&gt;</span><span class="s1">item_size * (cur + </span><span class="s4">1</span><span class="s1">),</span>
+                    <span class="s1">lim * lp</span><span class="s5">-&gt;</span><span class="s1">item_size);</span>
+        <span class="s1">}</span>
+        <span class="s3">// memmove tail of the list</span>
+        <span class="s1">cur = start + slicelength * step;</span>
+        <span class="s0">if </span><span class="s1">(cur &lt; lp</span><span class="s5">-&gt;</span><span class="s1">size) {</span>
+            <span class="s1">memmove(lp</span><span class="s5">-&gt;</span><span class="s1">items + lp</span><span class="s5">-&gt;</span><span class="s1">item_size * (cur - slicelength),</span>
+                    <span class="s1">lp</span><span class="s5">-&gt;</span><span class="s1">items + lp</span><span class="s5">-&gt;</span><span class="s1">item_size * cur,</span>
+                    <span class="s1">(lp</span><span class="s5">-&gt;</span><span class="s1">size - cur) * lp</span><span class="s5">-&gt;</span><span class="s1">item_size);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s3">// resize to correct size</span>
+    <span class="s1">result = numba_list_resize(lp, new_length);</span>
+    <span class="s0">if</span><span class="s1">(result &lt; LIST_OK) {</span>
+        <span class="s3">// Since we are decreasing the size, this should never happen</span>
+        <span class="s0">return </span><span class="s1">result;</span>
+    <span class="s1">}</span>
+    <span class="s0">return </span><span class="s1">LIST_OK;</span>
+<span class="s1">}</span>
+
+
+<span class="s3">/* Return the size of the list iterator (NB_ListIter) struct. 
+ */</span>
+<span class="s1">size_t</span>
+<span class="s1">numba_list_iter_sizeof() {</span>
+    <span class="s0">return sizeof</span><span class="s1">(NB_ListIter);</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Initialize a list iterator (NB_ListIter). 
+ * 
+ * it: an iterator 
+ * lp: a list to iterate over 
+ */</span>
+<span class="s0">void</span>
+<span class="s1">numba_list_iter(NB_ListIter *it, NB_List *lp) {</span>
+    <span class="s3">// set members of iterator</span>
+    <span class="s1">it</span><span class="s5">-&gt;</span><span class="s1">parent = lp;</span>
+    <span class="s1">it</span><span class="s5">-&gt;</span><span class="s1">size = lp</span><span class="s5">-&gt;</span><span class="s1">size;</span>
+    <span class="s1">it</span><span class="s5">-&gt;</span><span class="s1">pos = </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Obtain the next item from a list iterator. 
+ * 
+ * it: an iterator 
+ * item_ptr: pointer to hold the next item 
+ */</span>
+<span class="s0">int</span>
+<span class="s1">numba_list_iter_next(NB_ListIter *it, </span><span class="s0">const char </span><span class="s1">**item_ptr) {</span>
+    <span class="s1">NB_List *lp;</span>
+    <span class="s1">lp = it</span><span class="s5">-&gt;</span><span class="s1">parent;</span>
+    <span class="s3">/* FIXME: Detect list mutation during iteration */</span>
+    <span class="s0">if </span><span class="s1">(lp</span><span class="s5">-&gt;</span><span class="s1">size != it</span><span class="s5">-&gt;</span><span class="s1">size) {</span>
+        <span class="s0">return </span><span class="s1">LIST_ERR_MUTATED;</span>
+    <span class="s1">}</span>
+    <span class="s3">// get next element</span>
+    <span class="s0">if </span><span class="s1">(it</span><span class="s5">-&gt;</span><span class="s1">pos &lt; lp</span><span class="s5">-&gt;</span><span class="s1">size) {</span>
+        <span class="s1">*item_ptr = lp</span><span class="s5">-&gt;</span><span class="s1">items + lp</span><span class="s5">-&gt;</span><span class="s1">item_size * it</span><span class="s5">-&gt;</span><span class="s1">pos++;</span>
+        <span class="s0">return </span><span class="s1">LIST_OK;</span>
+    <span class="s1">}</span><span class="s0">else</span><span class="s1">{</span>
+        <span class="s0">return </span><span class="s1">LIST_ERR_ITER_EXHAUSTED;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+
+<span class="s0">#define </span><span class="s1">CHECK(CASE) {                                                   \</span>
+    <span class="s0">if </span><span class="s1">( !(CASE) ) {                                                    \</span>
+        <span class="s1">printf(</span><span class="s2">&quot;'%s' failed file %s:%d</span><span class="s0">\n</span><span class="s2">&quot;</span><span class="s1">, #CASE, __FILE__, __LINE__);   \</span>
+        <span class="s0">return </span><span class="s1">-</span><span class="s4">1</span><span class="s1">;                                                       \</span>
+    <span class="s1">}                                                                   \</span>
+<span class="s1">}</span>
+
+<span class="s3">/* Basic C based tests for the list. 
+ */</span>
+<span class="s0">int</span>
+<span class="s1">numba_test_list(</span><span class="s0">void</span><span class="s1">) {</span>
+    <span class="s1">NB_List *lp = NULL;</span>
+    <span class="s0">int </span><span class="s1">status, i;</span>
+    <span class="s1">Py_ssize_t it_count;</span>
+    <span class="s0">const char </span><span class="s1">*it_item = NULL;</span>
+    <span class="s1">NB_ListIter iter;</span>
+    <span class="s0">char </span><span class="s1">got_item[</span><span class="s4">4</span><span class="s1">] = </span><span class="s2">&quot;</span><span class="s0">\x</span><span class="s2">00</span><span class="s0">\x</span><span class="s2">00</span><span class="s0">\x</span><span class="s2">00</span><span class="s0">\x</span><span class="s2">00&quot;</span><span class="s1">;</span>
+    <span class="s0">const char </span><span class="s1">*test_items_1 = NULL, *test_items_2 = NULL;</span>
+    <span class="s0">char </span><span class="s1">*test_items_3 = NULL;</span>
+    <span class="s1">puts(</span><span class="s2">&quot;test_list&quot;</span><span class="s1">);</span>
+
+
+    <span class="s1">status = numba_list_new(&amp;lp, </span><span class="s4">4</span><span class="s1">, </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">item_size == </span><span class="s4">4</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">is_mutable == </span><span class="s4">1</span><span class="s1">);</span>
+
+    <span class="s3">// flip and check the is_mutable bit</span>
+    <span class="s1">CHECK(numba_list_is_mutable(lp) == </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">numba_list_set_is_mutable(lp, </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">CHECK(numba_list_is_mutable(lp) == </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">numba_list_set_is_mutable(lp, </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(numba_list_is_mutable(lp) == </span><span class="s4">1</span><span class="s1">);</span>
+
+    <span class="s3">// append 1st item, this will cause a realloc</span>
+    <span class="s1">status = numba_list_append(lp, </span><span class="s2">&quot;abc&quot;</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">4</span><span class="s1">);</span>
+    <span class="s1">status = numba_list_getitem(lp, </span><span class="s4">0</span><span class="s1">, got_item);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(memcmp(got_item, </span><span class="s2">&quot;abc&quot;</span><span class="s1">, </span><span class="s4">4</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// append 2nd item</span>
+    <span class="s1">status = numba_list_append(lp, </span><span class="s2">&quot;def&quot;</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">2</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">4</span><span class="s1">);</span>
+    <span class="s1">status = numba_list_getitem(lp, </span><span class="s4">1</span><span class="s1">, got_item);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(memcmp(got_item, </span><span class="s2">&quot;def&quot;</span><span class="s1">, </span><span class="s4">4</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// append 3rd item</span>
+    <span class="s1">status = numba_list_append(lp, </span><span class="s2">&quot;ghi&quot;</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">3</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">4</span><span class="s1">);</span>
+    <span class="s1">status = numba_list_getitem(lp, </span><span class="s4">2</span><span class="s1">, got_item);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(memcmp(got_item, </span><span class="s2">&quot;ghi&quot;</span><span class="s1">, </span><span class="s4">4</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// append 4th item</span>
+    <span class="s1">status = numba_list_append(lp, </span><span class="s2">&quot;jkl&quot;</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">4</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">4</span><span class="s1">);</span>
+    <span class="s1">status = numba_list_getitem(lp, </span><span class="s4">3</span><span class="s1">, got_item);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(memcmp(got_item, </span><span class="s2">&quot;jkl&quot;</span><span class="s1">, </span><span class="s4">4</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// append 5th item, this will cause another realloc</span>
+    <span class="s1">status = numba_list_append(lp, </span><span class="s2">&quot;mno&quot;</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">5</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">8</span><span class="s1">);</span>
+    <span class="s1">status = numba_list_getitem(lp, </span><span class="s4">4</span><span class="s1">, got_item);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(memcmp(got_item, </span><span class="s2">&quot;mno&quot;</span><span class="s1">, </span><span class="s4">4</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// overwrite 1st item</span>
+    <span class="s1">status = numba_list_setitem(lp, </span><span class="s4">0</span><span class="s1">, </span><span class="s2">&quot;pqr&quot;</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">5</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">8</span><span class="s1">);</span>
+    <span class="s1">status = numba_list_getitem(lp, </span><span class="s4">0</span><span class="s1">, got_item);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(memcmp(got_item, </span><span class="s2">&quot;pqr&quot;</span><span class="s1">, </span><span class="s4">4</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// get and del 1st item, check item shift</span>
+    <span class="s1">status = numba_list_getitem(lp, </span><span class="s4">0</span><span class="s1">, got_item);</span>
+    <span class="s1">status = numba_list_delitem(lp, </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">4</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">8</span><span class="s1">);</span>
+    <span class="s1">CHECK(memcmp(got_item, </span><span class="s2">&quot;pqr&quot;</span><span class="s1">, </span><span class="s4">4</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">CHECK(memcmp(lp</span><span class="s5">-&gt;</span><span class="s1">items, </span><span class="s2">&quot;def</span><span class="s0">\x</span><span class="s2">00ghi</span><span class="s0">\x</span><span class="s2">00jkl</span><span class="s0">\x</span><span class="s2">00mno</span><span class="s0">\x</span><span class="s2">00&quot;</span><span class="s1">, </span><span class="s4">16</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// get and del last (4th) item, no shift since only last item affected</span>
+    <span class="s1">status = numba_list_getitem(lp, </span><span class="s4">3</span><span class="s1">, got_item);</span>
+    <span class="s1">status = numba_list_delitem(lp, </span><span class="s4">3</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">3</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">6</span><span class="s1">);  </span><span class="s3">// this also shrinks the allocation</span>
+    <span class="s1">CHECK(memcmp(got_item, </span><span class="s2">&quot;mno&quot;</span><span class="s1">, </span><span class="s4">4</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">CHECK(memcmp(lp</span><span class="s5">-&gt;</span><span class="s1">items, </span><span class="s2">&quot;def</span><span class="s0">\x</span><span class="s2">00ghi</span><span class="s0">\x</span><span class="s2">00jkl</span><span class="s0">\x</span><span class="s2">00&quot;</span><span class="s1">, </span><span class="s4">12</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// flip and check the is_mutable member</span>
+    <span class="s1">CHECK(numba_list_is_mutable(lp) == </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">numba_list_set_is_mutable(lp, </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">CHECK(numba_list_is_mutable(lp) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// ensure that any attempts to mutate an immutable list fail</span>
+    <span class="s1">CHECK(numba_list_setitem(lp, </span><span class="s4">0</span><span class="s1">, </span><span class="s2">&quot;zzz&quot;</span><span class="s1">) == LIST_ERR_IMMUTABLE);</span>
+    <span class="s1">CHECK(numba_list_append(lp, </span><span class="s2">&quot;zzz&quot;</span><span class="s1">) == LIST_ERR_IMMUTABLE);</span>
+    <span class="s1">CHECK(numba_list_delitem(lp, </span><span class="s4">0</span><span class="s1">) == LIST_ERR_IMMUTABLE);</span>
+    <span class="s1">CHECK(numba_list_resize(lp, </span><span class="s4">23</span><span class="s1">) == LIST_ERR_IMMUTABLE);</span>
+    <span class="s1">CHECK(numba_list_delete_slice(lp, </span><span class="s4">0</span><span class="s1">, </span><span class="s4">3</span><span class="s1">, </span><span class="s4">1</span><span class="s1">) == LIST_ERR_IMMUTABLE);</span>
+
+    <span class="s3">// ensure that all attempts to query/read from and immutable list succeed</span>
+    <span class="s1">CHECK(numba_list_length(lp) == </span><span class="s4">3</span><span class="s1">);</span>
+    <span class="s1">status = numba_list_getitem(lp, </span><span class="s4">0</span><span class="s1">, got_item);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(memcmp(got_item, </span><span class="s2">&quot;def&quot;</span><span class="s1">, </span><span class="s4">4</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// flip the is_mutable member back  and check</span>
+    <span class="s1">numba_list_set_is_mutable(lp, </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(numba_list_is_mutable(lp) == </span><span class="s4">1</span><span class="s1">);</span>
+
+    <span class="s3">// test iterator</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size &gt; </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">numba_list_iter(&amp;iter, lp);</span>
+    <span class="s1">it_count = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">CHECK(iter.parent == lp);</span>
+    <span class="s1">CHECK(iter.pos == it_count);</span>
+
+    <span class="s3">// current contents of list</span>
+    <span class="s1">test_items_1 = </span><span class="s2">&quot;def</span><span class="s0">\x</span><span class="s2">00ghi</span><span class="s0">\x</span><span class="s2">00jkl</span><span class="s0">\x</span><span class="s2">00&quot;</span><span class="s1">;</span>
+    <span class="s0">while </span><span class="s1">( (status = numba_list_iter_next(&amp;iter, &amp;it_item)) == LIST_OK) {</span>
+        <span class="s1">it_count += </span><span class="s4">1</span><span class="s1">;</span>
+        <span class="s1">CHECK(iter.pos == it_count); </span><span class="s3">// check iterator position</span>
+        <span class="s1">CHECK(it_item != NULL); </span><span class="s3">// quick check item is non-null</span>
+        <span class="s3">// go fishing in test_items_1</span>
+        <span class="s1">CHECK(memcmp((</span><span class="s0">const char </span><span class="s1">*)test_items_1 + ((it_count - </span><span class="s4">1</span><span class="s1">) * </span><span class="s4">4</span><span class="s1">), it_item, </span><span class="s4">4</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">CHECK(status == LIST_ERR_ITER_EXHAUSTED);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == it_count);</span>
+
+    <span class="s3">// free existing list</span>
+    <span class="s1">numba_list_free(lp);</span>
+
+    <span class="s3">// test growth upon append and shrink during delitem</span>
+    <span class="s1">status = numba_list_new(&amp;lp, </span><span class="s4">1</span><span class="s1">, </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">item_size == </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// first, grow the list</span>
+    <span class="s3">// Use exactly 17 elements, should go through the allocation pattern:</span>
+    <span class="s3">// 0, 4, 8, 16, 25</span>
+    <span class="s0">for </span><span class="s1">(i = </span><span class="s4">0</span><span class="s1">; i &lt; </span><span class="s4">17 </span><span class="s1">; i++) {</span>
+        <span class="s0">switch</span><span class="s1">(i) {</span>
+            <span class="s3">// Check the allocation before</span>
+            <span class="s0">case </span><span class="s4">0</span><span class="s1">:  CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">0</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+            <span class="s0">case </span><span class="s4">4</span><span class="s1">:  CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">4</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+            <span class="s0">case </span><span class="s4">8</span><span class="s1">:  CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">8</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+            <span class="s0">case </span><span class="s4">16</span><span class="s1">: CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">16</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s1">status = numba_list_append(lp, (</span><span class="s0">const char</span><span class="s1">*)&amp;i);</span>
+        <span class="s1">CHECK(status == LIST_OK);</span>
+        <span class="s0">switch</span><span class="s1">(i) {</span>
+            <span class="s3">// Check that the growth happened accordingly</span>
+            <span class="s0">case </span><span class="s4">0</span><span class="s1">:  CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">4</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+            <span class="s0">case </span><span class="s4">4</span><span class="s1">:  CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">8</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+            <span class="s0">case </span><span class="s4">8</span><span class="s1">:  CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">16</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+            <span class="s0">case </span><span class="s4">16</span><span class="s1">: CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">25</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">17</span><span class="s1">);</span>
+
+    <span class="s3">// Check current contents of list</span>
+    <span class="s1">test_items_2  = </span><span class="s2">&quot;</span><span class="s0">\x</span><span class="s2">00</span><span class="s0">\x</span><span class="s2">01</span><span class="s0">\x</span><span class="s2">02</span><span class="s0">\x</span><span class="s2">03</span><span class="s0">\x</span><span class="s2">04</span><span class="s0">\x</span><span class="s2">05</span><span class="s0">\x</span><span class="s2">06</span><span class="s0">\x</span><span class="s2">07</span><span class="s0">\x</span><span class="s2">08</span><span class="s0">\x</span><span class="s2">09</span><span class="s0">\x</span><span class="s2">0a</span><span class="s0">\x</span><span class="s2">0b</span><span class="s0">\x</span><span class="s2">0c</span><span class="s0">\x</span><span class="s2">0d</span><span class="s0">\x</span><span class="s2">0e</span><span class="s0">\x</span><span class="s2">0f</span><span class="s0">\x</span><span class="s2">10&quot;</span><span class="s1">;</span>
+    <span class="s1">CHECK(memcmp(lp</span><span class="s5">-&gt;</span><span class="s1">items, test_items_2, </span><span class="s4">17</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// Now, delete them again and check that list shrinks</span>
+    <span class="s0">for </span><span class="s1">(i = </span><span class="s4">17</span><span class="s1">; i &gt; </span><span class="s4">0 </span><span class="s1">; i--) {</span>
+        <span class="s0">switch</span><span class="s1">(i) {</span>
+             <span class="s3">// Check the allocation before delitem</span>
+             <span class="s0">case </span><span class="s4">17</span><span class="s1">:  CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">25</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+             <span class="s0">case </span><span class="s4">12</span><span class="s1">:  CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">25</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+             <span class="s0">case </span><span class="s4">9</span><span class="s1">:   CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">18</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+             <span class="s0">case </span><span class="s4">6</span><span class="s1">:   CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">12</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+             <span class="s0">case </span><span class="s4">4</span><span class="s1">:   CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">8</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+             <span class="s0">case </span><span class="s4">3</span><span class="s1">:   CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">6</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+             <span class="s0">case </span><span class="s4">2</span><span class="s1">:   CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">5</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+             <span class="s0">case </span><span class="s4">1</span><span class="s1">:   CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">4</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s1">status = numba_list_getitem(lp, i-1, got_item);</span>
+        <span class="s1">status = numba_list_delitem(lp, i-1);</span>
+        <span class="s1">CHECK(status == LIST_OK);</span>
+        <span class="s0">switch</span><span class="s1">(i) {</span>
+             <span class="s3">// Check that the shrink happened accordingly</span>
+             <span class="s0">case </span><span class="s4">17</span><span class="s1">:  CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">25</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+             <span class="s0">case </span><span class="s4">12</span><span class="s1">:  CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">18</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+             <span class="s0">case </span><span class="s4">9</span><span class="s1">:   CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">12</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+             <span class="s0">case </span><span class="s4">6</span><span class="s1">:   CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">8</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+             <span class="s0">case </span><span class="s4">4</span><span class="s1">:   CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">6</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+             <span class="s0">case </span><span class="s4">3</span><span class="s1">:   CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">5</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+             <span class="s0">case </span><span class="s4">2</span><span class="s1">:   CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">4</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+             <span class="s0">case </span><span class="s4">1</span><span class="s1">:   CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">0</span><span class="s1">); </span><span class="s0">break</span><span class="s1">;</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s3">// free existing list</span>
+    <span class="s1">numba_list_free(lp);</span>
+
+
+    <span class="s3">// Setup list for testing delete_slice</span>
+    <span class="s1">status = numba_list_new(&amp;lp, </span><span class="s4">1</span><span class="s1">, </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">item_size == </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s0">for </span><span class="s1">(i = </span><span class="s4">0</span><span class="s1">; i &lt; </span><span class="s4">17 </span><span class="s1">; i++) {</span>
+        <span class="s1">status = numba_list_append(lp, (</span><span class="s0">const char</span><span class="s1">*)&amp;i);</span>
+        <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">}</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">17</span><span class="s1">);</span>
+    <span class="s1">test_items_3 = </span><span class="s2">&quot;</span><span class="s0">\x</span><span class="s2">00</span><span class="s0">\x</span><span class="s2">01</span><span class="s0">\x</span><span class="s2">02</span><span class="s0">\x</span><span class="s2">03</span><span class="s0">\x</span><span class="s2">04</span><span class="s0">\x</span><span class="s2">05</span><span class="s0">\x</span><span class="s2">06</span><span class="s0">\x</span><span class="s2">07</span><span class="s0">\x</span><span class="s2">08</span><span class="s0">\x</span><span class="s2">09</span><span class="s0">\x</span><span class="s2">0a</span><span class="s0">\x</span><span class="s2">0b</span><span class="s0">\x</span><span class="s2">0c</span><span class="s0">\x</span><span class="s2">0d</span><span class="s0">\x</span><span class="s2">0e</span><span class="s0">\x</span><span class="s2">0f</span><span class="s0">\x</span><span class="s2">10&quot;</span><span class="s1">;</span>
+    <span class="s1">CHECK(memcmp(lp</span><span class="s5">-&gt;</span><span class="s1">items, test_items_3, </span><span class="s4">17</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// delete multiple elements from the middle</span>
+    <span class="s1">status = numba_list_delete_slice(lp, </span><span class="s4">2</span><span class="s1">, </span><span class="s4">5</span><span class="s1">, </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">14</span><span class="s1">);</span>
+    <span class="s1">test_items_3  = </span><span class="s2">&quot;</span><span class="s0">\x</span><span class="s2">00</span><span class="s0">\x</span><span class="s2">01</span><span class="s0">\x</span><span class="s2">05</span><span class="s0">\x</span><span class="s2">06</span><span class="s0">\x</span><span class="s2">07</span><span class="s0">\x</span><span class="s2">08</span><span class="s0">\x</span><span class="s2">09</span><span class="s0">\x</span><span class="s2">0a</span><span class="s0">\x</span><span class="s2">0b</span><span class="s0">\x</span><span class="s2">0c</span><span class="s0">\x</span><span class="s2">0d</span><span class="s0">\x</span><span class="s2">0e</span><span class="s0">\x</span><span class="s2">0f</span><span class="s0">\x</span><span class="s2">10&quot;</span><span class="s1">;</span>
+    <span class="s1">CHECK(memcmp(lp</span><span class="s5">-&gt;</span><span class="s1">items, test_items_3, </span><span class="s4">14</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// delete single element from start</span>
+    <span class="s1">status = numba_list_delete_slice(lp, </span><span class="s4">0</span><span class="s1">, </span><span class="s4">1</span><span class="s1">, </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">13</span><span class="s1">);</span>
+    <span class="s1">test_items_3  = </span><span class="s2">&quot;</span><span class="s0">\x</span><span class="s2">01</span><span class="s0">\x</span><span class="s2">05</span><span class="s0">\x</span><span class="s2">06</span><span class="s0">\x</span><span class="s2">07</span><span class="s0">\x</span><span class="s2">08</span><span class="s0">\x</span><span class="s2">09</span><span class="s0">\x</span><span class="s2">0a</span><span class="s0">\x</span><span class="s2">0b</span><span class="s0">\x</span><span class="s2">0c</span><span class="s0">\x</span><span class="s2">0d</span><span class="s0">\x</span><span class="s2">0e</span><span class="s0">\x</span><span class="s2">0f</span><span class="s0">\x</span><span class="s2">10&quot;</span><span class="s1">;</span>
+    <span class="s1">CHECK(memcmp(lp</span><span class="s5">-&gt;</span><span class="s1">items, test_items_3, </span><span class="s4">13</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// delete single element from end</span>
+    <span class="s1">status = numba_list_delete_slice(lp, </span><span class="s4">12</span><span class="s1">, </span><span class="s4">13</span><span class="s1">, </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">12</span><span class="s1">);</span>
+    <span class="s1">test_items_3  = </span><span class="s2">&quot;</span><span class="s0">\x</span><span class="s2">01</span><span class="s0">\x</span><span class="s2">05</span><span class="s0">\x</span><span class="s2">06</span><span class="s0">\x</span><span class="s2">07</span><span class="s0">\x</span><span class="s2">08</span><span class="s0">\x</span><span class="s2">09</span><span class="s0">\x</span><span class="s2">0a</span><span class="s0">\x</span><span class="s2">0b</span><span class="s0">\x</span><span class="s2">0c</span><span class="s0">\x</span><span class="s2">0d</span><span class="s0">\x</span><span class="s2">0e</span><span class="s0">\x</span><span class="s2">0f&quot;</span><span class="s1">;</span>
+    <span class="s1">CHECK(memcmp(lp</span><span class="s5">-&gt;</span><span class="s1">items, test_items_3, </span><span class="s4">12</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// delete single element from middle</span>
+    <span class="s1">status = numba_list_delete_slice(lp, </span><span class="s4">4</span><span class="s1">, </span><span class="s4">5</span><span class="s1">, </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">11</span><span class="s1">);</span>
+    <span class="s1">test_items_3  = </span><span class="s2">&quot;</span><span class="s0">\x</span><span class="s2">01</span><span class="s0">\x</span><span class="s2">05</span><span class="s0">\x</span><span class="s2">06</span><span class="s0">\x</span><span class="s2">07</span><span class="s0">\x</span><span class="s2">09</span><span class="s0">\x</span><span class="s2">0a</span><span class="s0">\x</span><span class="s2">0b</span><span class="s0">\x</span><span class="s2">0c</span><span class="s0">\x</span><span class="s2">0d</span><span class="s0">\x</span><span class="s2">0e</span><span class="s0">\x</span><span class="s2">0f&quot;</span><span class="s1">;</span>
+    <span class="s1">CHECK(memcmp(lp</span><span class="s5">-&gt;</span><span class="s1">items, test_items_3, </span><span class="s4">11</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// delete all elements except first and last</span>
+    <span class="s1">status = numba_list_delete_slice(lp, </span><span class="s4">1</span><span class="s1">, </span><span class="s4">10</span><span class="s1">, </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">2</span><span class="s1">);</span>
+    <span class="s1">test_items_3  = </span><span class="s2">&quot;</span><span class="s0">\x</span><span class="s2">01</span><span class="s0">\x</span><span class="s2">0f&quot;</span><span class="s1">;</span>
+    <span class="s1">CHECK(memcmp(lp</span><span class="s5">-&gt;</span><span class="s1">items, test_items_3, </span><span class="s4">2</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// delete all remaining elements</span>
+    <span class="s1">status = numba_list_delete_slice(lp, </span><span class="s4">0</span><span class="s1">, lp</span><span class="s5">-&gt;</span><span class="s1">size, </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">test_items_3  = </span><span class="s2">&quot;&quot;</span><span class="s1">;</span>
+    <span class="s1">CHECK(memcmp(lp</span><span class="s5">-&gt;</span><span class="s1">items, test_items_3, </span><span class="s4">0</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// free existing list</span>
+    <span class="s1">numba_list_free(lp);</span>
+
+    <span class="s3">// Setup list for testing delete_slice with non unary step</span>
+    <span class="s1">status = numba_list_new(&amp;lp, </span><span class="s4">1</span><span class="s1">, </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">item_size == </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s0">for </span><span class="s1">(i = </span><span class="s4">0</span><span class="s1">; i &lt; </span><span class="s4">17 </span><span class="s1">; i++) {</span>
+        <span class="s1">status = numba_list_append(lp, (</span><span class="s0">const char</span><span class="s1">*)&amp;i);</span>
+        <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">}</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">17</span><span class="s1">);</span>
+
+    <span class="s3">// delete all items with odd index</span>
+    <span class="s1">status = numba_list_delete_slice(lp, </span><span class="s4">0</span><span class="s1">, </span><span class="s4">17</span><span class="s1">, </span><span class="s4">2</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">8</span><span class="s1">);</span>
+    <span class="s1">test_items_3 = </span><span class="s2">&quot;</span><span class="s0">\x</span><span class="s2">01</span><span class="s0">\x</span><span class="s2">03</span><span class="s0">\x</span><span class="s2">05</span><span class="s0">\x</span><span class="s2">07</span><span class="s0">\x</span><span class="s2">09</span><span class="s0">\x</span><span class="s2">0b</span><span class="s0">\x</span><span class="s2">0d</span><span class="s0">\x</span><span class="s2">0f&quot;</span><span class="s1">;</span>
+    <span class="s1">CHECK(memcmp(lp</span><span class="s5">-&gt;</span><span class="s1">items, test_items_3, </span><span class="s4">8</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// delete with a step of 4, starting at index 1</span>
+    <span class="s1">status = numba_list_delete_slice(lp, </span><span class="s4">1</span><span class="s1">, </span><span class="s4">8</span><span class="s1">, </span><span class="s4">4</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">6</span><span class="s1">);</span>
+    <span class="s1">test_items_3 = </span><span class="s2">&quot;</span><span class="s0">\x</span><span class="s2">01</span><span class="s0">\x</span><span class="s2">05</span><span class="s0">\x</span><span class="s2">07</span><span class="s0">\x</span><span class="s2">09</span><span class="s0">\x</span><span class="s2">0d</span><span class="s0">\x</span><span class="s2">0f&quot;</span><span class="s1">;</span>
+    <span class="s1">CHECK(memcmp(lp</span><span class="s5">-&gt;</span><span class="s1">items, test_items_3, </span><span class="s4">6</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// delete with a step of 2, but finish before end of list</span>
+    <span class="s1">status = numba_list_delete_slice(lp, </span><span class="s4">0</span><span class="s1">, </span><span class="s4">4</span><span class="s1">, </span><span class="s4">2</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">4</span><span class="s1">);</span>
+    <span class="s1">test_items_3 = </span><span class="s2">&quot;</span><span class="s0">\x</span><span class="s2">05</span><span class="s0">\x</span><span class="s2">09</span><span class="s0">\x</span><span class="s2">0d</span><span class="s0">\x</span><span class="s2">0f&quot;</span><span class="s1">;</span>
+    <span class="s1">CHECK(memcmp(lp</span><span class="s5">-&gt;</span><span class="s1">items, test_items_3, </span><span class="s4">4</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// no-op on empty slice</span>
+    <span class="s1">status = numba_list_delete_slice(lp, </span><span class="s4">0</span><span class="s1">, </span><span class="s4">0</span><span class="s1">, </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">4</span><span class="s1">);</span>
+    <span class="s1">test_items_3 = </span><span class="s2">&quot;</span><span class="s0">\x</span><span class="s2">05</span><span class="s0">\x</span><span class="s2">09</span><span class="s0">\x</span><span class="s2">0d</span><span class="s0">\x</span><span class="s2">0f&quot;</span><span class="s1">;</span>
+    <span class="s1">CHECK(memcmp(lp</span><span class="s5">-&gt;</span><span class="s1">items, test_items_3, </span><span class="s4">4</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// no-op on empty slice, non-zero index</span>
+    <span class="s1">status = numba_list_delete_slice(lp, </span><span class="s4">2</span><span class="s1">, </span><span class="s4">2</span><span class="s1">, </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">4</span><span class="s1">);</span>
+    <span class="s1">test_items_3 = </span><span class="s2">&quot;</span><span class="s0">\x</span><span class="s2">05</span><span class="s0">\x</span><span class="s2">09</span><span class="s0">\x</span><span class="s2">0d</span><span class="s0">\x</span><span class="s2">0f&quot;</span><span class="s1">;</span>
+    <span class="s1">CHECK(memcmp(lp</span><span class="s5">-&gt;</span><span class="s1">items, test_items_3, </span><span class="s4">4</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// free list and return 0</span>
+    <span class="s1">numba_list_free(lp);</span>
+
+    <span class="s3">// Setup list for testing delete_slice with negative step</span>
+    <span class="s1">status = numba_list_new(&amp;lp, </span><span class="s4">1</span><span class="s1">, </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">item_size == </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">allocated == </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s0">for </span><span class="s1">(i = </span><span class="s4">0</span><span class="s1">; i &lt; </span><span class="s4">17 </span><span class="s1">; i++) {</span>
+        <span class="s1">status = numba_list_append(lp, (</span><span class="s0">const char</span><span class="s1">*)&amp;i);</span>
+        <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">}</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">17</span><span class="s1">);</span>
+
+    <span class="s3">// delete all items using unary negative slice</span>
+    <span class="s1">status = numba_list_delete_slice(lp, </span><span class="s4">16</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// refill list</span>
+    <span class="s0">for </span><span class="s1">(i = </span><span class="s4">0</span><span class="s1">; i &lt; </span><span class="s4">17 </span><span class="s1">; i++) {</span>
+        <span class="s1">status = numba_list_append(lp, (</span><span class="s0">const char</span><span class="s1">*)&amp;i);</span>
+        <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">}</span>
+
+    <span class="s3">// delete all items using unary negative slice</span>
+    <span class="s3">// need to start at index of last item (16) and</span>
+    <span class="s3">// go beyond first item, i.e. -1 in Cd</span>
+    <span class="s1">status = numba_list_delete_slice(lp, </span><span class="s4">16</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">2</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == LIST_OK);</span>
+    <span class="s1">CHECK(lp</span><span class="s5">-&gt;</span><span class="s1">size == </span><span class="s4">8</span><span class="s1">);</span>
+    <span class="s1">test_items_3 = </span><span class="s2">&quot;</span><span class="s0">\x</span><span class="s2">01</span><span class="s0">\x</span><span class="s2">03</span><span class="s0">\x</span><span class="s2">05</span><span class="s0">\x</span><span class="s2">07</span><span class="s0">\x</span><span class="s2">09</span><span class="s0">\x</span><span class="s2">0b</span><span class="s0">\x</span><span class="s2">0d</span><span class="s0">\x</span><span class="s2">0f&quot;</span><span class="s1">;</span>
+    <span class="s1">CHECK(memcmp(lp</span><span class="s5">-&gt;</span><span class="s1">items, test_items_3, </span><span class="s4">8</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s3">// free list and return 0</span>
+    <span class="s1">numba_list_free(lp);</span>
+    <span class="s0">return </span><span class="s4">0</span><span class="s1">;</span>
+
+
+<span class="s1">}</span>
+
+<span class="s0">#undef </span><span class="s1">CHECK</span>
+</pre>
+</body>
+</html>

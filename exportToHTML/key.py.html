@@ -1,0 +1,882 @@
+<html>
+<head>
+<title>key.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #5f826b; font-style: italic;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #2aacb8;}
+.s6 { color: #6aab73;}
+.s7 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+key.py</font>
+</center></td></tr></table>
+<pre><span class="s0">#  Copyright 2011 Sybren A. Stüvel &lt;sybren@stuvel.eu&gt;</span>
+<span class="s0">#</span>
+<span class="s0">#  Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="s0">#  you may not use this file except in compliance with the License.</span>
+<span class="s0">#  You may obtain a copy of the License at</span>
+<span class="s0">#</span>
+<span class="s0">#      https://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="s0">#</span>
+<span class="s0">#  Unless required by applicable law or agreed to in writing, software</span>
+<span class="s0">#  distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="s0">#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="s0">#  See the License for the specific language governing permissions and</span>
+<span class="s0">#  limitations under the License.</span>
+
+<span class="s2">&quot;&quot;&quot;RSA key generation code. 
+ 
+Create new keys with the newkeys() function. It will give you a PublicKey and a 
+PrivateKey object. 
+ 
+Loading and saving keys requires the pyasn1 module. This module is imported as 
+late as possible, such that other functionality will remain working in absence 
+of pyasn1. 
+ 
+.. note:: 
+ 
+    Storing public and private keys via the `pickle` module is possible. 
+    However, it is insecure to load a key from an untrusted source. 
+    The pickle module is not secure against erroneous or maliciously 
+    constructed data. Never unpickle data received from an untrusted 
+    or unauthenticated source. 
+ 
+&quot;&quot;&quot;</span>
+
+<span class="s3">import </span><span class="s1">threading</span>
+<span class="s3">import </span><span class="s1">typing</span>
+<span class="s3">import </span><span class="s1">warnings</span>
+
+<span class="s3">import </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">prime</span>
+<span class="s3">import </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">pem</span>
+<span class="s3">import </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">common</span>
+<span class="s3">import </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">randnum</span>
+<span class="s3">import </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">core</span>
+
+
+<span class="s1">DEFAULT_EXPONENT </span><span class="s4">= </span><span class="s5">65537</span>
+
+
+<span class="s1">T </span><span class="s4">= </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">TypeVar</span><span class="s4">(</span><span class="s6">&quot;T&quot;</span><span class="s4">, </span><span class="s1">bound</span><span class="s4">=</span><span class="s6">&quot;AbstractKey&quot;</span><span class="s4">)</span>
+
+
+<span class="s3">class </span><span class="s1">AbstractKey</span><span class="s4">:</span>
+    <span class="s2">&quot;&quot;&quot;Abstract superclass for private and public keys.&quot;&quot;&quot;</span>
+
+    <span class="s1">__slots__ </span><span class="s4">= (</span><span class="s6">&quot;n&quot;</span><span class="s4">, </span><span class="s6">&quot;e&quot;</span><span class="s4">, </span><span class="s6">&quot;blindfac&quot;</span><span class="s4">, </span><span class="s6">&quot;blindfac_inverse&quot;</span><span class="s4">, </span><span class="s6">&quot;mutex&quot;</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">n</span><span class="s4">: </span><span class="s1">int</span><span class="s4">, </span><span class="s1">e</span><span class="s4">: </span><span class="s1">int</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n </span><span class="s4">= </span><span class="s1">n</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">e </span><span class="s4">= </span><span class="s1">e</span>
+
+        <span class="s0"># These will be computed properly on the first call to blind().</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">blindfac </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">blindfac_inverse </span><span class="s4">= -</span><span class="s5">1</span>
+
+        <span class="s0"># Used to protect updates to the blinding factor in multi-threaded</span>
+        <span class="s0"># environments.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">mutex </span><span class="s4">= </span><span class="s1">threading</span><span class="s4">.</span><span class="s1">Lock</span><span class="s4">()</span>
+
+    <span class="s4">@</span><span class="s1">classmethod</span>
+    <span class="s3">def </span><span class="s1">_load_pkcs1_pem</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">: </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">Type</span><span class="s4">[</span><span class="s1">T</span><span class="s4">], </span><span class="s1">keyfile</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">) </span><span class="s1">-&gt; T</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Loads a key in PKCS#1 PEM format, implement in a subclass. 
+ 
+        :param keyfile: contents of a PEM-encoded file that contains 
+            the public key. 
+        :type keyfile: bytes 
+ 
+        :return: the loaded key 
+        :rtype: AbstractKey 
+        &quot;&quot;&quot;</span>
+
+    <span class="s4">@</span><span class="s1">classmethod</span>
+    <span class="s3">def </span><span class="s1">_load_pkcs1_der</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">: </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">Type</span><span class="s4">[</span><span class="s1">T</span><span class="s4">], </span><span class="s1">keyfile</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">) </span><span class="s1">-&gt; T</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Loads a key in PKCS#1 PEM format, implement in a subclass. 
+ 
+        :param keyfile: contents of a DER-encoded file that contains 
+            the public key. 
+        :type keyfile: bytes 
+ 
+        :return: the loaded key 
+        :rtype: AbstractKey 
+        &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">_save_pkcs1_pem</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; bytes</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Saves the key in PKCS#1 PEM format, implement in a subclass. 
+ 
+        :returns: the PEM-encoded key. 
+        :rtype: bytes 
+        &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">_save_pkcs1_der</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; bytes</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Saves the key in PKCS#1 DER format, implement in a subclass. 
+ 
+        :returns: the DER-encoded key. 
+        :rtype: bytes 
+        &quot;&quot;&quot;</span>
+
+    <span class="s4">@</span><span class="s1">classmethod</span>
+    <span class="s3">def </span><span class="s1">load_pkcs1</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">: </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">Type</span><span class="s4">[</span><span class="s1">T</span><span class="s4">], </span><span class="s1">keyfile</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">, </span><span class="s1">format</span><span class="s4">: </span><span class="s1">str </span><span class="s4">= </span><span class="s6">&quot;PEM&quot;</span><span class="s4">) </span><span class="s1">-&gt; T</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Loads a key in PKCS#1 DER or PEM format. 
+ 
+        :param keyfile: contents of a DER- or PEM-encoded file that contains 
+            the key. 
+        :type keyfile: bytes 
+        :param format: the format of the file to load; 'PEM' or 'DER' 
+        :type format: str 
+ 
+        :return: the loaded key 
+        :rtype: AbstractKey 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">methods </span><span class="s4">= {</span>
+            <span class="s6">&quot;PEM&quot;</span><span class="s4">: </span><span class="s1">cls</span><span class="s4">.</span><span class="s1">_load_pkcs1_pem</span><span class="s4">,</span>
+            <span class="s6">&quot;DER&quot;</span><span class="s4">: </span><span class="s1">cls</span><span class="s4">.</span><span class="s1">_load_pkcs1_der</span><span class="s4">,</span>
+        <span class="s4">}</span>
+
+        <span class="s1">method </span><span class="s4">= </span><span class="s1">cls</span><span class="s4">.</span><span class="s1">_assert_format_exists</span><span class="s4">(</span><span class="s1">format</span><span class="s4">, </span><span class="s1">methods</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">method</span><span class="s4">(</span><span class="s1">keyfile</span><span class="s4">)</span>
+
+    <span class="s4">@</span><span class="s1">staticmethod</span>
+    <span class="s3">def </span><span class="s1">_assert_format_exists</span><span class="s4">(</span>
+        <span class="s1">file_format</span><span class="s4">: </span><span class="s1">str</span><span class="s4">, </span><span class="s1">methods</span><span class="s4">: </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">Mapping</span><span class="s4">[</span><span class="s1">str</span><span class="s4">, </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">Callable</span><span class="s4">]</span>
+    <span class="s4">) </span><span class="s1">-&gt; typing</span><span class="s4">.</span><span class="s1">Callable</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Checks whether the given file format exists in 'methods'.&quot;&quot;&quot;</span>
+
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">methods</span><span class="s4">[</span><span class="s1">file_format</span><span class="s4">]</span>
+        <span class="s3">except </span><span class="s1">KeyError </span><span class="s3">as </span><span class="s1">ex</span><span class="s4">:</span>
+            <span class="s1">formats </span><span class="s4">= </span><span class="s6">&quot;, &quot;</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">sorted</span><span class="s4">(</span><span class="s1">methods</span><span class="s4">.</span><span class="s1">keys</span><span class="s4">()))</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s6">&quot;Unsupported format: %r, try one of %s&quot; </span><span class="s4">% (</span><span class="s1">file_format</span><span class="s4">, </span><span class="s1">formats</span><span class="s4">)</span>
+            <span class="s4">) </span><span class="s3">from </span><span class="s1">ex</span>
+
+    <span class="s3">def </span><span class="s1">save_pkcs1</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">format</span><span class="s4">: </span><span class="s1">str </span><span class="s4">= </span><span class="s6">&quot;PEM&quot;</span><span class="s4">) </span><span class="s1">-&gt; bytes</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Saves the key in PKCS#1 DER or PEM format. 
+ 
+        :param format: the format to save; 'PEM' or 'DER' 
+        :type format: str 
+        :returns: the DER- or PEM-encoded key. 
+        :rtype: bytes 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">methods </span><span class="s4">= {</span>
+            <span class="s6">&quot;PEM&quot;</span><span class="s4">: </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_save_pkcs1_pem</span><span class="s4">,</span>
+            <span class="s6">&quot;DER&quot;</span><span class="s4">: </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_save_pkcs1_der</span><span class="s4">,</span>
+        <span class="s4">}</span>
+
+        <span class="s1">method </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_assert_format_exists</span><span class="s4">(</span><span class="s1">format</span><span class="s4">, </span><span class="s1">methods</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">method</span><span class="s4">()</span>
+
+    <span class="s3">def </span><span class="s1">blind</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">message</span><span class="s4">: </span><span class="s1">int</span><span class="s4">) </span><span class="s1">-&gt; typing</span><span class="s4">.</span><span class="s1">Tuple</span><span class="s4">[</span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">]:</span>
+        <span class="s2">&quot;&quot;&quot;Performs blinding on the message. 
+ 
+        :param message: the message, as integer, to blind. 
+        :param r: the random number to blind with. 
+        :return: tuple (the blinded message, the inverse of the used blinding factor) 
+ 
+        The blinding is such that message = unblind(decrypt(blind(encrypt(message))). 
+ 
+        See https://en.wikipedia.org/wiki/Blinding_%28cryptography%29 
+        &quot;&quot;&quot;</span>
+        <span class="s1">blindfac</span><span class="s4">, </span><span class="s1">blindfac_inverse </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_update_blinding_factor</span><span class="s4">()</span>
+        <span class="s1">blinded </span><span class="s4">= (</span><span class="s1">message </span><span class="s4">* </span><span class="s1">pow</span><span class="s4">(</span><span class="s1">blindfac</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">e</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n</span><span class="s4">)) % </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n</span>
+        <span class="s3">return </span><span class="s1">blinded</span><span class="s4">, </span><span class="s1">blindfac_inverse</span>
+
+    <span class="s3">def </span><span class="s1">unblind</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">blinded</span><span class="s4">: </span><span class="s1">int</span><span class="s4">, </span><span class="s1">blindfac_inverse</span><span class="s4">: </span><span class="s1">int</span><span class="s4">) </span><span class="s1">-&gt; int</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Performs blinding on the message using random number 'blindfac_inverse'. 
+ 
+        :param blinded: the blinded message, as integer, to unblind. 
+        :param blindfac: the factor to unblind with. 
+        :return: the original message. 
+ 
+        The blinding is such that message = unblind(decrypt(blind(encrypt(message))). 
+ 
+        See https://en.wikipedia.org/wiki/Blinding_%28cryptography%29 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s4">(</span><span class="s1">blindfac_inverse </span><span class="s4">* </span><span class="s1">blinded</span><span class="s4">) % </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n</span>
+
+    <span class="s3">def </span><span class="s1">_initial_blinding_factor</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; int</span><span class="s4">:</span>
+        <span class="s3">for </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s5">1000</span><span class="s4">):</span>
+            <span class="s1">blind_r </span><span class="s4">= </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">randnum</span><span class="s4">.</span><span class="s1">randint</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n </span><span class="s4">- </span><span class="s5">1</span><span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">prime</span><span class="s4">.</span><span class="s1">are_relatively_prime</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n</span><span class="s4">, </span><span class="s1">blind_r</span><span class="s4">):</span>
+                <span class="s3">return </span><span class="s1">blind_r</span>
+        <span class="s3">raise </span><span class="s1">RuntimeError</span><span class="s4">(</span><span class="s6">&quot;unable to find blinding factor&quot;</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_update_blinding_factor</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; typing</span><span class="s4">.</span><span class="s1">Tuple</span><span class="s4">[</span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">]:</span>
+        <span class="s2">&quot;&quot;&quot;Update blinding factors. 
+ 
+        Computing a blinding factor is expensive, so instead this function 
+        does this once, then updates the blinding factor as per section 9 
+        of 'A Timing Attack against RSA with the Chinese Remainder Theorem' 
+        by Werner Schindler. 
+        See https://tls.mbed.org/public/WSchindler-RSA_Timing_Attack.pdf 
+ 
+        :return: the new blinding factor and its inverse. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3">with </span><span class="s1">self</span><span class="s4">.</span><span class="s1">mutex</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">blindfac </span><span class="s4">&lt; </span><span class="s5">0</span><span class="s4">:</span>
+                <span class="s0"># Compute initial blinding factor, which is rather slow to do.</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">blindfac </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_initial_blinding_factor</span><span class="s4">()</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">blindfac_inverse </span><span class="s4">= </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">common</span><span class="s4">.</span><span class="s1">inverse</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">blindfac</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n</span><span class="s4">)</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s0"># Reuse previous blinding factor.</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">blindfac </span><span class="s4">= </span><span class="s1">pow</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">blindfac</span><span class="s4">, </span><span class="s5">2</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n</span><span class="s4">)</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">blindfac_inverse </span><span class="s4">= </span><span class="s1">pow</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">blindfac_inverse</span><span class="s4">, </span><span class="s5">2</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n</span><span class="s4">)</span>
+
+            <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">blindfac</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">blindfac_inverse</span>
+
+
+<span class="s3">class </span><span class="s1">PublicKey</span><span class="s4">(</span><span class="s1">AbstractKey</span><span class="s4">):</span>
+    <span class="s2">&quot;&quot;&quot;Represents a public RSA key. 
+ 
+    This key is also known as the 'encryption key'. It contains the 'n' and 'e' 
+    values. 
+ 
+    Supports attributes as well as dictionary-like access. Attribute access is 
+    faster, though. 
+ 
+    &gt;&gt;&gt; PublicKey(5, 3) 
+    PublicKey(5, 3) 
+ 
+    &gt;&gt;&gt; key = PublicKey(5, 3) 
+    &gt;&gt;&gt; key.n 
+    5 
+    &gt;&gt;&gt; key['n'] 
+    5 
+    &gt;&gt;&gt; key.e 
+    3 
+    &gt;&gt;&gt; key['e'] 
+    3 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">__slots__ </span><span class="s4">= ()</span>
+
+    <span class="s3">def </span><span class="s1">__getitem__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">key</span><span class="s4">: </span><span class="s1">str</span><span class="s4">) </span><span class="s1">-&gt; int</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">key</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__repr__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; str</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s6">&quot;PublicKey(%i, %i)&quot; </span><span class="s4">% (</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">e</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__getstate__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; typing</span><span class="s4">.</span><span class="s1">Tuple</span><span class="s4">[</span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">]:</span>
+        <span class="s2">&quot;&quot;&quot;Returns the key as tuple for pickling.&quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">e</span>
+
+    <span class="s3">def </span><span class="s1">__setstate__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">state</span><span class="s4">: </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">Tuple</span><span class="s4">[</span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">]) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Sets the key from tuple.&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">e </span><span class="s4">= </span><span class="s1">state</span>
+        <span class="s1">AbstractKey</span><span class="s4">.</span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">e</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__eq__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">other</span><span class="s4">: </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">Any</span><span class="s4">) </span><span class="s1">-&gt; bool</span><span class="s4">:</span>
+        <span class="s3">if </span><span class="s1">other </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s3">return False</span>
+
+        <span class="s3">if not </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">other</span><span class="s4">, </span><span class="s1">PublicKey</span><span class="s4">):</span>
+            <span class="s3">return False</span>
+
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n </span><span class="s4">== </span><span class="s1">other</span><span class="s4">.</span><span class="s1">n </span><span class="s3">and </span><span class="s1">self</span><span class="s4">.</span><span class="s1">e </span><span class="s4">== </span><span class="s1">other</span><span class="s4">.</span><span class="s1">e</span>
+
+    <span class="s3">def </span><span class="s1">__ne__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">other</span><span class="s4">: </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">Any</span><span class="s4">) </span><span class="s1">-&gt; bool</span><span class="s4">:</span>
+        <span class="s3">return not </span><span class="s4">(</span><span class="s1">self </span><span class="s4">== </span><span class="s1">other</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__hash__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; int</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">hash</span><span class="s4">((</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">e</span><span class="s4">))</span>
+
+    <span class="s4">@</span><span class="s1">classmethod</span>
+    <span class="s3">def </span><span class="s1">_load_pkcs1_der</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, </span><span class="s1">keyfile</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s6">&quot;PublicKey&quot;</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Loads a key in PKCS#1 DER format. 
+ 
+        :param keyfile: contents of a DER-encoded file that contains the public 
+            key. 
+        :return: a PublicKey object 
+ 
+        First let's construct a DER encoded key: 
+ 
+        &gt;&gt;&gt; import base64 
+        &gt;&gt;&gt; b64der = 'MAwCBQCNGmYtAgMBAAE=' 
+        &gt;&gt;&gt; der = base64.standard_b64decode(b64der) 
+ 
+        This loads the file: 
+ 
+        &gt;&gt;&gt; PublicKey._load_pkcs1_der(der) 
+        PublicKey(2367317549, 65537) 
+ 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3">from </span><span class="s1">pyasn1</span><span class="s4">.</span><span class="s1">codec</span><span class="s4">.</span><span class="s1">der </span><span class="s3">import </span><span class="s1">decoder</span>
+        <span class="s3">from </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">asn1 </span><span class="s3">import </span><span class="s1">AsnPubKey</span>
+
+        <span class="s4">(</span><span class="s1">priv</span><span class="s4">, </span><span class="s1">_</span><span class="s4">) = </span><span class="s1">decoder</span><span class="s4">.</span><span class="s1">decode</span><span class="s4">(</span><span class="s1">keyfile</span><span class="s4">, </span><span class="s1">asn1Spec</span><span class="s4">=</span><span class="s1">AsnPubKey</span><span class="s4">())</span>
+        <span class="s3">return </span><span class="s1">cls</span><span class="s4">(</span><span class="s1">n</span><span class="s4">=</span><span class="s1">int</span><span class="s4">(</span><span class="s1">priv</span><span class="s4">[</span><span class="s6">&quot;modulus&quot;</span><span class="s4">]), </span><span class="s1">e</span><span class="s4">=</span><span class="s1">int</span><span class="s4">(</span><span class="s1">priv</span><span class="s4">[</span><span class="s6">&quot;publicExponent&quot;</span><span class="s4">]))</span>
+
+    <span class="s3">def </span><span class="s1">_save_pkcs1_der</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; bytes</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Saves the public key in PKCS#1 DER format. 
+ 
+        :returns: the DER-encoded public key. 
+        :rtype: bytes 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3">from </span><span class="s1">pyasn1</span><span class="s4">.</span><span class="s1">codec</span><span class="s4">.</span><span class="s1">der </span><span class="s3">import </span><span class="s1">encoder</span>
+        <span class="s3">from </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">asn1 </span><span class="s3">import </span><span class="s1">AsnPubKey</span>
+
+        <span class="s0"># Create the ASN object</span>
+        <span class="s1">asn_key </span><span class="s4">= </span><span class="s1">AsnPubKey</span><span class="s4">()</span>
+        <span class="s1">asn_key</span><span class="s4">.</span><span class="s1">setComponentByName</span><span class="s4">(</span><span class="s6">&quot;modulus&quot;</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n</span><span class="s4">)</span>
+        <span class="s1">asn_key</span><span class="s4">.</span><span class="s1">setComponentByName</span><span class="s4">(</span><span class="s6">&quot;publicExponent&quot;</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">e</span><span class="s4">)</span>
+
+        <span class="s3">return </span><span class="s1">encoder</span><span class="s4">.</span><span class="s1">encode</span><span class="s4">(</span><span class="s1">asn_key</span><span class="s4">)</span>
+
+    <span class="s4">@</span><span class="s1">classmethod</span>
+    <span class="s3">def </span><span class="s1">_load_pkcs1_pem</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, </span><span class="s1">keyfile</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s6">&quot;PublicKey&quot;</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Loads a PKCS#1 PEM-encoded public key file. 
+ 
+        The contents of the file before the &quot;-----BEGIN RSA PUBLIC KEY-----&quot; and 
+        after the &quot;-----END RSA PUBLIC KEY-----&quot; lines is ignored. 
+ 
+        :param keyfile: contents of a PEM-encoded file that contains the public 
+            key. 
+        :return: a PublicKey object 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">der </span><span class="s4">= </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">pem</span><span class="s4">.</span><span class="s1">load_pem</span><span class="s4">(</span><span class="s1">keyfile</span><span class="s4">, </span><span class="s6">&quot;RSA PUBLIC KEY&quot;</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">cls</span><span class="s4">.</span><span class="s1">_load_pkcs1_der</span><span class="s4">(</span><span class="s1">der</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_save_pkcs1_pem</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; bytes</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Saves a PKCS#1 PEM-encoded public key file. 
+ 
+        :return: contents of a PEM-encoded file that contains the public key. 
+        :rtype: bytes 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">der </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_save_pkcs1_der</span><span class="s4">()</span>
+        <span class="s3">return </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">pem</span><span class="s4">.</span><span class="s1">save_pem</span><span class="s4">(</span><span class="s1">der</span><span class="s4">, </span><span class="s6">&quot;RSA PUBLIC KEY&quot;</span><span class="s4">)</span>
+
+    <span class="s4">@</span><span class="s1">classmethod</span>
+    <span class="s3">def </span><span class="s1">load_pkcs1_openssl_pem</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, </span><span class="s1">keyfile</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s6">&quot;PublicKey&quot;</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Loads a PKCS#1.5 PEM-encoded public key file from OpenSSL. 
+ 
+        These files can be recognised in that they start with BEGIN PUBLIC KEY 
+        rather than BEGIN RSA PUBLIC KEY. 
+ 
+        The contents of the file before the &quot;-----BEGIN PUBLIC KEY-----&quot; and 
+        after the &quot;-----END PUBLIC KEY-----&quot; lines is ignored. 
+ 
+        :param keyfile: contents of a PEM-encoded file that contains the public 
+            key, from OpenSSL. 
+        :type keyfile: bytes 
+        :return: a PublicKey object 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">der </span><span class="s4">= </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">pem</span><span class="s4">.</span><span class="s1">load_pem</span><span class="s4">(</span><span class="s1">keyfile</span><span class="s4">, </span><span class="s6">&quot;PUBLIC KEY&quot;</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">cls</span><span class="s4">.</span><span class="s1">load_pkcs1_openssl_der</span><span class="s4">(</span><span class="s1">der</span><span class="s4">)</span>
+
+    <span class="s4">@</span><span class="s1">classmethod</span>
+    <span class="s3">def </span><span class="s1">load_pkcs1_openssl_der</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, </span><span class="s1">keyfile</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s6">&quot;PublicKey&quot;</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Loads a PKCS#1 DER-encoded public key file from OpenSSL. 
+ 
+        :param keyfile: contents of a DER-encoded file that contains the public 
+            key, from OpenSSL. 
+        :return: a PublicKey object 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3">from </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">asn1 </span><span class="s3">import </span><span class="s1">OpenSSLPubKey</span>
+        <span class="s3">from </span><span class="s1">pyasn1</span><span class="s4">.</span><span class="s1">codec</span><span class="s4">.</span><span class="s1">der </span><span class="s3">import </span><span class="s1">decoder</span>
+        <span class="s3">from </span><span class="s1">pyasn1</span><span class="s4">.</span><span class="s1">type </span><span class="s3">import </span><span class="s1">univ</span>
+
+        <span class="s4">(</span><span class="s1">keyinfo</span><span class="s4">, </span><span class="s1">_</span><span class="s4">) = </span><span class="s1">decoder</span><span class="s4">.</span><span class="s1">decode</span><span class="s4">(</span><span class="s1">keyfile</span><span class="s4">, </span><span class="s1">asn1Spec</span><span class="s4">=</span><span class="s1">OpenSSLPubKey</span><span class="s4">())</span>
+
+        <span class="s3">if </span><span class="s1">keyinfo</span><span class="s4">[</span><span class="s6">&quot;header&quot;</span><span class="s4">][</span><span class="s6">&quot;oid&quot;</span><span class="s4">] != </span><span class="s1">univ</span><span class="s4">.</span><span class="s1">ObjectIdentifier</span><span class="s4">(</span><span class="s6">&quot;1.2.840.113549.1.1.1&quot;</span><span class="s4">):</span>
+            <span class="s3">raise </span><span class="s1">TypeError</span><span class="s4">(</span><span class="s6">&quot;This is not a DER-encoded OpenSSL-compatible public key&quot;</span><span class="s4">)</span>
+
+        <span class="s3">return </span><span class="s1">cls</span><span class="s4">.</span><span class="s1">_load_pkcs1_der</span><span class="s4">(</span><span class="s1">keyinfo</span><span class="s4">[</span><span class="s6">&quot;key&quot;</span><span class="s4">][</span><span class="s5">1</span><span class="s4">:])</span>
+
+
+<span class="s3">class </span><span class="s1">PrivateKey</span><span class="s4">(</span><span class="s1">AbstractKey</span><span class="s4">):</span>
+    <span class="s2">&quot;&quot;&quot;Represents a private RSA key. 
+ 
+    This key is also known as the 'decryption key'. It contains the 'n', 'e', 
+    'd', 'p', 'q' and other values. 
+ 
+    Supports attributes as well as dictionary-like access. Attribute access is 
+    faster, though. 
+ 
+    &gt;&gt;&gt; PrivateKey(3247, 65537, 833, 191, 17) 
+    PrivateKey(3247, 65537, 833, 191, 17) 
+ 
+    exp1, exp2 and coef will be calculated: 
+ 
+    &gt;&gt;&gt; pk = PrivateKey(3727264081, 65537, 3349121513, 65063, 57287) 
+    &gt;&gt;&gt; pk.exp1 
+    55063 
+    &gt;&gt;&gt; pk.exp2 
+    10095 
+    &gt;&gt;&gt; pk.coef 
+    50797 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">__slots__ </span><span class="s4">= (</span><span class="s6">&quot;d&quot;</span><span class="s4">, </span><span class="s6">&quot;p&quot;</span><span class="s4">, </span><span class="s6">&quot;q&quot;</span><span class="s4">, </span><span class="s6">&quot;exp1&quot;</span><span class="s4">, </span><span class="s6">&quot;exp2&quot;</span><span class="s4">, </span><span class="s6">&quot;coef&quot;</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">n</span><span class="s4">: </span><span class="s1">int</span><span class="s4">, </span><span class="s1">e</span><span class="s4">: </span><span class="s1">int</span><span class="s4">, </span><span class="s1">d</span><span class="s4">: </span><span class="s1">int</span><span class="s4">, </span><span class="s1">p</span><span class="s4">: </span><span class="s1">int</span><span class="s4">, </span><span class="s1">q</span><span class="s4">: </span><span class="s1">int</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s1">AbstractKey</span><span class="s4">.</span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">n</span><span class="s4">, </span><span class="s1">e</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">d </span><span class="s4">= </span><span class="s1">d</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">p </span><span class="s4">= </span><span class="s1">p</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">q </span><span class="s4">= </span><span class="s1">q</span>
+
+        <span class="s0"># Calculate exponents and coefficient.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">exp1 </span><span class="s4">= </span><span class="s1">int</span><span class="s4">(</span><span class="s1">d </span><span class="s4">% (</span><span class="s1">p </span><span class="s4">- </span><span class="s5">1</span><span class="s4">))</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">exp2 </span><span class="s4">= </span><span class="s1">int</span><span class="s4">(</span><span class="s1">d </span><span class="s4">% (</span><span class="s1">q </span><span class="s4">- </span><span class="s5">1</span><span class="s4">))</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">coef </span><span class="s4">= </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">common</span><span class="s4">.</span><span class="s1">inverse</span><span class="s4">(</span><span class="s1">q</span><span class="s4">, </span><span class="s1">p</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__getitem__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">key</span><span class="s4">: </span><span class="s1">str</span><span class="s4">) </span><span class="s1">-&gt; int</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">key</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__repr__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; str</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s6">&quot;PrivateKey(%i, %i, %i, %i, %i)&quot; </span><span class="s4">% (</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">n</span><span class="s4">,</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">e</span><span class="s4">,</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">d</span><span class="s4">,</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">p</span><span class="s4">,</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">q</span><span class="s4">,</span>
+        <span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__getstate__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; typing</span><span class="s4">.</span><span class="s1">Tuple</span><span class="s4">[</span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">]:</span>
+        <span class="s2">&quot;&quot;&quot;Returns the key as tuple for pickling.&quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">e</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">d</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">p</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">q</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">exp1</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">exp2</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">coef</span>
+
+    <span class="s3">def </span><span class="s1">__setstate__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">state</span><span class="s4">: </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">Tuple</span><span class="s4">[</span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">]) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Sets the key from tuple.&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">e</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">d</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">p</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">q</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">exp1</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">exp2</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">coef </span><span class="s4">= </span><span class="s1">state</span>
+        <span class="s1">AbstractKey</span><span class="s4">.</span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">e</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__eq__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">other</span><span class="s4">: </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">Any</span><span class="s4">) </span><span class="s1">-&gt; bool</span><span class="s4">:</span>
+        <span class="s3">if </span><span class="s1">other </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s3">return False</span>
+
+        <span class="s3">if not </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">other</span><span class="s4">, </span><span class="s1">PrivateKey</span><span class="s4">):</span>
+            <span class="s3">return False</span>
+
+        <span class="s3">return </span><span class="s4">(</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">n </span><span class="s4">== </span><span class="s1">other</span><span class="s4">.</span><span class="s1">n</span>
+            <span class="s3">and </span><span class="s1">self</span><span class="s4">.</span><span class="s1">e </span><span class="s4">== </span><span class="s1">other</span><span class="s4">.</span><span class="s1">e</span>
+            <span class="s3">and </span><span class="s1">self</span><span class="s4">.</span><span class="s1">d </span><span class="s4">== </span><span class="s1">other</span><span class="s4">.</span><span class="s1">d</span>
+            <span class="s3">and </span><span class="s1">self</span><span class="s4">.</span><span class="s1">p </span><span class="s4">== </span><span class="s1">other</span><span class="s4">.</span><span class="s1">p</span>
+            <span class="s3">and </span><span class="s1">self</span><span class="s4">.</span><span class="s1">q </span><span class="s4">== </span><span class="s1">other</span><span class="s4">.</span><span class="s1">q</span>
+            <span class="s3">and </span><span class="s1">self</span><span class="s4">.</span><span class="s1">exp1 </span><span class="s4">== </span><span class="s1">other</span><span class="s4">.</span><span class="s1">exp1</span>
+            <span class="s3">and </span><span class="s1">self</span><span class="s4">.</span><span class="s1">exp2 </span><span class="s4">== </span><span class="s1">other</span><span class="s4">.</span><span class="s1">exp2</span>
+            <span class="s3">and </span><span class="s1">self</span><span class="s4">.</span><span class="s1">coef </span><span class="s4">== </span><span class="s1">other</span><span class="s4">.</span><span class="s1">coef</span>
+        <span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__ne__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">other</span><span class="s4">: </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">Any</span><span class="s4">) </span><span class="s1">-&gt; bool</span><span class="s4">:</span>
+        <span class="s3">return not </span><span class="s4">(</span><span class="s1">self </span><span class="s4">== </span><span class="s1">other</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__hash__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; int</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">hash</span><span class="s4">((</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">e</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">d</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">p</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">q</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">exp1</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">exp2</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">coef</span><span class="s4">))</span>
+
+    <span class="s3">def </span><span class="s1">blinded_decrypt</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">encrypted</span><span class="s4">: </span><span class="s1">int</span><span class="s4">) </span><span class="s1">-&gt; int</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Decrypts the message using blinding to prevent side-channel attacks. 
+ 
+        :param encrypted: the encrypted message 
+        :type encrypted: int 
+ 
+        :returns: the decrypted message 
+        :rtype: int 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0"># Blinding and un-blinding should be using the same factor</span>
+        <span class="s1">blinded</span><span class="s4">, </span><span class="s1">blindfac_inverse </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">blind</span><span class="s4">(</span><span class="s1">encrypted</span><span class="s4">)</span>
+
+        <span class="s0"># Instead of using the core functionality, use the Chinese Remainder</span>
+        <span class="s0"># Theorem and be 2-4x faster. This the same as:</span>
+        <span class="s0">#</span>
+        <span class="s0"># decrypted = rsa.core.decrypt_int(blinded, self.d, self.n)</span>
+        <span class="s1">s1 </span><span class="s4">= </span><span class="s1">pow</span><span class="s4">(</span><span class="s1">blinded</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">exp1</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">p</span><span class="s4">)</span>
+        <span class="s1">s2 </span><span class="s4">= </span><span class="s1">pow</span><span class="s4">(</span><span class="s1">blinded</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">exp2</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">q</span><span class="s4">)</span>
+        <span class="s1">h </span><span class="s4">= ((</span><span class="s1">s1 </span><span class="s4">- </span><span class="s1">s2</span><span class="s4">) * </span><span class="s1">self</span><span class="s4">.</span><span class="s1">coef</span><span class="s4">) % </span><span class="s1">self</span><span class="s4">.</span><span class="s1">p</span>
+        <span class="s1">decrypted </span><span class="s4">= </span><span class="s1">s2 </span><span class="s4">+ </span><span class="s1">self</span><span class="s4">.</span><span class="s1">q </span><span class="s4">* </span><span class="s1">h</span>
+
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">unblind</span><span class="s4">(</span><span class="s1">decrypted</span><span class="s4">, </span><span class="s1">blindfac_inverse</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">blinded_encrypt</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">message</span><span class="s4">: </span><span class="s1">int</span><span class="s4">) </span><span class="s1">-&gt; int</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Encrypts the message using blinding to prevent side-channel attacks. 
+ 
+        :param message: the message to encrypt 
+        :type message: int 
+ 
+        :returns: the encrypted message 
+        :rtype: int 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">blinded</span><span class="s4">, </span><span class="s1">blindfac_inverse </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">blind</span><span class="s4">(</span><span class="s1">message</span><span class="s4">)</span>
+        <span class="s1">encrypted </span><span class="s4">= </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">core</span><span class="s4">.</span><span class="s1">encrypt_int</span><span class="s4">(</span><span class="s1">blinded</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">d</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">unblind</span><span class="s4">(</span><span class="s1">encrypted</span><span class="s4">, </span><span class="s1">blindfac_inverse</span><span class="s4">)</span>
+
+    <span class="s4">@</span><span class="s1">classmethod</span>
+    <span class="s3">def </span><span class="s1">_load_pkcs1_der</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, </span><span class="s1">keyfile</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s6">&quot;PrivateKey&quot;</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Loads a key in PKCS#1 DER format. 
+ 
+        :param keyfile: contents of a DER-encoded file that contains the private 
+            key. 
+        :type keyfile: bytes 
+        :return: a PrivateKey object 
+ 
+        First let's construct a DER encoded key: 
+ 
+        &gt;&gt;&gt; import base64 
+        &gt;&gt;&gt; b64der = 'MC4CAQACBQDeKYlRAgMBAAECBQDHn4npAgMA/icCAwDfxwIDANcXAgInbwIDAMZt' 
+        &gt;&gt;&gt; der = base64.standard_b64decode(b64der) 
+ 
+        This loads the file: 
+ 
+        &gt;&gt;&gt; PrivateKey._load_pkcs1_der(der) 
+        PrivateKey(3727264081, 65537, 3349121513, 65063, 57287) 
+ 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3">from </span><span class="s1">pyasn1</span><span class="s4">.</span><span class="s1">codec</span><span class="s4">.</span><span class="s1">der </span><span class="s3">import </span><span class="s1">decoder</span>
+
+        <span class="s4">(</span><span class="s1">priv</span><span class="s4">, </span><span class="s1">_</span><span class="s4">) = </span><span class="s1">decoder</span><span class="s4">.</span><span class="s1">decode</span><span class="s4">(</span><span class="s1">keyfile</span><span class="s4">)</span>
+
+        <span class="s0"># ASN.1 contents of DER encoded private key:</span>
+        <span class="s0">#</span>
+        <span class="s0"># RSAPrivateKey ::= SEQUENCE {</span>
+        <span class="s0">#     version           Version,</span>
+        <span class="s0">#     modulus           INTEGER,  -- n</span>
+        <span class="s0">#     publicExponent    INTEGER,  -- e</span>
+        <span class="s0">#     privateExponent   INTEGER,  -- d</span>
+        <span class="s0">#     prime1            INTEGER,  -- p</span>
+        <span class="s0">#     prime2            INTEGER,  -- q</span>
+        <span class="s0">#     exponent1         INTEGER,  -- d mod (p-1)</span>
+        <span class="s0">#     exponent2         INTEGER,  -- d mod (q-1)</span>
+        <span class="s0">#     coefficient       INTEGER,  -- (inverse of q) mod p</span>
+        <span class="s0">#     otherPrimeInfos   OtherPrimeInfos OPTIONAL</span>
+        <span class="s0"># }</span>
+
+        <span class="s3">if </span><span class="s1">priv</span><span class="s4">[</span><span class="s5">0</span><span class="s4">] != </span><span class="s5">0</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s6">&quot;Unable to read this file, version %s != 0&quot; </span><span class="s4">% </span><span class="s1">priv</span><span class="s4">[</span><span class="s5">0</span><span class="s4">])</span>
+
+        <span class="s1">as_ints </span><span class="s4">= </span><span class="s1">map</span><span class="s4">(</span><span class="s1">int</span><span class="s4">, </span><span class="s1">priv</span><span class="s4">[</span><span class="s5">1</span><span class="s4">:</span><span class="s5">6</span><span class="s4">])</span>
+        <span class="s1">key </span><span class="s4">= </span><span class="s1">cls</span><span class="s4">(*</span><span class="s1">as_ints</span><span class="s4">)</span>
+
+        <span class="s1">exp1</span><span class="s4">, </span><span class="s1">exp2</span><span class="s4">, </span><span class="s1">coef </span><span class="s4">= </span><span class="s1">map</span><span class="s4">(</span><span class="s1">int</span><span class="s4">, </span><span class="s1">priv</span><span class="s4">[</span><span class="s5">6</span><span class="s4">:</span><span class="s5">9</span><span class="s4">])</span>
+
+        <span class="s3">if </span><span class="s4">(</span><span class="s1">key</span><span class="s4">.</span><span class="s1">exp1</span><span class="s4">, </span><span class="s1">key</span><span class="s4">.</span><span class="s1">exp2</span><span class="s4">, </span><span class="s1">key</span><span class="s4">.</span><span class="s1">coef</span><span class="s4">) != (</span><span class="s1">exp1</span><span class="s4">, </span><span class="s1">exp2</span><span class="s4">, </span><span class="s1">coef</span><span class="s4">):</span>
+            <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span>
+                <span class="s6">&quot;You have provided a malformed keyfile. Either the exponents &quot;</span>
+                <span class="s6">&quot;or the coefficient are incorrect. Using the correct values &quot;</span>
+                <span class="s6">&quot;instead.&quot;</span><span class="s4">,</span>
+                <span class="s1">UserWarning</span><span class="s4">,</span>
+            <span class="s4">)</span>
+
+        <span class="s3">return </span><span class="s1">key</span>
+
+    <span class="s3">def </span><span class="s1">_save_pkcs1_der</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; bytes</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Saves the private key in PKCS#1 DER format. 
+ 
+        :returns: the DER-encoded private key. 
+        :rtype: bytes 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3">from </span><span class="s1">pyasn1</span><span class="s4">.</span><span class="s1">type </span><span class="s3">import </span><span class="s1">univ</span><span class="s4">, </span><span class="s1">namedtype</span>
+        <span class="s3">from </span><span class="s1">pyasn1</span><span class="s4">.</span><span class="s1">codec</span><span class="s4">.</span><span class="s1">der </span><span class="s3">import </span><span class="s1">encoder</span>
+
+        <span class="s3">class </span><span class="s1">AsnPrivKey</span><span class="s4">(</span><span class="s1">univ</span><span class="s4">.</span><span class="s1">Sequence</span><span class="s4">):</span>
+            <span class="s1">componentType </span><span class="s4">= </span><span class="s1">namedtype</span><span class="s4">.</span><span class="s1">NamedTypes</span><span class="s4">(</span>
+                <span class="s1">namedtype</span><span class="s4">.</span><span class="s1">NamedType</span><span class="s4">(</span><span class="s6">&quot;version&quot;</span><span class="s4">, </span><span class="s1">univ</span><span class="s4">.</span><span class="s1">Integer</span><span class="s4">()),</span>
+                <span class="s1">namedtype</span><span class="s4">.</span><span class="s1">NamedType</span><span class="s4">(</span><span class="s6">&quot;modulus&quot;</span><span class="s4">, </span><span class="s1">univ</span><span class="s4">.</span><span class="s1">Integer</span><span class="s4">()),</span>
+                <span class="s1">namedtype</span><span class="s4">.</span><span class="s1">NamedType</span><span class="s4">(</span><span class="s6">&quot;publicExponent&quot;</span><span class="s4">, </span><span class="s1">univ</span><span class="s4">.</span><span class="s1">Integer</span><span class="s4">()),</span>
+                <span class="s1">namedtype</span><span class="s4">.</span><span class="s1">NamedType</span><span class="s4">(</span><span class="s6">&quot;privateExponent&quot;</span><span class="s4">, </span><span class="s1">univ</span><span class="s4">.</span><span class="s1">Integer</span><span class="s4">()),</span>
+                <span class="s1">namedtype</span><span class="s4">.</span><span class="s1">NamedType</span><span class="s4">(</span><span class="s6">&quot;prime1&quot;</span><span class="s4">, </span><span class="s1">univ</span><span class="s4">.</span><span class="s1">Integer</span><span class="s4">()),</span>
+                <span class="s1">namedtype</span><span class="s4">.</span><span class="s1">NamedType</span><span class="s4">(</span><span class="s6">&quot;prime2&quot;</span><span class="s4">, </span><span class="s1">univ</span><span class="s4">.</span><span class="s1">Integer</span><span class="s4">()),</span>
+                <span class="s1">namedtype</span><span class="s4">.</span><span class="s1">NamedType</span><span class="s4">(</span><span class="s6">&quot;exponent1&quot;</span><span class="s4">, </span><span class="s1">univ</span><span class="s4">.</span><span class="s1">Integer</span><span class="s4">()),</span>
+                <span class="s1">namedtype</span><span class="s4">.</span><span class="s1">NamedType</span><span class="s4">(</span><span class="s6">&quot;exponent2&quot;</span><span class="s4">, </span><span class="s1">univ</span><span class="s4">.</span><span class="s1">Integer</span><span class="s4">()),</span>
+                <span class="s1">namedtype</span><span class="s4">.</span><span class="s1">NamedType</span><span class="s4">(</span><span class="s6">&quot;coefficient&quot;</span><span class="s4">, </span><span class="s1">univ</span><span class="s4">.</span><span class="s1">Integer</span><span class="s4">()),</span>
+            <span class="s4">)</span>
+
+        <span class="s0"># Create the ASN object</span>
+        <span class="s1">asn_key </span><span class="s4">= </span><span class="s1">AsnPrivKey</span><span class="s4">()</span>
+        <span class="s1">asn_key</span><span class="s4">.</span><span class="s1">setComponentByName</span><span class="s4">(</span><span class="s6">&quot;version&quot;</span><span class="s4">, </span><span class="s5">0</span><span class="s4">)</span>
+        <span class="s1">asn_key</span><span class="s4">.</span><span class="s1">setComponentByName</span><span class="s4">(</span><span class="s6">&quot;modulus&quot;</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n</span><span class="s4">)</span>
+        <span class="s1">asn_key</span><span class="s4">.</span><span class="s1">setComponentByName</span><span class="s4">(</span><span class="s6">&quot;publicExponent&quot;</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">e</span><span class="s4">)</span>
+        <span class="s1">asn_key</span><span class="s4">.</span><span class="s1">setComponentByName</span><span class="s4">(</span><span class="s6">&quot;privateExponent&quot;</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">d</span><span class="s4">)</span>
+        <span class="s1">asn_key</span><span class="s4">.</span><span class="s1">setComponentByName</span><span class="s4">(</span><span class="s6">&quot;prime1&quot;</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">p</span><span class="s4">)</span>
+        <span class="s1">asn_key</span><span class="s4">.</span><span class="s1">setComponentByName</span><span class="s4">(</span><span class="s6">&quot;prime2&quot;</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">q</span><span class="s4">)</span>
+        <span class="s1">asn_key</span><span class="s4">.</span><span class="s1">setComponentByName</span><span class="s4">(</span><span class="s6">&quot;exponent1&quot;</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">exp1</span><span class="s4">)</span>
+        <span class="s1">asn_key</span><span class="s4">.</span><span class="s1">setComponentByName</span><span class="s4">(</span><span class="s6">&quot;exponent2&quot;</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">exp2</span><span class="s4">)</span>
+        <span class="s1">asn_key</span><span class="s4">.</span><span class="s1">setComponentByName</span><span class="s4">(</span><span class="s6">&quot;coefficient&quot;</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">coef</span><span class="s4">)</span>
+
+        <span class="s3">return </span><span class="s1">encoder</span><span class="s4">.</span><span class="s1">encode</span><span class="s4">(</span><span class="s1">asn_key</span><span class="s4">)</span>
+
+    <span class="s4">@</span><span class="s1">classmethod</span>
+    <span class="s3">def </span><span class="s1">_load_pkcs1_pem</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, </span><span class="s1">keyfile</span><span class="s4">: </span><span class="s1">bytes</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s6">&quot;PrivateKey&quot;</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Loads a PKCS#1 PEM-encoded private key file. 
+ 
+        The contents of the file before the &quot;-----BEGIN RSA PRIVATE KEY-----&quot; and 
+        after the &quot;-----END RSA PRIVATE KEY-----&quot; lines is ignored. 
+ 
+        :param keyfile: contents of a PEM-encoded file that contains the private 
+            key. 
+        :type keyfile: bytes 
+        :return: a PrivateKey object 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">der </span><span class="s4">= </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">pem</span><span class="s4">.</span><span class="s1">load_pem</span><span class="s4">(</span><span class="s1">keyfile</span><span class="s4">, </span><span class="s7">b&quot;RSA PRIVATE KEY&quot;</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">cls</span><span class="s4">.</span><span class="s1">_load_pkcs1_der</span><span class="s4">(</span><span class="s1">der</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_save_pkcs1_pem</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; bytes</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Saves a PKCS#1 PEM-encoded private key file. 
+ 
+        :return: contents of a PEM-encoded file that contains the private key. 
+        :rtype: bytes 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">der </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_save_pkcs1_der</span><span class="s4">()</span>
+        <span class="s3">return </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">pem</span><span class="s4">.</span><span class="s1">save_pem</span><span class="s4">(</span><span class="s1">der</span><span class="s4">, </span><span class="s7">b&quot;RSA PRIVATE KEY&quot;</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">find_p_q</span><span class="s4">(</span>
+    <span class="s1">nbits</span><span class="s4">: </span><span class="s1">int</span><span class="s4">,</span>
+    <span class="s1">getprime_func</span><span class="s4">: </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">Callable</span><span class="s4">[[</span><span class="s1">int</span><span class="s4">], </span><span class="s1">int</span><span class="s4">] = </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">prime</span><span class="s4">.</span><span class="s1">getprime</span><span class="s4">,</span>
+    <span class="s1">accurate</span><span class="s4">: </span><span class="s1">bool </span><span class="s4">= </span><span class="s3">True</span><span class="s4">,</span>
+<span class="s4">) </span><span class="s1">-&gt; typing</span><span class="s4">.</span><span class="s1">Tuple</span><span class="s4">[</span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">]:</span>
+    <span class="s2">&quot;&quot;&quot;Returns a tuple of two different primes of nbits bits each. 
+ 
+    The resulting p * q has exactly 2 * nbits bits, and the returned p and q 
+    will not be equal. 
+ 
+    :param nbits: the number of bits in each of p and q. 
+    :param getprime_func: the getprime function, defaults to 
+        :py:func:`rsa.prime.getprime`. 
+ 
+        *Introduced in Python-RSA 3.1* 
+ 
+    :param accurate: whether to enable accurate mode or not. 
+    :returns: (p, q), where p &gt; q 
+ 
+    &gt;&gt;&gt; (p, q) = find_p_q(128) 
+    &gt;&gt;&gt; from rsa import common 
+    &gt;&gt;&gt; common.bit_size(p * q) 
+    256 
+ 
+    When not in accurate mode, the number of bits can be slightly less 
+ 
+    &gt;&gt;&gt; (p, q) = find_p_q(128, accurate=False) 
+    &gt;&gt;&gt; from rsa import common 
+    &gt;&gt;&gt; common.bit_size(p * q) &lt;= 256 
+    True 
+    &gt;&gt;&gt; common.bit_size(p * q) &gt; 240 
+    True 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">total_bits </span><span class="s4">= </span><span class="s1">nbits </span><span class="s4">* </span><span class="s5">2</span>
+
+    <span class="s0"># Make sure that p and q aren't too close or the factoring programs can</span>
+    <span class="s0"># factor n.</span>
+    <span class="s1">shift </span><span class="s4">= </span><span class="s1">nbits </span><span class="s4">// </span><span class="s5">16</span>
+    <span class="s1">pbits </span><span class="s4">= </span><span class="s1">nbits </span><span class="s4">+ </span><span class="s1">shift</span>
+    <span class="s1">qbits </span><span class="s4">= </span><span class="s1">nbits </span><span class="s4">- </span><span class="s1">shift</span>
+
+    <span class="s0"># Choose the two initial primes</span>
+    <span class="s1">p </span><span class="s4">= </span><span class="s1">getprime_func</span><span class="s4">(</span><span class="s1">pbits</span><span class="s4">)</span>
+    <span class="s1">q </span><span class="s4">= </span><span class="s1">getprime_func</span><span class="s4">(</span><span class="s1">qbits</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">is_acceptable</span><span class="s4">(</span><span class="s1">p</span><span class="s4">: </span><span class="s1">int</span><span class="s4">, </span><span class="s1">q</span><span class="s4">: </span><span class="s1">int</span><span class="s4">) </span><span class="s1">-&gt; bool</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Returns True iff p and q are acceptable: 
+ 
+        - p and q differ 
+        - (p * q) has the right nr of bits (when accurate=True) 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3">if </span><span class="s1">p </span><span class="s4">== </span><span class="s1">q</span><span class="s4">:</span>
+            <span class="s3">return False</span>
+
+        <span class="s3">if not </span><span class="s1">accurate</span><span class="s4">:</span>
+            <span class="s3">return True</span>
+
+        <span class="s0"># Make sure we have just the right amount of bits</span>
+        <span class="s1">found_size </span><span class="s4">= </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">common</span><span class="s4">.</span><span class="s1">bit_size</span><span class="s4">(</span><span class="s1">p </span><span class="s4">* </span><span class="s1">q</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">total_bits </span><span class="s4">== </span><span class="s1">found_size</span>
+
+    <span class="s0"># Keep choosing other primes until they match our requirements.</span>
+    <span class="s1">change_p </span><span class="s4">= </span><span class="s3">False</span>
+    <span class="s3">while not </span><span class="s1">is_acceptable</span><span class="s4">(</span><span class="s1">p</span><span class="s4">, </span><span class="s1">q</span><span class="s4">):</span>
+        <span class="s0"># Change p on one iteration and q on the other</span>
+        <span class="s3">if </span><span class="s1">change_p</span><span class="s4">:</span>
+            <span class="s1">p </span><span class="s4">= </span><span class="s1">getprime_func</span><span class="s4">(</span><span class="s1">pbits</span><span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">q </span><span class="s4">= </span><span class="s1">getprime_func</span><span class="s4">(</span><span class="s1">qbits</span><span class="s4">)</span>
+
+        <span class="s1">change_p </span><span class="s4">= </span><span class="s3">not </span><span class="s1">change_p</span>
+
+    <span class="s0"># We want p &gt; q as described on</span>
+    <span class="s0"># http://www.di-mgt.com.au/rsa_alg.html#crt</span>
+    <span class="s3">return </span><span class="s1">max</span><span class="s4">(</span><span class="s1">p</span><span class="s4">, </span><span class="s1">q</span><span class="s4">), </span><span class="s1">min</span><span class="s4">(</span><span class="s1">p</span><span class="s4">, </span><span class="s1">q</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">calculate_keys_custom_exponent</span><span class="s4">(</span><span class="s1">p</span><span class="s4">: </span><span class="s1">int</span><span class="s4">, </span><span class="s1">q</span><span class="s4">: </span><span class="s1">int</span><span class="s4">, </span><span class="s1">exponent</span><span class="s4">: </span><span class="s1">int</span><span class="s4">) </span><span class="s1">-&gt; typing</span><span class="s4">.</span><span class="s1">Tuple</span><span class="s4">[</span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">]:</span>
+    <span class="s2">&quot;&quot;&quot;Calculates an encryption and a decryption key given p, q and an exponent, 
+    and returns them as a tuple (e, d) 
+ 
+    :param p: the first large prime 
+    :param q: the second large prime 
+    :param exponent: the exponent for the key; only change this if you know 
+        what you're doing, as the exponent influences how difficult your 
+        private key can be cracked. A very common choice for e is 65537. 
+    :type exponent: int 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">phi_n </span><span class="s4">= (</span><span class="s1">p </span><span class="s4">- </span><span class="s5">1</span><span class="s4">) * (</span><span class="s1">q </span><span class="s4">- </span><span class="s5">1</span><span class="s4">)</span>
+
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s1">d </span><span class="s4">= </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">common</span><span class="s4">.</span><span class="s1">inverse</span><span class="s4">(</span><span class="s1">exponent</span><span class="s4">, </span><span class="s1">phi_n</span><span class="s4">)</span>
+    <span class="s3">except </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">common</span><span class="s4">.</span><span class="s1">NotRelativePrimeError </span><span class="s3">as </span><span class="s1">ex</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">common</span><span class="s4">.</span><span class="s1">NotRelativePrimeError</span><span class="s4">(</span>
+            <span class="s1">exponent</span><span class="s4">,</span>
+            <span class="s1">phi_n</span><span class="s4">,</span>
+            <span class="s1">ex</span><span class="s4">.</span><span class="s1">d</span><span class="s4">,</span>
+            <span class="s1">msg</span><span class="s4">=</span><span class="s6">&quot;e (%d) and phi_n (%d) are not relatively prime (divider=%i)&quot;</span>
+            <span class="s4">% (</span><span class="s1">exponent</span><span class="s4">, </span><span class="s1">phi_n</span><span class="s4">, </span><span class="s1">ex</span><span class="s4">.</span><span class="s1">d</span><span class="s4">),</span>
+        <span class="s4">) </span><span class="s3">from </span><span class="s1">ex</span>
+
+    <span class="s3">if </span><span class="s4">(</span><span class="s1">exponent </span><span class="s4">* </span><span class="s1">d</span><span class="s4">) % </span><span class="s1">phi_n </span><span class="s4">!= </span><span class="s5">1</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+            <span class="s6">&quot;e (%d) and d (%d) are not mult. inv. modulo &quot; &quot;phi_n (%d)&quot; </span><span class="s4">% (</span><span class="s1">exponent</span><span class="s4">, </span><span class="s1">d</span><span class="s4">, </span><span class="s1">phi_n</span><span class="s4">)</span>
+        <span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">exponent</span><span class="s4">, </span><span class="s1">d</span>
+
+
+<span class="s3">def </span><span class="s1">calculate_keys</span><span class="s4">(</span><span class="s1">p</span><span class="s4">: </span><span class="s1">int</span><span class="s4">, </span><span class="s1">q</span><span class="s4">: </span><span class="s1">int</span><span class="s4">) </span><span class="s1">-&gt; typing</span><span class="s4">.</span><span class="s1">Tuple</span><span class="s4">[</span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">]:</span>
+    <span class="s2">&quot;&quot;&quot;Calculates an encryption and a decryption key given p and q, and 
+    returns them as a tuple (e, d) 
+ 
+    :param p: the first large prime 
+    :param q: the second large prime 
+ 
+    :return: tuple (e, d) with the encryption and decryption exponents. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">return </span><span class="s1">calculate_keys_custom_exponent</span><span class="s4">(</span><span class="s1">p</span><span class="s4">, </span><span class="s1">q</span><span class="s4">, </span><span class="s1">DEFAULT_EXPONENT</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">gen_keys</span><span class="s4">(</span>
+    <span class="s1">nbits</span><span class="s4">: </span><span class="s1">int</span><span class="s4">,</span>
+    <span class="s1">getprime_func</span><span class="s4">: </span><span class="s1">typing</span><span class="s4">.</span><span class="s1">Callable</span><span class="s4">[[</span><span class="s1">int</span><span class="s4">], </span><span class="s1">int</span><span class="s4">],</span>
+    <span class="s1">accurate</span><span class="s4">: </span><span class="s1">bool </span><span class="s4">= </span><span class="s3">True</span><span class="s4">,</span>
+    <span class="s1">exponent</span><span class="s4">: </span><span class="s1">int </span><span class="s4">= </span><span class="s1">DEFAULT_EXPONENT</span><span class="s4">,</span>
+<span class="s4">) </span><span class="s1">-&gt; typing</span><span class="s4">.</span><span class="s1">Tuple</span><span class="s4">[</span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">, </span><span class="s1">int</span><span class="s4">]:</span>
+    <span class="s2">&quot;&quot;&quot;Generate RSA keys of nbits bits. Returns (p, q, e, d). 
+ 
+    Note: this can take a long time, depending on the key size. 
+ 
+    :param nbits: the total number of bits in ``p`` and ``q``. Both ``p`` and 
+        ``q`` will use ``nbits/2`` bits. 
+    :param getprime_func: either :py:func:`rsa.prime.getprime` or a function 
+        with similar signature. 
+    :param exponent: the exponent for the key; only change this if you know 
+        what you're doing, as the exponent influences how difficult your 
+        private key can be cracked. A very common choice for e is 65537. 
+    :type exponent: int 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0"># Regenerate p and q values, until calculate_keys doesn't raise a</span>
+    <span class="s0"># ValueError.</span>
+    <span class="s3">while True</span><span class="s4">:</span>
+        <span class="s4">(</span><span class="s1">p</span><span class="s4">, </span><span class="s1">q</span><span class="s4">) = </span><span class="s1">find_p_q</span><span class="s4">(</span><span class="s1">nbits </span><span class="s4">// </span><span class="s5">2</span><span class="s4">, </span><span class="s1">getprime_func</span><span class="s4">, </span><span class="s1">accurate</span><span class="s4">)</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s4">(</span><span class="s1">e</span><span class="s4">, </span><span class="s1">d</span><span class="s4">) = </span><span class="s1">calculate_keys_custom_exponent</span><span class="s4">(</span><span class="s1">p</span><span class="s4">, </span><span class="s1">q</span><span class="s4">, </span><span class="s1">exponent</span><span class="s4">=</span><span class="s1">exponent</span><span class="s4">)</span>
+            <span class="s3">break</span>
+        <span class="s3">except </span><span class="s1">ValueError</span><span class="s4">:</span>
+            <span class="s3">pass</span>
+
+    <span class="s3">return </span><span class="s1">p</span><span class="s4">, </span><span class="s1">q</span><span class="s4">, </span><span class="s1">e</span><span class="s4">, </span><span class="s1">d</span>
+
+
+<span class="s3">def </span><span class="s1">newkeys</span><span class="s4">(</span>
+    <span class="s1">nbits</span><span class="s4">: </span><span class="s1">int</span><span class="s4">,</span>
+    <span class="s1">accurate</span><span class="s4">: </span><span class="s1">bool </span><span class="s4">= </span><span class="s3">True</span><span class="s4">,</span>
+    <span class="s1">poolsize</span><span class="s4">: </span><span class="s1">int </span><span class="s4">= </span><span class="s5">1</span><span class="s4">,</span>
+    <span class="s1">exponent</span><span class="s4">: </span><span class="s1">int </span><span class="s4">= </span><span class="s1">DEFAULT_EXPONENT</span><span class="s4">,</span>
+<span class="s4">) </span><span class="s1">-&gt; typing</span><span class="s4">.</span><span class="s1">Tuple</span><span class="s4">[</span><span class="s1">PublicKey</span><span class="s4">, </span><span class="s1">PrivateKey</span><span class="s4">]:</span>
+    <span class="s2">&quot;&quot;&quot;Generates public and private keys, and returns them as (pub, priv). 
+ 
+    The public key is also known as the 'encryption key', and is a 
+    :py:class:`rsa.PublicKey` object. The private key is also known as the 
+    'decryption key' and is a :py:class:`rsa.PrivateKey` object. 
+ 
+    :param nbits: the number of bits required to store ``n = p*q``. 
+    :param accurate: when True, ``n`` will have exactly the number of bits you 
+        asked for. However, this makes key generation much slower. When False, 
+        `n`` may have slightly less bits. 
+    :param poolsize: the number of processes to use to generate the prime 
+        numbers. If set to a number &gt; 1, a parallel algorithm will be used. 
+        This requires Python 2.6 or newer. 
+    :param exponent: the exponent for the key; only change this if you know 
+        what you're doing, as the exponent influences how difficult your 
+        private key can be cracked. A very common choice for e is 65537. 
+    :type exponent: int 
+ 
+    :returns: a tuple (:py:class:`rsa.PublicKey`, :py:class:`rsa.PrivateKey`) 
+ 
+    The ``poolsize`` parameter was added in *Python-RSA 3.1* and requires 
+    Python 2.6 or newer. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">if </span><span class="s1">nbits </span><span class="s4">&lt; </span><span class="s5">16</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s6">&quot;Key too small&quot;</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">poolsize </span><span class="s4">&lt; </span><span class="s5">1</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s6">&quot;Pool size (%i) should be &gt;= 1&quot; </span><span class="s4">% </span><span class="s1">poolsize</span><span class="s4">)</span>
+
+    <span class="s0"># Determine which getprime function to use</span>
+    <span class="s3">if </span><span class="s1">poolsize </span><span class="s4">&gt; </span><span class="s5">1</span><span class="s4">:</span>
+        <span class="s3">from </span><span class="s1">rsa </span><span class="s3">import </span><span class="s1">parallel</span>
+
+        <span class="s3">def </span><span class="s1">getprime_func</span><span class="s4">(</span><span class="s1">nbits</span><span class="s4">: </span><span class="s1">int</span><span class="s4">) </span><span class="s1">-&gt; int</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">parallel</span><span class="s4">.</span><span class="s1">getprime</span><span class="s4">(</span><span class="s1">nbits</span><span class="s4">, </span><span class="s1">poolsize</span><span class="s4">=</span><span class="s1">poolsize</span><span class="s4">)</span>
+
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s1">getprime_func </span><span class="s4">= </span><span class="s1">rsa</span><span class="s4">.</span><span class="s1">prime</span><span class="s4">.</span><span class="s1">getprime</span>
+
+    <span class="s0"># Generate the key components</span>
+    <span class="s4">(</span><span class="s1">p</span><span class="s4">, </span><span class="s1">q</span><span class="s4">, </span><span class="s1">e</span><span class="s4">, </span><span class="s1">d</span><span class="s4">) = </span><span class="s1">gen_keys</span><span class="s4">(</span><span class="s1">nbits</span><span class="s4">, </span><span class="s1">getprime_func</span><span class="s4">, </span><span class="s1">accurate</span><span class="s4">=</span><span class="s1">accurate</span><span class="s4">, </span><span class="s1">exponent</span><span class="s4">=</span><span class="s1">exponent</span><span class="s4">)</span>
+
+    <span class="s0"># Create the key objects</span>
+    <span class="s1">n </span><span class="s4">= </span><span class="s1">p </span><span class="s4">* </span><span class="s1">q</span>
+
+    <span class="s3">return </span><span class="s4">(</span><span class="s1">PublicKey</span><span class="s4">(</span><span class="s1">n</span><span class="s4">, </span><span class="s1">e</span><span class="s4">), </span><span class="s1">PrivateKey</span><span class="s4">(</span><span class="s1">n</span><span class="s4">, </span><span class="s1">e</span><span class="s4">, </span><span class="s1">d</span><span class="s4">, </span><span class="s1">p</span><span class="s4">, </span><span class="s1">q</span><span class="s4">))</span>
+
+
+<span class="s1">__all__ </span><span class="s4">= [</span><span class="s6">&quot;PublicKey&quot;</span><span class="s4">, </span><span class="s6">&quot;PrivateKey&quot;</span><span class="s4">, </span><span class="s6">&quot;newkeys&quot;</span><span class="s4">]</span>
+
+<span class="s3">if </span><span class="s1">__name__ </span><span class="s4">== </span><span class="s6">&quot;__main__&quot;</span><span class="s4">:</span>
+    <span class="s3">import </span><span class="s1">doctest</span>
+
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s3">for </span><span class="s1">count </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s5">100</span><span class="s4">):</span>
+            <span class="s4">(</span><span class="s1">failures</span><span class="s4">, </span><span class="s1">tests</span><span class="s4">) = </span><span class="s1">doctest</span><span class="s4">.</span><span class="s1">testmod</span><span class="s4">()</span>
+            <span class="s3">if </span><span class="s1">failures</span><span class="s4">:</span>
+                <span class="s3">break</span>
+
+            <span class="s3">if </span><span class="s4">(</span><span class="s1">count </span><span class="s4">% </span><span class="s5">10 </span><span class="s4">== </span><span class="s5">0 </span><span class="s3">and </span><span class="s1">count</span><span class="s4">) </span><span class="s3">or </span><span class="s1">count </span><span class="s4">== </span><span class="s5">1</span><span class="s4">:</span>
+                <span class="s1">print</span><span class="s4">(</span><span class="s6">&quot;%i times&quot; </span><span class="s4">% </span><span class="s1">count</span><span class="s4">)</span>
+    <span class="s3">except </span><span class="s1">KeyboardInterrupt</span><span class="s4">:</span>
+        <span class="s1">print</span><span class="s4">(</span><span class="s6">&quot;Aborted&quot;</span><span class="s4">)</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s1">print</span><span class="s4">(</span><span class="s6">&quot;Doctests done&quot;</span><span class="s4">)</span>
+</pre>
+</body>
+</html>

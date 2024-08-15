@@ -1,0 +1,221 @@
+<html>
+<head>
+<title>test_lineinfo.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #7a7e85;}
+.s5 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_lineinfo.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">cuda</span><span class="s2">, </span><span class="s1">float32</span><span class="s2">, </span><span class="s1">int32</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">errors </span><span class="s0">import </span><span class="s1">NumbaInvalidConfigWarning</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">testing </span><span class="s0">import </span><span class="s1">CUDATestCase</span><span class="s2">, </span><span class="s1">skip_on_cudasim</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">tests</span><span class="s2">.</span><span class="s1">support </span><span class="s0">import </span><span class="s1">ignore_internal_warnings</span>
+<span class="s0">import </span><span class="s1">re</span>
+<span class="s0">import </span><span class="s1">unittest</span>
+<span class="s0">import </span><span class="s1">warnings</span>
+
+
+<span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s3">'Simulator does not produce lineinfo'</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">TestCudaLineInfo</span><span class="s2">(</span><span class="s1">CUDATestCase</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">_loc_directive_regex</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4"># This is used in several tests</span>
+
+        <span class="s1">pat </span><span class="s2">= (</span>
+            <span class="s3">r'\.loc'      </span><span class="s4"># .loc directive beginning</span>
+            <span class="s3">r'\s+[0-9]+'  </span><span class="s4"># whitespace then file index</span>
+            <span class="s3">r'\s+[0-9]+'  </span><span class="s4"># whitespace then line number</span>
+            <span class="s3">r'\s+[0-9]+'  </span><span class="s4"># whitespace then column position</span>
+        <span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">re</span><span class="s2">.</span><span class="s1">compile</span><span class="s2">(</span><span class="s1">pat</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">_check</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">fn</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">, </span><span class="s1">expect</span><span class="s2">):</span>
+        <span class="s1">fn</span><span class="s2">.</span><span class="s1">compile</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">)</span>
+        <span class="s1">llvm </span><span class="s2">= </span><span class="s1">fn</span><span class="s2">.</span><span class="s1">inspect_llvm</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">)</span>
+        <span class="s1">ptx </span><span class="s2">= </span><span class="s1">fn</span><span class="s2">.</span><span class="s1">inspect_asm</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">)</span>
+        <span class="s1">assertfn </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsNotNone </span><span class="s0">if </span><span class="s1">expect </span><span class="s0">else </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsNone</span>
+
+        <span class="s4"># DICompileUnit debug info metadata should all be of the</span>
+        <span class="s4"># DebugDirectivesOnly kind, and not the FullDebug kind</span>
+        <span class="s1">pat </span><span class="s2">= (</span>
+            <span class="s3">r'!DICompileUnit\(.*'    </span><span class="s4"># Opening of DICompileUnit metadata. Since</span>
+                                     <span class="s4"># the order of attributes is not</span>
+                                     <span class="s4"># guaranteed, we need to match arbitrarily</span>
+                                     <span class="s4"># afterwards.</span>
+            <span class="s3">r'emissionKind:\s+'      </span><span class="s4"># The emissionKind attribute followed by</span>
+                                     <span class="s4"># whitespace.</span>
+            <span class="s3">r'DebugDirectivesOnly'   </span><span class="s4"># The correct emissionKind.</span>
+        <span class="s2">)</span>
+        <span class="s1">match </span><span class="s2">= </span><span class="s1">re</span><span class="s2">.</span><span class="s1">compile</span><span class="s2">(</span><span class="s1">pat</span><span class="s2">).</span><span class="s1">search</span><span class="s2">(</span><span class="s1">llvm</span><span class="s2">)</span>
+        <span class="s1">assertfn</span><span class="s2">(</span><span class="s1">match</span><span class="s2">, </span><span class="s1">msg</span><span class="s2">=</span><span class="s1">ptx</span><span class="s2">)</span>
+
+        <span class="s1">pat </span><span class="s2">= (</span>
+            <span class="s3">r'!DICompileUnit\(.*'  </span><span class="s4"># Same as the pattern above, but for the</span>
+            <span class="s3">r'emissionKind:\s+'    </span><span class="s4"># incorrect FullDebug emissionKind.</span>
+            <span class="s3">r'FullDebug'           </span><span class="s4">#</span>
+        <span class="s2">)</span>
+        <span class="s1">match </span><span class="s2">= </span><span class="s1">re</span><span class="s2">.</span><span class="s1">compile</span><span class="s2">(</span><span class="s1">pat</span><span class="s2">).</span><span class="s1">search</span><span class="s2">(</span><span class="s1">llvm</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsNone</span><span class="s2">(</span><span class="s1">match</span><span class="s2">, </span><span class="s1">msg</span><span class="s2">=</span><span class="s1">ptx</span><span class="s2">)</span>
+
+        <span class="s4"># The name of this file should be present in the line mapping</span>
+        <span class="s4"># if lineinfo was propagated through correctly.</span>
+        <span class="s1">pat </span><span class="s2">= (</span>
+            <span class="s3">r'\.file'                </span><span class="s4"># .file directive beginning</span>
+            <span class="s3">r'\s+[0-9]+\s+'          </span><span class="s4"># file number surrounded by whitespace</span>
+            <span class="s3">r'&quot;.*test_lineinfo.py&quot;'  </span><span class="s4"># filename in quotes, ignoring full path</span>
+        <span class="s2">)</span>
+        <span class="s1">match </span><span class="s2">= </span><span class="s1">re</span><span class="s2">.</span><span class="s1">compile</span><span class="s2">(</span><span class="s1">pat</span><span class="s2">).</span><span class="s1">search</span><span class="s2">(</span><span class="s1">ptx</span><span class="s2">)</span>
+        <span class="s1">assertfn</span><span class="s2">(</span><span class="s1">match</span><span class="s2">, </span><span class="s1">msg</span><span class="s2">=</span><span class="s1">ptx</span><span class="s2">)</span>
+
+        <span class="s4"># .loc directives should be present in the ptx</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_loc_directive_regex</span><span class="s2">().</span><span class="s1">search</span><span class="s2">(</span><span class="s1">ptx</span><span class="s2">)</span>
+        <span class="s1">assertfn</span><span class="s2">(</span><span class="s1">match</span><span class="s2">, </span><span class="s1">msg</span><span class="s2">=</span><span class="s1">ptx</span><span class="s2">)</span>
+
+        <span class="s4"># Debug info sections should not be present when only lineinfo is</span>
+        <span class="s4"># generated</span>
+        <span class="s1">pat </span><span class="s2">= (</span>
+            <span class="s3">r'\.section\s+'  </span><span class="s4"># .section directive beginning</span>
+            <span class="s3">r'\.debug_info'  </span><span class="s4"># Section named &quot;.debug_info&quot;</span>
+        <span class="s2">)</span>
+        <span class="s1">match </span><span class="s2">= </span><span class="s1">re</span><span class="s2">.</span><span class="s1">compile</span><span class="s2">(</span><span class="s1">pat</span><span class="s2">).</span><span class="s1">search</span><span class="s2">(</span><span class="s1">ptx</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIsNone</span><span class="s2">(</span><span class="s1">match</span><span class="s2">, </span><span class="s1">msg</span><span class="s2">=</span><span class="s1">ptx</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_no_lineinfo_in_asm</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">lineinfo</span><span class="s2">=</span><span class="s0">False</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">foo</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+            <span class="s1">x</span><span class="s2">[</span><span class="s5">0</span><span class="s2">] = </span><span class="s5">1</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_check</span><span class="s2">(</span><span class="s1">foo</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">=(</span><span class="s1">int32</span><span class="s2">[:],), </span><span class="s1">expect</span><span class="s2">=</span><span class="s0">False</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_lineinfo_in_asm</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">lineinfo</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">foo</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+            <span class="s1">x</span><span class="s2">[</span><span class="s5">0</span><span class="s2">] = </span><span class="s5">1</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_check</span><span class="s2">(</span><span class="s1">foo</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">=(</span><span class="s1">int32</span><span class="s2">[:],), </span><span class="s1">expect</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_lineinfo_maintains_error_model</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">sig </span><span class="s2">= (</span><span class="s1">float32</span><span class="s2">[::</span><span class="s5">1</span><span class="s2">], </span><span class="s1">float32</span><span class="s2">[::</span><span class="s5">1</span><span class="s2">])</span>
+
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">, </span><span class="s1">lineinfo</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">divide_kernel</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">):</span>
+            <span class="s1">x</span><span class="s2">[</span><span class="s5">0</span><span class="s2">] /= </span><span class="s1">y</span><span class="s2">[</span><span class="s5">0</span><span class="s2">]</span>
+
+        <span class="s1">llvm </span><span class="s2">= </span><span class="s1">divide_kernel</span><span class="s2">.</span><span class="s1">inspect_llvm</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">)</span>
+
+        <span class="s4"># When the error model is Python, the device function returns 1 to</span>
+        <span class="s4"># signal an exception (e.g. divide by zero) has occurred. When the</span>
+        <span class="s4"># error model is the default NumPy one (as it should be when only</span>
+        <span class="s4"># lineinfo is enabled) the device function always returns 0.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertNotIn</span><span class="s2">(</span><span class="s3">'ret i32 1'</span><span class="s2">, </span><span class="s1">llvm</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_no_lineinfo_in_device_function</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4"># Ensure that no lineinfo is generated in device functions by default.</span>
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span>
+        <span class="s0">def </span><span class="s1">callee</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+            <span class="s1">x</span><span class="s2">[</span><span class="s5">0</span><span class="s2">] += </span><span class="s5">1</span>
+
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span>
+        <span class="s0">def </span><span class="s1">caller</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+            <span class="s1">x</span><span class="s2">[</span><span class="s5">0</span><span class="s2">] = </span><span class="s5">1</span>
+            <span class="s1">callee</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+
+        <span class="s1">sig </span><span class="s2">= (</span><span class="s1">int32</span><span class="s2">[:],)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_check</span><span class="s2">(</span><span class="s1">caller</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">=</span><span class="s1">sig</span><span class="s2">, </span><span class="s1">expect</span><span class="s2">=</span><span class="s0">False</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_lineinfo_in_device_function</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4"># First we define a device function / kernel pair and run the usual</span>
+        <span class="s4"># checks on the generated LLVM and PTX.</span>
+
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">lineinfo</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">callee</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+            <span class="s1">x</span><span class="s2">[</span><span class="s5">0</span><span class="s2">] += </span><span class="s5">1</span>
+
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">lineinfo</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">caller</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+            <span class="s1">x</span><span class="s2">[</span><span class="s5">0</span><span class="s2">] = </span><span class="s5">1</span>
+            <span class="s1">callee</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+
+        <span class="s1">sig </span><span class="s2">= (</span><span class="s1">int32</span><span class="s2">[:],)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_check</span><span class="s2">(</span><span class="s1">caller</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">=</span><span class="s1">sig</span><span class="s2">, </span><span class="s1">expect</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+
+        <span class="s4"># Now we can check the PTX of the device function specifically.</span>
+
+        <span class="s1">ptx </span><span class="s2">= </span><span class="s1">caller</span><span class="s2">.</span><span class="s1">inspect_asm</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">)</span>
+        <span class="s1">ptxlines </span><span class="s2">= </span><span class="s1">ptx</span><span class="s2">.</span><span class="s1">splitlines</span><span class="s2">()</span>
+
+        <span class="s4"># Check that there is no device function in the PTX</span>
+
+        <span class="s4"># A line beginning with &quot;.weak .func&quot; that identifies a device function</span>
+        <span class="s1">devfn_start </span><span class="s2">= </span><span class="s1">re</span><span class="s2">.</span><span class="s1">compile</span><span class="s2">(</span><span class="s3">r'^\.weak\s+\.func'</span><span class="s2">)</span>
+
+        <span class="s0">for </span><span class="s1">line </span><span class="s0">in </span><span class="s1">ptxlines</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">devfn_start</span><span class="s2">.</span><span class="s1">match</span><span class="s2">(</span><span class="s1">line</span><span class="s2">) </span><span class="s0">is not None</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">fail</span><span class="s2">(</span><span class="s3">f&quot;Found device function in PTX:</span><span class="s0">\n\n{</span><span class="s1">ptx</span><span class="s0">}</span><span class="s3">&quot;</span><span class="s2">)</span>
+
+        <span class="s4"># Scan for .loc directives that refer to an inlined device function</span>
+
+        <span class="s1">loc_directive </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_loc_directive_regex</span><span class="s2">()</span>
+        <span class="s1">found </span><span class="s2">= </span><span class="s0">False</span>
+
+        <span class="s0">for </span><span class="s1">line </span><span class="s0">in </span><span class="s1">ptxlines</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">loc_directive</span><span class="s2">.</span><span class="s1">search</span><span class="s2">(</span><span class="s1">line</span><span class="s2">) </span><span class="s0">is not None</span><span class="s2">:</span>
+                <span class="s0">if </span><span class="s3">'inlined_at' </span><span class="s0">in </span><span class="s1">line</span><span class="s2">:</span>
+                    <span class="s1">found </span><span class="s2">= </span><span class="s0">True</span>
+                    <span class="s0">break</span>
+
+        <span class="s0">if not </span><span class="s1">found</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">fail</span><span class="s2">(</span><span class="s3">f'No .loc directive with inlined_at info found'</span>
+                      <span class="s3">f'in:</span><span class="s0">\n\n{</span><span class="s1">ptx</span><span class="s0">}</span><span class="s3">'</span><span class="s2">)</span>
+
+        <span class="s4"># We also inspect the LLVM to ensure that there's debug info for each</span>
+        <span class="s4"># subprogram (function). A lightweight way to check this is to ensure</span>
+        <span class="s4"># that we have as many DISubprograms as we expect.</span>
+
+        <span class="s1">llvm </span><span class="s2">= </span><span class="s1">caller</span><span class="s2">.</span><span class="s1">inspect_llvm</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">)</span>
+        <span class="s1">subprograms </span><span class="s2">= </span><span class="s5">0</span>
+        <span class="s0">for </span><span class="s1">line </span><span class="s0">in </span><span class="s1">llvm</span><span class="s2">.</span><span class="s1">splitlines</span><span class="s2">():</span>
+            <span class="s0">if </span><span class="s3">'distinct !DISubprogram' </span><span class="s0">in </span><span class="s1">line</span><span class="s2">:</span>
+                <span class="s1">subprograms </span><span class="s2">+= </span><span class="s5">1</span>
+
+        <span class="s4"># One DISubprogram for each of:</span>
+        <span class="s4"># - The kernel wrapper</span>
+        <span class="s4"># - The caller</span>
+        <span class="s4"># - The callee</span>
+        <span class="s1">expected_subprograms </span><span class="s2">= </span><span class="s5">3</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">subprograms</span><span class="s2">, </span><span class="s1">expected_subprograms</span><span class="s2">,</span>
+                         <span class="s3">f'&quot;Expected </span><span class="s0">{</span><span class="s1">expected_subprograms</span><span class="s0">} </span><span class="s3">DISubprograms; '</span>
+                         <span class="s3">f'got </span><span class="s0">{</span><span class="s1">subprograms</span><span class="s0">}</span><span class="s3">'</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_debug_and_lineinfo_warning</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">with </span><span class="s1">warnings</span><span class="s2">.</span><span class="s1">catch_warnings</span><span class="s2">(</span><span class="s1">record</span><span class="s2">=</span><span class="s0">True</span><span class="s2">) </span><span class="s0">as </span><span class="s1">w</span><span class="s2">:</span>
+            <span class="s1">ignore_internal_warnings</span><span class="s2">()</span>
+
+            <span class="s4"># We pass opt=False to prevent the warning about opt and debug</span>
+            <span class="s4"># occurring as well</span>
+            <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">debug</span><span class="s2">=</span><span class="s0">True</span><span class="s2">, </span><span class="s1">lineinfo</span><span class="s2">=</span><span class="s0">True</span><span class="s2">, </span><span class="s1">opt</span><span class="s2">=</span><span class="s0">False</span><span class="s2">)</span>
+            <span class="s0">def </span><span class="s1">f</span><span class="s2">():</span>
+                <span class="s0">pass</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">w</span><span class="s2">), </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">w</span><span class="s2">[</span><span class="s5">0</span><span class="s2">].</span><span class="s1">category</span><span class="s2">, </span><span class="s1">NumbaInvalidConfigWarning</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s3">'debug and lineinfo are mutually exclusive'</span><span class="s2">,</span>
+                      <span class="s1">str</span><span class="s2">(</span><span class="s1">w</span><span class="s2">[</span><span class="s5">0</span><span class="s2">].</span><span class="s1">message</span><span class="s2">))</span>
+
+
+<span class="s0">if </span><span class="s1">__name__ </span><span class="s2">== </span><span class="s3">'__main__'</span><span class="s2">:</span>
+    <span class="s1">unittest</span><span class="s2">.</span><span class="s1">main</span><span class="s2">()</span>
+</pre>
+</body>
+</html>

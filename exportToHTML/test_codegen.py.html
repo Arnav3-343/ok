@@ -1,0 +1,284 @@
+<html>
+<head>
+<title>test_codegen.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_codegen.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Tests for numba.core.codegen. 
+&quot;&quot;&quot;</span>
+
+
+<span class="s2">import </span><span class="s1">warnings</span>
+<span class="s2">import </span><span class="s1">base64</span>
+<span class="s2">import </span><span class="s1">ctypes</span>
+<span class="s2">import </span><span class="s1">pickle</span>
+<span class="s2">import </span><span class="s1">re</span>
+<span class="s2">import </span><span class="s1">subprocess</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">import </span><span class="s1">weakref</span>
+
+<span class="s2">import </span><span class="s1">llvmlite</span><span class="s3">.</span><span class="s1">binding </span><span class="s2">as </span><span class="s1">ll</span>
+
+<span class="s2">import </span><span class="s1">unittest</span>
+<span class="s2">from </span><span class="s1">numba </span><span class="s2">import </span><span class="s1">njit</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">codegen </span><span class="s2">import </span><span class="s1">JITCPUCodegen</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">compiler_lock </span><span class="s2">import </span><span class="s1">global_compiler_lock</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">tests</span><span class="s3">.</span><span class="s1">support </span><span class="s2">import </span><span class="s1">TestCase</span>
+
+
+<span class="s1">asm_sum </span><span class="s3">= </span><span class="s4">r&quot;&quot;&quot; 
+    define i32 @sum(i32 %.1, i32 %.2) { 
+      %.3 = add i32 %.1, %.2 
+      ret i32 %.3 
+    } 
+    &quot;&quot;&quot;</span>
+
+<span class="s5"># Note we're using a rather mangled function name to check that it</span>
+<span class="s5"># is compatible with object serialization.</span>
+
+<span class="s1">asm_sum_inner </span><span class="s3">= </span><span class="s4">&quot;&quot;&quot; 
+    define i32 @&quot;__main__.ising_element_update$1.array(int8,_2d,_C).int64.int64&quot;(i32 %.1, i32 %.2) { 
+      %.3 = add i32 %.1, %.2 
+      ret i32 %.3 
+    } 
+&quot;&quot;&quot;    </span><span class="s5"># noqa: E501</span>
+
+<span class="s1">asm_sum_outer </span><span class="s3">= </span><span class="s4">&quot;&quot;&quot; 
+    declare i32 @&quot;__main__.ising_element_update$1.array(int8,_2d,_C).int64.int64&quot;(i32 %.1, i32 %.2) 
+ 
+    define i32 @sum(i32 %.1, i32 %.2) { 
+      %.3 = call i32 @&quot;__main__.ising_element_update$1.array(int8,_2d,_C).int64.int64&quot;(i32 %.1, i32 %.2) 
+      ret i32 %.3 
+    } 
+&quot;&quot;&quot;    </span><span class="s5"># noqa: E501</span>
+
+
+<span class="s1">ctypes_sum_ty </span><span class="s3">= </span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">CFUNCTYPE</span><span class="s3">(</span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">c_int</span><span class="s3">, </span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">c_int</span><span class="s3">, </span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">c_int</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">JITCPUCodegenTestCase</span><span class="s3">(</span><span class="s1">TestCase</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Test the JIT code generation. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">setUp</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">global_compiler_lock</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">codegen </span><span class="s3">= </span><span class="s1">JITCPUCodegen</span><span class="s3">(</span><span class="s4">'test_codegen'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">tearDown</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">del </span><span class="s1">self</span><span class="s3">.</span><span class="s1">codegen</span>
+        <span class="s1">global_compiler_lock</span><span class="s3">.</span><span class="s1">release</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">compile_module</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">asm</span><span class="s3">, </span><span class="s1">linking_asm</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s1">library </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">codegen</span><span class="s3">.</span><span class="s1">create_library</span><span class="s3">(</span><span class="s4">'compiled_module'</span><span class="s3">)</span>
+        <span class="s1">ll_module </span><span class="s3">= </span><span class="s1">ll</span><span class="s3">.</span><span class="s1">parse_assembly</span><span class="s3">(</span><span class="s1">asm</span><span class="s3">)</span>
+        <span class="s1">ll_module</span><span class="s3">.</span><span class="s1">verify</span><span class="s3">()</span>
+        <span class="s1">library</span><span class="s3">.</span><span class="s1">add_llvm_module</span><span class="s3">(</span><span class="s1">ll_module</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">linking_asm</span><span class="s3">:</span>
+            <span class="s1">linking_library </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">codegen</span><span class="s3">.</span><span class="s1">create_library</span><span class="s3">(</span><span class="s4">'linking_module'</span><span class="s3">)</span>
+            <span class="s1">ll_module </span><span class="s3">= </span><span class="s1">ll</span><span class="s3">.</span><span class="s1">parse_assembly</span><span class="s3">(</span><span class="s1">linking_asm</span><span class="s3">)</span>
+            <span class="s1">ll_module</span><span class="s3">.</span><span class="s1">verify</span><span class="s3">()</span>
+            <span class="s1">linking_library</span><span class="s3">.</span><span class="s1">add_llvm_module</span><span class="s3">(</span><span class="s1">ll_module</span><span class="s3">)</span>
+            <span class="s1">library</span><span class="s3">.</span><span class="s1">add_linking_library</span><span class="s3">(</span><span class="s1">linking_library</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">library</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">_check_unserialize_sum</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">state</span><span class="s3">):</span>
+        <span class="s1">codegen </span><span class="s3">= </span><span class="s1">JITCPUCodegen</span><span class="s3">(</span><span class="s4">'other_codegen'</span><span class="s3">)</span>
+        <span class="s1">library </span><span class="s3">= </span><span class="s1">codegen</span><span class="s3">.</span><span class="s1">unserialize_library</span><span class="s3">(</span><span class="s1">state</span><span class="s3">)</span>
+        <span class="s1">ptr </span><span class="s3">= </span><span class="s1">library</span><span class="s3">.</span><span class="s1">get_pointer_to_function</span><span class="s3">(</span><span class="s4">&quot;sum&quot;</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s1">ptr</span><span class="s3">, </span><span class="s1">ptr</span>
+        <span class="s1">cfunc </span><span class="s3">= </span><span class="s1">ctypes_sum_ty</span><span class="s3">(</span><span class="s1">ptr</span><span class="s3">)</span>
+        <span class="s1">res </span><span class="s3">= </span><span class="s1">cfunc</span><span class="s3">(</span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s1">res </span><span class="s3">== </span><span class="s6">5</span><span class="s3">, </span><span class="s1">res</span>
+
+    <span class="s2">def </span><span class="s1">test_get_pointer_to_function</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">library </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">compile_module</span><span class="s3">(</span><span class="s1">asm_sum</span><span class="s3">)</span>
+        <span class="s1">ptr </span><span class="s3">= </span><span class="s1">library</span><span class="s3">.</span><span class="s1">get_pointer_to_function</span><span class="s3">(</span><span class="s4">&quot;sum&quot;</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIsInstance</span><span class="s3">(</span><span class="s1">ptr</span><span class="s3">, </span><span class="s1">int</span><span class="s3">)</span>
+        <span class="s1">cfunc </span><span class="s3">= </span><span class="s1">ctypes_sum_ty</span><span class="s3">(</span><span class="s1">ptr</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">cfunc</span><span class="s3">(</span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">), </span><span class="s6">5</span><span class="s3">)</span>
+        <span class="s5"># Note: With llvm3.9.1, deleting `library` will cause memory error in</span>
+        <span class="s5">#       the following code during running of optimization passes in</span>
+        <span class="s5">#       LLVM. The reason of the error is unclear. The error is known to</span>
+        <span class="s5">#       replicate on osx64 and linux64.</span>
+
+        <span class="s5"># Same, but with dependency on another library</span>
+        <span class="s1">library2 </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">compile_module</span><span class="s3">(</span><span class="s1">asm_sum_outer</span><span class="s3">, </span><span class="s1">asm_sum_inner</span><span class="s3">)</span>
+        <span class="s1">ptr </span><span class="s3">= </span><span class="s1">library2</span><span class="s3">.</span><span class="s1">get_pointer_to_function</span><span class="s3">(</span><span class="s4">&quot;sum&quot;</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIsInstance</span><span class="s3">(</span><span class="s1">ptr</span><span class="s3">, </span><span class="s1">int</span><span class="s3">)</span>
+        <span class="s1">cfunc </span><span class="s3">= </span><span class="s1">ctypes_sum_ty</span><span class="s3">(</span><span class="s1">ptr</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">cfunc</span><span class="s3">(</span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">), </span><span class="s6">5</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_magic_tuple</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">tup </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">codegen</span><span class="s3">.</span><span class="s1">magic_tuple</span><span class="s3">()</span>
+        <span class="s1">pickle</span><span class="s3">.</span><span class="s1">dumps</span><span class="s3">(</span><span class="s1">tup</span><span class="s3">)</span>
+        <span class="s1">cg2 </span><span class="s3">= </span><span class="s1">JITCPUCodegen</span><span class="s3">(</span><span class="s4">'xxx'</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">cg2</span><span class="s3">.</span><span class="s1">magic_tuple</span><span class="s3">(), </span><span class="s1">tup</span><span class="s3">)</span>
+
+    <span class="s5"># Serialization tests.</span>
+
+    <span class="s2">def </span><span class="s1">_check_serialize_unserialize</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">state</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_unserialize_sum</span><span class="s3">(</span><span class="s1">state</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_check_unserialize_other_process</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">state</span><span class="s3">):</span>
+        <span class="s1">arg </span><span class="s3">= </span><span class="s1">base64</span><span class="s3">.</span><span class="s1">b64encode</span><span class="s3">(</span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">dumps</span><span class="s3">(</span><span class="s1">state</span><span class="s3">, -</span><span class="s6">1</span><span class="s3">))</span>
+        <span class="s1">code </span><span class="s3">= </span><span class="s4">&quot;&quot;&quot;if 1: 
+            import base64 
+            import pickle 
+            import sys 
+            from numba.tests.test_codegen import %(test_class)s 
+ 
+            state = pickle.loads(base64.b64decode(sys.argv[1])) 
+            %(test_class)s._check_unserialize_sum(state) 
+            &quot;&quot;&quot; </span><span class="s3">% </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">test_class</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">)</span>
+        <span class="s1">subprocess</span><span class="s3">.</span><span class="s1">check_call</span><span class="s3">([</span><span class="s1">sys</span><span class="s3">.</span><span class="s1">executable</span><span class="s3">, </span><span class="s4">'-c'</span><span class="s3">, </span><span class="s1">code</span><span class="s3">, </span><span class="s1">arg</span><span class="s3">.</span><span class="s1">decode</span><span class="s3">()])</span>
+
+    <span class="s2">def </span><span class="s1">test_serialize_unserialize_bitcode</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">library </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">compile_module</span><span class="s3">(</span><span class="s1">asm_sum_outer</span><span class="s3">, </span><span class="s1">asm_sum_inner</span><span class="s3">)</span>
+        <span class="s1">state </span><span class="s3">= </span><span class="s1">library</span><span class="s3">.</span><span class="s1">serialize_using_bitcode</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_serialize_unserialize</span><span class="s3">(</span><span class="s1">state</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_unserialize_other_process_bitcode</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">library </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">compile_module</span><span class="s3">(</span><span class="s1">asm_sum_outer</span><span class="s3">, </span><span class="s1">asm_sum_inner</span><span class="s3">)</span>
+        <span class="s1">state </span><span class="s3">= </span><span class="s1">library</span><span class="s3">.</span><span class="s1">serialize_using_bitcode</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_unserialize_other_process</span><span class="s3">(</span><span class="s1">state</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_serialize_unserialize_object_code</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">library </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">compile_module</span><span class="s3">(</span><span class="s1">asm_sum_outer</span><span class="s3">, </span><span class="s1">asm_sum_inner</span><span class="s3">)</span>
+        <span class="s1">library</span><span class="s3">.</span><span class="s1">enable_object_caching</span><span class="s3">()</span>
+        <span class="s1">state </span><span class="s3">= </span><span class="s1">library</span><span class="s3">.</span><span class="s1">serialize_using_object_code</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_serialize_unserialize</span><span class="s3">(</span><span class="s1">state</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_unserialize_other_process_object_code</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">library </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">compile_module</span><span class="s3">(</span><span class="s1">asm_sum_outer</span><span class="s3">, </span><span class="s1">asm_sum_inner</span><span class="s3">)</span>
+        <span class="s1">library</span><span class="s3">.</span><span class="s1">enable_object_caching</span><span class="s3">()</span>
+        <span class="s1">state </span><span class="s3">= </span><span class="s1">library</span><span class="s3">.</span><span class="s1">serialize_using_object_code</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_unserialize_other_process</span><span class="s3">(</span><span class="s1">state</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">test_cache_disabled_inspection</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        &quot;&quot;&quot;</span>
+        <span class="s1">library </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">compile_module</span><span class="s3">(</span><span class="s1">asm_sum_outer</span><span class="s3">, </span><span class="s1">asm_sum_inner</span><span class="s3">)</span>
+        <span class="s1">library</span><span class="s3">.</span><span class="s1">enable_object_caching</span><span class="s3">()</span>
+        <span class="s1">state </span><span class="s3">= </span><span class="s1">library</span><span class="s3">.</span><span class="s1">serialize_using_object_code</span><span class="s3">()</span>
+
+        <span class="s5"># exercise the valid behavior</span>
+        <span class="s2">with </span><span class="s1">warnings</span><span class="s3">.</span><span class="s1">catch_warnings</span><span class="s3">(</span><span class="s1">record</span><span class="s3">=</span><span class="s2">True</span><span class="s3">) </span><span class="s2">as </span><span class="s1">w</span><span class="s3">:</span>
+            <span class="s1">old_llvm </span><span class="s3">= </span><span class="s1">library</span><span class="s3">.</span><span class="s1">get_llvm_str</span><span class="s3">()</span>
+            <span class="s1">old_asm </span><span class="s3">= </span><span class="s1">library</span><span class="s3">.</span><span class="s1">get_asm_str</span><span class="s3">()</span>
+            <span class="s1">library</span><span class="s3">.</span><span class="s1">get_function_cfg</span><span class="s3">(</span><span class="s4">'sum'</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">w</span><span class="s3">), </span><span class="s6">0</span><span class="s3">)</span>
+
+        <span class="s5"># unserialize</span>
+        <span class="s1">codegen </span><span class="s3">= </span><span class="s1">JITCPUCodegen</span><span class="s3">(</span><span class="s4">'other_codegen'</span><span class="s3">)</span>
+        <span class="s1">library </span><span class="s3">= </span><span class="s1">codegen</span><span class="s3">.</span><span class="s1">unserialize_library</span><span class="s3">(</span><span class="s1">state</span><span class="s3">)</span>
+
+        <span class="s5"># the inspection methods would warn and give incorrect result</span>
+        <span class="s2">with </span><span class="s1">warnings</span><span class="s3">.</span><span class="s1">catch_warnings</span><span class="s3">(</span><span class="s1">record</span><span class="s3">=</span><span class="s2">True</span><span class="s3">) </span><span class="s2">as </span><span class="s1">w</span><span class="s3">:</span>
+            <span class="s1">warnings</span><span class="s3">.</span><span class="s1">simplefilter</span><span class="s3">(</span><span class="s4">&quot;always&quot;</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assertNotEqual</span><span class="s3">(</span><span class="s1">old_llvm</span><span class="s3">, </span><span class="s1">library</span><span class="s3">.</span><span class="s1">get_llvm_str</span><span class="s3">())</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">w</span><span class="s3">), </span><span class="s6">1</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIn</span><span class="s3">(</span><span class="s4">&quot;Inspection disabled&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">(</span><span class="s1">w</span><span class="s3">[</span><span class="s6">0</span><span class="s3">].</span><span class="s1">message</span><span class="s3">))</span>
+
+        <span class="s2">with </span><span class="s1">warnings</span><span class="s3">.</span><span class="s1">catch_warnings</span><span class="s3">(</span><span class="s1">record</span><span class="s3">=</span><span class="s2">True</span><span class="s3">) </span><span class="s2">as </span><span class="s1">w</span><span class="s3">:</span>
+            <span class="s1">warnings</span><span class="s3">.</span><span class="s1">simplefilter</span><span class="s3">(</span><span class="s4">&quot;always&quot;</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assertNotEqual</span><span class="s3">(</span><span class="s1">library</span><span class="s3">.</span><span class="s1">get_asm_str</span><span class="s3">(), </span><span class="s1">old_asm</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">w</span><span class="s3">), </span><span class="s6">1</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIn</span><span class="s3">(</span><span class="s4">&quot;Inspection disabled&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">(</span><span class="s1">w</span><span class="s3">[</span><span class="s6">0</span><span class="s3">].</span><span class="s1">message</span><span class="s3">))</span>
+
+        <span class="s2">with </span><span class="s1">warnings</span><span class="s3">.</span><span class="s1">catch_warnings</span><span class="s3">(</span><span class="s1">record</span><span class="s3">=</span><span class="s2">True</span><span class="s3">) </span><span class="s2">as </span><span class="s1">w</span><span class="s3">:</span>
+            <span class="s1">warnings</span><span class="s3">.</span><span class="s1">simplefilter</span><span class="s3">(</span><span class="s4">&quot;always&quot;</span><span class="s3">)</span>
+            <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">assertRaises</span><span class="s3">(</span><span class="s1">NameError</span><span class="s3">) </span><span class="s2">as </span><span class="s1">raises</span><span class="s3">:</span>
+                <span class="s1">library</span><span class="s3">.</span><span class="s1">get_function_cfg</span><span class="s3">(</span><span class="s4">'sum'</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">w</span><span class="s3">), </span><span class="s6">1</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIn</span><span class="s3">(</span><span class="s4">&quot;Inspection disabled&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">(</span><span class="s1">w</span><span class="s3">[</span><span class="s6">0</span><span class="s3">].</span><span class="s1">message</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIn</span><span class="s3">(</span><span class="s4">&quot;sum&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">(</span><span class="s1">raises</span><span class="s3">.</span><span class="s1">exception</span><span class="s3">))</span>
+
+    <span class="s5"># Lifetime tests</span>
+
+    <span class="s3">@</span><span class="s1">unittest</span><span class="s3">.</span><span class="s1">expectedFailure  </span><span class="s5"># MCJIT removeModule leaks and it is disabled</span>
+    <span class="s2">def </span><span class="s1">test_library_lifetime</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">library </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">compile_module</span><span class="s3">(</span><span class="s1">asm_sum_outer</span><span class="s3">, </span><span class="s1">asm_sum_inner</span><span class="s3">)</span>
+        <span class="s5"># Exercise code generation</span>
+        <span class="s1">library</span><span class="s3">.</span><span class="s1">enable_object_caching</span><span class="s3">()</span>
+        <span class="s1">library</span><span class="s3">.</span><span class="s1">serialize_using_bitcode</span><span class="s3">()</span>
+        <span class="s1">library</span><span class="s3">.</span><span class="s1">serialize_using_object_code</span><span class="s3">()</span>
+        <span class="s1">u </span><span class="s3">= </span><span class="s1">weakref</span><span class="s3">.</span><span class="s1">ref</span><span class="s3">(</span><span class="s1">library</span><span class="s3">)</span>
+        <span class="s1">v </span><span class="s3">= </span><span class="s1">weakref</span><span class="s3">.</span><span class="s1">ref</span><span class="s3">(</span><span class="s1">library</span><span class="s3">.</span><span class="s1">_final_module</span><span class="s3">)</span>
+        <span class="s2">del </span><span class="s1">library</span>
+        <span class="s5"># Both the library and its backing LLVM module are collected</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIs</span><span class="s3">(</span><span class="s1">u</span><span class="s3">(), </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertIs</span><span class="s3">(</span><span class="s1">v</span><span class="s3">(), </span><span class="s2">None</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestWrappers</span><span class="s3">(</span><span class="s1">TestCase</span><span class="s3">):</span>
+
+    <span class="s2">def </span><span class="s1">test_noinline_on_main_call</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5"># Checks that the cpython and cfunc wrapper produces a call with the</span>
+        <span class="s5"># &quot;noinline&quot; attr present for the decorated function.</span>
+
+        <span class="s3">@</span><span class="s1">njit</span>
+        <span class="s2">def </span><span class="s1">foo</span><span class="s3">():</span>
+            <span class="s2">pass</span>
+
+        <span class="s1">foo</span><span class="s3">()</span>
+        <span class="s1">sig </span><span class="s3">= </span><span class="s1">foo</span><span class="s3">.</span><span class="s1">signatures</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+
+        <span class="s1">ol </span><span class="s3">= </span><span class="s1">foo</span><span class="s3">.</span><span class="s1">overloads</span><span class="s3">[</span><span class="s1">sig</span><span class="s3">]</span>
+        <span class="s1">name </span><span class="s3">= </span><span class="s1">ol</span><span class="s3">.</span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">mangled_name</span><span class="s3">.</span><span class="s1">replace</span><span class="s3">(</span><span class="s4">&quot;$&quot;</span><span class="s3">, </span><span class="s4">r&quot;\$&quot;</span><span class="s3">)</span>
+        <span class="s1">p1 </span><span class="s3">= </span><span class="s4">r&quot;.*call.*{}&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s1">p2 </span><span class="s3">= </span><span class="s4">r&quot;.*(#[0-9]+).*&quot;</span>
+        <span class="s1">call_site </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">compile</span><span class="s3">(</span><span class="s1">p1 </span><span class="s3">+ </span><span class="s1">p2</span><span class="s3">)</span>
+
+        <span class="s1">lines </span><span class="s3">= </span><span class="s1">foo</span><span class="s3">.</span><span class="s1">inspect_llvm</span><span class="s3">(</span><span class="s1">sig</span><span class="s3">).</span><span class="s1">splitlines</span><span class="s3">()</span>
+        <span class="s1">meta_data_idx </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">lines</span><span class="s3">:</span>
+            <span class="s1">matched </span><span class="s3">= </span><span class="s1">call_site</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">l</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">matched</span><span class="s3">:</span>
+                <span class="s1">meta_data_idx</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">matched</span><span class="s3">.</span><span class="s1">groups</span><span class="s3">()[</span><span class="s6">0</span><span class="s3">])</span>
+
+        <span class="s5"># should be 2 calls, one from cpython wrapper one from cfunc wrapper</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">meta_data_idx</span><span class="s3">), </span><span class="s6">2</span><span class="s3">)</span>
+        <span class="s5"># both calls should refer to the same metadata item</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assertEqual</span><span class="s3">(</span><span class="s1">meta_data_idx</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">meta_data_idx</span><span class="s3">[</span><span class="s6">1</span><span class="s3">])</span>
+
+        <span class="s1">p1 </span><span class="s3">= </span><span class="s4">r&quot;^attributes\s+{}&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">meta_data_idx</span><span class="s3">[</span><span class="s6">0</span><span class="s3">])</span>
+        <span class="s1">p2 </span><span class="s3">= </span><span class="s4">r&quot;\s+=\s+{(.*)}.*$&quot;</span>
+        <span class="s1">attr_site </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">compile</span><span class="s3">(</span><span class="s1">p1 </span><span class="s3">+ </span><span class="s1">p2</span><span class="s3">)</span>
+
+        <span class="s2">for </span><span class="s1">l </span><span class="s2">in </span><span class="s1">reversed</span><span class="s3">(</span><span class="s1">lines</span><span class="s3">):</span>
+            <span class="s1">matched </span><span class="s3">= </span><span class="s1">attr_site</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">l</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">matched</span><span class="s3">:</span>
+                <span class="s1">meta_data </span><span class="s3">= </span><span class="s1">matched</span><span class="s3">.</span><span class="s1">groups</span><span class="s3">()[</span><span class="s6">0</span><span class="s3">]</span>
+                <span class="s1">lmeta </span><span class="s3">= </span><span class="s1">meta_data</span><span class="s3">.</span><span class="s1">strip</span><span class="s3">().</span><span class="s1">split</span><span class="s3">(</span><span class="s4">' '</span><span class="s3">)</span>
+                <span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">lmeta</span><span class="s3">:</span>
+                    <span class="s2">if </span><span class="s4">'noinline' </span><span class="s2">in </span><span class="s1">x</span><span class="s3">:</span>
+                        <span class="s2">break</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s2">continue</span>
+                <span class="s2">break</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fail</span><span class="s3">(</span><span class="s4">&quot;Metadata did not match 'noinline'&quot;</span><span class="s3">)</span>
+
+
+<span class="s2">if </span><span class="s1">__name__ </span><span class="s3">== </span><span class="s4">'__main__'</span><span class="s3">:</span>
+    <span class="s1">unittest</span><span class="s3">.</span><span class="s1">main</span><span class="s3">()</span>
+</pre>
+</body>
+</html>

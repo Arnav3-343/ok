@@ -1,0 +1,631 @@
+<html>
+<head>
+<title>config.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+.s6 { color: #5f826b; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+config.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">platform</span>
+<span class="s0">import </span><span class="s1">sys</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">re</span>
+<span class="s0">import </span><span class="s1">shutil</span>
+<span class="s0">import </span><span class="s1">warnings</span>
+<span class="s0">import </span><span class="s1">traceback</span>
+
+<span class="s2"># YAML needed to use file based Numba config</span>
+<span class="s0">try</span><span class="s3">:</span>
+    <span class="s0">import </span><span class="s1">yaml</span>
+    <span class="s1">_HAVE_YAML </span><span class="s3">= </span><span class="s0">True</span>
+<span class="s0">except </span><span class="s1">ImportError</span><span class="s3">:</span>
+    <span class="s1">_HAVE_YAML </span><span class="s3">= </span><span class="s0">False</span>
+
+
+<span class="s0">import </span><span class="s1">llvmlite</span><span class="s3">.</span><span class="s1">binding </span><span class="s0">as </span><span class="s1">ll</span>
+
+
+<span class="s1">IS_WIN32 </span><span class="s3">= </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">platform</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s4">'win32'</span><span class="s3">)</span>
+<span class="s1">IS_OSX </span><span class="s3">= </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">platform</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s4">'darwin'</span><span class="s3">)</span>
+<span class="s1">MACHINE_BITS </span><span class="s3">= </span><span class="s1">tuple</span><span class="s3">.</span><span class="s1">__itemsize__ </span><span class="s3">* </span><span class="s5">8</span>
+<span class="s1">IS_32BITS </span><span class="s3">= </span><span class="s1">MACHINE_BITS </span><span class="s3">== </span><span class="s5">32</span>
+<span class="s2"># Python version in (major, minor) tuple</span>
+<span class="s1">PYVERSION </span><span class="s3">= </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">version_info</span><span class="s3">[:</span><span class="s5">2</span><span class="s3">]</span>
+
+<span class="s2"># this is the name of the user supplied configuration file</span>
+<span class="s1">_config_fname </span><span class="s3">= </span><span class="s4">'.numba_config.yaml'</span>
+
+
+<span class="s0">def </span><span class="s1">_parse_cc</span><span class="s3">(</span><span class="s1">text</span><span class="s3">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    Parse CUDA compute capability version string. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if not </span><span class="s1">text</span><span class="s3">:</span>
+        <span class="s0">return None</span>
+    <span class="s0">else</span><span class="s3">:</span>
+        <span class="s1">m </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s4">r'(\d+)\.(\d+)'</span><span class="s3">, </span><span class="s1">text</span><span class="s3">)</span>
+        <span class="s0">if not </span><span class="s1">m</span><span class="s3">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Compute capability must be specified as a &quot;</span>
+                             <span class="s4">&quot;string of </span><span class="s0">\&quot;</span><span class="s4">major.minor</span><span class="s0">\&quot; </span><span class="s4">where major &quot;</span>
+                             <span class="s4">&quot;and minor are decimals&quot;</span><span class="s3">)</span>
+        <span class="s1">grp </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">groups</span><span class="s3">()</span>
+        <span class="s0">return </span><span class="s1">int</span><span class="s3">(</span><span class="s1">grp</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]), </span><span class="s1">int</span><span class="s3">(</span><span class="s1">grp</span><span class="s3">[</span><span class="s5">1</span><span class="s3">])</span>
+
+
+<span class="s0">def </span><span class="s1">_os_supports_avx</span><span class="s3">():</span>
+    <span class="s6">&quot;&quot;&quot; 
+    Whether the current OS supports AVX, regardless of the CPU. 
+ 
+    This is necessary because the user may be running a very old Linux 
+    kernel (e.g. CentOS 5) on a recent CPU. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s3">(</span><span class="s0">not </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">platform</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s4">'linux'</span><span class="s3">)</span>
+            <span class="s0">or </span><span class="s1">platform</span><span class="s3">.</span><span class="s1">machine</span><span class="s3">() </span><span class="s0">not in </span><span class="s3">(</span><span class="s4">'i386'</span><span class="s3">, </span><span class="s4">'i586'</span><span class="s3">, </span><span class="s4">'i686'</span><span class="s3">, </span><span class="s4">'x86_64'</span><span class="s3">)):</span>
+        <span class="s0">return True</span>
+    <span class="s2"># Executing the CPUID instruction may report AVX available even though</span>
+    <span class="s2"># the kernel doesn't support it, so parse /proc/cpuinfo instead.</span>
+    <span class="s0">try</span><span class="s3">:</span>
+        <span class="s1">f </span><span class="s3">= </span><span class="s1">open</span><span class="s3">(</span><span class="s4">'/proc/cpuinfo'</span><span class="s3">, </span><span class="s4">'r'</span><span class="s3">)</span>
+    <span class="s0">except </span><span class="s1">OSError</span><span class="s3">:</span>
+        <span class="s2"># If /proc isn't available, assume yes</span>
+        <span class="s0">return True</span>
+    <span class="s0">with </span><span class="s1">f</span><span class="s3">:</span>
+        <span class="s0">for </span><span class="s1">line </span><span class="s0">in </span><span class="s1">f</span><span class="s3">:</span>
+            <span class="s1">head</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">body </span><span class="s3">= </span><span class="s1">line</span><span class="s3">.</span><span class="s1">partition</span><span class="s3">(</span><span class="s4">':'</span><span class="s3">)</span>
+            <span class="s0">if </span><span class="s1">head</span><span class="s3">.</span><span class="s1">strip</span><span class="s3">() == </span><span class="s4">'flags' </span><span class="s0">and </span><span class="s4">'avx' </span><span class="s0">in </span><span class="s1">body</span><span class="s3">.</span><span class="s1">split</span><span class="s3">():</span>
+                <span class="s0">return True</span>
+        <span class="s0">else</span><span class="s3">:</span>
+            <span class="s0">return False</span>
+
+
+<span class="s1">_old_style_deprecation_msg </span><span class="s3">= (</span>
+    <span class="s4">&quot;NUMBA_CAPTURED_ERRORS=old_style is deprecated. &quot;</span>
+    <span class="s4">&quot;It will be removed in the next release. See details at &quot;</span>
+    <span class="s4">&quot;https://numba.readthedocs.io/en/latest/reference/deprecation.html#deprecation-of-old-style-numba-captured-errors&quot; </span><span class="s2"># noqa: E501</span>
+<span class="s3">)</span>
+
+
+<span class="s2"># Choose how to handle captured errors</span>
+<span class="s0">def </span><span class="s1">_validate_captured_errors_style</span><span class="s3">(</span><span class="s1">style_str</span><span class="s3">):</span>
+    <span class="s2"># to prevent circular import</span>
+    <span class="s0">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">errors </span><span class="s0">import </span><span class="s1">NumbaDeprecationWarning</span>
+
+    <span class="s1">rendered_style </span><span class="s3">= </span><span class="s1">str</span><span class="s3">(</span><span class="s1">style_str</span><span class="s3">)</span>
+    <span class="s0">if </span><span class="s1">rendered_style </span><span class="s0">not in </span><span class="s3">(</span><span class="s4">'new_style'</span><span class="s3">, </span><span class="s4">'old_style'</span><span class="s3">, </span><span class="s4">'default'</span><span class="s3">):</span>
+        <span class="s1">msg </span><span class="s3">= (</span><span class="s4">&quot;Invalid style in NUMBA_CAPTURED_ERRORS: &quot;</span>
+               <span class="s4">f&quot;</span><span class="s0">{</span><span class="s1">rendered_style</span><span class="s0">}</span><span class="s4">&quot;</span><span class="s3">)</span>
+        <span class="s0">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+    <span class="s0">else</span><span class="s3">:</span>
+        <span class="s0">if </span><span class="s1">rendered_style </span><span class="s3">== </span><span class="s4">'default'</span><span class="s3">:</span>
+            <span class="s1">rendered_style </span><span class="s3">= </span><span class="s4">'new_style'</span>
+        <span class="s0">elif </span><span class="s1">rendered_style </span><span class="s3">== </span><span class="s4">'old_style'</span><span class="s3">:</span>
+            <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span><span class="s1">_old_style_deprecation_msg</span><span class="s3">,</span>
+                          <span class="s1">NumbaDeprecationWarning</span><span class="s3">)</span>
+        <span class="s0">return </span><span class="s1">rendered_style</span>
+
+
+<span class="s0">class </span><span class="s1">_OptLevel</span><span class="s3">(</span><span class="s1">int</span><span class="s3">):</span>
+    <span class="s6">&quot;&quot;&quot;This class holds the &quot;optimisation level&quot; set in `NUMBA_OPT`. As this env 
+    var can be an int or a string, but is almost always interpreted as an int, 
+    this class subclasses int so as to get the common behaviour but stores the 
+    actual value as a `_raw_value` member. The value &quot;max&quot; is a special case 
+    and the property `is_opt_max` can be queried to find if the optimisation 
+    level (supplied value at construction time) is &quot;max&quot;.&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__new__</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, *</span><span class="s1">args</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">):</span>
+        <span class="s0">assert </span><span class="s1">len</span><span class="s3">(</span><span class="s1">args</span><span class="s3">) == </span><span class="s5">1</span>
+        <span class="s3">(</span><span class="s1">value</span><span class="s3">,) = </span><span class="s1">args</span>
+        <span class="s1">_int_value </span><span class="s3">= </span><span class="s5">3 </span><span class="s0">if </span><span class="s1">value </span><span class="s3">== </span><span class="s4">'max' </span><span class="s0">else </span><span class="s1">int</span><span class="s3">(</span><span class="s1">value</span><span class="s3">)</span>
+        <span class="s2"># the int ctor is always called with an appropriate integer value</span>
+        <span class="s1">new </span><span class="s3">= </span><span class="s1">super</span><span class="s3">().</span><span class="s1">__new__</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">_int_value</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">)</span>
+        <span class="s2"># raw value is max or int</span>
+        <span class="s1">new</span><span class="s3">.</span><span class="s1">_raw_value </span><span class="s3">= </span><span class="s1">value </span><span class="s0">if </span><span class="s1">value </span><span class="s3">== </span><span class="s4">'max' </span><span class="s0">else </span><span class="s1">_int_value</span>
+        <span class="s0">return </span><span class="s1">new</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">is_opt_max</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s6">&quot;&quot;&quot;Returns True if the the optimisation level is &quot;max&quot; False 
+        otherwise.&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_raw_value </span><span class="s3">== </span><span class="s4">&quot;max&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_raw_value</span><span class="s3">, </span><span class="s1">str</span><span class="s3">):</span>
+            <span class="s1">arg </span><span class="s3">= </span><span class="s4">f&quot;'</span><span class="s0">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_raw_value</span><span class="s0">}</span><span class="s4">'&quot;</span>
+        <span class="s0">else</span><span class="s3">:</span>
+            <span class="s1">arg </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_raw_value</span>
+        <span class="s0">return </span><span class="s4">f&quot;_OptLevel(</span><span class="s0">{</span><span class="s1">arg</span><span class="s0">}</span><span class="s4">)&quot;</span>
+
+
+<span class="s0">def </span><span class="s1">_process_opt_level</span><span class="s3">(</span><span class="s1">opt_level</span><span class="s3">):</span>
+
+    <span class="s0">if </span><span class="s1">opt_level </span><span class="s0">not in </span><span class="s3">(</span><span class="s4">'0'</span><span class="s3">, </span><span class="s4">'1'</span><span class="s3">, </span><span class="s4">'2'</span><span class="s3">, </span><span class="s4">'3'</span><span class="s3">, </span><span class="s4">'max'</span><span class="s3">):</span>
+        <span class="s1">msg </span><span class="s3">= (</span><span class="s4">&quot;Environment variable `NUMBA_OPT` is set to an unsupported &quot;</span>
+               <span class="s4">f&quot;value '</span><span class="s0">{</span><span class="s1">opt_level</span><span class="s0">}</span><span class="s4">', supported values are 0, 1, 2, 3, and &quot;</span>
+               <span class="s4">&quot;'max'&quot;</span><span class="s3">)</span>
+        <span class="s0">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+    <span class="s0">else</span><span class="s3">:</span>
+        <span class="s0">return </span><span class="s1">_OptLevel</span><span class="s3">(</span><span class="s1">opt_level</span><span class="s3">)</span>
+
+
+<span class="s0">class </span><span class="s1">_EnvReloader</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">reset</span><span class="s3">()</span>
+
+    <span class="s0">def </span><span class="s1">reset</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">old_environ </span><span class="s3">= {}</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">force</span><span class="s3">=</span><span class="s0">True</span><span class="s3">)</span>
+
+    <span class="s0">def </span><span class="s1">update</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">force</span><span class="s3">=</span><span class="s0">False</span><span class="s3">):</span>
+        <span class="s1">new_environ </span><span class="s3">= {}</span>
+
+        <span class="s2"># first check if there's a .numba_config.yaml and use values from that</span>
+        <span class="s0">if </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">exists</span><span class="s3">(</span><span class="s1">_config_fname</span><span class="s3">) </span><span class="s0">and </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">isfile</span><span class="s3">(</span><span class="s1">_config_fname</span><span class="s3">):</span>
+            <span class="s0">if not </span><span class="s1">_HAVE_YAML</span><span class="s3">:</span>
+                <span class="s1">msg </span><span class="s3">= (</span><span class="s4">&quot;A Numba config file is found but YAML parsing &quot;</span>
+                       <span class="s4">&quot;capabilities appear to be missing. &quot;</span>
+                       <span class="s4">&quot;To use this feature please install `pyyaml`. e.g. &quot;</span>
+                       <span class="s4">&quot;`conda install pyyaml`.&quot;</span><span class="s3">)</span>
+                <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+            <span class="s0">else</span><span class="s3">:</span>
+                <span class="s0">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">_config_fname</span><span class="s3">, </span><span class="s4">'rt'</span><span class="s3">) </span><span class="s0">as </span><span class="s1">f</span><span class="s3">:</span>
+                    <span class="s1">y_conf </span><span class="s3">= </span><span class="s1">yaml</span><span class="s3">.</span><span class="s1">safe_load</span><span class="s3">(</span><span class="s1">f</span><span class="s3">)</span>
+                <span class="s0">if </span><span class="s1">y_conf </span><span class="s0">is not None</span><span class="s3">:</span>
+                    <span class="s0">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">y_conf</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+                        <span class="s1">new_environ</span><span class="s3">[</span><span class="s4">'NUMBA_' </span><span class="s3">+ </span><span class="s1">k</span><span class="s3">.</span><span class="s1">upper</span><span class="s3">()] = </span><span class="s1">v</span>
+
+        <span class="s2"># clobber file based config with any locally defined env vars</span>
+        <span class="s0">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">value </span><span class="s0">in </span><span class="s1">os</span><span class="s3">.</span><span class="s1">environ</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+            <span class="s0">if </span><span class="s1">name</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s4">'NUMBA_'</span><span class="s3">):</span>
+                <span class="s1">new_environ</span><span class="s3">[</span><span class="s1">name</span><span class="s3">] = </span><span class="s1">value</span>
+        <span class="s2"># We update the config variables if at least one NUMBA environment</span>
+        <span class="s2"># variable was modified.  This lets the user modify values</span>
+        <span class="s2"># directly in the config module without having them when</span>
+        <span class="s2"># reload_config() is called by the compiler.</span>
+        <span class="s0">if </span><span class="s1">force </span><span class="s0">or </span><span class="s1">self</span><span class="s3">.</span><span class="s1">old_environ </span><span class="s3">!= </span><span class="s1">new_environ</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">process_environ</span><span class="s3">(</span><span class="s1">new_environ</span><span class="s3">)</span>
+            <span class="s2"># Store a copy</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">old_environ </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">new_environ</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">validate</span><span class="s3">()</span>
+
+    <span class="s0">def </span><span class="s1">validate</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">global </span><span class="s1">CUDA_USE_NVIDIA_BINDING</span>
+
+        <span class="s0">if </span><span class="s1">CUDA_USE_NVIDIA_BINDING</span><span class="s3">:  </span><span class="s2"># noqa: F821</span>
+            <span class="s0">try</span><span class="s3">:</span>
+                <span class="s0">import </span><span class="s1">cuda  </span><span class="s2"># noqa: F401</span>
+            <span class="s0">except </span><span class="s1">ImportError </span><span class="s0">as </span><span class="s1">ie</span><span class="s3">:</span>
+                <span class="s1">msg </span><span class="s3">= (</span><span class="s4">&quot;CUDA Python bindings requested (the environment &quot;</span>
+                       <span class="s4">&quot;variable NUMBA_CUDA_USE_NVIDIA_BINDING is set), &quot;</span>
+                       <span class="s4">f&quot;but they are not importable: </span><span class="s0">{</span><span class="s1">ie</span><span class="s3">.</span><span class="s1">msg</span><span class="s0">}</span><span class="s4">.&quot;</span><span class="s3">)</span>
+                <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+
+                <span class="s1">CUDA_USE_NVIDIA_BINDING </span><span class="s3">= </span><span class="s0">False</span>
+
+            <span class="s0">if </span><span class="s1">CUDA_PER_THREAD_DEFAULT_STREAM</span><span class="s3">:  </span><span class="s2"># noqa: F821</span>
+                <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span><span class="s4">&quot;PTDS support is handled by CUDA Python when &quot;</span>
+                              <span class="s4">&quot;using the NVIDIA binding. Please set the &quot;</span>
+                              <span class="s4">&quot;environment variable &quot;</span>
+                              <span class="s4">&quot;CUDA_PYTHON_CUDA_PER_THREAD_DEFAULT_STREAM to 1 &quot;</span>
+                              <span class="s4">&quot;instead.&quot;</span><span class="s3">)</span>
+
+    <span class="s0">def </span><span class="s1">process_environ</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">environ</span><span class="s3">):</span>
+        <span class="s0">def </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s1">name</span><span class="s3">, </span><span class="s1">ctor</span><span class="s3">, </span><span class="s1">default</span><span class="s3">):</span>
+            <span class="s1">value </span><span class="s3">= </span><span class="s1">environ</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s0">if </span><span class="s1">value </span><span class="s0">is None</span><span class="s3">:</span>
+                <span class="s0">return </span><span class="s1">default</span><span class="s3">() </span><span class="s0">if </span><span class="s1">callable</span><span class="s3">(</span><span class="s1">default</span><span class="s3">) </span><span class="s0">else </span><span class="s1">default</span>
+            <span class="s0">try</span><span class="s3">:</span>
+                <span class="s0">return </span><span class="s1">ctor</span><span class="s3">(</span><span class="s1">value</span><span class="s3">)</span>
+            <span class="s0">except </span><span class="s1">Exception</span><span class="s3">:</span>
+                <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span><span class="s4">f&quot;Environment variable '</span><span class="s0">{</span><span class="s1">name</span><span class="s0">}</span><span class="s4">' is defined but &quot;</span>
+                              <span class="s4">f&quot;its associated value '</span><span class="s0">{</span><span class="s1">value</span><span class="s0">}</span><span class="s4">' could not be &quot;</span>
+                              <span class="s4">&quot;parsed.</span><span class="s0">\n</span><span class="s4">The parse failed with exception:</span><span class="s0">\n</span><span class="s4">&quot;</span>
+                              <span class="s4">f&quot;</span><span class="s0">{</span><span class="s1">traceback</span><span class="s3">.</span><span class="s1">format_exc</span><span class="s3">()</span><span class="s0">}</span><span class="s4">&quot;</span><span class="s3">,</span>
+                              <span class="s1">RuntimeWarning</span><span class="s3">)</span>
+                <span class="s0">return </span><span class="s1">default</span>
+
+        <span class="s0">def </span><span class="s1">optional_str</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s0">return </span><span class="s1">str</span><span class="s3">(</span><span class="s1">x</span><span class="s3">) </span><span class="s0">if </span><span class="s1">x </span><span class="s0">is not None else None</span>
+
+        <span class="s2"># RVSDG frontend selection</span>
+        <span class="s1">USE_RVSDG_FRONTEND </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_USE_RVSDG_FRONTEND&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># developer mode produces full tracebacks, disables help instructions</span>
+        <span class="s1">DEVELOPER_MODE </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DEVELOPER_MODE&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># disable performance warnings, will switch of the generation of</span>
+        <span class="s2"># warnings of the class NumbaPerformanceWarning</span>
+        <span class="s1">DISABLE_PERFORMANCE_WARNINGS </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span>
+            <span class="s4">&quot;NUMBA_DISABLE_PERFORMANCE_WARNINGS&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># Flag to enable full exception reporting</span>
+        <span class="s1">FULL_TRACEBACKS </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span>
+            <span class="s4">&quot;NUMBA_FULL_TRACEBACKS&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s1">DEVELOPER_MODE</span><span class="s3">)</span>
+
+        <span class="s2"># Show help text when an error occurs</span>
+        <span class="s1">SHOW_HELP </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_SHOW_HELP&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># The color scheme to use for error messages, default is no color</span>
+        <span class="s2"># just bold fonts in use.</span>
+        <span class="s1">COLOR_SCHEME </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_COLOR_SCHEME&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">, </span><span class="s4">&quot;no_color&quot;</span><span class="s3">)</span>
+
+        <span class="s2"># Whether to globally enable bounds checking. The default None means</span>
+        <span class="s2"># to use the value of the flag to @njit. 0 or 1 overrides the flag</span>
+        <span class="s2"># globally.</span>
+        <span class="s1">BOUNDSCHECK </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_BOUNDSCHECK&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s0">None</span><span class="s3">)</span>
+
+        <span class="s2"># Whether to always warn about potential uninitialized variables</span>
+        <span class="s2"># because static controlflow analysis cannot find a definition</span>
+        <span class="s2"># in one or more of the incoming paths.</span>
+        <span class="s1">ALWAYS_WARN_UNINIT_VAR </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span>
+            <span class="s4">&quot;NUMBA_ALWAYS_WARN_UNINIT_VAR&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">,</span>
+        <span class="s3">)</span>
+
+        <span class="s2"># Whether to warn about kernel launches where the grid size will</span>
+        <span class="s2"># under utilize the GPU due to low occupancy. On by default.</span>
+        <span class="s1">CUDA_LOW_OCCUPANCY_WARNINGS </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span>
+            <span class="s4">&quot;NUMBA_CUDA_LOW_OCCUPANCY_WARNINGS&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">1</span><span class="s3">)</span>
+
+        <span class="s2"># Whether to use the official CUDA Python API Bindings</span>
+        <span class="s1">CUDA_USE_NVIDIA_BINDING </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span>
+            <span class="s4">&quot;NUMBA_CUDA_USE_NVIDIA_BINDING&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># Debug flag to control compiler debug print</span>
+        <span class="s1">DEBUG </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DEBUG&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># DEBUG print IR after pass names</span>
+        <span class="s1">DEBUG_PRINT_AFTER </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DEBUG_PRINT_AFTER&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">, </span><span class="s4">&quot;none&quot;</span><span class="s3">)</span>
+
+        <span class="s2"># DEBUG print IR before pass names</span>
+        <span class="s1">DEBUG_PRINT_BEFORE </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DEBUG_PRINT_BEFORE&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">, </span><span class="s4">&quot;none&quot;</span><span class="s3">)</span>
+
+        <span class="s2"># DEBUG print IR before and after pass names</span>
+        <span class="s1">DEBUG_PRINT_WRAP </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DEBUG_PRINT_WRAP&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">, </span><span class="s4">&quot;none&quot;</span><span class="s3">)</span>
+
+        <span class="s2"># Highlighting in intermediate dumps</span>
+        <span class="s1">HIGHLIGHT_DUMPS </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_HIGHLIGHT_DUMPS&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># JIT Debug flag to trigger IR instruction print</span>
+        <span class="s1">DEBUG_JIT </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DEBUG_JIT&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># Enable debugging of front-end operation</span>
+        <span class="s2"># (up to and including IR generation)</span>
+        <span class="s1">DEBUG_FRONTEND </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DEBUG_FRONTEND&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># Enable debug prints in nrtdynmod and use of &quot;safe&quot; API functions</span>
+        <span class="s1">DEBUG_NRT </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DEBUG_NRT&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># Enable NRT statistics counters</span>
+        <span class="s1">NRT_STATS </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_NRT_STATS&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># How many recently deserialized functions to retain regardless</span>
+        <span class="s2"># of external references</span>
+        <span class="s1">FUNCTION_CACHE_SIZE </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_FUNCTION_CACHE_SIZE&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">128</span><span class="s3">)</span>
+
+        <span class="s2"># Maximum tuple size that parfors will unpack and pass to</span>
+        <span class="s2"># internal gufunc.</span>
+        <span class="s1">PARFOR_MAX_TUPLE_SIZE </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_PARFOR_MAX_TUPLE_SIZE&quot;</span><span class="s3">,</span>
+                                         <span class="s1">int</span><span class="s3">, </span><span class="s5">100</span><span class="s3">)</span>
+
+        <span class="s2"># Enable logging of cache operation</span>
+        <span class="s1">DEBUG_CACHE </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DEBUG_CACHE&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s1">DEBUG</span><span class="s3">)</span>
+
+        <span class="s2"># Redirect cache directory</span>
+        <span class="s2"># Contains path to the directory</span>
+        <span class="s1">CACHE_DIR </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_CACHE_DIR&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">, </span><span class="s4">&quot;&quot;</span><span class="s3">)</span>
+
+        <span class="s2"># Enable tracing support</span>
+        <span class="s1">TRACE </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_TRACE&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># Enable chrome tracing support</span>
+        <span class="s1">CHROME_TRACE </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_CHROME_TRACE&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">, </span><span class="s4">&quot;&quot;</span><span class="s3">)</span>
+
+        <span class="s2"># Enable debugging of type inference</span>
+        <span class="s1">DEBUG_TYPEINFER </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DEBUG_TYPEINFER&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># Configure compilation target to use the specified CPU name</span>
+        <span class="s2"># and CPU feature as the host information.</span>
+        <span class="s2"># Note: this overrides &quot;host&quot; option for AOT compilation.</span>
+        <span class="s1">CPU_NAME </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_CPU_NAME&quot;</span><span class="s3">, </span><span class="s1">optional_str</span><span class="s3">, </span><span class="s0">None</span><span class="s3">)</span>
+        <span class="s1">CPU_FEATURES </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_CPU_FEATURES&quot;</span><span class="s3">, </span><span class="s1">optional_str</span><span class="s3">,</span>
+                                <span class="s3">(</span><span class="s4">&quot;&quot; </span><span class="s0">if </span><span class="s1">str</span><span class="s3">(</span><span class="s1">CPU_NAME</span><span class="s3">).</span><span class="s1">lower</span><span class="s3">() == </span><span class="s4">'generic'</span>
+                                 <span class="s0">else None</span><span class="s3">))</span>
+        <span class="s2"># Optimization level</span>
+        <span class="s1">OPT </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_OPT&quot;</span><span class="s3">, </span><span class="s1">_process_opt_level</span><span class="s3">, </span><span class="s1">_OptLevel</span><span class="s3">(</span><span class="s5">3</span><span class="s3">))</span>
+
+        <span class="s2"># Force dump of Python bytecode</span>
+        <span class="s1">DUMP_BYTECODE </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DUMP_BYTECODE&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s1">DEBUG_FRONTEND</span><span class="s3">)</span>
+
+        <span class="s2"># Force dump of control flow graph</span>
+        <span class="s1">DUMP_CFG </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DUMP_CFG&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s1">DEBUG_FRONTEND</span><span class="s3">)</span>
+
+        <span class="s2"># Force dump of Numba IR</span>
+        <span class="s1">DUMP_IR </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DUMP_IR&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">,</span>
+                           <span class="s1">DEBUG_FRONTEND</span><span class="s3">)</span>
+
+        <span class="s2"># Force dump of Numba IR in SSA form</span>
+        <span class="s1">DUMP_SSA </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DUMP_SSA&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">,</span>
+                            <span class="s1">DEBUG_FRONTEND </span><span class="s0">or </span><span class="s1">DEBUG_TYPEINFER</span><span class="s3">)</span>
+
+        <span class="s2"># print debug info of analysis and optimization on array operations</span>
+        <span class="s1">DEBUG_ARRAY_OPT </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DEBUG_ARRAY_OPT&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># insert debug stmts to print information at runtime</span>
+        <span class="s1">DEBUG_ARRAY_OPT_RUNTIME </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span>
+            <span class="s4">&quot;NUMBA_DEBUG_ARRAY_OPT_RUNTIME&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># print stats about parallel for-loops</span>
+        <span class="s1">DEBUG_ARRAY_OPT_STATS </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DEBUG_ARRAY_OPT_STATS&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># prints user friendly information about parallel</span>
+        <span class="s1">PARALLEL_DIAGNOSTICS </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_PARALLEL_DIAGNOSTICS&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># print debug info of inline closure pass</span>
+        <span class="s1">DEBUG_INLINE_CLOSURE </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DEBUG_INLINE_CLOSURE&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># Force dump of LLVM IR</span>
+        <span class="s1">DUMP_LLVM </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DUMP_LLVM&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s1">DEBUG</span><span class="s3">)</span>
+
+        <span class="s2"># Force dump of Function optimized LLVM IR</span>
+        <span class="s1">DUMP_FUNC_OPT </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DUMP_FUNC_OPT&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s1">DEBUG</span><span class="s3">)</span>
+
+        <span class="s2"># Force dump of Optimized LLVM IR</span>
+        <span class="s1">DUMP_OPTIMIZED </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DUMP_OPTIMIZED&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s1">DEBUG</span><span class="s3">)</span>
+
+        <span class="s2"># Force disable loop vectorize</span>
+        <span class="s1">LOOP_VECTORIZE </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_LOOP_VECTORIZE&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">1</span><span class="s3">)</span>
+
+        <span class="s2"># Enable superword-level parallelism vectorization, default is off</span>
+        <span class="s2"># since #8705 (miscompilation).</span>
+        <span class="s1">SLP_VECTORIZE </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_SLP_VECTORIZE&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># Force dump of generated assembly</span>
+        <span class="s1">DUMP_ASSEMBLY </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DUMP_ASSEMBLY&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s1">DEBUG</span><span class="s3">)</span>
+
+        <span class="s2"># Force dump of type annotation</span>
+        <span class="s1">ANNOTATE </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DUMP_ANNOTATION&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># Dump IR in such as way as to aid in &quot;diff&quot;ing.</span>
+        <span class="s1">DIFF_IR </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DIFF_IR&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># Dump type annotation in html format</span>
+        <span class="s0">def </span><span class="s1">fmt_html_path</span><span class="s3">(</span><span class="s1">path</span><span class="s3">):</span>
+            <span class="s0">if </span><span class="s1">path </span><span class="s0">is None</span><span class="s3">:</span>
+                <span class="s0">return </span><span class="s1">path</span>
+            <span class="s0">else</span><span class="s3">:</span>
+                <span class="s0">return </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">abspath</span><span class="s3">(</span><span class="s1">path</span><span class="s3">)</span>
+
+        <span class="s1">HTML </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DUMP_HTML&quot;</span><span class="s3">, </span><span class="s1">fmt_html_path</span><span class="s3">, </span><span class="s0">None</span><span class="s3">)</span>
+
+        <span class="s2"># x86-64 specific</span>
+        <span class="s2"># Enable AVX on supported platforms where it won't degrade performance.</span>
+        <span class="s0">def </span><span class="s1">avx_default</span><span class="s3">():</span>
+            <span class="s0">if not </span><span class="s1">_os_supports_avx</span><span class="s3">():</span>
+                <span class="s0">return False</span>
+            <span class="s0">else</span><span class="s3">:</span>
+                <span class="s2"># There are various performance issues with AVX and LLVM</span>
+                <span class="s2"># on some CPUs (list at</span>
+                <span class="s2"># http://llvm.org/bugs/buglist.cgi?quicksearch=avx).</span>
+                <span class="s2"># For now we'd rather disable it, since it can pessimize code</span>
+                <span class="s1">cpu_name </span><span class="s3">= </span><span class="s1">CPU_NAME </span><span class="s0">or </span><span class="s1">ll</span><span class="s3">.</span><span class="s1">get_host_cpu_name</span><span class="s3">()</span>
+                <span class="s1">disabled_cpus </span><span class="s3">= {</span><span class="s4">'corei7-avx'</span><span class="s3">, </span><span class="s4">'core-avx-i'</span><span class="s3">,</span>
+                                 <span class="s4">'sandybridge'</span><span class="s3">, </span><span class="s4">'ivybridge'</span><span class="s3">}</span>
+                <span class="s2"># Disable known baseline CPU names that virtual machines may</span>
+                <span class="s2"># incorrectly report as having AVX support.</span>
+                <span class="s2"># This can cause problems with the SVML-pass's use of AVX512.</span>
+                <span class="s2"># See https://github.com/numba/numba/issues/9582</span>
+                <span class="s1">disabled_cpus </span><span class="s3">|= {</span><span class="s4">'nocona'</span><span class="s3">}</span>
+                <span class="s0">return </span><span class="s1">cpu_name </span><span class="s0">not in </span><span class="s1">disabled_cpus</span>
+
+        <span class="s1">ENABLE_AVX </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_ENABLE_AVX&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s1">avx_default</span><span class="s3">)</span>
+
+        <span class="s2"># if set and SVML is available, it will be disabled</span>
+        <span class="s2"># By default, it's disabled on 32-bit platforms.</span>
+        <span class="s1">DISABLE_INTEL_SVML </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span>
+            <span class="s4">&quot;NUMBA_DISABLE_INTEL_SVML&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s1">IS_32BITS</span><span class="s3">)</span>
+
+        <span class="s2"># Disable jit for debugging</span>
+        <span class="s1">DISABLE_JIT </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DISABLE_JIT&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># choose parallel backend to use</span>
+        <span class="s1">THREADING_LAYER_PRIORITY </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span>
+            <span class="s4">&quot;NUMBA_THREADING_LAYER_PRIORITY&quot;</span><span class="s3">,</span>
+            <span class="s0">lambda </span><span class="s1">string</span><span class="s3">: </span><span class="s1">string</span><span class="s3">.</span><span class="s1">split</span><span class="s3">(),</span>
+            <span class="s3">[</span><span class="s4">'tbb'</span><span class="s3">, </span><span class="s4">'omp'</span><span class="s3">, </span><span class="s4">'workqueue'</span><span class="s3">],</span>
+        <span class="s3">)</span>
+        <span class="s1">THREADING_LAYER </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_THREADING_LAYER&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">, </span><span class="s4">'default'</span><span class="s3">)</span>
+
+        <span class="s1">CAPTURED_ERRORS </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_CAPTURED_ERRORS&quot;</span><span class="s3">,</span>
+                                   <span class="s1">_validate_captured_errors_style</span><span class="s3">,</span>
+                                   <span class="s4">'new_style'</span><span class="s3">)</span>
+
+        <span class="s2"># CUDA Configs</span>
+
+        <span class="s2"># Whether to warn about kernel launches where a host array</span>
+        <span class="s2"># is used as a parameter, forcing a copy to and from the device.</span>
+        <span class="s2"># On by default.</span>
+        <span class="s1">CUDA_WARN_ON_IMPLICIT_COPY </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span>
+            <span class="s4">&quot;NUMBA_CUDA_WARN_ON_IMPLICIT_COPY&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">1</span><span class="s3">)</span>
+
+        <span class="s2"># Force CUDA compute capability to a specific version</span>
+        <span class="s1">FORCE_CUDA_CC </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_FORCE_CUDA_CC&quot;</span><span class="s3">, </span><span class="s1">_parse_cc</span><span class="s3">, </span><span class="s0">None</span><span class="s3">)</span>
+
+        <span class="s2"># The default compute capability to target when compiling to PTX.</span>
+        <span class="s1">CUDA_DEFAULT_PTX_CC </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_CUDA_DEFAULT_PTX_CC&quot;</span><span class="s3">, </span><span class="s1">_parse_cc</span><span class="s3">,</span>
+                                       <span class="s3">(</span><span class="s5">5</span><span class="s3">, </span><span class="s5">0</span><span class="s3">))</span>
+
+        <span class="s2"># Disable CUDA support</span>
+        <span class="s1">DISABLE_CUDA </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DISABLE_CUDA&quot;</span><span class="s3">,</span>
+                                <span class="s1">int</span><span class="s3">, </span><span class="s1">int</span><span class="s3">(</span><span class="s1">MACHINE_BITS </span><span class="s3">== </span><span class="s5">32</span><span class="s3">))</span>
+
+        <span class="s2"># Enable CUDA simulator</span>
+        <span class="s1">ENABLE_CUDASIM </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_ENABLE_CUDASIM&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># CUDA logging level</span>
+        <span class="s2"># Any level name from the *logging* module.  Case insensitive.</span>
+        <span class="s2"># Defaults to CRITICAL if not set or invalid.</span>
+        <span class="s2"># Note: This setting only applies when logging is not configured.</span>
+        <span class="s2">#       Any existing logging configuration is preserved.</span>
+        <span class="s1">CUDA_LOG_LEVEL </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_CUDA_LOG_LEVEL&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">, </span><span class="s4">''</span><span class="s3">)</span>
+
+        <span class="s2"># Include argument values in the CUDA Driver API logs</span>
+        <span class="s1">CUDA_LOG_API_ARGS </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_CUDA_LOG_API_ARGS&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># Maximum number of pending CUDA deallocations (default: 10)</span>
+        <span class="s1">CUDA_DEALLOCS_COUNT </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_CUDA_MAX_PENDING_DEALLOCS_COUNT&quot;</span><span class="s3">,</span>
+                                       <span class="s1">int</span><span class="s3">, </span><span class="s5">10</span><span class="s3">)</span>
+
+        <span class="s2"># Maximum ratio of pending CUDA deallocations to capacity (default: 0.2)</span>
+        <span class="s1">CUDA_DEALLOCS_RATIO </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_CUDA_MAX_PENDING_DEALLOCS_RATIO&quot;</span><span class="s3">,</span>
+                                       <span class="s1">float</span><span class="s3">, </span><span class="s5">0.2</span><span class="s3">)</span>
+
+        <span class="s1">CUDA_ARRAY_INTERFACE_SYNC </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_CUDA_ARRAY_INTERFACE_SYNC&quot;</span><span class="s3">,</span>
+                                             <span class="s1">int</span><span class="s3">, </span><span class="s5">1</span><span class="s3">)</span>
+
+        <span class="s2"># Path of the directory that the CUDA driver libraries are located</span>
+        <span class="s1">CUDA_DRIVER </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_CUDA_DRIVER&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">, </span><span class="s4">''</span><span class="s3">)</span>
+
+        <span class="s2"># Buffer size for logs produced by CUDA driver operations (e.g.</span>
+        <span class="s2"># linking)</span>
+        <span class="s1">CUDA_LOG_SIZE </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_CUDA_LOG_SIZE&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">1024</span><span class="s3">)</span>
+
+        <span class="s2"># Whether to generate verbose log messages when JIT linking</span>
+        <span class="s1">CUDA_VERBOSE_JIT_LOG </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_CUDA_VERBOSE_JIT_LOG&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">1</span><span class="s3">)</span>
+
+        <span class="s2"># Whether the default stream is the per-thread default stream</span>
+        <span class="s1">CUDA_PER_THREAD_DEFAULT_STREAM </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span>
+            <span class="s4">&quot;NUMBA_CUDA_PER_THREAD_DEFAULT_STREAM&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s1">CUDA_ENABLE_MINOR_VERSION_COMPATIBILITY </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span>
+            <span class="s4">&quot;NUMBA_CUDA_ENABLE_MINOR_VERSION_COMPATIBILITY&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># Location of the CUDA include files</span>
+        <span class="s0">if </span><span class="s1">IS_WIN32</span><span class="s3">:</span>
+            <span class="s1">cuda_path </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">environ</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s4">'CUDA_PATH'</span><span class="s3">)</span>
+            <span class="s0">if </span><span class="s1">cuda_path</span><span class="s3">:</span>
+                <span class="s1">default_cuda_include_path </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">cuda_path</span><span class="s3">, </span><span class="s4">&quot;include&quot;</span><span class="s3">)</span>
+            <span class="s0">else</span><span class="s3">:</span>
+                <span class="s1">default_cuda_include_path </span><span class="s3">= </span><span class="s4">&quot;cuda_include_not_found&quot;</span>
+        <span class="s0">else</span><span class="s3">:</span>
+            <span class="s1">default_cuda_include_path </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">os</span><span class="s3">.</span><span class="s1">sep</span><span class="s3">, </span><span class="s4">'usr'</span><span class="s3">, </span><span class="s4">'local'</span><span class="s3">,</span>
+                                                     <span class="s4">'cuda'</span><span class="s3">, </span><span class="s4">'include'</span><span class="s3">)</span>
+        <span class="s1">CUDA_INCLUDE_PATH </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_CUDA_INCLUDE_PATH&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">,</span>
+                                     <span class="s1">default_cuda_include_path</span><span class="s3">)</span>
+
+        <span class="s2"># Threading settings</span>
+
+        <span class="s2"># The default number of threads to use.</span>
+        <span class="s0">def </span><span class="s1">num_threads_default</span><span class="s3">():</span>
+            <span class="s0">try</span><span class="s3">:</span>
+                <span class="s1">sched_getaffinity </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">sched_getaffinity</span>
+            <span class="s0">except </span><span class="s1">AttributeError</span><span class="s3">:</span>
+                <span class="s0">pass</span>
+            <span class="s0">else</span><span class="s3">:</span>
+                <span class="s0">return </span><span class="s1">max</span><span class="s3">(</span><span class="s5">1</span><span class="s3">, </span><span class="s1">len</span><span class="s3">(</span><span class="s1">sched_getaffinity</span><span class="s3">(</span><span class="s5">0</span><span class="s3">)))</span>
+
+            <span class="s1">cpu_count </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">cpu_count</span><span class="s3">()</span>
+            <span class="s0">if </span><span class="s1">cpu_count </span><span class="s0">is not None</span><span class="s3">:</span>
+                <span class="s0">return </span><span class="s1">max</span><span class="s3">(</span><span class="s5">1</span><span class="s3">, </span><span class="s1">cpu_count</span><span class="s3">)</span>
+
+            <span class="s0">return </span><span class="s5">1</span>
+
+        <span class="s1">NUMBA_DEFAULT_NUM_THREADS </span><span class="s3">= </span><span class="s1">num_threads_default</span><span class="s3">()</span>
+
+        <span class="s2"># Numba thread pool size (defaults to number of CPUs on the system).</span>
+        <span class="s1">_NUMBA_NUM_THREADS </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_NUM_THREADS&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">,</span>
+                                      <span class="s1">NUMBA_DEFAULT_NUM_THREADS</span><span class="s3">)</span>
+        <span class="s0">if </span><span class="s3">(</span><span class="s4">'NUMBA_NUM_THREADS' </span><span class="s0">in </span><span class="s1">globals</span><span class="s3">()</span>
+                <span class="s0">and </span><span class="s1">globals</span><span class="s3">()[</span><span class="s4">'NUMBA_NUM_THREADS'</span><span class="s3">] != </span><span class="s1">_NUMBA_NUM_THREADS</span><span class="s3">):</span>
+
+            <span class="s0">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">np</span><span class="s3">.</span><span class="s1">ufunc </span><span class="s0">import </span><span class="s1">parallel</span>
+            <span class="s0">if </span><span class="s1">parallel</span><span class="s3">.</span><span class="s1">_is_initialized</span><span class="s3">:</span>
+                <span class="s0">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s4">&quot;Cannot set NUMBA_NUM_THREADS to a &quot;</span>
+                                   <span class="s4">&quot;different value once the threads have been &quot;</span>
+                                   <span class="s4">&quot;launched (currently have %s, &quot;</span>
+                                   <span class="s4">&quot;trying to set %s)&quot; </span><span class="s3">%</span>
+                                   <span class="s3">(</span><span class="s1">_NUMBA_NUM_THREADS</span><span class="s3">,</span>
+                                    <span class="s1">globals</span><span class="s3">()[</span><span class="s4">'NUMBA_NUM_THREADS'</span><span class="s3">]))</span>
+
+        <span class="s1">NUMBA_NUM_THREADS </span><span class="s3">= </span><span class="s1">_NUMBA_NUM_THREADS</span>
+        <span class="s0">del </span><span class="s1">_NUMBA_NUM_THREADS</span>
+
+        <span class="s2"># Profiling support</span>
+
+        <span class="s2"># Indicates if a profiler detected. Only VTune can be detected for now</span>
+        <span class="s1">RUNNING_UNDER_PROFILER </span><span class="s3">= </span><span class="s4">'VS_PROFILER' </span><span class="s0">in </span><span class="s1">os</span><span class="s3">.</span><span class="s1">environ</span>
+
+        <span class="s2"># Enables jit events in LLVM to support profiling of dynamic code</span>
+        <span class="s1">ENABLE_PROFILING </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span>
+            <span class="s4">&quot;NUMBA_ENABLE_PROFILING&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s1">int</span><span class="s3">(</span><span class="s1">RUNNING_UNDER_PROFILER</span><span class="s3">))</span>
+
+        <span class="s2"># Debug Info</span>
+
+        <span class="s2"># The default value for the `debug` flag</span>
+        <span class="s1">DEBUGINFO_DEFAULT </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_DEBUGINFO&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s1">ENABLE_PROFILING</span><span class="s3">)</span>
+        <span class="s1">CUDA_DEBUGINFO_DEFAULT </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_CUDA_DEBUGINFO&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s1">EXTEND_VARIABLE_LIFETIMES </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_EXTEND_VARIABLE_LIFETIMES&quot;</span><span class="s3">,</span>
+                                             <span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+
+        <span class="s2"># gdb binary location</span>
+        <span class="s0">def </span><span class="s1">which_gdb</span><span class="s3">(</span><span class="s1">path_or_bin</span><span class="s3">):</span>
+            <span class="s1">gdb </span><span class="s3">= </span><span class="s1">shutil</span><span class="s3">.</span><span class="s1">which</span><span class="s3">(</span><span class="s1">path_or_bin</span><span class="s3">)</span>
+            <span class="s0">return </span><span class="s1">gdb </span><span class="s0">if </span><span class="s1">gdb </span><span class="s0">is not None else </span><span class="s1">path_or_bin</span>
+
+        <span class="s1">GDB_BINARY </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_GDB_BINARY&quot;</span><span class="s3">, </span><span class="s1">which_gdb</span><span class="s3">, </span><span class="s4">'gdb'</span><span class="s3">)</span>
+
+        <span class="s2"># CUDA Memory management</span>
+        <span class="s1">CUDA_MEMORY_MANAGER </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span><span class="s4">&quot;NUMBA_CUDA_MEMORY_MANAGER&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">,</span>
+                                       <span class="s4">'default'</span><span class="s3">)</span>
+
+        <span class="s2"># Experimental refprune pass</span>
+        <span class="s1">LLVM_REFPRUNE_PASS </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span>
+            <span class="s4">&quot;NUMBA_LLVM_REFPRUNE_PASS&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">1</span><span class="s3">,</span>
+        <span class="s3">)</span>
+        <span class="s1">LLVM_REFPRUNE_FLAGS </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span>
+            <span class="s4">&quot;NUMBA_LLVM_REFPRUNE_FLAGS&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">,</span>
+            <span class="s4">&quot;all&quot; </span><span class="s0">if </span><span class="s1">LLVM_REFPRUNE_PASS </span><span class="s0">else </span><span class="s4">&quot;&quot;</span><span class="s3">,</span>
+        <span class="s3">)</span>
+
+        <span class="s2"># llvmlite memory manager</span>
+        <span class="s1">USE_LLVMLITE_MEMORY_MANAGER </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span>
+            <span class="s4">&quot;NUMBA_USE_LLVMLITE_MEMORY_MANAGER&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s0">None</span>
+        <span class="s3">)</span>
+
+        <span class="s2"># Timing support.</span>
+
+        <span class="s2"># LLVM_PASS_TIMINGS enables LLVM recording of pass timings.</span>
+        <span class="s1">LLVM_PASS_TIMINGS </span><span class="s3">= </span><span class="s1">_readenv</span><span class="s3">(</span>
+            <span class="s4">&quot;NUMBA_LLVM_PASS_TIMINGS&quot;</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s5">0</span><span class="s3">,</span>
+        <span class="s3">)</span>
+
+        <span class="s2"># Inject the configuration values into the module globals</span>
+        <span class="s0">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">value </span><span class="s0">in </span><span class="s1">locals</span><span class="s3">().</span><span class="s1">copy</span><span class="s3">().</span><span class="s1">items</span><span class="s3">():</span>
+            <span class="s0">if </span><span class="s1">name</span><span class="s3">.</span><span class="s1">isupper</span><span class="s3">():</span>
+                <span class="s1">globals</span><span class="s3">()[</span><span class="s1">name</span><span class="s3">] = </span><span class="s1">value</span>
+
+
+<span class="s1">_env_reloader </span><span class="s3">= </span><span class="s1">_EnvReloader</span><span class="s3">()</span>
+
+
+<span class="s0">def </span><span class="s1">reload_config</span><span class="s3">():</span>
+    <span class="s6">&quot;&quot;&quot; 
+    Reload the configuration from environment variables, if necessary. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_env_reloader</span><span class="s3">.</span><span class="s1">update</span><span class="s3">()</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,227 @@
+<html>
+<head>
+<title>gdb_print_extension.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+.s6 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+gdb_print_extension.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;gdb printing extension for Numba types. 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">re</span>
+
+<span class="s2">try</span><span class="s3">:</span>
+    <span class="s2">import </span><span class="s1">gdb</span><span class="s3">.</span><span class="s1">printing</span>
+    <span class="s2">import </span><span class="s1">gdb</span>
+<span class="s2">except </span><span class="s1">ImportError</span><span class="s3">:</span>
+    <span class="s2">raise </span><span class="s1">ImportError</span><span class="s3">(</span><span class="s4">&quot;GDB python support is not available.&quot;</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">NumbaArrayPrinter</span><span class="s3">:</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">val </span><span class="s3">= </span><span class="s1">val</span>
+
+    <span class="s2">def </span><span class="s1">to_string</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+            <span class="s1">HAVE_NUMPY </span><span class="s3">= </span><span class="s2">True</span>
+        <span class="s2">except </span><span class="s1">ImportError</span><span class="s3">:</span>
+            <span class="s1">HAVE_NUMPY </span><span class="s3">= </span><span class="s2">False</span>
+
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">NULL </span><span class="s3">= </span><span class="s5">0x0</span>
+
+            <span class="s6"># Raw data references, these need unpacking/interpreting.</span>
+
+            <span class="s6"># Member &quot;data&quot; is...</span>
+            <span class="s6"># DW_TAG_member of DIDerivedType, tag of DW_TAG_pointer_type</span>
+            <span class="s6"># encoding e.g. DW_ATE_float</span>
+            <span class="s1">data </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">val</span><span class="s3">[</span><span class="s4">&quot;data&quot;</span><span class="s3">]</span>
+
+            <span class="s6"># Member &quot;itemsize&quot; is...</span>
+            <span class="s6"># DW_TAG_member of DIBasicType encoding DW_ATE_signed</span>
+            <span class="s1">itemsize </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">val</span><span class="s3">[</span><span class="s4">&quot;itemsize&quot;</span><span class="s3">]</span>
+
+            <span class="s6"># Members &quot;shape&quot; and &quot;strides&quot; are...</span>
+            <span class="s6"># DW_TAG_member of DIDerivedType, the type is a DICompositeType</span>
+            <span class="s6"># (it's a Numba UniTuple) with tag: DW_TAG_array_type, i.e. it's an</span>
+            <span class="s6"># array repr, it has a basetype of e.g. DW_ATE_unsigned and also</span>
+            <span class="s6"># &quot;elements&quot; which are referenced with a DISubrange(count: &lt;const&gt;)</span>
+            <span class="s6"># to say how many elements are in the array.</span>
+            <span class="s1">rshp </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">val</span><span class="s3">[</span><span class="s4">&quot;shape&quot;</span><span class="s3">]</span>
+            <span class="s1">rstrides </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">val</span><span class="s3">[</span><span class="s4">&quot;strides&quot;</span><span class="s3">]</span>
+
+            <span class="s6"># bool on whether the data is aligned.</span>
+            <span class="s1">is_aligned </span><span class="s3">= </span><span class="s2">False</span>
+
+            <span class="s6"># type information decode, simple type:</span>
+            <span class="s1">ty_str </span><span class="s3">= </span><span class="s1">str</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">val</span><span class="s3">.</span><span class="s1">type</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">HAVE_NUMPY </span><span class="s2">and </span><span class="s3">(</span><span class="s4">'aligned' </span><span class="s2">in </span><span class="s1">ty_str </span><span class="s2">or </span><span class="s4">'Record' </span><span class="s2">in </span><span class="s1">ty_str</span><span class="s3">):</span>
+                <span class="s1">ty_str </span><span class="s3">= </span><span class="s1">ty_str</span><span class="s3">.</span><span class="s1">replace</span><span class="s3">(</span><span class="s4">'unaligned '</span><span class="s3">,</span><span class="s4">''</span><span class="s3">).</span><span class="s1">strip</span><span class="s3">()</span>
+                <span class="s1">matcher </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">compile</span><span class="s3">(</span><span class="s4">r&quot;array\((Record.*), (.*), (.*)\)\ \(.*&quot;</span><span class="s3">)</span>
+                <span class="s6"># NOTE: need to deal with &quot;Alignment&quot; else dtype size is wrong</span>
+                <span class="s1">arr_info </span><span class="s3">= [</span><span class="s1">x</span><span class="s3">.</span><span class="s1">strip</span><span class="s3">() </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">matcher</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">ty_str</span><span class="s3">).</span><span class="s1">groups</span><span class="s3">()]</span>
+                <span class="s1">dtype_str</span><span class="s3">, </span><span class="s1">ndim_str</span><span class="s3">, </span><span class="s1">order_str </span><span class="s3">= </span><span class="s1">arr_info</span>
+                <span class="s1">rstr </span><span class="s3">= </span><span class="s4">r'Record\((.*\[.*\]);([0-9]+);(True|False)'</span>
+                <span class="s1">rstr_match </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">rstr</span><span class="s3">, </span><span class="s1">dtype_str</span><span class="s3">)</span>
+                <span class="s6"># balign is unused, it's the alignment</span>
+                <span class="s1">fields</span><span class="s3">, </span><span class="s1">balign</span><span class="s3">, </span><span class="s1">is_aligned_str </span><span class="s3">= </span><span class="s1">rstr_match</span><span class="s3">.</span><span class="s1">groups</span><span class="s3">()</span>
+                <span class="s1">is_aligned </span><span class="s3">= </span><span class="s1">is_aligned_str </span><span class="s3">== </span><span class="s4">'True'</span>
+                <span class="s1">field_dts </span><span class="s3">= </span><span class="s1">fields</span><span class="s3">.</span><span class="s1">split</span><span class="s3">(</span><span class="s4">','</span><span class="s3">)</span>
+                <span class="s1">struct_entries </span><span class="s3">= []</span>
+                <span class="s2">for </span><span class="s1">f </span><span class="s2">in </span><span class="s1">field_dts</span><span class="s3">:</span>
+                    <span class="s1">splitted </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">split</span><span class="s3">(</span><span class="s4">'['</span><span class="s3">)</span>
+                    <span class="s1">name </span><span class="s3">= </span><span class="s1">splitted</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+                    <span class="s1">dt_part </span><span class="s3">= </span><span class="s1">splitted</span><span class="s3">[</span><span class="s5">1</span><span class="s3">:]</span>
+                    <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">dt_part</span><span class="s3">) &gt; </span><span class="s5">1</span><span class="s3">:</span>
+                        <span class="s2">raise </span><span class="s1">TypeError</span><span class="s3">(</span><span class="s4">'Unsupported sub-type: %s' </span><span class="s3">% </span><span class="s1">f</span><span class="s3">)</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s1">dt_part </span><span class="s3">= </span><span class="s1">dt_part</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+                        <span class="s2">if </span><span class="s4">&quot;nestedarray&quot; </span><span class="s2">in </span><span class="s1">dt_part</span><span class="s3">:</span>
+                            <span class="s2">raise </span><span class="s1">TypeError</span><span class="s3">(</span><span class="s4">'Unsupported sub-type: %s' </span><span class="s3">% </span><span class="s1">f</span><span class="s3">)</span>
+                        <span class="s1">dt_as_str </span><span class="s3">= </span><span class="s1">dt_part</span><span class="s3">.</span><span class="s1">split</span><span class="s3">(</span><span class="s4">';'</span><span class="s3">)[</span><span class="s5">0</span><span class="s3">].</span><span class="s1">split</span><span class="s3">(</span><span class="s4">'='</span><span class="s3">)[</span><span class="s5">1</span><span class="s3">]</span>
+                        <span class="s1">dtype </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s1">dt_as_str</span><span class="s3">)</span>
+                    <span class="s1">struct_entries</span><span class="s3">.</span><span class="s1">append</span><span class="s3">((</span><span class="s1">name</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">))</span>
+                    <span class="s6"># The dtype is actually a record of some sort</span>
+                <span class="s1">dtype_str </span><span class="s3">= </span><span class="s1">struct_entries</span>
+            <span class="s2">else</span><span class="s3">:  </span><span class="s6"># simple type</span>
+                <span class="s1">matcher </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">compile</span><span class="s3">(</span><span class="s4">r&quot;array\((.*),(.*),(.*)\)\ \(.*&quot;</span><span class="s3">)</span>
+                <span class="s1">arr_info </span><span class="s3">= [</span><span class="s1">x</span><span class="s3">.</span><span class="s1">strip</span><span class="s3">() </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">matcher</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">ty_str</span><span class="s3">).</span><span class="s1">groups</span><span class="s3">()]</span>
+                <span class="s1">dtype_str</span><span class="s3">, </span><span class="s1">ndim_str</span><span class="s3">, </span><span class="s1">order_str </span><span class="s3">= </span><span class="s1">arr_info</span>
+                <span class="s6"># fix up unichr dtype</span>
+                <span class="s2">if </span><span class="s4">'unichr x ' </span><span class="s2">in </span><span class="s1">dtype_str</span><span class="s3">:</span>
+                    <span class="s1">dtype_str </span><span class="s3">= </span><span class="s1">dtype_str</span><span class="s3">[</span><span class="s5">1</span><span class="s3">:-</span><span class="s5">1</span><span class="s3">].</span><span class="s1">replace</span><span class="s3">(</span><span class="s4">'unichr x '</span><span class="s3">, </span><span class="s4">'&lt;U'</span><span class="s3">)</span>
+
+            <span class="s2">def </span><span class="s1">dwarr2inttuple</span><span class="s3">(</span><span class="s1">dwarr</span><span class="s3">):</span>
+                <span class="s6"># Converts a gdb handle to a dwarf array to a tuple of ints</span>
+                <span class="s1">fields </span><span class="s3">= </span><span class="s1">dwarr</span><span class="s3">.</span><span class="s1">type</span><span class="s3">.</span><span class="s1">fields</span><span class="s3">()</span>
+                <span class="s1">lo</span><span class="s3">, </span><span class="s1">hi </span><span class="s3">= </span><span class="s1">fields</span><span class="s3">[</span><span class="s5">0</span><span class="s3">].</span><span class="s1">type</span><span class="s3">.</span><span class="s1">range</span><span class="s3">()</span>
+                <span class="s2">return </span><span class="s1">tuple</span><span class="s3">([</span><span class="s1">int</span><span class="s3">(</span><span class="s1">dwarr</span><span class="s3">[</span><span class="s1">x</span><span class="s3">]) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">lo</span><span class="s3">, </span><span class="s1">hi </span><span class="s3">+ </span><span class="s5">1</span><span class="s3">)])</span>
+
+            <span class="s6"># shape/strides extraction</span>
+            <span class="s1">shape </span><span class="s3">= </span><span class="s1">dwarr2inttuple</span><span class="s3">(</span><span class="s1">rshp</span><span class="s3">)</span>
+            <span class="s1">strides </span><span class="s3">= </span><span class="s1">dwarr2inttuple</span><span class="s3">(</span><span class="s1">rstrides</span><span class="s3">)</span>
+
+            <span class="s6"># if data is not NULL</span>
+            <span class="s2">if </span><span class="s1">data </span><span class="s3">!= </span><span class="s1">NULL</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">HAVE_NUMPY</span><span class="s3">:</span>
+                    <span class="s6"># The data extent in bytes is:</span>
+                    <span class="s6"># sum(shape * strides)</span>
+                    <span class="s6"># get the data, then wire to as_strided</span>
+                    <span class="s1">shp_arr </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([</span><span class="s1">max</span><span class="s3">(</span><span class="s5">0</span><span class="s3">, </span><span class="s1">x </span><span class="s3">- </span><span class="s5">1</span><span class="s3">) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">shape</span><span class="s3">])</span>
+                    <span class="s1">strd_arr </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s1">strides</span><span class="s3">)</span>
+                    <span class="s1">extent </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">shp_arr </span><span class="s3">* </span><span class="s1">strd_arr</span><span class="s3">)</span>
+                    <span class="s1">extent </span><span class="s3">+= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">itemsize</span><span class="s3">)</span>
+                    <span class="s1">dtype_clazz </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s1">dtype_str</span><span class="s3">, </span><span class="s1">align</span><span class="s3">=</span><span class="s1">is_aligned</span><span class="s3">)</span>
+                    <span class="s1">dtype </span><span class="s3">= </span><span class="s1">dtype_clazz</span>
+                    <span class="s1">this_proc </span><span class="s3">= </span><span class="s1">gdb</span><span class="s3">.</span><span class="s1">selected_inferior</span><span class="s3">()</span>
+                    <span class="s1">mem </span><span class="s3">= </span><span class="s1">this_proc</span><span class="s3">.</span><span class="s1">read_memory</span><span class="s3">(</span><span class="s1">int</span><span class="s3">(</span><span class="s1">data</span><span class="s3">), </span><span class="s1">extent</span><span class="s3">)</span>
+                    <span class="s1">arr_data </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">frombuffer</span><span class="s3">(</span><span class="s1">mem</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">)</span>
+                    <span class="s1">new_arr </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">lib</span><span class="s3">.</span><span class="s1">stride_tricks</span><span class="s3">.</span><span class="s1">as_strided</span><span class="s3">(</span><span class="s1">arr_data</span><span class="s3">,</span>
+                                                              <span class="s1">shape</span><span class="s3">=</span><span class="s1">shape</span><span class="s3">,</span>
+                                                              <span class="s1">strides</span><span class="s3">=</span><span class="s1">strides</span><span class="s3">,)</span>
+                    <span class="s2">return </span><span class="s4">'</span><span class="s2">\n</span><span class="s4">' </span><span class="s3">+ </span><span class="s1">str</span><span class="s3">(</span><span class="s1">new_arr</span><span class="s3">)</span>
+                <span class="s6"># Catch all for no NumPy</span>
+                <span class="s2">return </span><span class="s4">&quot;array([...], dtype=%s, shape=%s)&quot; </span><span class="s3">% (</span><span class="s1">dtype_str</span><span class="s3">, </span><span class="s1">shape</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s6"># Not yet initialized or NULLed out data</span>
+                <span class="s1">buf </span><span class="s3">= </span><span class="s1">list</span><span class="s3">([</span><span class="s4">&quot;NULL/Uninitialized&quot;</span><span class="s3">])</span>
+                <span class="s2">return </span><span class="s4">&quot;array([&quot; </span><span class="s3">+ </span><span class="s4">', '</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">buf</span><span class="s3">) + </span><span class="s4">&quot;]&quot; </span><span class="s3">+ </span><span class="s4">&quot;)&quot;</span>
+        <span class="s2">except </span><span class="s1">Exception </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s4">'array[Exception: Failed to parse. %s]' </span><span class="s3">% </span><span class="s1">e</span>
+
+
+<span class="s2">class </span><span class="s1">NumbaComplexPrinter</span><span class="s3">:</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">val </span><span class="s3">= </span><span class="s1">val</span>
+
+    <span class="s2">def </span><span class="s1">to_string</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s4">&quot;%s+%sj&quot; </span><span class="s3">% (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">val</span><span class="s3">[</span><span class="s4">'real'</span><span class="s3">], </span><span class="s1">self</span><span class="s3">.</span><span class="s1">val</span><span class="s3">[</span><span class="s4">'imag'</span><span class="s3">])</span>
+
+
+<span class="s2">class </span><span class="s1">NumbaTuplePrinter</span><span class="s3">:</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">val </span><span class="s3">= </span><span class="s1">val</span>
+
+    <span class="s2">def </span><span class="s1">to_string</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">buf </span><span class="s3">= []</span>
+        <span class="s1">fields </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">val</span><span class="s3">.</span><span class="s1">type</span><span class="s3">.</span><span class="s1">fields</span><span class="s3">()</span>
+        <span class="s2">for </span><span class="s1">f </span><span class="s2">in </span><span class="s1">fields</span><span class="s3">:</span>
+            <span class="s1">buf</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">str</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">val</span><span class="s3">[</span><span class="s1">f</span><span class="s3">.</span><span class="s1">name</span><span class="s3">]))</span>
+        <span class="s2">return </span><span class="s4">&quot;(%s)&quot; </span><span class="s3">% </span><span class="s4">', '</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">buf</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">NumbaUniTuplePrinter</span><span class="s3">:</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">val </span><span class="s3">= </span><span class="s1">val</span>
+
+    <span class="s2">def </span><span class="s1">to_string</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s6"># unituples are arrays</span>
+        <span class="s1">fields </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">val</span><span class="s3">.</span><span class="s1">type</span><span class="s3">.</span><span class="s1">fields</span><span class="s3">()</span>
+        <span class="s1">lo</span><span class="s3">, </span><span class="s1">hi </span><span class="s3">= </span><span class="s1">fields</span><span class="s3">[</span><span class="s5">0</span><span class="s3">].</span><span class="s1">type</span><span class="s3">.</span><span class="s1">range</span><span class="s3">()</span>
+        <span class="s1">buf </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">lo</span><span class="s3">, </span><span class="s1">hi </span><span class="s3">+ </span><span class="s5">1</span><span class="s3">):</span>
+            <span class="s1">buf</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">str</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">val</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]))</span>
+        <span class="s2">return </span><span class="s4">&quot;(%s)&quot; </span><span class="s3">% </span><span class="s4">', '</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">buf</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">NumbaUnicodeTypePrinter</span><span class="s3">:</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">val </span><span class="s3">= </span><span class="s1">val</span>
+
+    <span class="s2">def </span><span class="s1">to_string</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">NULL </span><span class="s3">= </span><span class="s5">0x0</span>
+        <span class="s1">data </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">val</span><span class="s3">[</span><span class="s4">&quot;data&quot;</span><span class="s3">]</span>
+        <span class="s1">nitems </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">val</span><span class="s3">[</span><span class="s4">&quot;length&quot;</span><span class="s3">]</span>
+        <span class="s1">kind </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">val</span><span class="s3">[</span><span class="s4">&quot;kind&quot;</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">data </span><span class="s3">!= </span><span class="s1">NULL</span><span class="s3">:</span>
+            <span class="s6"># This needs sorting out, encoding is wrong</span>
+            <span class="s1">this_proc </span><span class="s3">= </span><span class="s1">gdb</span><span class="s3">.</span><span class="s1">selected_inferior</span><span class="s3">()</span>
+            <span class="s1">mem </span><span class="s3">= </span><span class="s1">this_proc</span><span class="s3">.</span><span class="s1">read_memory</span><span class="s3">(</span><span class="s1">int</span><span class="s3">(</span><span class="s1">data</span><span class="s3">), </span><span class="s1">nitems </span><span class="s3">* </span><span class="s1">kind</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">mem</span><span class="s3">, </span><span class="s1">memoryview</span><span class="s3">):</span>
+                <span class="s1">buf </span><span class="s3">= </span><span class="s1">bytes</span><span class="s3">(</span><span class="s1">mem</span><span class="s3">).</span><span class="s1">decode</span><span class="s3">()</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">buf </span><span class="s3">= </span><span class="s1">mem</span><span class="s3">.</span><span class="s1">decode</span><span class="s3">(</span><span class="s4">'utf-8'</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">buf </span><span class="s3">= </span><span class="s1">str</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s4">&quot;'%s'&quot; </span><span class="s3">% </span><span class="s1">buf</span>
+
+
+<span class="s2">def </span><span class="s1">_create_printers</span><span class="s3">():</span>
+    <span class="s1">printer </span><span class="s3">= </span><span class="s1">gdb</span><span class="s3">.</span><span class="s1">printing</span><span class="s3">.</span><span class="s1">RegexpCollectionPrettyPrinter</span><span class="s3">(</span><span class="s4">&quot;Numba&quot;</span><span class="s3">)</span>
+    <span class="s1">printer</span><span class="s3">.</span><span class="s1">add_printer</span><span class="s3">(</span><span class="s4">'Numba unaligned array printer'</span><span class="s3">, </span><span class="s4">'^unaligned array</span><span class="s2">\\</span><span class="s4">('</span><span class="s3">,</span>
+                        <span class="s1">NumbaArrayPrinter</span><span class="s3">)</span>
+    <span class="s1">printer</span><span class="s3">.</span><span class="s1">add_printer</span><span class="s3">(</span><span class="s4">'Numba array printer'</span><span class="s3">, </span><span class="s4">'^array</span><span class="s2">\\</span><span class="s4">('</span><span class="s3">, </span><span class="s1">NumbaArrayPrinter</span><span class="s3">)</span>
+    <span class="s1">printer</span><span class="s3">.</span><span class="s1">add_printer</span><span class="s3">(</span><span class="s4">'Numba complex printer'</span><span class="s3">, </span><span class="s4">'^complex[0-9]+</span><span class="s2">\\ </span><span class="s4">'</span><span class="s3">,</span>
+                        <span class="s1">NumbaComplexPrinter</span><span class="s3">)</span>
+    <span class="s1">printer</span><span class="s3">.</span><span class="s1">add_printer</span><span class="s3">(</span><span class="s4">'Numba Tuple printer'</span><span class="s3">, </span><span class="s4">'^Tuple</span><span class="s2">\\</span><span class="s4">('</span><span class="s3">,</span>
+                        <span class="s1">NumbaTuplePrinter</span><span class="s3">)</span>
+    <span class="s1">printer</span><span class="s3">.</span><span class="s1">add_printer</span><span class="s3">(</span><span class="s4">'Numba UniTuple printer'</span><span class="s3">, </span><span class="s4">'^UniTuple</span><span class="s2">\\</span><span class="s4">('</span><span class="s3">,</span>
+                        <span class="s1">NumbaUniTuplePrinter</span><span class="s3">)</span>
+    <span class="s1">printer</span><span class="s3">.</span><span class="s1">add_printer</span><span class="s3">(</span><span class="s4">'Numba unicode_type printer'</span><span class="s3">, </span><span class="s4">'^unicode_type</span><span class="s2">\\</span><span class="s4">s+</span><span class="s2">\\</span><span class="s4">('</span><span class="s3">,</span>
+                        <span class="s1">NumbaUnicodeTypePrinter</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">printer</span>
+
+
+<span class="s6"># register the Numba pretty printers for the current object</span>
+<span class="s1">gdb</span><span class="s3">.</span><span class="s1">printing</span><span class="s3">.</span><span class="s1">register_pretty_printer</span><span class="s3">(</span><span class="s1">gdb</span><span class="s3">.</span><span class="s1">current_objfile</span><span class="s3">(), </span><span class="s1">_create_printers</span><span class="s3">())</span>
+</pre>
+</body>
+</html>

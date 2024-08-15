@@ -1,0 +1,1500 @@
+<html>
+<head>
+<title>multistroke.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #cf8e6d;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+multistroke.py</font>
+</center></td></tr></table>
+<pre><span class="s0">''' 
+Multistroke gesture recognizer 
+============================== 
+ 
+.. versionadded:: 
+    1.9.0 
+ 
+.. warning:: 
+ 
+    This is experimental and subject to change as long as this warning notice 
+    is present. 
+ 
+See :file:`kivy/examples/demo/multistroke/main.py` for a complete application 
+example. 
+ 
+Conceptual Overview 
+------------------- 
+ 
+This module implements the Protractor gesture recognition algorithm. 
+ 
+:class:`Recognizer` is the search/database API similar to 
+:class:`~kivy.gesture.GestureDatabase`. It maintains a list of 
+:class:`MultistrokeGesture` objects and allows you to search for a 
+user-input gestures among them. 
+ 
+:class:`ProgressTracker` tracks the progress of a :meth:`Recognizer.recognize` 
+call. It can be used to interact with the running recognizer task, for example 
+forcing it to stop half-way, or analyzing results as they arrive. 
+ 
+:class:`MultistrokeGesture` represents a gesture in the gesture database 
+(:attr:`Recognizer.db`). It is a container for :class:`UnistrokeTemplate` 
+objects, and implements the heap permute algorithm to automatically generate 
+all possible stroke orders (if desired). 
+ 
+:class:`UnistrokeTemplate` represents a single stroke path. It's typically 
+instantiated automatically by :class:`MultistrokeGesture`, but sometimes you 
+may need to create them manually. 
+ 
+:class:`Candidate` represents a user-input gesture that is used to search 
+the gesture database for matches. It is normally instantiated automatically 
+by calling :meth:`Recognizer.recognize`. 
+ 
+Usage examples 
+-------------- 
+ 
+See :file:`kivy/examples/demo/multistroke/main.py` for a complete application 
+example. 
+ 
+You can bind to events on :class:`Recognizer` to track the state of all 
+calls to :meth:`Recognizer.recognize`. The callback function will receive an 
+instance of :class:`ProgressTracker` that can be used to analyze and control 
+various aspects of the recognition process :: 
+ 
+    from kivy.vector import Vector 
+    from kivy.multistroke import Recognizer 
+ 
+    gdb = Recognizer() 
+ 
+    def search_start(gdb, pt): 
+        print(&quot;A search is starting with %d tasks&quot; % (pt.tasks)) 
+ 
+    def search_stop(gdb, pt): 
+        # This will call max() on the result dictionary, so it's best to store 
+        # it instead of calling it 3 times consecutively 
+        best = pt.best 
+        print(&quot;Search ended (%s). Best is %s (score %f, distance %f)&quot; % ( 
+            pt.status, best['name'], best['score'], best['dist'] )) 
+ 
+    # Bind your callbacks to track all matching operations 
+    gdb.bind(on_search_start=search_start) 
+    gdb.bind(on_search_complete=search_stop) 
+ 
+    # The format below is referred to as `strokes`, a list of stroke paths. 
+    # Note that each path shown here consists of two points, ie a straight 
+    # line; if you plot them it looks like a T, hence the name. 
+    gdb.add_gesture('T', [ 
+        [Vector(30, 7), Vector(103, 7)], 
+        [Vector(66, 7), Vector(66, 87)]]) 
+ 
+    # Now you can search for the 'T' gesture using similar data (user input). 
+    # This will trigger both of the callbacks bound above. 
+    gdb.recognize([ 
+        [Vector(45, 8), Vector(110, 12)], 
+        [Vector(88, 9), Vector(85, 95)]]) 
+ 
+On the next :class:`~kivy.clock.Clock` tick, the matching process starts 
+(and, in this case, completes). 
+ 
+To track individual calls to :meth:`Recognizer.recognize`, use the return 
+value (also a :class:`ProgressTracker` instance) :: 
+ 
+    # Same as above, but keep track of progress using returned value 
+    progress = gdb.recognize([ 
+        [Vector(45, 8), Vector(110, 12)], 
+        [Vector(88, 9), Vector(85, 95)]]) 
+ 
+    progress.bind(on_progress=my_other_callback) 
+    print(progress.progress) # = 0 
+ 
+    # [ assuming a kivy.clock.Clock.tick() here ] 
+ 
+    print(result.progress) # = 1 
+ 
+Algorithm details 
+----------------- 
+ 
+For more information about the matching algorithm, see: 
+ 
+&quot;Protractor: A fast and accurate gesture recognizer&quot; by Yang Li 
+  http://yangl.org/pdf/protractor-chi2010.pdf 
+ 
+&quot;$N-Protractor&quot; by Lisa Anthony and Jacob O. Wobbrock 
+  http://depts.washington.edu/aimgroup/proj/dollar/ndollar-protractor.pdf 
+ 
+Some of the code is derived from the JavaScript implementation here: 
+  http://depts.washington.edu/aimgroup/proj/dollar/ndollar.html 
+'''</span>
+
+<span class="s1">__all__ </span><span class="s2">= (</span><span class="s3">'Recognizer'</span><span class="s2">, </span><span class="s3">'ProgressTracker'</span><span class="s2">, </span><span class="s3">'MultistrokeGesture'</span><span class="s2">,</span>
+           <span class="s3">'UnistrokeTemplate'</span><span class="s2">, </span><span class="s3">'Candidate'</span><span class="s2">)</span>
+
+<span class="s4">import </span><span class="s1">pickle</span>
+<span class="s4">import </span><span class="s1">base64</span>
+<span class="s4">import </span><span class="s1">zlib</span>
+<span class="s4">from </span><span class="s1">re </span><span class="s4">import </span><span class="s1">match </span><span class="s4">as </span><span class="s1">re_match</span>
+<span class="s4">from </span><span class="s1">collections </span><span class="s4">import </span><span class="s1">deque</span>
+<span class="s4">from </span><span class="s1">math </span><span class="s4">import </span><span class="s1">sqrt</span><span class="s2">, </span><span class="s1">pi</span><span class="s2">, </span><span class="s1">radians</span><span class="s2">, </span><span class="s1">acos</span><span class="s2">, </span><span class="s1">atan</span><span class="s2">, </span><span class="s1">atan2</span><span class="s2">, </span><span class="s1">pow</span><span class="s2">, </span><span class="s1">floor</span>
+<span class="s4">from </span><span class="s1">math </span><span class="s4">import </span><span class="s1">sin </span><span class="s4">as </span><span class="s1">math_sin</span><span class="s2">, </span><span class="s1">cos </span><span class="s4">as </span><span class="s1">math_cos</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">vector </span><span class="s4">import </span><span class="s1">Vector</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">clock </span><span class="s4">import </span><span class="s1">Clock</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">event </span><span class="s4">import </span><span class="s1">EventDispatcher</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">properties </span><span class="s4">import </span><span class="s1">ListProperty</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">compat </span><span class="s4">import </span><span class="s1">PY2</span>
+<span class="s4">from </span><span class="s1">io </span><span class="s4">import </span><span class="s1">BytesIO</span>
+
+<span class="s4">if not </span><span class="s1">PY2</span><span class="s2">:</span>
+    <span class="s1">xrange </span><span class="s2">= </span><span class="s1">range</span>
+
+<span class="s5"># Default number of gesture matches per frame</span>
+<span class="s5"># FIXME: relevant number</span>
+<span class="s1">DEFAULT_GPF </span><span class="s2">= </span><span class="s6">10</span>
+
+<span class="s5"># Algorithm data</span>
+<span class="s1">SQUARESIZE </span><span class="s2">= </span><span class="s6">250.0</span>
+<span class="s1">ONEDTHRESHOLD </span><span class="s2">= </span><span class="s6">0.25</span>
+<span class="s1">ORIGIN </span><span class="s2">= </span><span class="s1">Vector</span><span class="s2">(</span><span class="s6">0</span><span class="s2">, </span><span class="s6">0</span><span class="s2">)</span>
+
+
+<span class="s4">class </span><span class="s1">MultistrokeError</span><span class="s2">(</span><span class="s1">Exception</span><span class="s2">):</span>
+    <span class="s4">pass</span>
+
+
+<span class="s5"># -----------------------------------------------------------------------------</span>
+<span class="s5"># Recognizer</span>
+<span class="s5"># -----------------------------------------------------------------------------</span>
+
+<span class="s4">class </span><span class="s1">Recognizer</span><span class="s2">(</span><span class="s1">EventDispatcher</span><span class="s2">):</span>
+    <span class="s0">''':class:`Recognizer` provides a gesture database with matching 
+    facilities. 
+ 
+    :Events: 
+        `on_search_start` 
+            Fired when a new search is started using this Recognizer. 
+ 
+        `on_search_complete` 
+            Fired when a running search ends, for whatever reason. 
+            (use :data:`ProgressTracker.status` to find out) 
+ 
+    :Properties: 
+        `db` 
+            A :class:`ListProperty` that contains the available 
+            :class:`MultistrokeGesture` objects. 
+ 
+            :attr:`db` is a 
+            :class:`~kivy.properties.ListProperty` and defaults to [] 
+    '''</span>
+
+    <span class="s1">db </span><span class="s2">= </span><span class="s1">ListProperty</span><span class="s2">([])</span>
+
+    <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">Recognizer</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">(**</span><span class="s1">kwargs</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">register_event_type</span><span class="s2">(</span><span class="s3">'on_search_start'</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">register_event_type</span><span class="s2">(</span><span class="s3">'on_search_complete'</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">filter</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s0">''':meth:`filter` returns a subset of objects in :attr:`self.db`, 
+        according to given criteria. This is used by many other methods of 
+        the :class:`Recognizer`; the arguments below can for example be 
+        used when calling :meth:`Recognizer.recognize` or 
+        :meth:`Recognizer.export_gesture`. You normally don't need to call 
+        this directly. 
+ 
+        :Arguments: 
+ 
+            `name` 
+                Limits the returned list to gestures where 
+                :attr:`MultistrokeGesture.name` matches given regular 
+                expression(s). If re.match(name, MultistrokeGesture.name) 
+                tests true, the gesture is included in the returned list. 
+                Can be a string or an array of strings :: 
+ 
+                    gdb = Recognizer() 
+ 
+                    # Will match all names that start with a capital N 
+                    # (ie Next, New, N, Nebraska etc, but not &quot;n&quot; or &quot;next&quot;) 
+                    gdb.filter(name='N') 
+ 
+                    # exactly 'N' 
+                    gdb.filter(name='N$') 
+ 
+                    # Nebraska, teletubbies, France, fraggle, N, n, etc 
+                    gdb.filter(name=['[Nn]', '(?i)T', '(?i)F']) 
+ 
+            `priority` 
+                Limits the returned list to gestures with certain 
+                :attr:`MultistrokeGesture.priority` values. If specified as an 
+                integer, only gestures with a lower priority are returned. If 
+                specified as a list (min/max) :: 
+ 
+                    # Max priority 50 
+                    gdb.filter(priority=50) 
+ 
+                    # Max priority 50 (same result as above) 
+                    gdb.filter(priority=[0, 50]) 
+ 
+                    # Min priority 50, max 100 
+                    gdb.filter(priority=[50, 100]) 
+ 
+                When this option is used, :attr:`Recognizer.db` is 
+                automatically sorted according to priority, incurring extra 
+                cost. You can use `force_priority_sort` to override this 
+                behavior if your gestures are already sorted according to 
+                priority. 
+ 
+            `orientation_sensitive` 
+                Limits the returned list to gestures that are 
+                orientation sensitive (True), gestures that are not orientation 
+                sensitive (False) or None (ignore template sensitivity, this is 
+                the default). 
+ 
+            `numstrokes` 
+                Limits the returned list to gestures that have the specified 
+                number of strokes (in :attr:`MultistrokeGesture.strokes`). 
+                Can be a single integer or a list of integers. 
+ 
+            `numpoints` 
+                Limits the returned list to gestures that have specific 
+                :attr:`MultistrokeGesture.numpoints` values. This is provided 
+                for flexibility, do not use it unless you understand what it 
+                does. Can be a single integer or a list of integers. 
+ 
+            `force_priority_sort` 
+                Can be used to override the default sort behavior. Normally 
+                :class:`MultistrokeGesture` objects are returned in priority 
+                order if the `priority` option is used. Setting this to True 
+                will return gestures sorted in priority order, False will 
+                return in the order gestures were added. None means decide 
+                automatically (the default). 
+ 
+                .. Note :: 
+                    For improved performance, you can load your gesture 
+                    database in priority order and set this to False when 
+                    calling :meth:`Recognizer.recognize` 
+ 
+            `db` 
+                Can be set if you want to filter a different list of objects 
+                than :attr:`Recognizer.db`. You probably don't want to do this; 
+                it is used internally by :meth:`import_gesture`. 
+        '''</span>
+        <span class="s1">have_filters </span><span class="s2">= </span><span class="s4">False</span>
+
+        <span class="s1">kwargs_get </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span>
+
+        <span class="s1">name </span><span class="s2">= </span><span class="s1">kwargs_get</span><span class="s2">(</span><span class="s3">'name'</span><span class="s2">, </span><span class="s4">None</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s1">name </span><span class="s4">is not None</span><span class="s2">:</span>
+            <span class="s1">have_filters </span><span class="s2">= </span><span class="s4">True</span>
+            <span class="s4">if not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">name</span><span class="s2">, </span><span class="s1">list</span><span class="s2">):</span>
+                <span class="s1">name </span><span class="s2">= [</span><span class="s1">name</span><span class="s2">]</span>
+
+        <span class="s1">priority </span><span class="s2">= </span><span class="s1">kwargs_get</span><span class="s2">(</span><span class="s3">'priority'</span><span class="s2">, </span><span class="s4">None</span><span class="s2">)</span>
+        <span class="s1">min_p</span><span class="s2">, </span><span class="s1">max_p </span><span class="s2">= </span><span class="s4">None</span><span class="s2">, </span><span class="s4">None</span>
+        <span class="s4">if </span><span class="s1">priority </span><span class="s4">is not None</span><span class="s2">:</span>
+            <span class="s1">have_filters </span><span class="s2">= </span><span class="s4">True</span>
+            <span class="s4">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">priority</span><span class="s2">, </span><span class="s1">list</span><span class="s2">):</span>
+                <span class="s1">min_p</span><span class="s2">, </span><span class="s1">max_p </span><span class="s2">= </span><span class="s1">priority</span>
+            <span class="s4">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">priority</span><span class="s2">, </span><span class="s1">int</span><span class="s2">):</span>
+                <span class="s1">min_p</span><span class="s2">, </span><span class="s1">max_p </span><span class="s2">= </span><span class="s4">None</span><span class="s2">, </span><span class="s1">priority</span>
+
+        <span class="s1">numstrokes </span><span class="s2">= </span><span class="s1">kwargs_get</span><span class="s2">(</span><span class="s3">'numstrokes'</span><span class="s2">, </span><span class="s4">None</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s1">numstrokes </span><span class="s4">is not None</span><span class="s2">:</span>
+            <span class="s1">have_filters </span><span class="s2">= </span><span class="s4">True</span>
+            <span class="s4">if not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">numstrokes</span><span class="s2">, </span><span class="s1">list</span><span class="s2">):</span>
+                <span class="s1">numstrokes </span><span class="s2">= [</span><span class="s1">numstrokes</span><span class="s2">]</span>
+
+        <span class="s1">numpoints </span><span class="s2">= </span><span class="s1">kwargs_get</span><span class="s2">(</span><span class="s3">'numpoints'</span><span class="s2">, </span><span class="s4">None</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s1">numpoints </span><span class="s4">is not None</span><span class="s2">:</span>
+            <span class="s1">have_filters </span><span class="s2">= </span><span class="s4">True</span>
+            <span class="s4">if not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">numpoints</span><span class="s2">, </span><span class="s1">list</span><span class="s2">):</span>
+                <span class="s1">numpoints </span><span class="s2">= [</span><span class="s1">numpoints</span><span class="s2">]</span>
+
+        <span class="s1">orientation_sens </span><span class="s2">= </span><span class="s1">kwargs_get</span><span class="s2">(</span><span class="s3">'orientation_sensitive'</span><span class="s2">, </span><span class="s4">None</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s1">orientation_sens </span><span class="s4">is not None</span><span class="s2">:</span>
+            <span class="s1">have_filters </span><span class="s2">= </span><span class="s4">True</span>
+
+        <span class="s5"># Prepare a correctly sorted tasklist</span>
+        <span class="s1">force_priority_sort </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'force_priority_sort'</span><span class="s2">, </span><span class="s4">None</span><span class="s2">)</span>
+        <span class="s1">force_sort_on </span><span class="s2">= </span><span class="s1">force_priority_sort </span><span class="s4">and True</span>
+        <span class="s1">force_sort_off </span><span class="s2">= (</span><span class="s1">force_priority_sort </span><span class="s4">is False</span><span class="s2">) </span><span class="s4">and True</span>
+
+        <span class="s1">db </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'db'</span><span class="s2">, </span><span class="s4">None</span><span class="s2">) </span><span class="s4">or </span><span class="s1">self</span><span class="s2">.</span><span class="s1">db</span>
+        <span class="s4">if </span><span class="s2">(</span><span class="s1">force_sort_on </span><span class="s4">or </span><span class="s1">priority</span><span class="s2">) </span><span class="s4">and not </span><span class="s1">force_sort_off</span><span class="s2">:</span>
+            <span class="s1">tasklist </span><span class="s2">= </span><span class="s1">sorted</span><span class="s2">(</span><span class="s1">db</span><span class="s2">, </span><span class="s1">key</span><span class="s2">=</span><span class="s4">lambda </span><span class="s1">n</span><span class="s2">: </span><span class="s1">n</span><span class="s2">.</span><span class="s1">priority</span><span class="s2">)</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s1">tasklist </span><span class="s2">= </span><span class="s1">db</span>
+
+        <span class="s5"># Now test each gesture in the database against filter criteria</span>
+        <span class="s1">out </span><span class="s2">= </span><span class="s1">deque</span><span class="s2">()</span>
+        <span class="s4">if not </span><span class="s1">have_filters</span><span class="s2">:</span>
+            <span class="s1">out</span><span class="s2">.</span><span class="s1">extend</span><span class="s2">(</span><span class="s1">tasklist</span><span class="s2">)</span>
+            <span class="s4">return </span><span class="s1">out</span>
+
+        <span class="s1">out_append </span><span class="s2">= </span><span class="s1">out</span><span class="s2">.</span><span class="s1">append</span>
+        <span class="s4">for </span><span class="s1">gesture </span><span class="s4">in </span><span class="s1">tasklist</span><span class="s2">:</span>
+
+            <span class="s4">if </span><span class="s2">(</span><span class="s1">orientation_sens </span><span class="s4">is not None and</span>
+                    <span class="s1">orientation_sens </span><span class="s2">!= </span><span class="s1">gesture</span><span class="s2">.</span><span class="s1">orientation_sens</span><span class="s2">):</span>
+                <span class="s4">continue</span>
+
+            <span class="s4">if </span><span class="s1">numpoints </span><span class="s4">and </span><span class="s1">gesture</span><span class="s2">.</span><span class="s1">numpoints </span><span class="s4">not in </span><span class="s1">numpoints</span><span class="s2">:</span>
+                <span class="s4">continue</span>
+
+            <span class="s4">if </span><span class="s1">numstrokes </span><span class="s4">and </span><span class="s1">len</span><span class="s2">(</span><span class="s1">gesture</span><span class="s2">.</span><span class="s1">strokes</span><span class="s2">) </span><span class="s4">not in </span><span class="s1">numstrokes</span><span class="s2">:</span>
+                <span class="s4">continue</span>
+
+            <span class="s4">if </span><span class="s1">min_p </span><span class="s4">is not None and </span><span class="s1">gesture</span><span class="s2">.</span><span class="s1">priority </span><span class="s2">&lt; </span><span class="s1">min_p</span><span class="s2">:</span>
+                <span class="s4">continue</span>
+
+            <span class="s4">if </span><span class="s1">max_p </span><span class="s4">is not None and </span><span class="s1">gesture</span><span class="s2">.</span><span class="s1">priority </span><span class="s2">&gt; </span><span class="s1">max_p</span><span class="s2">:</span>
+                <span class="s4">return </span><span class="s1">out</span>
+
+            <span class="s4">if </span><span class="s1">name</span><span class="s2">:</span>
+                <span class="s4">for </span><span class="s1">f </span><span class="s4">in </span><span class="s1">name</span><span class="s2">:</span>
+                    <span class="s4">if </span><span class="s1">re_match</span><span class="s2">(</span><span class="s1">f</span><span class="s2">, </span><span class="s1">gesture</span><span class="s2">.</span><span class="s1">name</span><span class="s2">):</span>
+                        <span class="s1">out_append</span><span class="s2">(</span><span class="s1">gesture</span><span class="s2">)</span>
+                        <span class="s4">break</span>
+            <span class="s4">else</span><span class="s2">:</span>
+                <span class="s1">out_append</span><span class="s2">(</span><span class="s1">gesture</span><span class="s2">)</span>
+
+        <span class="s4">return </span><span class="s1">out</span>
+
+    <span class="s4">def </span><span class="s1">add_gesture</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">strokes</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s0">'''Add a new gesture to the database. This will instantiate a new 
+        :class:`MultistrokeGesture` with `strokes` and append it to self.db. 
+ 
+        .. Note :: 
+            If you already have instantiated a :class:`MultistrokeGesture` 
+            object and wish to add it, append it to :attr:`Recognizer.db` 
+            manually. 
+        '''</span>
+        <span class="s4">if not </span><span class="s1">strokes</span><span class="s2">:</span>
+            <span class="s4">return False</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">db</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span>
+            <span class="s1">MultistrokeGesture</span><span class="s2">(</span><span class="s1">name</span><span class="s2">=</span><span class="s1">name</span><span class="s2">, </span><span class="s1">strokes</span><span class="s2">=</span><span class="s1">strokes</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">)</span>
+        <span class="s2">)</span>
+        <span class="s4">return True</span>
+
+    <span class="s4">def </span><span class="s1">parse_gesture</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">data</span><span class="s2">):</span>
+        <span class="s0">'''Parse data formatted by export_gesture(). Returns a list of 
+        :class:`MultistrokeGesture` objects. This is used internally by 
+        :meth:`import_gesture`, you normally don't need to call this 
+        directly.'''</span>
+        <span class="s1">io </span><span class="s2">= </span><span class="s1">BytesIO</span><span class="s2">(</span><span class="s1">zlib</span><span class="s2">.</span><span class="s1">decompress</span><span class="s2">(</span><span class="s1">base64</span><span class="s2">.</span><span class="s1">b64decode</span><span class="s2">(</span><span class="s1">data</span><span class="s2">)))</span>
+
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">pickle</span><span class="s2">.</span><span class="s1">Unpickler</span><span class="s2">(</span><span class="s1">io</span><span class="s2">)</span>
+        <span class="s1">multistrokes </span><span class="s2">= []</span>
+        <span class="s1">ms_append </span><span class="s2">= </span><span class="s1">multistrokes</span><span class="s2">.</span><span class="s1">append</span>
+        <span class="s4">for </span><span class="s1">multistroke </span><span class="s4">in </span><span class="s1">p</span><span class="s2">.</span><span class="s1">load</span><span class="s2">():</span>
+            <span class="s1">strokes </span><span class="s2">= </span><span class="s1">multistroke</span><span class="s2">[</span><span class="s3">'strokes'</span><span class="s2">]</span>
+            <span class="s1">multistroke</span><span class="s2">[</span><span class="s3">'strokes'</span><span class="s2">] = [[</span><span class="s1">Vector</span><span class="s2">(</span>
+                <span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">) </span><span class="s4">for </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y </span><span class="s4">in </span><span class="s1">line</span><span class="s2">] </span><span class="s4">for </span><span class="s1">line </span><span class="s4">in </span><span class="s1">strokes</span><span class="s2">]</span>
+            <span class="s1">ms_append</span><span class="s2">(</span><span class="s1">MultistrokeGesture</span><span class="s2">(**</span><span class="s1">multistroke</span><span class="s2">))</span>
+        <span class="s4">return </span><span class="s1">multistrokes</span>
+
+    <span class="s5"># FIXME: use a try block, maybe shelve or something</span>
+    <span class="s4">def </span><span class="s1">export_gesture</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">=</span><span class="s4">None</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s0">'''Export a list of :class:`MultistrokeGesture` objects. Outputs a 
+        base64-encoded string that can be decoded to a Python list with 
+        the :meth:`parse_gesture` function or imported directly to 
+        :attr:`self.db` using :meth:`Recognizer.import_gesture`. If 
+        `filename` is specified, the output is written to disk, otherwise 
+        returned. 
+ 
+        This method accepts optional :meth:`Recognizer.filter` arguments. 
+        '''</span>
+        <span class="s1">io </span><span class="s2">= </span><span class="s1">BytesIO</span><span class="s2">()</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">pickle</span><span class="s2">.</span><span class="s1">Pickler</span><span class="s2">(</span><span class="s1">io</span><span class="s2">, </span><span class="s1">protocol</span><span class="s2">=</span><span class="s6">0</span><span class="s2">)</span>
+        <span class="s1">multistrokes </span><span class="s2">= []</span>
+        <span class="s1">defaults </span><span class="s2">= {</span><span class="s3">'priority'</span><span class="s2">: </span><span class="s6">100</span><span class="s2">, </span><span class="s3">'numpoints'</span><span class="s2">: </span><span class="s6">16</span><span class="s2">, </span><span class="s3">'stroke_sens'</span><span class="s2">: </span><span class="s4">True</span><span class="s2">,</span>
+                    <span class="s3">'orientation_sens'</span><span class="s2">: </span><span class="s4">False</span><span class="s2">, </span><span class="s3">'angle_similarity'</span><span class="s2">: </span><span class="s6">30.0</span><span class="s2">}</span>
+        <span class="s1">dkeys </span><span class="s2">= </span><span class="s1">defaults</span><span class="s2">.</span><span class="s1">keys</span><span class="s2">()</span>
+
+        <span class="s4">for </span><span class="s1">multistroke </span><span class="s4">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">filter</span><span class="s2">(**</span><span class="s1">kwargs</span><span class="s2">):</span>
+            <span class="s1">m </span><span class="s2">= </span><span class="s1">dict</span><span class="s2">(</span><span class="s1">defaults</span><span class="s2">)</span>
+            <span class="s1">m </span><span class="s2">= {</span><span class="s3">'name'</span><span class="s2">: </span><span class="s1">multistroke</span><span class="s2">.</span><span class="s1">name</span><span class="s2">}</span>
+            <span class="s4">for </span><span class="s1">attr </span><span class="s4">in </span><span class="s1">dkeys</span><span class="s2">:</span>
+                <span class="s1">m</span><span class="s2">[</span><span class="s1">attr</span><span class="s2">] = </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">multistroke</span><span class="s2">, </span><span class="s1">attr</span><span class="s2">)</span>
+            <span class="s1">m</span><span class="s2">[</span><span class="s3">'strokes'</span><span class="s2">] = </span><span class="s1">tuple</span><span class="s2">([(</span><span class="s1">p</span><span class="s2">.</span><span class="s1">x</span><span class="s2">, </span><span class="s1">p</span><span class="s2">.</span><span class="s1">y</span><span class="s2">) </span><span class="s4">for </span><span class="s1">p </span><span class="s4">in </span><span class="s1">line</span><span class="s2">]</span>
+                                 <span class="s4">for </span><span class="s1">line </span><span class="s4">in </span><span class="s1">multistroke</span><span class="s2">.</span><span class="s1">strokes</span><span class="s2">)</span>
+            <span class="s1">multistrokes</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">m</span><span class="s2">)</span>
+        <span class="s1">p</span><span class="s2">.</span><span class="s1">dump</span><span class="s2">(</span><span class="s1">multistrokes</span><span class="s2">)</span>
+
+        <span class="s4">if </span><span class="s1">filename</span><span class="s2">:</span>
+            <span class="s1">f </span><span class="s2">= </span><span class="s1">open</span><span class="s2">(</span><span class="s1">filename</span><span class="s2">, </span><span class="s3">'wb'</span><span class="s2">)</span>
+            <span class="s1">f</span><span class="s2">.</span><span class="s1">write</span><span class="s2">(</span><span class="s1">base64</span><span class="s2">.</span><span class="s1">b64encode</span><span class="s2">(</span><span class="s1">zlib</span><span class="s2">.</span><span class="s1">compress</span><span class="s2">(</span><span class="s1">io</span><span class="s2">.</span><span class="s1">getvalue</span><span class="s2">(), </span><span class="s6">9</span><span class="s2">)))</span>
+            <span class="s1">f</span><span class="s2">.</span><span class="s1">close</span><span class="s2">()</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s1">base64</span><span class="s2">.</span><span class="s1">b64encode</span><span class="s2">(</span><span class="s1">zlib</span><span class="s2">.</span><span class="s1">compress</span><span class="s2">(</span><span class="s1">io</span><span class="s2">.</span><span class="s1">getvalue</span><span class="s2">(), </span><span class="s6">9</span><span class="s2">))</span>
+
+    <span class="s5"># FIXME: match them all with protractor, and don't load exacts? or</span>
+    <span class="s5"># just compare the data or something; seems better to do this on import</span>
+    <span class="s5"># than on every subsequent call to recognize(). And fix it in general,</span>
+    <span class="s5"># too.</span>
+    <span class="s4">def </span><span class="s1">import_gesture</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">data</span><span class="s2">=</span><span class="s4">None</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">=</span><span class="s4">None</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s0">'''Import a list of gestures as formatted by :meth:`export_gesture`. 
+        One of `data` or `filename` must be specified. 
+ 
+        This method accepts optional :meth:`Recognizer.filter` arguments, 
+        if none are specified then all gestures in specified data are 
+        imported.'''</span>
+        <span class="s4">if </span><span class="s1">filename </span><span class="s4">is not None</span><span class="s2">:</span>
+            <span class="s4">with </span><span class="s1">open</span><span class="s2">(</span><span class="s1">filename</span><span class="s2">, </span><span class="s3">&quot;rb&quot;</span><span class="s2">) </span><span class="s4">as </span><span class="s1">infile</span><span class="s2">:</span>
+                <span class="s1">data </span><span class="s2">= </span><span class="s1">infile</span><span class="s2">.</span><span class="s1">read</span><span class="s2">()</span>
+        <span class="s4">elif </span><span class="s1">data </span><span class="s4">is None</span><span class="s2">:</span>
+            <span class="s4">raise </span><span class="s1">MultistrokeError</span><span class="s2">(</span><span class="s3">'import_gesture needs data= or filename='</span><span class="s2">)</span>
+
+        <span class="s1">new </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">filter</span><span class="s2">(</span><span class="s1">db</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">parse_gesture</span><span class="s2">(</span><span class="s1">data</span><span class="s2">), **</span><span class="s1">kwargs</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s1">new</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">db</span><span class="s2">.</span><span class="s1">extend</span><span class="s2">(</span><span class="s1">new</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">transfer_gesture</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">tgt</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s0">'''Transfers :class:`MultistrokeGesture` objects from 
+        :attr:`Recognizer.db` to another :class:`Recognizer` instance `tgt`. 
+ 
+        This method accepts optional :meth:`Recognizer.filter` arguments. 
+        '''</span>
+        <span class="s4">if </span><span class="s1">hasattr</span><span class="s2">(</span><span class="s1">tgt</span><span class="s2">, </span><span class="s3">'db'</span><span class="s2">) </span><span class="s4">and </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">tgt</span><span class="s2">.</span><span class="s1">db</span><span class="s2">, </span><span class="s1">list</span><span class="s2">):</span>
+            <span class="s1">send </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">filter</span><span class="s2">(**</span><span class="s1">kwargs</span><span class="s2">)</span>
+            <span class="s4">if </span><span class="s1">send</span><span class="s2">:</span>
+                <span class="s1">tgt</span><span class="s2">.</span><span class="s1">db</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s4">None</span><span class="s2">)</span>
+                <span class="s1">tgt</span><span class="s2">.</span><span class="s1">db</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">:] = </span><span class="s1">send</span>
+                <span class="s4">return True</span>
+
+    <span class="s4">def </span><span class="s1">prepare_templates</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s0">'''This method is used to prepare :class:`UnistrokeTemplate` objects 
+        within the gestures in self.db. This is useful if you want to minimize 
+        punishment of lazy resampling by preparing all vectors in advance. If 
+        you do this before a call to :meth:`Recognizer.export_gesture`, you 
+        will have the vectors computed when you load the data later. 
+ 
+        This method accepts optional :meth:`Recognizer.filter` arguments. 
+ 
+        `force_numpoints`, if specified, will prepare all templates to the 
+        given number of points (instead of each template's preferred n; ie 
+        :data:`UnistrokeTemplate.numpoints`). You normally don't want to 
+        do this.'''</span>
+        <span class="s4">for </span><span class="s1">gesture </span><span class="s4">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">filter</span><span class="s2">(**</span><span class="s1">kwargs</span><span class="s2">):</span>
+            <span class="s4">for </span><span class="s1">tpl </span><span class="s4">in </span><span class="s1">gesture</span><span class="s2">:</span>
+                <span class="s1">n </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'force_numpoints'</span><span class="s2">, </span><span class="s1">tpl</span><span class="s2">.</span><span class="s1">numpoints</span><span class="s2">)</span>
+                <span class="s1">tpl</span><span class="s2">.</span><span class="s1">prepare</span><span class="s2">(</span><span class="s1">n</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">recognize</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">strokes</span><span class="s2">, </span><span class="s1">goodscore</span><span class="s2">=</span><span class="s4">None</span><span class="s2">, </span><span class="s1">timeout</span><span class="s2">=</span><span class="s6">0</span><span class="s2">, </span><span class="s1">delay</span><span class="s2">=</span><span class="s6">0</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s0">'''Search for gestures matching `strokes`. Returns a 
+        :class:`ProgressTracker` instance. 
+ 
+        This method accepts optional :meth:`Recognizer.filter` arguments. 
+ 
+        :Arguments: 
+ 
+            `strokes` 
+                A list of stroke paths (list of lists of 
+                :class:`~kivy.vector.Vector` objects) that will be matched 
+                against gestures in the database. Can also be a 
+                :class:`Candidate` instance. 
+ 
+                .. Warning :: 
+ 
+                    If you manually supply a :class:`Candidate` that has a 
+                    skip-flag, make sure that the correct filter arguments 
+                    are set. Otherwise the system will attempt to load vectors 
+                    that have not been computed. For example, if you set 
+                    `skip_bounded` and do not set `orientation_sensitive` to 
+                    False, it will raise an exception if an 
+                    orientation_sensitive :class:`UnistrokeTemplate` 
+                    is encountered. 
+ 
+            `goodscore` 
+                If this is set (between 0.0 - 1.0) and a gesture score is 
+                equal to or higher than the specified value, the search is 
+                immediately halted and the on_search_complete event is 
+                fired (+ the on_complete event of the associated 
+                :class:`ProgressTracker` instance). Default is None (disabled). 
+ 
+            `timeout` 
+                Specifies a timeout (in seconds) for when the search is 
+                aborted and the results returned. This option applies only 
+                when `max_gpf` is not 0. Default value is 0, meaning all 
+                gestures in the database will be tested, no matter how long 
+                it takes. 
+ 
+            `max_gpf` 
+                Specifies the maximum number of :class:`MultistrokeGesture` 
+                objects that can be processed per frame. When exceeded, will 
+                cause the search to halt and resume work in the next frame. 
+                Setting to 0 will complete the search immediately (and block 
+                the UI). 
+ 
+                .. Warning :: 
+ 
+                    This does not limit the number of 
+                    :class:`UnistrokeTemplate` objects matched! If a single 
+                    gesture has a million templates, they will all be 
+                    processed in a single frame with max_gpf=1! 
+ 
+            `delay` 
+                Sets an optional delay between each run of the recognizer 
+                loop. Normally, a run is scheduled for the next frame until 
+                the tasklist is exhausted. If you set this, there will be an 
+                additional delay between each run (specified in seconds). 
+                Default is 0, resume in the next frame. 
+ 
+            `force_numpoints` 
+                forces all templates (and candidate) to be prepared to a 
+                certain number of points. This can be useful for example if 
+                you are evaluating templates for optimal n (do not use this 
+                unless you understand what it does). 
+        '''</span>
+        <span class="s1">GPF </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'max_gpf'</span><span class="s2">, </span><span class="s1">DEFAULT_GPF</span><span class="s2">)</span>
+
+        <span class="s5"># Obtain a list of MultistrokeGesture objects matching filter arguments</span>
+        <span class="s1">tasklist </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">filter</span><span class="s2">(**</span><span class="s1">kwargs</span><span class="s2">)</span>
+
+        <span class="s5"># Initialize the candidate and result objects</span>
+        <span class="s1">cand </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_candidate</span><span class="s2">(</span><span class="s1">strokes</span><span class="s2">)</span>
+        <span class="s1">result </span><span class="s2">= </span><span class="s1">ProgressTracker</span><span class="s2">(</span><span class="s1">cand</span><span class="s2">, </span><span class="s1">len</span><span class="s2">(</span><span class="s1">tasklist</span><span class="s2">))</span>
+
+        <span class="s5"># This is done to inform caller if they bind to on_complete and there</span>
+        <span class="s5"># is nothing to do; perhaps should just return None?</span>
+        <span class="s4">if not </span><span class="s1">tasklist</span><span class="s2">:</span>
+            <span class="s1">result</span><span class="s2">.</span><span class="s1">status </span><span class="s2">= </span><span class="s3">'complete'</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_search_complete'</span><span class="s2">, </span><span class="s1">result</span><span class="s2">)</span>
+
+            <span class="s4">def </span><span class="s1">result_hack</span><span class="s2">(</span><span class="s1">dt</span><span class="s2">):</span>
+                <span class="s1">result</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_complete'</span><span class="s2">)</span>
+            <span class="s1">Clock</span><span class="s2">.</span><span class="s1">schedule_once</span><span class="s2">(</span><span class="s1">result_hack</span><span class="s2">)</span>
+            <span class="s4">return </span><span class="s1">result</span>
+
+        <span class="s5"># This callback is scheduled once per frame until completed</span>
+        <span class="s4">def </span><span class="s1">_recognize_tick</span><span class="s2">(</span><span class="s1">dt</span><span class="s2">):</span>
+            <span class="s1">start_gc </span><span class="s2">= </span><span class="s1">result</span><span class="s2">.</span><span class="s1">_completed</span>
+            <span class="s1">stop_now </span><span class="s2">= </span><span class="s4">False</span>
+
+            <span class="s4">while not </span><span class="s1">stop_now </span><span class="s4">and </span><span class="s2">(</span><span class="s1">tasklist </span><span class="s4">and not </span><span class="s1">result</span><span class="s2">.</span><span class="s1">_break_flag</span><span class="s2">) </span><span class="s4">and </span><span class="s1">\</span>
+                    <span class="s2">(</span><span class="s4">not </span><span class="s1">GPF </span><span class="s4">or </span><span class="s2">(</span><span class="s1">result</span><span class="s2">.</span><span class="s1">_completed </span><span class="s2">- </span><span class="s1">start_gc </span><span class="s2">&lt; </span><span class="s1">GPF</span><span class="s2">)):</span>
+
+                <span class="s4">if </span><span class="s2">(</span><span class="s1">timeout </span><span class="s4">and</span>
+                        <span class="s1">Clock</span><span class="s2">.</span><span class="s1">get_time</span><span class="s2">() - </span><span class="s1">result</span><span class="s2">.</span><span class="s1">_start_time </span><span class="s2">&gt;= </span><span class="s1">timeout</span><span class="s2">):</span>
+                    <span class="s1">result</span><span class="s2">.</span><span class="s1">status </span><span class="s2">= </span><span class="s3">'timeout'</span>
+                    <span class="s1">stop_now </span><span class="s2">= </span><span class="s4">True</span>
+                    <span class="s4">break</span>
+
+                <span class="s5"># Get the best distance and number of matching operations done</span>
+                <span class="s1">gesture </span><span class="s2">= </span><span class="s1">tasklist</span><span class="s2">.</span><span class="s1">popleft</span><span class="s2">()</span>
+                <span class="s1">tpl</span><span class="s2">, </span><span class="s1">d</span><span class="s2">, </span><span class="s1">res</span><span class="s2">, </span><span class="s1">mos </span><span class="s2">= </span><span class="s1">gesture</span><span class="s2">.</span><span class="s1">match_candidate</span><span class="s2">(</span>
+                    <span class="s1">cand</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">)</span>
+
+                <span class="s4">if </span><span class="s1">tpl </span><span class="s4">is not None</span><span class="s2">:</span>
+                    <span class="s1">score </span><span class="s2">= </span><span class="s1">result</span><span class="s2">.</span><span class="s1">_add_result</span><span class="s2">(</span><span class="s1">gesture</span><span class="s2">, </span><span class="s1">d</span><span class="s2">, </span><span class="s1">tpl</span><span class="s2">, </span><span class="s1">res</span><span class="s2">)</span>
+                    <span class="s4">if </span><span class="s1">goodscore </span><span class="s4">is not None and </span><span class="s1">score </span><span class="s2">&gt;= </span><span class="s1">goodscore</span><span class="s2">:</span>
+                        <span class="s1">result</span><span class="s2">.</span><span class="s1">status </span><span class="s2">= </span><span class="s3">'goodscore'</span>
+                        <span class="s1">stop_now </span><span class="s2">= </span><span class="s4">True</span>
+
+                <span class="s1">result</span><span class="s2">.</span><span class="s1">_match_ops </span><span class="s2">+= </span><span class="s1">mos</span>
+                <span class="s1">result</span><span class="s2">.</span><span class="s1">_completed </span><span class="s2">+= </span><span class="s6">1</span>
+                <span class="s1">result</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_progress'</span><span class="s2">)</span>
+
+            <span class="s5"># The loop has ended. Prepare to dispatch 'complete'</span>
+            <span class="s4">def </span><span class="s1">_dispatch</span><span class="s2">():</span>
+                <span class="s1">result</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_complete'</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_search_complete'</span><span class="s2">, </span><span class="s1">result</span><span class="s2">)</span>
+                <span class="s4">return False</span>
+
+            <span class="s5"># Dispatch or reschedule another run</span>
+            <span class="s4">if not </span><span class="s1">tasklist</span><span class="s2">:</span>
+                <span class="s1">result</span><span class="s2">.</span><span class="s1">status </span><span class="s2">= </span><span class="s3">'complete'</span>
+                <span class="s4">return </span><span class="s1">_dispatch</span><span class="s2">()</span>
+            <span class="s4">elif </span><span class="s1">result</span><span class="s2">.</span><span class="s1">_break_flag</span><span class="s2">:</span>
+                <span class="s1">result</span><span class="s2">.</span><span class="s1">status </span><span class="s2">= </span><span class="s3">'stop'</span>
+                <span class="s4">return </span><span class="s1">_dispatch</span><span class="s2">()</span>
+            <span class="s4">elif </span><span class="s1">stop_now</span><span class="s2">:</span>
+                <span class="s4">return </span><span class="s1">_dispatch</span><span class="s2">()</span>
+            <span class="s4">else</span><span class="s2">:</span>
+                <span class="s1">Clock</span><span class="s2">.</span><span class="s1">schedule_once</span><span class="s2">(</span><span class="s1">_recognize_tick</span><span class="s2">, </span><span class="s1">delay</span><span class="s2">)</span>
+                <span class="s4">return True</span>
+        <span class="s5"># End _recognize_tick()</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_search_start'</span><span class="s2">, </span><span class="s1">result</span><span class="s2">)</span>
+        <span class="s4">if not </span><span class="s1">GPF</span><span class="s2">:</span>
+            <span class="s1">_recognize_tick</span><span class="s2">(</span><span class="s6">0</span><span class="s2">)</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s1">Clock</span><span class="s2">.</span><span class="s1">schedule_once</span><span class="s2">(</span><span class="s1">_recognize_tick</span><span class="s2">, </span><span class="s6">0</span><span class="s2">)</span>
+
+        <span class="s4">return </span><span class="s1">result</span>
+
+    <span class="s4">def </span><span class="s1">_candidate</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">strokes</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s5"># recognize() helper function, do not use directly. Set up a</span>
+        <span class="s5"># Candidate object from arguments. Either use a specified object</span>
+        <span class="s5"># or make a new one from strokes and apply safe skip_* settings to</span>
+        <span class="s5"># use less resources.</span>
+        <span class="s4">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">strokes</span><span class="s2">, </span><span class="s1">Candidate</span><span class="s2">):</span>
+            <span class="s4">return </span><span class="s1">strokes</span>
+
+        <span class="s4">if </span><span class="s2">(</span><span class="s4">not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">strokes</span><span class="s2">, </span><span class="s1">list</span><span class="s2">) </span><span class="s4">or not </span><span class="s1">len</span><span class="s2">(</span><span class="s1">strokes</span><span class="s2">) </span><span class="s4">or not</span>
+                <span class="s1">isinstance</span><span class="s2">(</span><span class="s1">strokes</span><span class="s2">[</span><span class="s6">0</span><span class="s2">], </span><span class="s1">list</span><span class="s2">)):</span>
+            <span class="s4">raise </span><span class="s1">MultistrokeError</span><span class="s2">(</span><span class="s3">'recognize() needs strokes= '</span>
+                                   <span class="s3">'list or Candidate'</span><span class="s2">)</span>
+
+        <span class="s1">cand </span><span class="s2">= </span><span class="s1">Candidate</span><span class="s2">(</span><span class="s1">strokes</span><span class="s2">)</span>
+        <span class="s1">o_filter </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'orientation_sensitive'</span><span class="s2">, </span><span class="s4">None</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s1">o_filter </span><span class="s4">is False</span><span class="s2">:</span>
+            <span class="s1">cand</span><span class="s2">.</span><span class="s1">skip_bounded </span><span class="s2">= </span><span class="s4">True</span>
+        <span class="s4">elif </span><span class="s1">o_filter </span><span class="s4">is True</span><span class="s2">:</span>
+            <span class="s1">cand</span><span class="s2">.</span><span class="s1">skip_invariant </span><span class="s2">= </span><span class="s4">True</span>
+
+        <span class="s4">return </span><span class="s1">cand</span>
+
+    <span class="s5"># Default event handlers</span>
+    <span class="s4">def </span><span class="s1">on_search_start</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">result</span><span class="s2">):</span>
+        <span class="s4">pass</span>
+
+    <span class="s4">def </span><span class="s1">on_search_complete</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">result</span><span class="s2">):</span>
+        <span class="s4">pass</span>
+
+
+<span class="s5"># -----------------------------------------------------------------------------</span>
+<span class="s5"># ProgressTracker</span>
+<span class="s5"># -----------------------------------------------------------------------------</span>
+
+<span class="s4">class </span><span class="s1">ProgressTracker</span><span class="s2">(</span><span class="s1">EventDispatcher</span><span class="s2">):</span>
+    <span class="s0">'''Represents an ongoing (or completed) search operation. Instantiated and 
+    returned by the :meth:`Recognizer.recognize` method when it is called. The 
+    `results` attribute is a dictionary that is  updated as the recognition 
+    operation progresses. 
+ 
+    .. Note :: 
+        You do not need to instantiate this class. 
+ 
+    :Arguments: 
+        `candidate` 
+            :class:`Candidate` object to be evaluated 
+        `tasks` 
+            Total number of gestures in tasklist (to test against) 
+ 
+    :Events: 
+        `on_progress` 
+            Fired for every gesture that is processed 
+        `on_result` 
+            Fired when a new result is added, and it is the first match 
+            for the `name` so far, or a consecutive match with better score. 
+        `on_complete` 
+            Fired when the search is completed, for whatever reason. 
+            (use `ProgressTracker.status` to find out) 
+ 
+    :Attributes: 
+        `results` 
+            A dictionary of all results (so far). The key is the name of the 
+            gesture (ie :attr:`UnistrokeTemplate.name` usually inherited from 
+            :class:`MultistrokeGesture`). Each item in the dictionary is a 
+            dict with the following entries: 
+ 
+                `name` 
+                    Name of the matched template (redundant) 
+                `score` 
+                    Computed score from 1.0 (perfect match) to 0.0 
+                `dist` 
+                    Cosine distance from candidate to template (low=closer) 
+                `gesture` 
+                    The :class:`MultistrokeGesture` object that was matched 
+                `best_template` 
+                    Index of the best matching template (in 
+                    :attr:`MultistrokeGesture.templates`) 
+                `template_results` 
+                    List of distances for all templates. The list index 
+                    corresponds to a :class:`UnistrokeTemplate` index in 
+                    gesture.templates. 
+ 
+        `status` 
+            `search` 
+                Currently working 
+            `stop` 
+                Was stopped by the user (:meth:`stop` called) 
+            `timeout` 
+                A timeout occurred (specified as `timeout=` to recognize()) 
+            `goodscore` 
+                The search was stopped early because a gesture with a high 
+                enough score was found (specified as `goodscore=` to 
+                recognize()) 
+            `complete` 
+                The search is complete (all gestures matching filters were 
+                tested) 
+    '''</span>
+    <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">candidate</span><span class="s2">, </span><span class="s1">tasks</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">status </span><span class="s2">= </span><span class="s3">'search'</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">candidate </span><span class="s2">= </span><span class="s1">candidate</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">results </span><span class="s2">= {}</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">tasks </span><span class="s2">= </span><span class="s1">tasks</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_start_time </span><span class="s2">= </span><span class="s1">Clock</span><span class="s2">.</span><span class="s1">get_time</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_match_ops </span><span class="s2">= </span><span class="s6">0</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_completed </span><span class="s2">= </span><span class="s6">0</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_break_flag </span><span class="s2">= </span><span class="s4">False</span>
+
+        <span class="s5"># fired by recognize()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">register_event_type</span><span class="s2">(</span><span class="s3">'on_complete'</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">register_event_type</span><span class="s2">(</span><span class="s3">'on_progress'</span><span class="s2">)</span>
+
+        <span class="s5"># fired locally</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">register_event_type</span><span class="s2">(</span><span class="s3">'on_result'</span><span class="s2">)</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">ProgressTracker</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">(**</span><span class="s1">kwargs</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s4">def </span><span class="s1">progress</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Returns the progress as a float, 0 is 0% done, 1 is 100%. This 
+        is a Python property.'''</span>
+        <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">tasks</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s6">1</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_completed </span><span class="s2">/ </span><span class="s1">float</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">tasks</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s4">def </span><span class="s1">best</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Return the best match found by recognize() so far. It returns a 
+        dictionary with three keys, 'name', 'dist' and 'score' representing 
+        the template's name, distance (from candidate path) and the 
+        computed score value. This is a Python property.'''</span>
+        <span class="s1">results </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">results  </span><span class="s5"># to avoid too many self. lookups</span>
+        <span class="s4">if not </span><span class="s1">results</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s2">{</span><span class="s3">'name'</span><span class="s2">: </span><span class="s4">None</span><span class="s2">, </span><span class="s3">'dist'</span><span class="s2">: </span><span class="s4">None</span><span class="s2">, </span><span class="s3">'score'</span><span class="s2">: </span><span class="s6">0</span><span class="s2">}</span>
+        <span class="s1">b </span><span class="s2">= </span><span class="s1">max</span><span class="s2">(</span><span class="s1">results</span><span class="s2">, </span><span class="s1">key</span><span class="s2">=</span><span class="s4">lambda </span><span class="s1">r</span><span class="s2">: </span><span class="s1">results</span><span class="s2">[</span><span class="s1">r</span><span class="s2">][</span><span class="s3">'score'</span><span class="s2">])</span>
+        <span class="s4">return </span><span class="s2">{</span>
+            <span class="s3">'name'</span><span class="s2">: </span><span class="s1">results</span><span class="s2">[</span><span class="s1">b</span><span class="s2">][</span><span class="s3">'name'</span><span class="s2">],</span>
+            <span class="s3">'dist'</span><span class="s2">: </span><span class="s1">results</span><span class="s2">[</span><span class="s1">b</span><span class="s2">][</span><span class="s3">'dist'</span><span class="s2">],</span>
+            <span class="s3">'score'</span><span class="s2">: </span><span class="s1">results</span><span class="s2">[</span><span class="s1">b</span><span class="s2">][</span><span class="s3">'score'</span><span class="s2">]</span>
+        <span class="s2">}</span>
+
+    <span class="s4">def </span><span class="s1">stop</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Raises a stop flag that is checked by the search process. It will 
+        be stopped on the next clock tick (if it is still running).'''</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_break_flag </span><span class="s2">= </span><span class="s4">True</span>
+
+    <span class="s4">def </span><span class="s1">_add_result</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">gesture</span><span class="s2">, </span><span class="s1">dist</span><span class="s2">, </span><span class="s1">tpl</span><span class="s2">, </span><span class="s1">res</span><span class="s2">):</span>
+        <span class="s5"># Add a result; used internally by the recognize() function</span>
+        <span class="s4">if </span><span class="s1">tpl </span><span class="s2">&lt;= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">res</span><span class="s2">):</span>
+            <span class="s1">n </span><span class="s2">= </span><span class="s1">gesture</span><span class="s2">.</span><span class="s1">templates</span><span class="s2">[</span><span class="s1">tpl</span><span class="s2">].</span><span class="s1">name</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s6">0.</span>
+
+        <span class="s4">if </span><span class="s1">n </span><span class="s4">not in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">results </span><span class="s4">or </span><span class="s1">dist </span><span class="s2">&lt; </span><span class="s1">self</span><span class="s2">.</span><span class="s1">results</span><span class="s2">[</span><span class="s1">n</span><span class="s2">][</span><span class="s3">'dist'</span><span class="s2">]:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">results</span><span class="s2">[</span><span class="s1">n</span><span class="s2">] = {</span>
+                <span class="s3">'name'</span><span class="s2">: </span><span class="s1">n</span><span class="s2">,</span>
+                <span class="s3">'dist'</span><span class="s2">: </span><span class="s1">dist</span><span class="s2">,</span>
+                <span class="s3">'gesture'</span><span class="s2">: </span><span class="s1">gesture</span><span class="s2">,</span>
+                <span class="s3">'best_template'</span><span class="s2">: </span><span class="s1">tpl</span><span class="s2">,</span>
+                <span class="s3">'template_results'</span><span class="s2">: </span><span class="s1">res</span>
+            <span class="s2">}</span>
+
+            <span class="s4">if not </span><span class="s1">dist</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">results</span><span class="s2">[</span><span class="s1">n</span><span class="s2">][</span><span class="s3">'score'</span><span class="s2">] = </span><span class="s6">1.0</span>
+            <span class="s4">else</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">results</span><span class="s2">[</span><span class="s1">n</span><span class="s2">][</span><span class="s3">'score'</span><span class="s2">] = </span><span class="s6">1.0 </span><span class="s2">- (</span><span class="s1">dist </span><span class="s2">/ </span><span class="s1">pi</span><span class="s2">)</span>
+
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_result'</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">results</span><span class="s2">[</span><span class="s1">n</span><span class="s2">])</span>
+            <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">results</span><span class="s2">[</span><span class="s1">n</span><span class="s2">][</span><span class="s3">'score'</span><span class="s2">]</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s6">0.</span>
+
+    <span class="s4">def </span><span class="s1">on_complete</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">pass</span>
+
+    <span class="s4">def </span><span class="s1">on_progress</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">pass</span>
+
+    <span class="s4">def </span><span class="s1">on_result</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">result</span><span class="s2">):</span>
+        <span class="s4">pass</span>
+
+
+<span class="s5"># -----------------------------------------------------------------------------</span>
+<span class="s5"># MultistrokeGesture</span>
+<span class="s5"># -----------------------------------------------------------------------------</span>
+
+<span class="s4">class </span><span class="s1">MultistrokeGesture</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s0">''':class:`MultistrokeGesture` represents a gesture. It maintains a set of 
+    `strokes` and generates unistroke (ie :class:`UnistrokeTemplate`) 
+    permutations that are used for evaluating candidates against this gesture 
+    later. 
+ 
+    :Arguments: 
+        `name` 
+            Identifies the name of the gesture - it is returned to you in the 
+            results of a :meth:`Recognizer.recognize` search. You can have any 
+            number of MultistrokeGesture objects with the same name; many 
+            definitions of one gesture. The same name is given to all the 
+            generated unistroke permutations. Required, no default. 
+        `strokes` 
+            A list of paths that represents the gesture. A path is a list of 
+            Vector objects:: 
+ 
+                gesture = MultistrokeGesture('my_gesture', strokes=[ 
+                  [Vector(x1, y1), Vector(x2, y2), ...... ], # stroke 1 
+                  [Vector(), Vector(), Vector(), Vector() ]  # stroke 2 
+                  #, [stroke 3], [stroke 4], ... 
+                ]) 
+ 
+            For template matching purposes, all the strokes are combined to a 
+            single list (unistroke). You should still specify the strokes 
+            individually, and set `stroke_sensitive` True (whenever possible). 
+ 
+            Once you do this, unistroke permutations are immediately generated 
+            and stored in `self.templates` for later, unless you set the 
+            `permute` flag to False. 
+        `priority` 
+            Determines when :func:`Recognizer.recognize` will attempt to match 
+            this template, lower priorities are evaluated first (only if 
+            a priority `filter` is used). You should use lower priority on 
+            gestures that are more likely to match. For example, set user 
+            templates at lower number than generic templates. Default is 100. 
+        `numpoints` 
+            Determines the number of points this gesture should be resampled to 
+            (for matching purposes). The default is 16. 
+        `stroke_sensitive` 
+            Determines if the number of strokes (paths) in this gesture is 
+            required to be the same in the candidate (user input) gesture 
+            during matching. If this is False, candidates will always be 
+            evaluated, disregarding the number of strokes. Default is True. 
+        `orientation_sensitive` 
+            Determines if this gesture is orientation sensitive. If True, 
+            aligns the indicative orientation with the one of eight base 
+            orientations that requires least rotation. Default is True. 
+        `angle_similarity` 
+            This is used by the :func:`Recognizer.recognize` function when a 
+            candidate is evaluated against this gesture. If the angles between 
+            them are too far off, the template is considered a non-match. 
+            Default is 30.0 (degrees) 
+        `permute` 
+            If False, do not use Heap Permute algorithm to generate different 
+            stroke orders when instantiated. If you set this to False, a 
+            single UnistrokeTemplate built from `strokes` is used. 
+    '''</span>
+    <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">strokes</span><span class="s2">=</span><span class="s4">None</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">name </span><span class="s2">= </span><span class="s1">name</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">priority </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'priority'</span><span class="s2">, </span><span class="s6">100</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">numpoints </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'numpoints'</span><span class="s2">, </span><span class="s6">16</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">stroke_sens </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'stroke_sensitive'</span><span class="s2">, </span><span class="s4">True</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">orientation_sens </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'orientation_sensitive'</span><span class="s2">, </span><span class="s4">True</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">angle_similarity </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'angle_similarity'</span><span class="s2">, </span><span class="s6">30.0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">strokes </span><span class="s2">= []</span>
+
+        <span class="s4">if </span><span class="s1">strokes </span><span class="s4">is not None</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">strokes </span><span class="s2">= </span><span class="s1">strokes</span>
+            <span class="s4">if </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'permute'</span><span class="s2">, </span><span class="s4">True</span><span class="s2">):</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">permute</span><span class="s2">()</span>
+            <span class="s4">else</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">templates </span><span class="s2">= [</span><span class="s1">UnistrokeTemplate</span><span class="s2">(</span><span class="s1">name</span><span class="s2">,</span>
+                                  <span class="s1">points</span><span class="s2">=[</span><span class="s1">i </span><span class="s4">for </span><span class="s1">sub </span><span class="s4">in </span><span class="s1">strokes </span><span class="s4">for </span><span class="s1">i </span><span class="s4">in </span><span class="s1">sub</span><span class="s2">],</span>
+                                  <span class="s1">numpoints</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">numpoints</span><span class="s2">,</span>
+                                  <span class="s1">orientation_sensitive</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">orientation_sens</span><span class="s2">)]</span>
+
+    <span class="s4">def </span><span class="s1">angle_similarity_threshold</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s1">radians</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">angle_similarity</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">add_stroke</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">stroke</span><span class="s2">, </span><span class="s1">permute</span><span class="s2">=</span><span class="s4">False</span><span class="s2">):</span>
+        <span class="s0">'''Add a stroke to the self.strokes list. If `permute` is True, the 
+        :meth:`permute` method is called to generate new unistroke templates'''</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">strokes</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">stroke</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s1">permute</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">permute</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">get_distance</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">cand</span><span class="s2">, </span><span class="s1">tpl</span><span class="s2">, </span><span class="s1">numpoints</span><span class="s2">=</span><span class="s4">None</span><span class="s2">):</span>
+        <span class="s0">'''Compute the distance from this Candidate to a UnistrokeTemplate. 
+        Returns the Cosine distance between the stroke paths. 
+ 
+        `numpoints` will prepare both the UnistrokeTemplate and Candidate path 
+        to n points (when necessary), you probably don't want to do this. 
+        '''</span>
+        <span class="s1">n </span><span class="s2">= </span><span class="s1">numpoints</span>
+        <span class="s4">if </span><span class="s1">n </span><span class="s4">is None or </span><span class="s1">n </span><span class="s2">&lt; </span><span class="s6">2</span><span class="s2">:</span>
+            <span class="s1">n </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">numpoints</span>
+
+        <span class="s5"># optimal_cosine_distance() inlined here for performance</span>
+        <span class="s1">v1 </span><span class="s2">= </span><span class="s1">tpl</span><span class="s2">.</span><span class="s1">get_vector</span><span class="s2">(</span><span class="s1">n</span><span class="s2">)</span>
+        <span class="s1">v2 </span><span class="s2">= </span><span class="s1">cand</span><span class="s2">.</span><span class="s1">get_protractor_vector</span><span class="s2">(</span><span class="s1">n</span><span class="s2">, </span><span class="s1">tpl</span><span class="s2">.</span><span class="s1">orientation_sens</span><span class="s2">)</span>
+
+        <span class="s1">a </span><span class="s2">= </span><span class="s6">0.0</span>
+        <span class="s1">b </span><span class="s2">= </span><span class="s6">0.0</span>
+
+        <span class="s4">for </span><span class="s1">i </span><span class="s4">in </span><span class="s1">xrange</span><span class="s2">(</span><span class="s6">0</span><span class="s2">, </span><span class="s1">len</span><span class="s2">(</span><span class="s1">v1</span><span class="s2">), </span><span class="s6">2</span><span class="s2">):</span>
+            <span class="s1">a </span><span class="s2">+= (</span><span class="s1">v1</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] * </span><span class="s1">v2</span><span class="s2">[</span><span class="s1">i</span><span class="s2">]) + (</span><span class="s1">v1</span><span class="s2">[</span><span class="s1">i </span><span class="s2">+ </span><span class="s6">1</span><span class="s2">] * </span><span class="s1">v2</span><span class="s2">[</span><span class="s1">i </span><span class="s2">+ </span><span class="s6">1</span><span class="s2">])</span>
+            <span class="s1">b </span><span class="s2">+= (</span><span class="s1">v1</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] * </span><span class="s1">v2</span><span class="s2">[</span><span class="s1">i </span><span class="s2">+ </span><span class="s6">1</span><span class="s2">]) - (</span><span class="s1">v1</span><span class="s2">[</span><span class="s1">i </span><span class="s2">+ </span><span class="s6">1</span><span class="s2">] * </span><span class="s1">v2</span><span class="s2">[</span><span class="s1">i</span><span class="s2">])</span>
+
+        <span class="s1">angle </span><span class="s2">= </span><span class="s1">atan</span><span class="s2">(</span><span class="s1">b </span><span class="s2">/ </span><span class="s1">a</span><span class="s2">)</span>
+
+        <span class="s5"># If you put the below directly into math.acos(), you will get a domain</span>
+        <span class="s5"># error when a=1.0 and angle=0.0 (ie math_cos(angle)=1.0). It seems to</span>
+        <span class="s5"># be because float representation of 1.0*1.0 is &gt;1.0 (ie 1.00000...001)</span>
+        <span class="s5"># and this is problematic for math.acos().</span>
+        <span class="s5"># If you try math.acos(1.0*1.0) in interpreter it does not happen,</span>
+        <span class="s5"># only with exact match at runtime</span>
+        <span class="s1">result </span><span class="s2">= </span><span class="s1">a </span><span class="s2">* </span><span class="s1">math_cos</span><span class="s2">(</span><span class="s1">angle</span><span class="s2">) + </span><span class="s1">b </span><span class="s2">* </span><span class="s1">math_sin</span><span class="s2">(</span><span class="s1">angle</span><span class="s2">)</span>
+
+        <span class="s5"># FIXME: I'm sure there is a better way to do it but..</span>
+        <span class="s4">if </span><span class="s1">result </span><span class="s2">&gt;= </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s1">result </span><span class="s2">= </span><span class="s6">1</span>
+        <span class="s4">elif </span><span class="s1">result </span><span class="s2">&lt;= -</span><span class="s6">1</span><span class="s2">:  </span><span class="s5"># has not happened to me, but I leave it here.</span>
+            <span class="s1">result </span><span class="s2">= -</span><span class="s6">1</span>
+        <span class="s4">return </span><span class="s1">acos</span><span class="s2">(</span><span class="s1">result</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">match_candidate</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">cand</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s0">'''Match a given candidate against this MultistrokeGesture object. Will 
+        test against all templates and report results as a list of four 
+        items: 
+ 
+            `index 0` 
+                Best matching template's index (in self.templates) 
+            `index 1` 
+                Computed distance from the template to the candidate path 
+            `index 2` 
+                List of distances for all templates. The list index 
+                corresponds to a :class:`UnistrokeTemplate` index in 
+                self.templates. 
+            `index 3` 
+                Counter for the number of performed matching operations, ie 
+                templates matched against the candidate 
+        '''</span>
+        <span class="s1">best_d </span><span class="s2">= </span><span class="s1">float</span><span class="s2">(</span><span class="s3">'infinity'</span><span class="s2">)</span>
+        <span class="s1">best_tpl </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s1">mos </span><span class="s2">= </span><span class="s6">0</span>
+        <span class="s1">out </span><span class="s2">= []</span>
+
+        <span class="s4">if </span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">stroke_sens </span><span class="s4">and </span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">strokes</span><span class="s2">) != </span><span class="s1">len</span><span class="s2">(</span><span class="s1">cand</span><span class="s2">.</span><span class="s1">strokes</span><span class="s2">)):</span>
+            <span class="s4">return </span><span class="s2">(</span><span class="s1">best_tpl</span><span class="s2">, </span><span class="s1">best_d</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">mos</span><span class="s2">)</span>
+
+        <span class="s1">skip_bounded </span><span class="s2">= </span><span class="s1">cand</span><span class="s2">.</span><span class="s1">skip_bounded</span>
+        <span class="s1">skip_invariant </span><span class="s2">= </span><span class="s1">cand</span><span class="s2">.</span><span class="s1">skip_invariant</span>
+        <span class="s1">get_distance </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_distance</span>
+        <span class="s1">ang_sim_threshold </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">angle_similarity_threshold</span><span class="s2">()</span>
+
+        <span class="s4">for </span><span class="s1">idx</span><span class="s2">, </span><span class="s1">tpl </span><span class="s4">in </span><span class="s1">enumerate</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">templates</span><span class="s2">):</span>
+            <span class="s5"># Handle a theoretical case where a MultistrokeGesture is composed</span>
+            <span class="s5"># manually and the orientation_sensitive flag is True, and contains</span>
+            <span class="s5"># a UnistrokeTemplate that has orientation_sensitive=False (or vice</span>
+            <span class="s5"># versa). This would cause KeyError - requesting nonexistent vector</span>
+            <span class="s4">if </span><span class="s1">tpl</span><span class="s2">.</span><span class="s1">orientation_sens</span><span class="s2">:</span>
+                <span class="s4">if </span><span class="s1">skip_bounded</span><span class="s2">:</span>
+                    <span class="s4">continue</span>
+            <span class="s4">elif </span><span class="s1">skip_invariant</span><span class="s2">:</span>
+                <span class="s4">continue</span>
+
+            <span class="s5"># Count as a match operation now, since the call to get_</span>
+            <span class="s5"># angle_similarity below will force vector calculation,</span>
+            <span class="s5"># even if it doesn't make it to get_distance</span>
+            <span class="s1">mos </span><span class="s2">+= </span><span class="s6">1</span>
+
+            <span class="s5"># Note: With this implementation, we always resample the candidate</span>
+            <span class="s5"># to *any* encountered UnistrokeTemplate numpoints here, the filter</span>
+            <span class="s5"># is only applied to MultistrokeGesture. See theoretical case</span>
+            <span class="s5"># above; should not matter normally.</span>
+            <span class="s1">n </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'force_numpoints'</span><span class="s2">, </span><span class="s1">tpl</span><span class="s2">.</span><span class="s1">numpoints</span><span class="s2">)</span>
+
+            <span class="s5"># Skip if candidate/gesture angles are too far off</span>
+            <span class="s1">ang_sim </span><span class="s2">= </span><span class="s1">cand</span><span class="s2">.</span><span class="s1">get_angle_similarity</span><span class="s2">(</span><span class="s1">tpl</span><span class="s2">, </span><span class="s1">numpoints</span><span class="s2">=</span><span class="s1">n</span><span class="s2">)</span>
+            <span class="s4">if </span><span class="s1">ang_sim </span><span class="s2">&gt; </span><span class="s1">ang_sim_threshold</span><span class="s2">:</span>
+                <span class="s4">continue</span>
+
+            <span class="s5"># Get the distance between cand/tpl paths</span>
+            <span class="s1">d </span><span class="s2">= </span><span class="s1">get_distance</span><span class="s2">(</span><span class="s1">cand</span><span class="s2">, </span><span class="s1">tpl</span><span class="s2">, </span><span class="s1">numpoints</span><span class="s2">=</span><span class="s1">n</span><span class="s2">)</span>
+            <span class="s1">out</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">d</span><span class="s2">)</span>
+
+            <span class="s4">if </span><span class="s1">d </span><span class="s2">&lt; </span><span class="s1">best_d</span><span class="s2">:</span>
+                <span class="s1">best_d </span><span class="s2">= </span><span class="s1">d</span>
+                <span class="s1">best_tpl </span><span class="s2">= </span><span class="s1">idx</span>
+
+        <span class="s4">return </span><span class="s2">(</span><span class="s1">best_tpl</span><span class="s2">, </span><span class="s1">best_d</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">mos</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">permute</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Generate all possible unistroke permutations from self.strokes and 
+        save the resulting list of UnistrokeTemplate objects in self.templates. 
+ 
+        Quote from http://faculty.washington.edu/wobbrock/pubs/gi-10.2.pdf :: 
+ 
+            We use Heap Permute [16] (p. 179) to generate all stroke orders 
+            in a multistroke gesture. Then, to generate stroke directions for 
+            each order, we treat each component stroke as a dichotomous 
+            [0,1] variable. There are 2^N combinations for N strokes, so we 
+            convert the decimal values 0 to 2^N-1, inclusive, to binary 
+            representations and regard each bit as indicating forward (0) or 
+            reverse (1). This algorithm is often used to generate truth tables 
+            in propositional logic. 
+ 
+        See section 4.1: &quot;$N Algorithm&quot; of the linked paper for details. 
+ 
+        .. Warning :: 
+ 
+            Using heap permute for gestures with more than 3 strokes 
+            can result in very large number of templates (a 9-stroke 
+            gesture = 38 million templates). If you are dealing with 
+            these types of gestures, you should manually compose 
+            all the desired stroke orders. 
+        '''</span>
+        <span class="s5"># Seed with index of each stroke</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_order </span><span class="s2">= [</span><span class="s1">i </span><span class="s4">for </span><span class="s1">i </span><span class="s4">in </span><span class="s1">xrange</span><span class="s2">(</span><span class="s6">0</span><span class="s2">, </span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">strokes</span><span class="s2">))]</span>
+
+        <span class="s5"># Prepare ._orders</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_orders </span><span class="s2">= []</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_heap_permute</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">strokes</span><span class="s2">))</span>
+        <span class="s4">del </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_order</span>
+
+        <span class="s5"># Generate unistroke permutations</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">templates </span><span class="s2">= [</span><span class="s1">UnistrokeTemplate</span><span class="s2">(</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">name</span><span class="s2">,</span>
+            <span class="s1">points</span><span class="s2">=</span><span class="s1">permutation</span><span class="s2">,</span>
+            <span class="s1">numpoints</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">numpoints</span><span class="s2">,</span>
+            <span class="s1">orientation_sensitive</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">orientation_sens</span>
+        <span class="s2">) </span><span class="s4">for </span><span class="s1">permutation </span><span class="s4">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_make_unistrokes</span><span class="s2">()]</span>
+        <span class="s4">del </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_orders</span>
+
+    <span class="s4">def </span><span class="s1">_heap_permute</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">n</span><span class="s2">):</span>
+        <span class="s5"># Heap Permute algorithm</span>
+        <span class="s1">self_order </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_order</span>
+        <span class="s4">if </span><span class="s1">n </span><span class="s2">== </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_orders</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">self_order</span><span class="s2">[:])</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s1">i </span><span class="s2">= </span><span class="s6">0</span>
+            <span class="s4">for </span><span class="s1">i </span><span class="s4">in </span><span class="s1">xrange</span><span class="s2">(</span><span class="s6">0</span><span class="s2">, </span><span class="s1">n</span><span class="s2">):</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_heap_permute</span><span class="s2">(</span><span class="s1">n </span><span class="s2">- </span><span class="s6">1</span><span class="s2">)</span>
+                <span class="s4">if </span><span class="s1">n </span><span class="s2">% </span><span class="s6">2 </span><span class="s2">== </span><span class="s6">1</span><span class="s2">:</span>
+                    <span class="s1">tmp </span><span class="s2">= </span><span class="s1">self_order</span><span class="s2">[</span><span class="s6">0</span><span class="s2">]</span>
+                    <span class="s1">self_order</span><span class="s2">[</span><span class="s6">0</span><span class="s2">] = </span><span class="s1">self_order</span><span class="s2">[</span><span class="s1">n </span><span class="s2">- </span><span class="s6">1</span><span class="s2">]</span>
+                    <span class="s1">self_order</span><span class="s2">[</span><span class="s1">n </span><span class="s2">- </span><span class="s6">1</span><span class="s2">] = </span><span class="s1">tmp</span>
+                <span class="s4">else</span><span class="s2">:</span>
+                    <span class="s1">tmp </span><span class="s2">= </span><span class="s1">self_order</span><span class="s2">[</span><span class="s1">i</span><span class="s2">]</span>
+                    <span class="s1">self_order</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] = </span><span class="s1">self_order</span><span class="s2">[</span><span class="s1">n </span><span class="s2">- </span><span class="s6">1</span><span class="s2">]</span>
+                    <span class="s1">self_order</span><span class="s2">[</span><span class="s1">n </span><span class="s2">- </span><span class="s6">1</span><span class="s2">] = </span><span class="s1">tmp</span>
+
+    <span class="s4">def </span><span class="s1">_make_unistrokes</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Create unistroke permutations from self.strokes</span>
+        <span class="s1">unistrokes </span><span class="s2">= []</span>
+        <span class="s1">unistrokes_append </span><span class="s2">= </span><span class="s1">unistrokes</span><span class="s2">.</span><span class="s1">append</span>
+        <span class="s1">self_strokes </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">strokes</span>
+        <span class="s4">for </span><span class="s1">r </span><span class="s4">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_orders</span><span class="s2">:</span>
+            <span class="s1">b </span><span class="s2">= </span><span class="s6">0</span>
+            <span class="s4">while </span><span class="s1">b </span><span class="s2">&lt; </span><span class="s1">pow</span><span class="s2">(</span><span class="s6">2</span><span class="s2">, </span><span class="s1">len</span><span class="s2">(</span><span class="s1">r</span><span class="s2">)):  </span><span class="s5"># use b's bits for directions</span>
+                <span class="s1">unistroke </span><span class="s2">= []</span>
+                <span class="s1">unistroke_append </span><span class="s2">= </span><span class="s1">unistroke</span><span class="s2">.</span><span class="s1">append</span>
+                <span class="s4">for </span><span class="s1">i </span><span class="s4">in </span><span class="s1">xrange</span><span class="s2">(</span><span class="s6">0</span><span class="s2">, </span><span class="s1">len</span><span class="s2">(</span><span class="s1">r</span><span class="s2">)):</span>
+                    <span class="s1">pts </span><span class="s2">= </span><span class="s1">self_strokes</span><span class="s2">[</span><span class="s1">r</span><span class="s2">[</span><span class="s1">i</span><span class="s2">]][:]</span>
+                    <span class="s4">if </span><span class="s2">(</span><span class="s1">b </span><span class="s2">&gt;&gt; </span><span class="s1">i</span><span class="s2">) &amp; </span><span class="s6">1 </span><span class="s2">== </span><span class="s6">1</span><span class="s2">:  </span><span class="s5"># is b's bit at index i 1?</span>
+                        <span class="s1">pts</span><span class="s2">.</span><span class="s1">reverse</span><span class="s2">()</span>
+                    <span class="s1">unistroke_append</span><span class="s2">(</span><span class="s4">None</span><span class="s2">)</span>
+                    <span class="s1">unistroke</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">:] = </span><span class="s1">pts</span>
+
+                <span class="s1">unistrokes_append</span><span class="s2">(</span><span class="s1">unistroke</span><span class="s2">)</span>
+                <span class="s1">b </span><span class="s2">+= </span><span class="s6">1</span>
+        <span class="s4">return </span><span class="s1">unistrokes</span>
+
+
+<span class="s5"># -----------------------------------------------------------------------------</span>
+<span class="s5"># UnistrokeTemplate</span>
+<span class="s5"># -----------------------------------------------------------------------------</span>
+
+<span class="s4">class </span><span class="s1">UnistrokeTemplate</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s0">'''Represents a (uni)stroke path as a list of Vectors. Normally, this class 
+    is instantiated by MultistrokeGesture and not by the programmer directly. 
+    However, it is possible to manually compose UnistrokeTemplate objects. 
+ 
+    :Arguments: 
+        `name` 
+            Identifies the name of the gesture. This is normally inherited from 
+            the parent MultistrokeGesture object when a template is generated. 
+        `points` 
+            A list of points that represents a unistroke path. This is normally 
+            one of the possible stroke order permutations from a 
+            MultistrokeGesture. 
+        `numpoints` 
+            The number of points this template should (ideally) be resampled to 
+            before the matching process. The default is 16, but you can use a 
+            template-specific settings if that improves results. 
+        `orientation_sensitive` 
+            Determines if this template is orientation sensitive (True) or 
+            fully rotation invariant (False). The default is True. 
+ 
+    .. Note:: 
+        You will get an exception if you set a skip-flag and then attempt to 
+        retrieve those vectors. 
+    '''</span>
+    <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">points</span><span class="s2">=</span><span class="s4">None</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">name </span><span class="s2">= </span><span class="s1">name</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">numpoints </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'numpoints'</span><span class="s2">, </span><span class="s6">16</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">orientation_sens </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'orientation_sensitive'</span><span class="s2">, </span><span class="s4">True</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">db </span><span class="s2">= {}</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">points </span><span class="s2">= []</span>
+
+        <span class="s4">if </span><span class="s1">points </span><span class="s4">is not None</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">points </span><span class="s2">= </span><span class="s1">points</span>
+
+    <span class="s4">def </span><span class="s1">add_point</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">p</span><span class="s2">):</span>
+        <span class="s0">'''Add a point to the unistroke/path. This invalidates all previously 
+        computed vectors.'''</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">points</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">p</span><span class="s2">)</span>
+        <span class="s5"># All previously computed data is now void.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">db </span><span class="s2">= {}</span>
+
+    <span class="s5"># Used to lazily prepare the template</span>
+    <span class="s4">def </span><span class="s1">_get_db_key</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">key</span><span class="s2">, </span><span class="s1">numpoints</span><span class="s2">=</span><span class="s4">None</span><span class="s2">):</span>
+        <span class="s1">n </span><span class="s2">= </span><span class="s1">numpoints </span><span class="s4">and </span><span class="s1">numpoints </span><span class="s4">or </span><span class="s1">self</span><span class="s2">.</span><span class="s1">numpoints</span>
+        <span class="s4">if </span><span class="s1">n </span><span class="s4">not in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">db</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">prepare</span><span class="s2">(</span><span class="s1">n</span><span class="s2">)</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">db</span><span class="s2">[</span><span class="s1">n</span><span class="s2">][</span><span class="s1">key</span><span class="s2">]</span>
+
+    <span class="s4">def </span><span class="s1">get_start_unit_vector</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">numpoints</span><span class="s2">=</span><span class="s4">None</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_db_key</span><span class="s2">(</span><span class="s3">'startvector'</span><span class="s2">, </span><span class="s1">numpoints</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">get_vector</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">numpoints</span><span class="s2">=</span><span class="s4">None</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_db_key</span><span class="s2">(</span><span class="s3">'vector'</span><span class="s2">, </span><span class="s1">numpoints</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">get_points</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">numpoints</span><span class="s2">=</span><span class="s4">None</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_db_key</span><span class="s2">(</span><span class="s3">'points'</span><span class="s2">, </span><span class="s1">numpoints</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">prepare</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">numpoints</span><span class="s2">=</span><span class="s4">None</span><span class="s2">):</span>
+        <span class="s0">'''This function prepares the UnistrokeTemplate for matching given a 
+        target number of points (for resample). 16 is optimal.'''</span>
+
+        <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">points</span><span class="s2">:</span>
+            <span class="s4">raise </span><span class="s1">MultistrokeError</span><span class="s2">(</span><span class="s3">'prepare() called without self.points'</span><span class="s2">)</span>
+
+        <span class="s5"># How many points are we resampling to?</span>
+        <span class="s1">n </span><span class="s2">= </span><span class="s1">numpoints </span><span class="s4">or </span><span class="s1">self</span><span class="s2">.</span><span class="s1">numpoints</span>
+        <span class="s4">if not </span><span class="s1">n </span><span class="s4">or </span><span class="s1">n </span><span class="s2">&lt; </span><span class="s6">2</span><span class="s2">:</span>
+            <span class="s4">raise </span><span class="s1">MultistrokeError</span><span class="s2">(</span><span class="s3">'prepare() called with invalid numpoints'</span><span class="s2">)</span>
+
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">resample</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">points</span><span class="s2">, </span><span class="s1">n</span><span class="s2">)</span>
+        <span class="s1">radians </span><span class="s2">= </span><span class="s1">indicative_angle</span><span class="s2">(</span><span class="s1">p</span><span class="s2">)</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">rotate_by</span><span class="s2">(</span><span class="s1">p</span><span class="s2">, -</span><span class="s1">radians</span><span class="s2">)</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">scale_dim</span><span class="s2">(</span><span class="s1">p</span><span class="s2">, </span><span class="s1">SQUARESIZE</span><span class="s2">, </span><span class="s1">ONEDTHRESHOLD</span><span class="s2">)</span>
+
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">orientation_sens</span><span class="s2">:</span>
+            <span class="s1">p </span><span class="s2">= </span><span class="s1">rotate_by</span><span class="s2">(</span><span class="s1">p</span><span class="s2">, +</span><span class="s1">radians</span><span class="s2">)  </span><span class="s5"># restore</span>
+
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">translate_to</span><span class="s2">(</span><span class="s1">p</span><span class="s2">, </span><span class="s1">ORIGIN</span><span class="s2">)</span>
+
+        <span class="s5"># Now store it using the number of points in the resampled path as the</span>
+        <span class="s5"># dict key. On the next call to get_*, it will be returned instead of</span>
+        <span class="s5"># recomputed. Implicitly, you must reset self.db or call prepare() for</span>
+        <span class="s5"># all the keys once you manipulate self.points.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">db</span><span class="s2">[</span><span class="s1">n</span><span class="s2">] = {</span>
+            <span class="s5"># Compute STARTANGLEINDEX as n/8:</span>
+            <span class="s3">'startvector'</span><span class="s2">: </span><span class="s1">start_unit_vector</span><span class="s2">(</span><span class="s1">p</span><span class="s2">, (</span><span class="s1">n </span><span class="s2">/ </span><span class="s6">8</span><span class="s2">)),</span>
+            <span class="s3">'vector'</span><span class="s2">: </span><span class="s1">vectorize</span><span class="s2">(</span><span class="s1">p</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">orientation_sens</span><span class="s2">)</span>
+        <span class="s2">}</span>
+
+
+<span class="s5"># -----------------------------------------------------------------------------</span>
+<span class="s5"># Candidate</span>
+<span class="s5"># -----------------------------------------------------------------------------</span>
+
+<span class="s4">class </span><span class="s1">Candidate</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s0">'''Represents a set of unistroke paths of user input, ie data to be matched 
+    against a :class:`UnistrokeTemplate` object using the Protractor algorithm. 
+    By default, data is precomputed to match both rotation bounded and fully 
+    invariant :class:`UnistrokeTemplate` objects. 
+ 
+    :Arguments: 
+        `strokes` 
+            See :data:`MultistrokeGesture.strokes` for format example. The 
+            Candidate strokes are simply combined to a unistroke in the order 
+            given. The idea is that this will match one of the unistroke 
+            permutations in `MultistrokeGesture.templates`. 
+        `numpoints` 
+            The Candidate's default N; this is only for a fallback, it is not 
+            normally used since n is driven by the UnistrokeTemplate we are 
+            being compared to. 
+        `skip_bounded` 
+            If True, do not generate/store rotation bounded vectors 
+        `skip_invariant` 
+            If True, do not generate/store rotation invariant vectors 
+ 
+    Note that you WILL get errors if you set a skip-flag and then attempt to 
+    retrieve the data.'''</span>
+    <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">strokes</span><span class="s2">=</span><span class="s4">None</span><span class="s2">, </span><span class="s1">numpoints</span><span class="s2">=</span><span class="s6">16</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">skip_invariant </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'skip_invariant'</span><span class="s2">, </span><span class="s4">False</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">skip_bounded </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'skip_bounded'</span><span class="s2">, </span><span class="s4">False</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">numpoints </span><span class="s2">= </span><span class="s1">numpoints</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">db </span><span class="s2">= {}</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">strokes </span><span class="s2">= []</span>
+
+        <span class="s4">if </span><span class="s1">strokes </span><span class="s4">is not None</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">strokes </span><span class="s2">= </span><span class="s1">strokes</span>
+
+    <span class="s4">def </span><span class="s1">add_stroke</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">stroke</span><span class="s2">):</span>
+        <span class="s0">'''Add a stroke to the candidate; this will invalidate all 
+        previously computed vectors'''</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">points</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">stroke</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">db </span><span class="s2">= {}</span>
+
+    <span class="s5"># Used to lazily prepare the candidate</span>
+    <span class="s4">def </span><span class="s1">_get_db_key</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">key</span><span class="s2">, </span><span class="s1">numpoints</span><span class="s2">, </span><span class="s1">orientation_sens</span><span class="s2">):</span>
+        <span class="s1">n </span><span class="s2">= </span><span class="s1">numpoints </span><span class="s4">and </span><span class="s1">numpoints </span><span class="s4">or </span><span class="s1">self</span><span class="s2">.</span><span class="s1">numpoints</span>
+        <span class="s4">if </span><span class="s1">n </span><span class="s4">not in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">db</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">prepare</span><span class="s2">(</span><span class="s1">n</span><span class="s2">)</span>
+
+        <span class="s1">prefix </span><span class="s2">= </span><span class="s1">orientation_sens </span><span class="s4">and </span><span class="s3">'bound_' </span><span class="s4">or </span><span class="s3">'inv_'</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">db</span><span class="s2">[</span><span class="s1">n</span><span class="s2">][</span><span class="s1">prefix </span><span class="s2">+ </span><span class="s1">key</span><span class="s2">]</span>
+
+    <span class="s4">def </span><span class="s1">get_start_unit_vector</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">numpoints</span><span class="s2">, </span><span class="s1">orientation_sens</span><span class="s2">):</span>
+        <span class="s0">'''(Internal use only) Get the start vector for this Candidate, 
+        with the path resampled to `numpoints` points. This is the first 
+        step in the matching process. It is compared to a 
+        UnistrokeTemplate object's start vector to determine angle 
+        similarity.'''</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_db_key</span><span class="s2">(</span><span class="s3">'startvector'</span><span class="s2">, </span><span class="s1">numpoints</span><span class="s2">, </span><span class="s1">orientation_sens</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">get_protractor_vector</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">numpoints</span><span class="s2">, </span><span class="s1">orientation_sens</span><span class="s2">):</span>
+        <span class="s0">'''(Internal use only) Return vector for comparing to a 
+        UnistrokeTemplate with Protractor'''</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_db_key</span><span class="s2">(</span><span class="s3">'vector'</span><span class="s2">, </span><span class="s1">numpoints</span><span class="s2">, </span><span class="s1">orientation_sens</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">get_angle_similarity</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">tpl</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s0">'''(Internal use only) Compute the angle similarity between this 
+        Candidate and a UnistrokeTemplate object. Returns a number that 
+        represents the angle similarity (lower is more similar).'''</span>
+        <span class="s1">n </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'numpoints'</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">numpoints</span><span class="s2">)</span>
+
+        <span class="s5"># angle_between_unit_vectors() inlined here for performance</span>
+        <span class="s1">v1x</span><span class="s2">, </span><span class="s1">v1y </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_start_unit_vector</span><span class="s2">(</span><span class="s1">n</span><span class="s2">, </span><span class="s1">tpl</span><span class="s2">.</span><span class="s1">orientation_sens</span><span class="s2">)</span>
+        <span class="s1">v2x</span><span class="s2">, </span><span class="s1">v2y </span><span class="s2">= </span><span class="s1">tpl</span><span class="s2">.</span><span class="s1">get_start_unit_vector</span><span class="s2">(</span><span class="s1">n</span><span class="s2">)</span>
+
+        <span class="s1">n </span><span class="s2">= (</span><span class="s1">v1x </span><span class="s2">* </span><span class="s1">v2x </span><span class="s2">+ </span><span class="s1">v1y </span><span class="s2">* </span><span class="s1">v2y</span><span class="s2">)</span>
+        <span class="s5"># FIXME: Domain error on float representation of 1.0 (exact match)</span>
+        <span class="s5"># (see comments in MultistrokeGesture.get_distance())</span>
+        <span class="s4">if </span><span class="s1">n </span><span class="s2">&gt;= </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s6">0.0</span>
+        <span class="s4">if </span><span class="s1">n </span><span class="s2">&lt;= -</span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s1">pi</span>
+        <span class="s4">return </span><span class="s1">acos</span><span class="s2">(</span><span class="s1">n</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">prepare</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">numpoints</span><span class="s2">=</span><span class="s4">None</span><span class="s2">):</span>
+        <span class="s0">'''Prepare the Candidate vectors. self.strokes is combined to a single 
+        unistroke (connected end-to-end), resampled to :attr:`numpoints` 
+        points, and then the vectors are calculated and stored in self.db (for 
+        use by `get_distance` and `get_angle_similarity`)'''</span>
+        <span class="s1">n </span><span class="s2">= </span><span class="s1">numpoints </span><span class="s4">and </span><span class="s1">numpoints </span><span class="s4">or </span><span class="s1">self</span><span class="s2">.</span><span class="s1">numpoints</span>
+
+        <span class="s5"># Inlined combine_strokes() for performance</span>
+        <span class="s1">points </span><span class="s2">= [</span><span class="s1">i </span><span class="s4">for </span><span class="s1">sub </span><span class="s4">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">strokes </span><span class="s4">for </span><span class="s1">i </span><span class="s4">in </span><span class="s1">sub</span><span class="s2">]</span>
+        <span class="s1">points </span><span class="s2">= </span><span class="s1">resample</span><span class="s2">(</span><span class="s1">points</span><span class="s2">, </span><span class="s1">n</span><span class="s2">)</span>
+        <span class="s1">radians </span><span class="s2">= </span><span class="s1">indicative_angle</span><span class="s2">(</span><span class="s1">points</span><span class="s2">)</span>
+        <span class="s1">points </span><span class="s2">= </span><span class="s1">rotate_by</span><span class="s2">(</span><span class="s1">points</span><span class="s2">, -</span><span class="s1">radians</span><span class="s2">)</span>
+        <span class="s1">points </span><span class="s2">= </span><span class="s1">scale_dim</span><span class="s2">(</span><span class="s1">points</span><span class="s2">, </span><span class="s1">SQUARESIZE</span><span class="s2">, </span><span class="s1">ONEDTHRESHOLD</span><span class="s2">)</span>
+
+        <span class="s5"># Compute STARTANGLEINDEX as n / 8</span>
+        <span class="s1">angidx </span><span class="s2">= </span><span class="s1">n </span><span class="s2">/ </span><span class="s6">8</span>
+        <span class="s1">cand </span><span class="s2">= {}</span>
+
+        <span class="s5"># full rotation invariance</span>
+        <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">skip_invariant</span><span class="s2">:</span>
+            <span class="s1">inv_points </span><span class="s2">= </span><span class="s1">translate_to</span><span class="s2">(</span><span class="s1">points</span><span class="s2">, </span><span class="s1">ORIGIN</span><span class="s2">)</span>
+            <span class="s1">cand</span><span class="s2">[</span><span class="s3">'inv_startvector'</span><span class="s2">] = </span><span class="s1">start_unit_vector</span><span class="s2">(</span><span class="s1">inv_points</span><span class="s2">, </span><span class="s1">angidx</span><span class="s2">)</span>
+            <span class="s1">cand</span><span class="s2">[</span><span class="s3">'inv_vector'</span><span class="s2">] = </span><span class="s1">vectorize</span><span class="s2">(</span><span class="s1">inv_points</span><span class="s2">, </span><span class="s4">False</span><span class="s2">)</span>
+
+        <span class="s5"># rotation bounded invariance</span>
+        <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">skip_bounded</span><span class="s2">:</span>
+            <span class="s1">bound_points </span><span class="s2">= </span><span class="s1">rotate_by</span><span class="s2">(</span><span class="s1">points</span><span class="s2">, +</span><span class="s1">radians</span><span class="s2">)  </span><span class="s5"># restore</span>
+            <span class="s1">bound_points </span><span class="s2">= </span><span class="s1">translate_to</span><span class="s2">(</span><span class="s1">bound_points</span><span class="s2">, </span><span class="s1">ORIGIN</span><span class="s2">)</span>
+            <span class="s1">cand</span><span class="s2">[</span><span class="s3">'bound_startvector'</span><span class="s2">] = </span><span class="s1">start_unit_vector</span><span class="s2">(</span><span class="s1">bound_points</span><span class="s2">, </span><span class="s1">angidx</span><span class="s2">)</span>
+            <span class="s1">cand</span><span class="s2">[</span><span class="s3">'bound_vector'</span><span class="s2">] = </span><span class="s1">vectorize</span><span class="s2">(</span><span class="s1">bound_points</span><span class="s2">, </span><span class="s4">True</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">db</span><span class="s2">[</span><span class="s1">n</span><span class="s2">] = </span><span class="s1">cand</span>
+
+
+<span class="s5"># -----------------------------------------------------------------------------</span>
+<span class="s5"># Helper functions from this point on. This is all directly related to the</span>
+<span class="s5"># recognition algorithm, and is almost 100% transcription from the JavaScript</span>
+<span class="s5"># -----------------------------------------------------------------------------</span>
+<span class="s4">def </span><span class="s1">resample</span><span class="s2">(</span><span class="s1">points</span><span class="s2">, </span><span class="s1">n</span><span class="s2">):</span>
+    <span class="s5"># Resample a path to `n` points</span>
+    <span class="s4">if not </span><span class="s1">len</span><span class="s2">(</span><span class="s1">points</span><span class="s2">) </span><span class="s4">or not </span><span class="s1">n </span><span class="s4">or </span><span class="s1">n </span><span class="s2">&lt; </span><span class="s6">2</span><span class="s2">:</span>
+        <span class="s4">raise </span><span class="s1">MultistrokeError</span><span class="s2">(</span><span class="s3">'resample() called with invalid arguments'</span><span class="s2">)</span>
+
+    <span class="s1">interval </span><span class="s2">= </span><span class="s1">path_length</span><span class="s2">(</span><span class="s1">points</span><span class="s2">) / (</span><span class="s1">n </span><span class="s2">- </span><span class="s6">1</span><span class="s2">)</span>
+    <span class="s1">D </span><span class="s2">= </span><span class="s6">0.0</span>
+    <span class="s1">i </span><span class="s2">= </span><span class="s6">1</span>
+    <span class="s1">newpoints </span><span class="s2">= [</span><span class="s1">points</span><span class="s2">[</span><span class="s6">0</span><span class="s2">]]</span>
+    <span class="s1">workpoints </span><span class="s2">= </span><span class="s1">points</span><span class="s2">[:]</span>
+    <span class="s1">newpoints_len </span><span class="s2">= </span><span class="s6">1</span>
+    <span class="s1">workpoints_len </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">points</span><span class="s2">)</span>
+
+    <span class="s1">new_append </span><span class="s2">= </span><span class="s1">newpoints</span><span class="s2">.</span><span class="s1">append</span>
+    <span class="s1">work_insert </span><span class="s2">= </span><span class="s1">workpoints</span><span class="s2">.</span><span class="s1">insert</span>
+    <span class="s4">while </span><span class="s1">i </span><span class="s2">&lt; </span><span class="s1">len</span><span class="s2">(</span><span class="s1">workpoints</span><span class="s2">):</span>
+        <span class="s1">p1 </span><span class="s2">= </span><span class="s1">workpoints</span><span class="s2">[</span><span class="s1">i </span><span class="s2">- </span><span class="s6">1</span><span class="s2">]</span>
+        <span class="s1">p2 </span><span class="s2">= </span><span class="s1">workpoints</span><span class="s2">[</span><span class="s1">i</span><span class="s2">]</span>
+        <span class="s1">d </span><span class="s2">= </span><span class="s1">distance</span><span class="s2">(</span><span class="s1">p1</span><span class="s2">, </span><span class="s1">p2</span><span class="s2">)</span>
+
+        <span class="s4">if </span><span class="s1">D </span><span class="s2">+ </span><span class="s1">d </span><span class="s2">&gt;= </span><span class="s1">interval</span><span class="s2">:</span>
+            <span class="s1">qx </span><span class="s2">= </span><span class="s1">p1</span><span class="s2">[</span><span class="s6">0</span><span class="s2">] + ((</span><span class="s1">interval </span><span class="s2">- </span><span class="s1">D</span><span class="s2">) / </span><span class="s1">d</span><span class="s2">) * (</span><span class="s1">p2</span><span class="s2">[</span><span class="s6">0</span><span class="s2">] - </span><span class="s1">p1</span><span class="s2">[</span><span class="s6">0</span><span class="s2">])</span>
+            <span class="s1">qy </span><span class="s2">= </span><span class="s1">p1</span><span class="s2">[</span><span class="s6">1</span><span class="s2">] + ((</span><span class="s1">interval </span><span class="s2">- </span><span class="s1">D</span><span class="s2">) / </span><span class="s1">d</span><span class="s2">) * (</span><span class="s1">p2</span><span class="s2">[</span><span class="s6">1</span><span class="s2">] - </span><span class="s1">p1</span><span class="s2">[</span><span class="s6">1</span><span class="s2">])</span>
+            <span class="s1">q </span><span class="s2">= </span><span class="s1">Vector</span><span class="s2">(</span><span class="s1">qx</span><span class="s2">, </span><span class="s1">qy</span><span class="s2">)</span>
+            <span class="s1">new_append</span><span class="s2">(</span><span class="s1">q</span><span class="s2">)</span>
+            <span class="s1">work_insert</span><span class="s2">(</span><span class="s1">i</span><span class="s2">, </span><span class="s1">q</span><span class="s2">)  </span><span class="s5"># q is the next i</span>
+            <span class="s1">newpoints_len </span><span class="s2">+= </span><span class="s6">1</span>
+            <span class="s1">workpoints_len </span><span class="s2">+= </span><span class="s6">1</span>
+            <span class="s1">D </span><span class="s2">= </span><span class="s6">0.0</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s1">D </span><span class="s2">+= </span><span class="s1">d</span>
+
+        <span class="s1">i </span><span class="s2">+= </span><span class="s6">1</span>
+
+    <span class="s5"># rounding error; insert the last point</span>
+    <span class="s4">if </span><span class="s1">newpoints_len </span><span class="s2">&lt; </span><span class="s1">n</span><span class="s2">:</span>
+        <span class="s1">new_append</span><span class="s2">(</span><span class="s1">points</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">])</span>
+
+    <span class="s4">return </span><span class="s1">newpoints</span>
+
+
+<span class="s4">def </span><span class="s1">indicative_angle</span><span class="s2">(</span><span class="s1">points</span><span class="s2">):</span>
+    <span class="s1">cx</span><span class="s2">, </span><span class="s1">cy </span><span class="s2">= </span><span class="s1">centroid</span><span class="s2">(</span><span class="s1">points</span><span class="s2">)</span>
+    <span class="s4">return </span><span class="s1">atan2</span><span class="s2">(</span><span class="s1">cy </span><span class="s2">- </span><span class="s1">points</span><span class="s2">[</span><span class="s6">0</span><span class="s2">][</span><span class="s6">1</span><span class="s2">], </span><span class="s1">cx </span><span class="s2">- </span><span class="s1">points</span><span class="s2">[</span><span class="s6">0</span><span class="s2">][</span><span class="s6">0</span><span class="s2">])</span>
+
+
+<span class="s4">def </span><span class="s1">rotate_by</span><span class="s2">(</span><span class="s1">points</span><span class="s2">, </span><span class="s1">radians</span><span class="s2">):</span>
+    <span class="s5"># Rotate points around centroid</span>
+    <span class="s1">cx</span><span class="s2">, </span><span class="s1">cy </span><span class="s2">= </span><span class="s1">centroid</span><span class="s2">(</span><span class="s1">points</span><span class="s2">)</span>
+    <span class="s1">cos </span><span class="s2">= </span><span class="s1">math_cos</span><span class="s2">(</span><span class="s1">radians</span><span class="s2">)</span>
+    <span class="s1">sin </span><span class="s2">= </span><span class="s1">math_sin</span><span class="s2">(</span><span class="s1">radians</span><span class="s2">)</span>
+    <span class="s1">newpoints </span><span class="s2">= []</span>
+    <span class="s1">newpoints_append </span><span class="s2">= </span><span class="s1">newpoints</span><span class="s2">.</span><span class="s1">append</span>
+
+    <span class="s4">for </span><span class="s1">i </span><span class="s4">in </span><span class="s1">xrange</span><span class="s2">(</span><span class="s6">0</span><span class="s2">, </span><span class="s1">len</span><span class="s2">(</span><span class="s1">points</span><span class="s2">)):</span>
+        <span class="s1">qx </span><span class="s2">= (</span><span class="s1">points</span><span class="s2">[</span><span class="s1">i</span><span class="s2">][</span><span class="s6">0</span><span class="s2">] - </span><span class="s1">cx</span><span class="s2">) * </span><span class="s1">cos </span><span class="s2">- (</span><span class="s1">points</span><span class="s2">[</span><span class="s1">i</span><span class="s2">][</span><span class="s6">1</span><span class="s2">] - </span><span class="s1">cy</span><span class="s2">) * </span><span class="s1">sin </span><span class="s2">+ </span><span class="s1">cx</span>
+        <span class="s1">qy </span><span class="s2">= (</span><span class="s1">points</span><span class="s2">[</span><span class="s1">i</span><span class="s2">][</span><span class="s6">0</span><span class="s2">] - </span><span class="s1">cx</span><span class="s2">) * </span><span class="s1">sin </span><span class="s2">+ (</span><span class="s1">points</span><span class="s2">[</span><span class="s1">i</span><span class="s2">][</span><span class="s6">1</span><span class="s2">] - </span><span class="s1">cy</span><span class="s2">) * </span><span class="s1">cos </span><span class="s2">+ </span><span class="s1">cy</span>
+        <span class="s1">newpoints_append</span><span class="s2">(</span><span class="s1">Vector</span><span class="s2">(</span><span class="s1">qx</span><span class="s2">, </span><span class="s1">qy</span><span class="s2">))</span>
+
+    <span class="s4">return </span><span class="s1">newpoints</span>
+
+
+<span class="s4">def </span><span class="s1">scale_dim</span><span class="s2">(</span><span class="s1">points</span><span class="s2">, </span><span class="s1">size</span><span class="s2">, </span><span class="s1">oneDratio</span><span class="s2">):</span>
+    <span class="s1">bbox_x</span><span class="s2">, </span><span class="s1">bbox_y</span><span class="s2">, </span><span class="s1">bbox_w</span><span class="s2">, </span><span class="s1">bbox_h </span><span class="s2">= </span><span class="s1">bounding_box</span><span class="s2">(</span><span class="s1">points</span><span class="s2">)</span>
+
+    <span class="s4">if </span><span class="s1">bbox_h </span><span class="s2">== </span><span class="s6">0 </span><span class="s4">or </span><span class="s1">bbox_w </span><span class="s2">== </span><span class="s6">0</span><span class="s2">:</span>
+        <span class="s4">raise </span><span class="s1">MultistrokeError</span><span class="s2">(</span>
+            <span class="s3">'scale_dim() called with invalid points: h:{}, w:{}'</span>
+            <span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">bbox_h</span><span class="s2">, </span><span class="s1">bbox_w</span><span class="s2">))</span>
+
+    <span class="s5"># 1D or 2D gesture test</span>
+    <span class="s1">uniformly </span><span class="s2">= </span><span class="s1">min</span><span class="s2">(</span><span class="s1">bbox_w </span><span class="s2">/ </span><span class="s1">bbox_h</span><span class="s2">, </span><span class="s1">bbox_h </span><span class="s2">/ </span><span class="s1">bbox_w</span><span class="s2">) &lt;= </span><span class="s1">oneDratio</span>
+
+    <span class="s4">if </span><span class="s1">uniformly</span><span class="s2">:</span>
+        <span class="s1">qx_size </span><span class="s2">= </span><span class="s1">size </span><span class="s2">/ </span><span class="s1">max</span><span class="s2">(</span><span class="s1">bbox_w</span><span class="s2">, </span><span class="s1">bbox_h</span><span class="s2">)</span>
+        <span class="s1">qy_size </span><span class="s2">= </span><span class="s1">size </span><span class="s2">/ </span><span class="s1">max</span><span class="s2">(</span><span class="s1">bbox_w</span><span class="s2">, </span><span class="s1">bbox_h</span><span class="s2">)</span>
+    <span class="s4">else</span><span class="s2">:</span>
+        <span class="s1">qx_size </span><span class="s2">= </span><span class="s1">size </span><span class="s2">/ </span><span class="s1">bbox_w</span>
+        <span class="s1">qy_size </span><span class="s2">= </span><span class="s1">size </span><span class="s2">/ </span><span class="s1">bbox_h</span>
+
+    <span class="s1">newpoints </span><span class="s2">= []</span>
+    <span class="s1">newpoints_append </span><span class="s2">= </span><span class="s1">newpoints</span><span class="s2">.</span><span class="s1">append</span>
+
+    <span class="s4">for </span><span class="s1">p </span><span class="s4">in </span><span class="s1">points</span><span class="s2">:</span>
+        <span class="s1">qx </span><span class="s2">= </span><span class="s1">p</span><span class="s2">[</span><span class="s6">0</span><span class="s2">] * </span><span class="s1">qx_size</span>
+        <span class="s1">qy </span><span class="s2">= </span><span class="s1">p</span><span class="s2">[</span><span class="s6">1</span><span class="s2">] * </span><span class="s1">qy_size</span>
+        <span class="s1">newpoints_append</span><span class="s2">(</span><span class="s1">Vector</span><span class="s2">(</span><span class="s1">qx</span><span class="s2">, </span><span class="s1">qy</span><span class="s2">))</span>
+
+    <span class="s4">return </span><span class="s1">newpoints</span>
+
+
+<span class="s4">def </span><span class="s1">translate_to</span><span class="s2">(</span><span class="s1">points</span><span class="s2">, </span><span class="s1">pt</span><span class="s2">):</span>
+    <span class="s5"># Translate points around centroid</span>
+    <span class="s1">cx</span><span class="s2">, </span><span class="s1">cy </span><span class="s2">= </span><span class="s1">centroid</span><span class="s2">(</span><span class="s1">points</span><span class="s2">)</span>
+    <span class="s1">ptx</span><span class="s2">, </span><span class="s1">pty </span><span class="s2">= </span><span class="s1">pt</span>
+    <span class="s1">newpoints </span><span class="s2">= []</span>
+    <span class="s4">for </span><span class="s1">p </span><span class="s4">in </span><span class="s1">points</span><span class="s2">:</span>
+        <span class="s1">qx </span><span class="s2">= </span><span class="s1">p</span><span class="s2">[</span><span class="s6">0</span><span class="s2">] + </span><span class="s1">ptx </span><span class="s2">- </span><span class="s1">cx</span>
+        <span class="s1">qy </span><span class="s2">= </span><span class="s1">p</span><span class="s2">[</span><span class="s6">1</span><span class="s2">] + </span><span class="s1">pty </span><span class="s2">- </span><span class="s1">cy</span>
+        <span class="s1">newpoints</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">Vector</span><span class="s2">(</span><span class="s1">qx</span><span class="s2">, </span><span class="s1">qy</span><span class="s2">))</span>
+    <span class="s4">return </span><span class="s1">newpoints</span>
+
+
+<span class="s4">def </span><span class="s1">vectorize</span><span class="s2">(</span><span class="s1">points</span><span class="s2">, </span><span class="s1">use_bounded_rotation_invariance</span><span class="s2">):</span>
+    <span class="s5"># Helper function for the Protractor algorithm</span>
+    <span class="s1">cos </span><span class="s2">= </span><span class="s6">1.0</span>
+    <span class="s1">sin </span><span class="s2">= </span><span class="s6">0.0</span>
+
+    <span class="s4">if </span><span class="s1">use_bounded_rotation_invariance</span><span class="s2">:</span>
+        <span class="s1">ang </span><span class="s2">= </span><span class="s1">atan2</span><span class="s2">(</span><span class="s1">points</span><span class="s2">[</span><span class="s6">0</span><span class="s2">][</span><span class="s6">1</span><span class="s2">], </span><span class="s1">points</span><span class="s2">[</span><span class="s6">0</span><span class="s2">][</span><span class="s6">0</span><span class="s2">])</span>
+        <span class="s1">bo </span><span class="s2">= (</span><span class="s1">pi </span><span class="s2">/ </span><span class="s6">4.</span><span class="s2">) * </span><span class="s1">floor</span><span class="s2">((</span><span class="s1">ang </span><span class="s2">+ </span><span class="s1">pi </span><span class="s2">/ </span><span class="s6">8.</span><span class="s2">) / (</span><span class="s1">pi </span><span class="s2">/ </span><span class="s6">4.</span><span class="s2">))</span>
+        <span class="s1">cos </span><span class="s2">= </span><span class="s1">math_cos</span><span class="s2">(</span><span class="s1">bo </span><span class="s2">- </span><span class="s1">ang</span><span class="s2">)</span>
+        <span class="s1">sin </span><span class="s2">= </span><span class="s1">math_sin</span><span class="s2">(</span><span class="s1">bo </span><span class="s2">- </span><span class="s1">ang</span><span class="s2">)</span>
+
+    <span class="s1">sum </span><span class="s2">= </span><span class="s6">0.0</span>
+    <span class="s1">vector </span><span class="s2">= []</span>
+    <span class="s1">vector_len </span><span class="s2">= </span><span class="s6">0</span>
+    <span class="s1">vector_append </span><span class="s2">= </span><span class="s1">vector</span><span class="s2">.</span><span class="s1">append</span>
+
+    <span class="s4">for </span><span class="s1">px</span><span class="s2">, </span><span class="s1">py </span><span class="s4">in </span><span class="s1">points</span><span class="s2">:</span>
+        <span class="s1">newx </span><span class="s2">= </span><span class="s1">px </span><span class="s2">* </span><span class="s1">cos </span><span class="s2">- </span><span class="s1">py </span><span class="s2">* </span><span class="s1">sin</span>
+        <span class="s1">newy </span><span class="s2">= </span><span class="s1">py </span><span class="s2">* </span><span class="s1">cos </span><span class="s2">+ </span><span class="s1">px </span><span class="s2">* </span><span class="s1">sin</span>
+        <span class="s1">vector_append</span><span class="s2">(</span><span class="s1">newx</span><span class="s2">)</span>
+        <span class="s1">vector_append</span><span class="s2">(</span><span class="s1">newy</span><span class="s2">)</span>
+        <span class="s1">vector_len </span><span class="s2">+= </span><span class="s6">2</span>
+        <span class="s1">sum </span><span class="s2">+= </span><span class="s1">newx </span><span class="s2">** </span><span class="s6">2 </span><span class="s2">+ </span><span class="s1">newy </span><span class="s2">** </span><span class="s6">2</span>
+
+    <span class="s1">magnitude </span><span class="s2">= </span><span class="s1">sqrt</span><span class="s2">(</span><span class="s1">sum</span><span class="s2">)</span>
+    <span class="s4">for </span><span class="s1">i </span><span class="s4">in </span><span class="s1">xrange</span><span class="s2">(</span><span class="s6">0</span><span class="s2">, </span><span class="s1">vector_len</span><span class="s2">):</span>
+        <span class="s1">vector</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] /= </span><span class="s1">magnitude</span>
+
+    <span class="s4">return </span><span class="s1">vector</span>
+
+
+<span class="s4">def </span><span class="s1">centroid</span><span class="s2">(</span><span class="s1">points</span><span class="s2">):</span>
+    <span class="s1">x </span><span class="s2">= </span><span class="s6">0.0</span>
+    <span class="s1">y </span><span class="s2">= </span><span class="s6">0.0</span>
+    <span class="s1">points_len </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">points</span><span class="s2">)</span>
+
+    <span class="s4">for </span><span class="s1">i </span><span class="s4">in </span><span class="s1">xrange</span><span class="s2">(</span><span class="s6">0</span><span class="s2">, </span><span class="s1">points_len</span><span class="s2">):</span>
+        <span class="s1">x </span><span class="s2">+= </span><span class="s1">points</span><span class="s2">[</span><span class="s1">i</span><span class="s2">][</span><span class="s6">0</span><span class="s2">]</span>
+        <span class="s1">y </span><span class="s2">+= </span><span class="s1">points</span><span class="s2">[</span><span class="s1">i</span><span class="s2">][</span><span class="s6">1</span><span class="s2">]</span>
+
+    <span class="s1">x </span><span class="s2">/= </span><span class="s1">points_len</span>
+    <span class="s1">y </span><span class="s2">/= </span><span class="s1">points_len</span>
+
+    <span class="s4">return </span><span class="s1">Vector</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">)</span>
+
+
+<span class="s4">def </span><span class="s1">bounding_box</span><span class="s2">(</span><span class="s1">points</span><span class="s2">):</span>
+    <span class="s1">minx </span><span class="s2">= </span><span class="s1">float</span><span class="s2">(</span><span class="s3">'infinity'</span><span class="s2">)</span>
+    <span class="s1">miny </span><span class="s2">= </span><span class="s1">float</span><span class="s2">(</span><span class="s3">'infinity'</span><span class="s2">)</span>
+    <span class="s1">maxx </span><span class="s2">= </span><span class="s1">float</span><span class="s2">(</span><span class="s3">'-infinity'</span><span class="s2">)</span>
+    <span class="s1">maxy </span><span class="s2">= </span><span class="s1">float</span><span class="s2">(</span><span class="s3">'-infinity'</span><span class="s2">)</span>
+
+    <span class="s4">for </span><span class="s1">px</span><span class="s2">, </span><span class="s1">py </span><span class="s4">in </span><span class="s1">points</span><span class="s2">:</span>
+        <span class="s4">if </span><span class="s1">px </span><span class="s2">&lt; </span><span class="s1">minx</span><span class="s2">:</span>
+            <span class="s1">minx </span><span class="s2">= </span><span class="s1">px</span>
+        <span class="s4">if </span><span class="s1">px </span><span class="s2">&gt; </span><span class="s1">maxx</span><span class="s2">:</span>
+            <span class="s1">maxx </span><span class="s2">= </span><span class="s1">px</span>
+        <span class="s4">if </span><span class="s1">py </span><span class="s2">&lt; </span><span class="s1">miny</span><span class="s2">:</span>
+            <span class="s1">miny </span><span class="s2">= </span><span class="s1">py</span>
+        <span class="s4">if </span><span class="s1">py </span><span class="s2">&gt; </span><span class="s1">maxy</span><span class="s2">:</span>
+            <span class="s1">maxy </span><span class="s2">= </span><span class="s1">py</span>
+
+    <span class="s4">return </span><span class="s2">(</span><span class="s1">minx</span><span class="s2">, </span><span class="s1">miny</span><span class="s2">, </span><span class="s1">maxx </span><span class="s2">- </span><span class="s1">minx </span><span class="s2">+ </span><span class="s6">1</span><span class="s2">, </span><span class="s1">maxy </span><span class="s2">- </span><span class="s1">miny </span><span class="s2">+ </span><span class="s6">1</span><span class="s2">)</span>
+
+
+<span class="s4">def </span><span class="s1">path_length</span><span class="s2">(</span><span class="s1">points</span><span class="s2">):</span>
+    <span class="s1">d </span><span class="s2">= </span><span class="s6">0.0</span>
+    <span class="s4">for </span><span class="s1">i </span><span class="s4">in </span><span class="s1">xrange</span><span class="s2">(</span><span class="s6">1</span><span class="s2">, </span><span class="s1">len</span><span class="s2">(</span><span class="s1">points</span><span class="s2">)):</span>
+        <span class="s1">d </span><span class="s2">+= </span><span class="s1">distance</span><span class="s2">(</span><span class="s1">points</span><span class="s2">[</span><span class="s1">i </span><span class="s2">- </span><span class="s6">1</span><span class="s2">], </span><span class="s1">points</span><span class="s2">[</span><span class="s1">i</span><span class="s2">])</span>
+    <span class="s4">return </span><span class="s1">d</span>
+
+
+<span class="s4">def </span><span class="s1">distance</span><span class="s2">(</span><span class="s1">p1</span><span class="s2">, </span><span class="s1">p2</span><span class="s2">):</span>
+    <span class="s1">dx </span><span class="s2">= </span><span class="s1">p2</span><span class="s2">[</span><span class="s6">0</span><span class="s2">] - </span><span class="s1">p1</span><span class="s2">[</span><span class="s6">0</span><span class="s2">]</span>
+    <span class="s1">dy </span><span class="s2">= </span><span class="s1">p2</span><span class="s2">[</span><span class="s6">1</span><span class="s2">] - </span><span class="s1">p1</span><span class="s2">[</span><span class="s6">1</span><span class="s2">]</span>
+    <span class="s4">return </span><span class="s1">sqrt</span><span class="s2">(</span><span class="s1">dx </span><span class="s2">** </span><span class="s6">2 </span><span class="s2">+ </span><span class="s1">dy </span><span class="s2">** </span><span class="s6">2</span><span class="s2">)</span>
+
+
+<span class="s4">def </span><span class="s1">start_unit_vector</span><span class="s2">(</span><span class="s1">points</span><span class="s2">, </span><span class="s1">index</span><span class="s2">):</span>
+    <span class="s1">i </span><span class="s2">= </span><span class="s1">int</span><span class="s2">(</span><span class="s1">index</span><span class="s2">)</span>
+    <span class="s1">vx</span><span class="s2">, </span><span class="s1">vy </span><span class="s2">= </span><span class="s1">points</span><span class="s2">[</span><span class="s1">i</span><span class="s2">][</span><span class="s6">0</span><span class="s2">] - </span><span class="s1">points</span><span class="s2">[</span><span class="s6">0</span><span class="s2">][</span><span class="s6">0</span><span class="s2">], </span><span class="s1">points</span><span class="s2">[</span><span class="s1">i</span><span class="s2">][</span><span class="s6">1</span><span class="s2">] - </span><span class="s1">points</span><span class="s2">[</span><span class="s6">0</span><span class="s2">][</span><span class="s6">1</span><span class="s2">]</span>
+    <span class="s1">length </span><span class="s2">= </span><span class="s1">sqrt</span><span class="s2">(</span><span class="s1">vx </span><span class="s2">** </span><span class="s6">2 </span><span class="s2">+ </span><span class="s1">vy </span><span class="s2">** </span><span class="s6">2</span><span class="s2">)</span>
+    <span class="s4">return </span><span class="s1">Vector</span><span class="s2">(</span><span class="s1">vx </span><span class="s2">/ </span><span class="s1">length</span><span class="s2">, </span><span class="s1">vy </span><span class="s2">/ </span><span class="s1">length</span><span class="s2">)</span>
+</pre>
+</body>
+</html>

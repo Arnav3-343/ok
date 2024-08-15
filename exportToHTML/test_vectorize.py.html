@@ -1,0 +1,305 @@
+<html>
+<head>
+<title>test_vectorize.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #7a7e85;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_vectorize.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+
+<span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">namedtuple</span>
+<span class="s0">from </span><span class="s1">itertools </span><span class="s0">import </span><span class="s1">product</span>
+<span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">vectorize</span>
+<span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">cuda</span><span class="s2">, </span><span class="s1">int32</span><span class="s2">, </span><span class="s1">float32</span><span class="s2">, </span><span class="s1">float64</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">cudadrv</span><span class="s2">.</span><span class="s1">driver </span><span class="s0">import </span><span class="s1">CudaAPIError</span><span class="s2">, </span><span class="s1">driver</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">testing </span><span class="s0">import </span><span class="s1">skip_on_cudasim</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">testing </span><span class="s0">import </span><span class="s1">CUDATestCase</span>
+<span class="s0">import </span><span class="s1">unittest</span>
+
+
+<span class="s3"># Signatures to test with - these are all homogeneous in dtype, so the output</span>
+<span class="s3"># dtype should match the input dtype - the output should not have been cast</span>
+<span class="s3"># upwards, as reported in #8400: https://github.com/numba/numba/issues/8400</span>
+<span class="s1">signatures </span><span class="s2">= [</span><span class="s1">int32</span><span class="s2">(</span><span class="s1">int32</span><span class="s2">, </span><span class="s1">int32</span><span class="s2">),</span>
+              <span class="s1">float32</span><span class="s2">(</span><span class="s1">float32</span><span class="s2">, </span><span class="s1">float32</span><span class="s2">),</span>
+              <span class="s1">float64</span><span class="s2">(</span><span class="s1">float64</span><span class="s2">, </span><span class="s1">float64</span><span class="s2">)]</span>
+
+<span class="s3"># The order here is chosen such that each subsequent dtype might have been</span>
+<span class="s3"># casted to a previously-used dtype. This is unlikely to be an issue for CUDA,</span>
+<span class="s3"># but there might be future circumstances in which it becomes relevant, perhaps</span>
+<span class="s3"># if it supported Dynamic UFuncs, and we want to ensure that an implementation</span>
+<span class="s3"># for a the given dtype is used rather than casting the input upwards.</span>
+<span class="s1">dtypes </span><span class="s2">= (</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">)</span>
+
+<span class="s3"># NumPy ndarray orders</span>
+<span class="s1">orders </span><span class="s2">= (</span><span class="s4">'C'</span><span class="s2">, </span><span class="s4">'F'</span><span class="s2">)</span>
+
+<span class="s3"># Input sizes corresponding to operations:</span>
+<span class="s3"># - Less than one warp,</span>
+<span class="s3"># - Less than one block,</span>
+<span class="s3"># - Greater than one block (i.e. many blocks)</span>
+<span class="s1">input_sizes </span><span class="s2">= (</span><span class="s5">8</span><span class="s2">, </span><span class="s5">100</span><span class="s2">, </span><span class="s5">2 </span><span class="s2">** </span><span class="s5">10 </span><span class="s2">+ </span><span class="s5">1</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s4">'ufunc API unsupported in the simulator'</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">TestCUDAVectorize</span><span class="s2">(</span><span class="s1">CUDATestCase</span><span class="s2">):</span>
+    <span class="s3"># Presumably chosen as an odd number unlikely to coincide with the total</span>
+    <span class="s3"># thread count, and large enough to ensure a significant number of blocks</span>
+    <span class="s3"># are used.</span>
+    <span class="s1">N </span><span class="s2">= </span><span class="s5">1000001</span>
+
+    <span class="s0">def </span><span class="s1">test_scalar</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+
+        <span class="s2">@</span><span class="s1">vectorize</span><span class="s2">(</span><span class="s1">signatures</span><span class="s2">, </span><span class="s1">target</span><span class="s2">=</span><span class="s4">'cuda'</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">vector_add</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">a </span><span class="s2">+ </span><span class="s1">b</span>
+
+        <span class="s1">a </span><span class="s2">= </span><span class="s5">1.2</span>
+        <span class="s1">b </span><span class="s2">= </span><span class="s5">2.3</span>
+        <span class="s1">c </span><span class="s2">= </span><span class="s1">vector_add</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">c</span><span class="s2">, </span><span class="s1">a </span><span class="s2">+ </span><span class="s1">b</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_1d</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+
+        <span class="s2">@</span><span class="s1">vectorize</span><span class="s2">(</span><span class="s1">signatures</span><span class="s2">, </span><span class="s1">target</span><span class="s2">=</span><span class="s4">'cuda'</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">vector_add</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">a </span><span class="s2">+ </span><span class="s1">b</span>
+
+        <span class="s0">for </span><span class="s1">ty </span><span class="s0">in </span><span class="s1">dtypes</span><span class="s2">:</span>
+            <span class="s1">data </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">array</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">random</span><span class="s2">.</span><span class="s1">random</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">N</span><span class="s2">), </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">ty</span><span class="s2">)</span>
+            <span class="s1">expected </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">data</span><span class="s2">, </span><span class="s1">data</span><span class="s2">)</span>
+            <span class="s1">actual </span><span class="s2">= </span><span class="s1">vector_add</span><span class="s2">(</span><span class="s1">data</span><span class="s2">, </span><span class="s1">data</span><span class="s2">)</span>
+            <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_allclose</span><span class="s2">(</span><span class="s1">expected</span><span class="s2">, </span><span class="s1">actual</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">actual</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">ty</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_1d_async</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+
+        <span class="s2">@</span><span class="s1">vectorize</span><span class="s2">(</span><span class="s1">signatures</span><span class="s2">, </span><span class="s1">target</span><span class="s2">=</span><span class="s4">'cuda'</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">vector_add</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">a </span><span class="s2">+ </span><span class="s1">b</span>
+
+        <span class="s1">stream </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">stream</span><span class="s2">()</span>
+
+        <span class="s0">for </span><span class="s1">ty </span><span class="s0">in </span><span class="s1">dtypes</span><span class="s2">:</span>
+            <span class="s1">data </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">array</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">random</span><span class="s2">.</span><span class="s1">random</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">N</span><span class="s2">), </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">ty</span><span class="s2">)</span>
+            <span class="s1">device_data </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">data</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">)</span>
+
+            <span class="s1">dresult </span><span class="s2">= </span><span class="s1">vector_add</span><span class="s2">(</span><span class="s1">device_data</span><span class="s2">, </span><span class="s1">device_data</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">stream</span><span class="s2">)</span>
+            <span class="s1">actual </span><span class="s2">= </span><span class="s1">dresult</span><span class="s2">.</span><span class="s1">copy_to_host</span><span class="s2">()</span>
+
+            <span class="s1">expected </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">data</span><span class="s2">, </span><span class="s1">data</span><span class="s2">)</span>
+
+            <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_allclose</span><span class="s2">(</span><span class="s1">expected</span><span class="s2">, </span><span class="s1">actual</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">actual</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">ty</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_nd</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+
+        <span class="s2">@</span><span class="s1">vectorize</span><span class="s2">(</span><span class="s1">signatures</span><span class="s2">, </span><span class="s1">target</span><span class="s2">=</span><span class="s4">'cuda'</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">vector_add</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">a </span><span class="s2">+ </span><span class="s1">b</span>
+
+        <span class="s0">for </span><span class="s1">nd</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">order </span><span class="s0">in </span><span class="s1">product</span><span class="s2">(</span><span class="s1">range</span><span class="s2">(</span><span class="s5">1</span><span class="s2">, </span><span class="s5">8</span><span class="s2">), </span><span class="s1">dtypes</span><span class="s2">, </span><span class="s1">orders</span><span class="s2">):</span>
+            <span class="s1">shape </span><span class="s2">= (</span><span class="s5">4</span><span class="s2">,) * </span><span class="s1">nd</span>
+            <span class="s1">data </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">random</span><span class="s2">.</span><span class="s1">random</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">).</span><span class="s1">astype</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">)</span>
+            <span class="s1">data2 </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">array</span><span class="s2">(</span><span class="s1">data</span><span class="s2">.</span><span class="s1">T</span><span class="s2">, </span><span class="s1">order</span><span class="s2">=</span><span class="s1">order</span><span class="s2">)</span>
+
+            <span class="s1">expected </span><span class="s2">= </span><span class="s1">data </span><span class="s2">+ </span><span class="s1">data2</span>
+            <span class="s1">actual </span><span class="s2">= </span><span class="s1">vector_add</span><span class="s2">(</span><span class="s1">data</span><span class="s2">, </span><span class="s1">data2</span><span class="s2">)</span>
+            <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_allclose</span><span class="s2">(</span><span class="s1">expected</span><span class="s2">, </span><span class="s1">actual</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">actual</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_output_arg</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s2">@</span><span class="s1">vectorize</span><span class="s2">(</span><span class="s1">signatures</span><span class="s2">, </span><span class="s1">target</span><span class="s2">=</span><span class="s4">'cuda'</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">vector_add</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">a </span><span class="s2">+ </span><span class="s1">b</span>
+
+        <span class="s1">A </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s5">10</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">)</span>
+        <span class="s1">B </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s5">10</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">)</span>
+
+        <span class="s1">expected </span><span class="s2">= </span><span class="s1">A </span><span class="s2">+ </span><span class="s1">B</span>
+        <span class="s1">actual </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">empty_like</span><span class="s2">(</span><span class="s1">A</span><span class="s2">)</span>
+        <span class="s1">vector_add</span><span class="s2">(</span><span class="s1">A</span><span class="s2">, </span><span class="s1">B</span><span class="s2">, </span><span class="s1">out</span><span class="s2">=</span><span class="s1">actual</span><span class="s2">)</span>
+
+        <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_allclose</span><span class="s2">(</span><span class="s1">expected</span><span class="s2">, </span><span class="s1">actual</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">expected</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">actual</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_reduce</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s2">@</span><span class="s1">vectorize</span><span class="s2">(</span><span class="s1">signatures</span><span class="s2">, </span><span class="s1">target</span><span class="s2">=</span><span class="s4">'cuda'</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">vector_add</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">a </span><span class="s2">+ </span><span class="s1">b</span>
+
+        <span class="s1">dtype </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span>
+
+        <span class="s0">for </span><span class="s1">n </span><span class="s0">in </span><span class="s1">input_sizes</span><span class="s2">:</span>
+            <span class="s1">x </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s1">n</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">dtype</span><span class="s2">)</span>
+            <span class="s1">expected </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">add</span><span class="s2">.</span><span class="s1">reduce</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+            <span class="s1">actual </span><span class="s2">= </span><span class="s1">vector_add</span><span class="s2">.</span><span class="s1">reduce</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+            <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_allclose</span><span class="s2">(</span><span class="s1">expected</span><span class="s2">, </span><span class="s1">actual</span><span class="s2">)</span>
+            <span class="s3"># np.add.reduce is special-cased to return an int64 for any int</span>
+            <span class="s3"># arguments, so we can't compare against its returned dtype when</span>
+            <span class="s3"># we're checking the general reduce machinery (which just happens</span>
+            <span class="s3"># to be using addition). Instead, compare against the input dtype.</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">actual</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_reduce_async</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+
+        <span class="s2">@</span><span class="s1">vectorize</span><span class="s2">(</span><span class="s1">signatures</span><span class="s2">, </span><span class="s1">target</span><span class="s2">=</span><span class="s4">'cuda'</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">vector_add</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">a </span><span class="s2">+ </span><span class="s1">b</span>
+
+        <span class="s1">stream </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">stream</span><span class="s2">()</span>
+        <span class="s1">dtype </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span>
+
+        <span class="s0">for </span><span class="s1">n </span><span class="s0">in </span><span class="s1">input_sizes</span><span class="s2">:</span>
+            <span class="s1">x </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s1">n</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">dtype</span><span class="s2">)</span>
+            <span class="s1">expected </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">add</span><span class="s2">.</span><span class="s1">reduce</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+            <span class="s1">dx </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">)</span>
+            <span class="s1">actual </span><span class="s2">= </span><span class="s1">vector_add</span><span class="s2">.</span><span class="s1">reduce</span><span class="s2">(</span><span class="s1">dx</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">stream</span><span class="s2">)</span>
+            <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_allclose</span><span class="s2">(</span><span class="s1">expected</span><span class="s2">, </span><span class="s1">actual</span><span class="s2">)</span>
+            <span class="s3"># Compare against the input dtype as in test_reduce().</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">actual</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_manual_transfer</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s2">@</span><span class="s1">vectorize</span><span class="s2">(</span><span class="s1">signatures</span><span class="s2">, </span><span class="s1">target</span><span class="s2">=</span><span class="s4">'cuda'</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">vector_add</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">a </span><span class="s2">+ </span><span class="s1">b</span>
+
+        <span class="s1">n </span><span class="s2">= </span><span class="s5">10</span>
+        <span class="s1">x </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s1">n</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">)</span>
+        <span class="s1">dx </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+        <span class="s1">expected </span><span class="s2">= </span><span class="s1">x </span><span class="s2">+ </span><span class="s1">x</span>
+        <span class="s1">actual </span><span class="s2">= </span><span class="s1">vector_add</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">dx</span><span class="s2">).</span><span class="s1">copy_to_host</span><span class="s2">()</span>
+        <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_equal</span><span class="s2">(</span><span class="s1">expected</span><span class="s2">, </span><span class="s1">actual</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">expected</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">actual</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_ufunc_output_2d</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s2">@</span><span class="s1">vectorize</span><span class="s2">(</span><span class="s1">signatures</span><span class="s2">, </span><span class="s1">target</span><span class="s2">=</span><span class="s4">'cuda'</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">vector_add</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">a </span><span class="s2">+ </span><span class="s1">b</span>
+
+        <span class="s1">n </span><span class="s2">= </span><span class="s5">10</span>
+        <span class="s1">x </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s1">n</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">).</span><span class="s1">reshape</span><span class="s2">(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">5</span><span class="s2">)</span>
+        <span class="s1">dx </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+        <span class="s1">vector_add</span><span class="s2">(</span><span class="s1">dx</span><span class="s2">, </span><span class="s1">dx</span><span class="s2">, </span><span class="s1">out</span><span class="s2">=</span><span class="s1">dx</span><span class="s2">)</span>
+
+        <span class="s1">expected </span><span class="s2">= </span><span class="s1">x </span><span class="s2">+ </span><span class="s1">x</span>
+        <span class="s1">actual </span><span class="s2">= </span><span class="s1">dx</span><span class="s2">.</span><span class="s1">copy_to_host</span><span class="s2">()</span>
+        <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_equal</span><span class="s2">(</span><span class="s1">expected</span><span class="s2">, </span><span class="s1">actual</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">expected</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">actual</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">check_tuple_arg</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">):</span>
+        <span class="s2">@</span><span class="s1">vectorize</span><span class="s2">(</span><span class="s1">signatures</span><span class="s2">, </span><span class="s1">target</span><span class="s2">=</span><span class="s4">'cuda'</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">vector_add</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">a </span><span class="s2">+ </span><span class="s1">b</span>
+
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">vector_add</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">)</span>
+        <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_equal</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">asarray</span><span class="s2">(</span><span class="s1">a</span><span class="s2">) + </span><span class="s1">np</span><span class="s2">.</span><span class="s1">asarray</span><span class="s2">(</span><span class="s1">b</span><span class="s2">), </span><span class="s1">r</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_tuple_arg</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">a </span><span class="s2">= (</span><span class="s5">1.0</span><span class="s2">, </span><span class="s5">2.0</span><span class="s2">, </span><span class="s5">3.0</span><span class="s2">)</span>
+        <span class="s1">b </span><span class="s2">= (</span><span class="s5">4.0</span><span class="s2">, </span><span class="s5">5.0</span><span class="s2">, </span><span class="s5">6.0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_tuple_arg</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_namedtuple_arg</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">Point </span><span class="s2">= </span><span class="s1">namedtuple</span><span class="s2">(</span><span class="s4">'Point'</span><span class="s2">, (</span><span class="s4">'x'</span><span class="s2">, </span><span class="s4">'y'</span><span class="s2">, </span><span class="s4">'z'</span><span class="s2">))</span>
+        <span class="s1">a </span><span class="s2">= </span><span class="s1">Point</span><span class="s2">(</span><span class="s1">x</span><span class="s2">=</span><span class="s5">1.0</span><span class="s2">, </span><span class="s1">y</span><span class="s2">=</span><span class="s5">2.0</span><span class="s2">, </span><span class="s1">z</span><span class="s2">=</span><span class="s5">3.0</span><span class="s2">)</span>
+        <span class="s1">b </span><span class="s2">= </span><span class="s1">Point</span><span class="s2">(</span><span class="s1">x</span><span class="s2">=</span><span class="s5">4.0</span><span class="s2">, </span><span class="s1">y</span><span class="s2">=</span><span class="s5">5.0</span><span class="s2">, </span><span class="s1">z</span><span class="s2">=</span><span class="s5">6.0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_tuple_arg</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_tuple_of_array_arg</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">arr </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s5">10</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">)</span>
+        <span class="s1">a </span><span class="s2">= (</span><span class="s1">arr</span><span class="s2">, </span><span class="s1">arr </span><span class="s2">+ </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">b </span><span class="s2">= (</span><span class="s1">arr </span><span class="s2">+ </span><span class="s5">2</span><span class="s2">, </span><span class="s1">arr </span><span class="s2">+ </span><span class="s5">2</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_tuple_arg</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_tuple_of_namedtuple_arg</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">Point </span><span class="s2">= </span><span class="s1">namedtuple</span><span class="s2">(</span><span class="s4">'Point'</span><span class="s2">, (</span><span class="s4">'x'</span><span class="s2">, </span><span class="s4">'y'</span><span class="s2">, </span><span class="s4">'z'</span><span class="s2">))</span>
+        <span class="s1">a </span><span class="s2">= (</span><span class="s1">Point</span><span class="s2">(</span><span class="s1">x</span><span class="s2">=</span><span class="s5">1.0</span><span class="s2">, </span><span class="s1">y</span><span class="s2">=</span><span class="s5">2.0</span><span class="s2">, </span><span class="s1">z</span><span class="s2">=</span><span class="s5">3.0</span><span class="s2">), </span><span class="s1">Point</span><span class="s2">(</span><span class="s1">x</span><span class="s2">=</span><span class="s5">1.5</span><span class="s2">, </span><span class="s1">y</span><span class="s2">=</span><span class="s5">2.5</span><span class="s2">, </span><span class="s1">z</span><span class="s2">=</span><span class="s5">3.5</span><span class="s2">))</span>
+        <span class="s1">b </span><span class="s2">= (</span><span class="s1">Point</span><span class="s2">(</span><span class="s1">x</span><span class="s2">=</span><span class="s5">4.0</span><span class="s2">, </span><span class="s1">y</span><span class="s2">=</span><span class="s5">5.0</span><span class="s2">, </span><span class="s1">z</span><span class="s2">=</span><span class="s5">6.0</span><span class="s2">), </span><span class="s1">Point</span><span class="s2">(</span><span class="s1">x</span><span class="s2">=</span><span class="s5">4.5</span><span class="s2">, </span><span class="s1">y</span><span class="s2">=</span><span class="s5">5.5</span><span class="s2">, </span><span class="s1">z</span><span class="s2">=</span><span class="s5">6.5</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_tuple_arg</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_namedtuple_of_array_arg</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">xs1 </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s5">10</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">)</span>
+        <span class="s1">ys1 </span><span class="s2">= </span><span class="s1">xs1 </span><span class="s2">+ </span><span class="s5">2</span>
+        <span class="s1">xs2 </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s5">10</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">) * </span><span class="s5">2</span>
+        <span class="s1">ys2 </span><span class="s2">= </span><span class="s1">xs2 </span><span class="s2">+ </span><span class="s5">1</span>
+        <span class="s1">Points </span><span class="s2">= </span><span class="s1">namedtuple</span><span class="s2">(</span><span class="s4">'Points'</span><span class="s2">, (</span><span class="s4">'xs'</span><span class="s2">, </span><span class="s4">'ys'</span><span class="s2">))</span>
+        <span class="s1">a </span><span class="s2">= </span><span class="s1">Points</span><span class="s2">(</span><span class="s1">xs</span><span class="s2">=</span><span class="s1">xs1</span><span class="s2">, </span><span class="s1">ys</span><span class="s2">=</span><span class="s1">ys1</span><span class="s2">)</span>
+        <span class="s1">b </span><span class="s2">= </span><span class="s1">Points</span><span class="s2">(</span><span class="s1">xs</span><span class="s2">=</span><span class="s1">xs2</span><span class="s2">, </span><span class="s1">ys</span><span class="s2">=</span><span class="s1">ys2</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_tuple_arg</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_name_attribute</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s2">@</span><span class="s1">vectorize</span><span class="s2">(</span><span class="s4">'f8(f8)'</span><span class="s2">, </span><span class="s1">target</span><span class="s2">=</span><span class="s4">'cuda'</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">bar</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">x </span><span class="s2">** </span><span class="s5">2</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">bar</span><span class="s2">.</span><span class="s1">__name__</span><span class="s2">, </span><span class="s4">'bar'</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_no_transfer_for_device_data</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Initialize test data on the device prior to banning host &lt;-&gt; device</span>
+        <span class="s3"># transfer</span>
+
+        <span class="s1">noise </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">random</span><span class="s2">.</span><span class="s1">randn</span><span class="s2">(</span><span class="s5">1</span><span class="s2">, </span><span class="s5">3</span><span class="s2">, </span><span class="s5">64</span><span class="s2">, </span><span class="s5">64</span><span class="s2">).</span><span class="s1">astype</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">)</span>
+        <span class="s1">noise </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">noise</span><span class="s2">)</span>
+
+        <span class="s3"># A mock of a CUDA function that always raises a CudaAPIError</span>
+
+        <span class="s0">def </span><span class="s1">raising_transfer</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+            <span class="s0">raise </span><span class="s1">CudaAPIError</span><span class="s2">(</span><span class="s5">999</span><span class="s2">, </span><span class="s4">'Transfer not allowed'</span><span class="s2">)</span>
+
+        <span class="s3"># Use the mock for transfers between the host and device</span>
+
+        <span class="s1">old_HtoD </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">driver</span><span class="s2">, </span><span class="s4">'cuMemcpyHtoD'</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+        <span class="s1">old_DtoH </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">driver</span><span class="s2">, </span><span class="s4">'cuMemcpyDtoH'</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+
+        <span class="s1">setattr</span><span class="s2">(</span><span class="s1">driver</span><span class="s2">, </span><span class="s4">'cuMemcpyHtoD'</span><span class="s2">, </span><span class="s1">raising_transfer</span><span class="s2">)</span>
+        <span class="s1">setattr</span><span class="s2">(</span><span class="s1">driver</span><span class="s2">, </span><span class="s4">'cuMemcpyDtoH'</span><span class="s2">, </span><span class="s1">raising_transfer</span><span class="s2">)</span>
+
+        <span class="s3"># Ensure that the mock functions are working as expected</span>
+
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaisesRegex</span><span class="s2">(</span><span class="s1">CudaAPIError</span><span class="s2">, </span><span class="s4">&quot;Transfer not allowed&quot;</span><span class="s2">):</span>
+            <span class="s1">noise</span><span class="s2">.</span><span class="s1">copy_to_host</span><span class="s2">()</span>
+
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">assertRaisesRegex</span><span class="s2">(</span><span class="s1">CudaAPIError</span><span class="s2">, </span><span class="s4">&quot;Transfer not allowed&quot;</span><span class="s2">):</span>
+            <span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">([</span><span class="s5">1</span><span class="s2">])</span>
+
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s3"># Check that defining and calling a ufunc with data on the device</span>
+            <span class="s3"># induces no transfers</span>
+
+            <span class="s2">@</span><span class="s1">vectorize</span><span class="s2">([</span><span class="s4">'float32(float32)'</span><span class="s2">], </span><span class="s1">target</span><span class="s2">=</span><span class="s4">'cuda'</span><span class="s2">)</span>
+            <span class="s0">def </span><span class="s1">func</span><span class="s2">(</span><span class="s1">noise</span><span class="s2">):</span>
+                <span class="s0">return </span><span class="s1">noise </span><span class="s2">+ </span><span class="s5">1.0</span>
+
+            <span class="s1">func</span><span class="s2">(</span><span class="s1">noise</span><span class="s2">)</span>
+        <span class="s0">finally</span><span class="s2">:</span>
+            <span class="s3"># Replace our mocks with the original implementations. If there was</span>
+            <span class="s3"># no original implementation, simply remove ours.</span>
+
+            <span class="s0">if </span><span class="s1">old_HtoD </span><span class="s0">is not None</span><span class="s2">:</span>
+                <span class="s1">setattr</span><span class="s2">(</span><span class="s1">driver</span><span class="s2">, </span><span class="s4">'cuMemcpyHtoD'</span><span class="s2">, </span><span class="s1">old_HtoD</span><span class="s2">)</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s0">del </span><span class="s1">driver</span><span class="s2">.</span><span class="s1">cuMemcpyHtoD</span>
+            <span class="s0">if </span><span class="s1">old_DtoH </span><span class="s0">is not None</span><span class="s2">:</span>
+                <span class="s1">setattr</span><span class="s2">(</span><span class="s1">driver</span><span class="s2">, </span><span class="s4">'cuMemcpyDtoH'</span><span class="s2">, </span><span class="s1">old_DtoH</span><span class="s2">)</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s0">del </span><span class="s1">driver</span><span class="s2">.</span><span class="s1">cuMemcpyDtoH</span>
+
+
+<span class="s0">if </span><span class="s1">__name__ </span><span class="s2">== </span><span class="s4">'__main__'</span><span class="s2">:</span>
+    <span class="s1">unittest</span><span class="s2">.</span><span class="s1">main</span><span class="s2">()</span>
+</pre>
+</body>
+</html>

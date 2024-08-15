@@ -1,0 +1,332 @@
+<html>
+<head>
+<title>cc.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #5f826b; font-style: italic;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+cc.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">setuptools </span><span class="s0">import </span><span class="s1">distutils </span><span class="s0">as </span><span class="s1">dutils</span>
+<span class="s0">from </span><span class="s1">setuptools</span><span class="s2">.</span><span class="s1">command </span><span class="s0">import </span><span class="s1">build_ext</span>
+<span class="s0">from </span><span class="s1">setuptools</span><span class="s2">.</span><span class="s1">extension </span><span class="s0">import </span><span class="s1">Extension</span>
+
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">shutil</span>
+<span class="s0">import </span><span class="s1">sys</span>
+<span class="s0">import </span><span class="s1">tempfile</span>
+
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">typing</span><span class="s2">, </span><span class="s1">sigutils</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">compiler_lock </span><span class="s0">import </span><span class="s1">global_compiler_lock</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">pycc</span><span class="s2">.</span><span class="s1">compiler </span><span class="s0">import </span><span class="s1">ModuleCompiler</span><span class="s2">, </span><span class="s1">ExportEntry</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">pycc</span><span class="s2">.</span><span class="s1">platform </span><span class="s0">import </span><span class="s1">Toolchain</span>
+<span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">cext</span>
+
+
+<span class="s1">dir_util </span><span class="s2">= </span><span class="s1">dutils</span><span class="s2">.</span><span class="s1">dir_util</span>
+<span class="s1">log </span><span class="s2">= </span><span class="s1">dutils</span><span class="s2">.</span><span class="s1">log</span>
+<span class="s1">extension_libs </span><span class="s2">= </span><span class="s1">cext</span><span class="s2">.</span><span class="s1">get_extension_libs</span><span class="s2">()</span>
+
+
+<span class="s0">class </span><span class="s1">CC</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    An ahead-of-time compiler to create extension modules that don't 
+    depend on Numba. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s4"># NOTE: using ccache can speed up repetitive builds</span>
+    <span class="s4"># (especially for the mixin modules)</span>
+
+    <span class="s1">_mixin_sources </span><span class="s2">= [</span><span class="s5">'modulemixin.c'</span><span class="s2">,]  + </span><span class="s1">extension_libs</span>
+
+    <span class="s4"># -flto strips all unused helper functions, which 1) makes the</span>
+    <span class="s4"># produced output much smaller and 2) can make the linking step faster.</span>
+    <span class="s4"># (the Windows linker seems to do this by default, judging by the results)</span>
+
+    <span class="s1">_extra_cflags </span><span class="s2">= {</span>
+        <span class="s4"># Comment out due to odd behavior with GCC 4.9+ with LTO</span>
+        <span class="s4"># 'posix': ['-flto'],</span>
+        <span class="s2">}</span>
+
+    <span class="s1">_extra_ldflags </span><span class="s2">= {</span>
+        <span class="s4"># Comment out due to odd behavior with GCC 4.9+ with LTO</span>
+        <span class="s4"># 'posix': ['-flto'],</span>
+        <span class="s2">}</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">extension_name</span><span class="s2">, </span><span class="s1">source_module</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s5">'.' </span><span class="s0">in </span><span class="s1">extension_name</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s5">&quot;basename should be a simple module name, not &quot;</span>
+                             <span class="s5">&quot;qualified name&quot;</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_basename </span><span class="s2">= </span><span class="s1">extension_name</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_init_function </span><span class="s2">= </span><span class="s5">'pycc_init_' </span><span class="s2">+ </span><span class="s1">extension_name</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_exported_functions </span><span class="s2">= {}</span>
+        <span class="s4"># Resolve source module name and directory</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">sys</span><span class="s2">.</span><span class="s1">_getframe</span><span class="s2">(</span><span class="s6">1</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">source_module </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s1">dct </span><span class="s2">= </span><span class="s1">f</span><span class="s2">.</span><span class="s1">f_globals</span>
+            <span class="s1">source_module </span><span class="s2">= </span><span class="s1">dct</span><span class="s2">[</span><span class="s5">'__name__'</span><span class="s2">]</span>
+        <span class="s0">elif </span><span class="s1">hasattr</span><span class="s2">(</span><span class="s1">source_module</span><span class="s2">, </span><span class="s5">'__name__'</span><span class="s2">):</span>
+            <span class="s1">dct </span><span class="s2">= </span><span class="s1">source_module</span><span class="s2">.</span><span class="s1">__dict__</span>
+            <span class="s1">source_module </span><span class="s2">= </span><span class="s1">source_module</span><span class="s2">.</span><span class="s1">__name__</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">dct </span><span class="s2">= </span><span class="s1">sys</span><span class="s2">.</span><span class="s1">modules</span><span class="s2">[</span><span class="s1">source_module</span><span class="s2">].</span><span class="s1">__dict__</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_source_path </span><span class="s2">= </span><span class="s1">dct</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s5">'__file__'</span><span class="s2">, </span><span class="s5">''</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_source_module </span><span class="s2">= </span><span class="s1">source_module</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_toolchain </span><span class="s2">= </span><span class="s1">Toolchain</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_verbose </span><span class="s2">= </span><span class="s0">False</span>
+        <span class="s4"># By default, output in directory of caller module</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_output_dir </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">dirname</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_source_path</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_output_file </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_toolchain</span><span class="s2">.</span><span class="s1">get_ext_filename</span><span class="s2">(</span><span class="s1">extension_name</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_use_nrt </span><span class="s2">= </span><span class="s0">True</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_target_cpu </span><span class="s2">= </span><span class="s5">''</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">name</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        The name of the extension module to create. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_basename</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">output_file</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        The specific output file (a DLL) that will be generated. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_output_file</span>
+
+    <span class="s2">@</span><span class="s1">output_file</span><span class="s2">.</span><span class="s1">setter</span>
+    <span class="s0">def </span><span class="s1">output_file</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">value</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_output_file </span><span class="s2">= </span><span class="s1">value</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">output_dir</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        The directory the output file will be put in. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_output_dir</span>
+
+    <span class="s2">@</span><span class="s1">output_dir</span><span class="s2">.</span><span class="s1">setter</span>
+    <span class="s0">def </span><span class="s1">output_dir</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">value</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_output_dir </span><span class="s2">= </span><span class="s1">value</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">use_nrt</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_use_nrt</span>
+
+    <span class="s2">@</span><span class="s1">use_nrt</span><span class="s2">.</span><span class="s1">setter</span>
+    <span class="s0">def </span><span class="s1">use_nrt</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">value</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_use_nrt </span><span class="s2">= </span><span class="s1">value</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">target_cpu</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        The target CPU model for code generation. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_target_cpu</span>
+
+    <span class="s2">@</span><span class="s1">target_cpu</span><span class="s2">.</span><span class="s1">setter</span>
+    <span class="s0">def </span><span class="s1">target_cpu</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">value</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_target_cpu </span><span class="s2">= </span><span class="s1">value</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">verbose</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Whether to display detailed information when compiling. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_verbose</span>
+
+    <span class="s2">@</span><span class="s1">verbose</span><span class="s2">.</span><span class="s1">setter</span>
+    <span class="s0">def </span><span class="s1">verbose</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">value</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_verbose </span><span class="s2">= </span><span class="s1">value</span>
+
+    <span class="s0">def </span><span class="s1">export</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">exported_name</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Mark a function for exporting in the extension module. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">fn_args</span><span class="s2">, </span><span class="s1">fn_retty </span><span class="s2">= </span><span class="s1">sigutils</span><span class="s2">.</span><span class="s1">normalize_signature</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">)</span>
+        <span class="s1">sig </span><span class="s2">= </span><span class="s1">typing</span><span class="s2">.</span><span class="s1">signature</span><span class="s2">(</span><span class="s1">fn_retty</span><span class="s2">, *</span><span class="s1">fn_args</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">exported_name </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_exported_functions</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">KeyError</span><span class="s2">(</span><span class="s5">&quot;duplicated export symbol %s&quot; </span><span class="s2">% (</span><span class="s1">exported_name</span><span class="s2">))</span>
+
+        <span class="s0">def </span><span class="s1">decorator</span><span class="s2">(</span><span class="s1">func</span><span class="s2">):</span>
+            <span class="s1">entry </span><span class="s2">= </span><span class="s1">ExportEntry</span><span class="s2">(</span><span class="s1">exported_name</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">, </span><span class="s1">func</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_exported_functions</span><span class="s2">[</span><span class="s1">exported_name</span><span class="s2">] = </span><span class="s1">entry</span>
+            <span class="s0">return </span><span class="s1">func</span>
+
+        <span class="s0">return </span><span class="s1">decorator</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">_export_entries</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">sorted</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_exported_functions</span><span class="s2">.</span><span class="s1">values</span><span class="s2">(),</span>
+                      <span class="s1">key</span><span class="s2">=</span><span class="s0">lambda </span><span class="s1">entry</span><span class="s2">: </span><span class="s1">entry</span><span class="s2">.</span><span class="s1">symbol</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">_get_mixin_sources</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">here </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">dirname</span><span class="s2">(</span><span class="s1">__file__</span><span class="s2">)</span>
+        <span class="s1">mixin_sources </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_mixin_sources</span><span class="s2">[:]</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_use_nrt</span><span class="s2">:</span>
+            <span class="s1">mixin_sources</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s5">'../core/runtime/nrt.cpp'</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s2">[</span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">here</span><span class="s2">, </span><span class="s1">f</span><span class="s2">) </span><span class="s0">for </span><span class="s1">f </span><span class="s0">in </span><span class="s1">mixin_sources</span><span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">_get_mixin_defines</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4"># Macro definitions required by modulemixin.c</span>
+        <span class="s0">return </span><span class="s2">[</span>
+            <span class="s2">(</span><span class="s5">'PYCC_MODULE_NAME'</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_basename</span><span class="s2">),</span>
+            <span class="s2">(</span><span class="s5">'PYCC_USE_NRT'</span><span class="s2">, </span><span class="s1">int</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_use_nrt</span><span class="s2">)),</span>
+            <span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">_get_extra_cflags</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">extra_cflags </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_extra_cflags</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">sys</span><span class="s2">.</span><span class="s1">platform</span><span class="s2">, [])</span>
+        <span class="s0">if not </span><span class="s1">extra_cflags</span><span class="s2">:</span>
+            <span class="s1">extra_cflags </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_extra_cflags</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">os</span><span class="s2">.</span><span class="s1">name</span><span class="s2">, [])</span>
+        <span class="s0">return </span><span class="s1">extra_cflags</span>
+
+    <span class="s0">def </span><span class="s1">_get_extra_ldflags</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">extra_ldflags </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_extra_ldflags</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">sys</span><span class="s2">.</span><span class="s1">platform</span><span class="s2">, [])</span>
+        <span class="s0">if not </span><span class="s1">extra_ldflags</span><span class="s2">:</span>
+            <span class="s1">extra_ldflags </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_extra_ldflags</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">os</span><span class="s2">.</span><span class="s1">name</span><span class="s2">, [])</span>
+        <span class="s4"># helperlib uses pthread on linux. make sure we are linking to it.</span>
+        <span class="s0">if </span><span class="s1">sys</span><span class="s2">.</span><span class="s1">platform</span><span class="s2">.</span><span class="s1">startswith</span><span class="s2">(</span><span class="s5">&quot;linux&quot;</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s5">&quot;-pthread&quot; </span><span class="s0">not in </span><span class="s1">extra_ldflags</span><span class="s2">:</span>
+                <span class="s1">extra_ldflags</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s5">'-pthread'</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">extra_ldflags</span>
+
+    <span class="s0">def </span><span class="s1">_compile_mixins</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">build_dir</span><span class="s2">):</span>
+        <span class="s1">sources </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_mixin_sources</span><span class="s2">()</span>
+        <span class="s1">macros </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_mixin_defines</span><span class="s2">()</span>
+        <span class="s1">include_dirs </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_toolchain</span><span class="s2">.</span><span class="s1">get_python_include_dirs</span><span class="s2">()</span>
+
+        <span class="s1">extra_cflags </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_extra_cflags</span><span class="s2">()</span>
+        <span class="s4"># XXX distutils creates a whole subtree inside build_dir,</span>
+        <span class="s4"># e.g. /tmp/test_pycc/home/antoine/numba/numba/pycc/modulemixin.o</span>
+        <span class="s1">objects </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_toolchain</span><span class="s2">.</span><span class="s1">compile_objects</span><span class="s2">(</span><span class="s1">sources</span><span class="s2">, </span><span class="s1">build_dir</span><span class="s2">,</span>
+                                                  <span class="s1">include_dirs</span><span class="s2">=</span><span class="s1">include_dirs</span><span class="s2">,</span>
+                                                  <span class="s1">macros</span><span class="s2">=</span><span class="s1">macros</span><span class="s2">,</span>
+                                                  <span class="s1">extra_cflags</span><span class="s2">=</span><span class="s1">extra_cflags</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">objects</span>
+
+    <span class="s2">@</span><span class="s1">global_compiler_lock</span>
+    <span class="s0">def </span><span class="s1">_compile_object_files</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">build_dir</span><span class="s2">):</span>
+        <span class="s1">compiler </span><span class="s2">= </span><span class="s1">ModuleCompiler</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_export_entries</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_basename</span><span class="s2">,</span>
+                                <span class="s1">self</span><span class="s2">.</span><span class="s1">_use_nrt</span><span class="s2">, </span><span class="s1">cpu_name</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_target_cpu</span><span class="s2">)</span>
+        <span class="s1">compiler</span><span class="s2">.</span><span class="s1">external_init_function </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_init_function</span>
+        <span class="s1">temp_obj </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">build_dir</span><span class="s2">,</span>
+                                <span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">splitext</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_output_file</span><span class="s2">)[</span><span class="s6">0</span><span class="s2">] + </span><span class="s5">'.o'</span><span class="s2">)</span>
+        <span class="s1">log</span><span class="s2">.</span><span class="s1">info</span><span class="s2">(</span><span class="s5">&quot;generating LLVM code for '%s' into %s&quot;</span><span class="s2">,</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_basename</span><span class="s2">, </span><span class="s1">temp_obj</span><span class="s2">)</span>
+        <span class="s1">compiler</span><span class="s2">.</span><span class="s1">write_native_object</span><span class="s2">(</span><span class="s1">temp_obj</span><span class="s2">, </span><span class="s1">wrap</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s2">[</span><span class="s1">temp_obj</span><span class="s2">], </span><span class="s1">compiler</span><span class="s2">.</span><span class="s1">dll_exports</span>
+
+    <span class="s2">@</span><span class="s1">global_compiler_lock</span>
+    <span class="s0">def </span><span class="s1">compile</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Compile the extension module. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_toolchain</span><span class="s2">.</span><span class="s1">verbose </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">verbose</span>
+        <span class="s1">build_dir </span><span class="s2">= </span><span class="s1">tempfile</span><span class="s2">.</span><span class="s1">mkdtemp</span><span class="s2">(</span><span class="s1">prefix</span><span class="s2">=</span><span class="s5">'pycc-build-%s-' </span><span class="s2">% </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_basename</span><span class="s2">)</span>
+
+        <span class="s4"># Compile object file</span>
+        <span class="s1">objects</span><span class="s2">, </span><span class="s1">dll_exports </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_compile_object_files</span><span class="s2">(</span><span class="s1">build_dir</span><span class="s2">)</span>
+
+        <span class="s4"># Compile mixins</span>
+        <span class="s1">objects </span><span class="s2">+= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_compile_mixins</span><span class="s2">(</span><span class="s1">build_dir</span><span class="s2">)</span>
+
+        <span class="s4"># Then create shared library</span>
+        <span class="s1">extra_ldflags </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_extra_ldflags</span><span class="s2">()</span>
+        <span class="s1">output_dll </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_output_dir</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_output_file</span><span class="s2">)</span>
+        <span class="s1">libraries </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_toolchain</span><span class="s2">.</span><span class="s1">get_python_libraries</span><span class="s2">()</span>
+        <span class="s1">library_dirs </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_toolchain</span><span class="s2">.</span><span class="s1">get_python_library_dirs</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_toolchain</span><span class="s2">.</span><span class="s1">link_shared</span><span class="s2">(</span><span class="s1">output_dll</span><span class="s2">, </span><span class="s1">objects</span><span class="s2">,</span>
+                                    <span class="s1">libraries</span><span class="s2">, </span><span class="s1">library_dirs</span><span class="s2">,</span>
+                                    <span class="s1">export_symbols</span><span class="s2">=</span><span class="s1">dll_exports</span><span class="s2">,</span>
+                                    <span class="s1">extra_ldflags</span><span class="s2">=</span><span class="s1">extra_ldflags</span><span class="s2">)</span>
+
+        <span class="s1">shutil</span><span class="s2">.</span><span class="s1">rmtree</span><span class="s2">(</span><span class="s1">build_dir</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">distutils_extension</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Create a distutils extension object that can be used in your 
+        setup.py. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">macros </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s5">'macros'</span><span class="s2">, []) + </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_mixin_defines</span><span class="s2">()</span>
+        <span class="s1">depends </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s5">'depends'</span><span class="s2">, []) + [</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_source_path</span><span class="s2">]</span>
+        <span class="s1">extra_compile_args </span><span class="s2">= (</span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s5">'extra_compile_args'</span><span class="s2">, [])</span>
+                              <span class="s2">+ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_extra_cflags</span><span class="s2">())</span>
+        <span class="s1">extra_link_args </span><span class="s2">= (</span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s5">'extra_link_args'</span><span class="s2">, [])</span>
+                           <span class="s2">+ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_extra_ldflags</span><span class="s2">())</span>
+        <span class="s1">include_dirs </span><span class="s2">= (</span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s5">'include_dirs'</span><span class="s2">, [])</span>
+                        <span class="s2">+ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_toolchain</span><span class="s2">.</span><span class="s1">get_python_include_dirs</span><span class="s2">())</span>
+        <span class="s1">libraries </span><span class="s2">= (</span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s5">'libraries'</span><span class="s2">, [])</span>
+                     <span class="s2">+ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_toolchain</span><span class="s2">.</span><span class="s1">get_python_libraries</span><span class="s2">())</span>
+        <span class="s1">library_dirs </span><span class="s2">= (</span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s5">'library_dirs'</span><span class="s2">, [])</span>
+                        <span class="s2">+ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_toolchain</span><span class="s2">.</span><span class="s1">get_python_library_dirs</span><span class="s2">())</span>
+        <span class="s1">python_package_path </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_source_module</span><span class="s2">[:</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_source_module</span><span class="s2">.</span><span class="s1">rfind</span><span class="s2">(</span><span class="s5">'.'</span><span class="s2">)+</span><span class="s6">1</span><span class="s2">]</span>
+
+        <span class="s1">ext </span><span class="s2">= </span><span class="s1">_CCExtension</span><span class="s2">(</span><span class="s1">name</span><span class="s2">=</span><span class="s1">python_package_path </span><span class="s2">+ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_basename</span><span class="s2">,</span>
+                           <span class="s1">sources</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_mixin_sources</span><span class="s2">(),</span>
+                           <span class="s1">depends</span><span class="s2">=</span><span class="s1">depends</span><span class="s2">,</span>
+                           <span class="s1">define_macros</span><span class="s2">=</span><span class="s1">macros</span><span class="s2">,</span>
+                           <span class="s1">include_dirs</span><span class="s2">=</span><span class="s1">include_dirs</span><span class="s2">,</span>
+                           <span class="s1">libraries</span><span class="s2">=</span><span class="s1">libraries</span><span class="s2">,</span>
+                           <span class="s1">library_dirs</span><span class="s2">=</span><span class="s1">library_dirs</span><span class="s2">,</span>
+                           <span class="s1">extra_compile_args</span><span class="s2">=</span><span class="s1">extra_compile_args</span><span class="s2">,</span>
+                           <span class="s1">extra_link_args</span><span class="s2">=</span><span class="s1">extra_link_args</span><span class="s2">,</span>
+                           <span class="s2">**</span><span class="s1">kwargs</span><span class="s2">)</span>
+        <span class="s1">ext</span><span class="s2">.</span><span class="s1">monkey_patch_distutils</span><span class="s2">()</span>
+        <span class="s1">ext</span><span class="s2">.</span><span class="s1">_cc </span><span class="s2">= </span><span class="s1">self</span>
+        <span class="s0">return </span><span class="s1">ext</span>
+
+
+<span class="s0">class </span><span class="s1">_CCExtension</span><span class="s2">(</span><span class="s1">Extension</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    A Numba-specific Extension subclass to LLVM-compile pure Python code 
+    to an extension module. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_cc </span><span class="s2">= </span><span class="s0">None</span>
+    <span class="s1">_distutils_monkey_patched </span><span class="s2">= </span><span class="s0">False</span>
+
+    <span class="s0">def </span><span class="s1">_prepare_object_files</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">build_ext</span><span class="s2">):</span>
+        <span class="s1">cc </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_cc</span>
+        <span class="s1">dir_util</span><span class="s2">.</span><span class="s1">mkpath</span><span class="s2">(</span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">build_ext</span><span class="s2">.</span><span class="s1">build_temp</span><span class="s2">, *</span><span class="s1">self</span><span class="s2">.</span><span class="s1">name</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s5">'.'</span><span class="s2">)[:-</span><span class="s6">1</span><span class="s2">]))</span>
+        <span class="s1">objects</span><span class="s2">, </span><span class="s1">_ </span><span class="s2">= </span><span class="s1">cc</span><span class="s2">.</span><span class="s1">_compile_object_files</span><span class="s2">(</span><span class="s1">build_ext</span><span class="s2">.</span><span class="s1">build_temp</span><span class="s2">)</span>
+        <span class="s4"># Add generated object files for linking</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">extra_objects </span><span class="s2">= </span><span class="s1">objects</span>
+
+    <span class="s2">@</span><span class="s1">classmethod</span>
+    <span class="s0">def </span><span class="s1">monkey_patch_distutils</span><span class="s2">(</span><span class="s1">cls</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Monkey-patch distutils with our own build_ext class knowing 
+        about pycc-compiled extensions modules. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">cls</span><span class="s2">.</span><span class="s1">_distutils_monkey_patched</span><span class="s2">:</span>
+            <span class="s0">return</span>
+
+        <span class="s1">_orig_build_ext </span><span class="s2">= </span><span class="s1">build_ext</span><span class="s2">.</span><span class="s1">build_ext</span>
+
+        <span class="s0">class </span><span class="s1">_CC_build_ext</span><span class="s2">(</span><span class="s1">_orig_build_ext</span><span class="s2">):</span>
+
+            <span class="s0">def </span><span class="s1">build_extension</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ext</span><span class="s2">):</span>
+                <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ext</span><span class="s2">, </span><span class="s1">_CCExtension</span><span class="s2">):</span>
+                    <span class="s1">ext</span><span class="s2">.</span><span class="s1">_prepare_object_files</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)</span>
+
+                <span class="s1">_orig_build_ext</span><span class="s2">.</span><span class="s1">build_extension</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ext</span><span class="s2">)</span>
+
+        <span class="s1">build_ext</span><span class="s2">.</span><span class="s1">build_ext </span><span class="s2">= </span><span class="s1">_CC_build_ext</span>
+
+        <span class="s1">cls</span><span class="s2">.</span><span class="s1">_distutils_monkey_patched </span><span class="s2">= </span><span class="s0">True</span>
+</pre>
+</body>
+</html>

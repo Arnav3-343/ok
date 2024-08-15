@@ -1,0 +1,652 @@
+<html>
+<head>
+<title>nrt.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #6aab73;}
+.s4 { color: #2aacb8;}
+.s5 { color: #c77dbb;}
+.s6 { color: #0da19e;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+nrt.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* MSVC C99 doesn't have &lt;stdatomic.h&gt;, else this could be written in easily 
+ * in C */</span>
+<span class="s2">#include </span><span class="s1">&lt;atomic&gt;</span>
+
+<span class="s2">#ifdef </span><span class="s1">_MSC_VER</span>
+<span class="s2">#include </span><span class="s1">&lt;inttypes.h&gt;</span>
+<span class="s2">#endif</span>
+
+<span class="s2">#include </span><span class="s1">&lt;stdarg.h&gt;</span>
+<span class="s2">#include </span><span class="s1">&lt;string.h&gt; </span><span class="s0">/* for memset */</span>
+<span class="s2">#include </span><span class="s3">&quot;nrt.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;assert.h&quot;</span>
+
+
+<span class="s0">/* NOTE: if changing the layout, please update numba.core.runtime.atomicops */</span>
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s1">{</span>
+<span class="s2">struct </span><span class="s1">MemInfo {</span>
+    <span class="s1">std::atomic_size_t     refct;</span>
+    <span class="s1">NRT_dtor_function dtor;</span>
+    <span class="s2">void              </span><span class="s1">*dtor_info;</span>
+    <span class="s2">void              </span><span class="s1">*data;</span>
+    <span class="s1">size_t            size;    </span><span class="s0">/* only used for NRT allocated memory */</span>
+    <span class="s1">NRT_ExternalAllocator *external_allocator;</span>
+<span class="s1">};</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* 
+ * Misc helpers. 
+ */</span>
+
+<span class="s2">static void </span><span class="s1">nrt_fatal_error(</span><span class="s2">const char </span><span class="s1">*msg)</span>
+<span class="s1">{</span>
+    <span class="s1">fprintf(stderr, </span><span class="s3">&quot;Fatal Numba error: %s</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, msg);</span>
+    <span class="s1">fflush(stderr); </span><span class="s0">/* it helps in Windows debug build */</span>
+
+<span class="s2">#if </span><span class="s1">defined(MS_WINDOWS) &amp;&amp; defined(_DEBUG)</span>
+    <span class="s1">DebugBreak();</span>
+<span class="s2">#endif</span>
+    <span class="s1">abort();</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Global resources. 
+ */</span>
+
+<span class="s2">struct </span><span class="s1">NRT_MemSys {</span>
+    <span class="s0">/* Shutdown flag */</span>
+    <span class="s2">int </span><span class="s1">shutting;</span>
+    <span class="s0">/* Stats */</span>
+    <span class="s2">struct </span><span class="s1">{</span>
+        <span class="s2">bool </span><span class="s1">enabled;</span>
+        <span class="s1">std::atomic_size_t alloc;</span>
+        <span class="s1">std::atomic_size_t free;</span>
+        <span class="s1">std::atomic_size_t mi_alloc;</span>
+        <span class="s1">std::atomic_size_t mi_free;</span>
+    <span class="s1">} stats;</span>
+    <span class="s0">/* System allocation functions */</span>
+    <span class="s2">struct </span><span class="s1">{</span>
+        <span class="s1">NRT_malloc_func malloc;</span>
+        <span class="s1">NRT_realloc_func realloc;</span>
+        <span class="s1">NRT_free_func free;</span>
+    <span class="s1">} allocator;</span>
+<span class="s1">};</span>
+
+
+<span class="s0">/* The Memory System object */</span>
+<span class="s2">static </span><span class="s1">NRT_MemSys TheMSys;</span>
+
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">NRT_MemSys_init(</span><span class="s2">void</span><span class="s1">) {</span>
+    <span class="s1">TheMSys.shutting = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s0">// Stats are off by default, call NRT_MemSys_enable_stats to enable</span>
+    <span class="s1">TheMSys.stats.enabled = </span><span class="s2">false</span><span class="s1">;</span>
+    <span class="s1">TheMSys.stats.alloc = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">TheMSys.stats.free = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">TheMSys.stats.mi_alloc = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">TheMSys.stats.mi_free = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s0">/* Bind to libc allocator */</span>
+    <span class="s1">TheMSys.allocator.malloc = malloc;</span>
+    <span class="s1">TheMSys.allocator.realloc = realloc;</span>
+    <span class="s1">TheMSys.allocator.free = free;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">NRT_MemSys_shutdown(</span><span class="s2">void</span><span class="s1">) {</span>
+    <span class="s1">TheMSys.shutting = </span><span class="s4">1</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">NRT_MemSys_enable_stats(</span><span class="s2">void</span><span class="s1">) {</span>
+    <span class="s1">TheMSys.stats.enabled = </span><span class="s5">true</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">NRT_MemSys_disable_stats(</span><span class="s2">void</span><span class="s1">) {</span>
+    <span class="s1">TheMSys.stats.enabled = </span><span class="s2">false</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s1">size_t NRT_MemSys_stats_enabled(</span><span class="s2">void</span><span class="s1">) {</span>
+    <span class="s2">return </span><span class="s1">(size_t)TheMSys.stats.enabled;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">NRT_MemSys_set_allocator(NRT_malloc_func malloc_func,</span>
+                              <span class="s1">NRT_realloc_func realloc_func,</span>
+                              <span class="s1">NRT_free_func free_func)</span>
+<span class="s1">{</span>
+    <span class="s2">bool </span><span class="s1">stats_cond = </span><span class="s2">false</span><span class="s1">;</span>
+    <span class="s2">if </span><span class="s1">(TheMSys.stats.enabled)</span>
+    <span class="s1">{</span>
+        <span class="s1">stats_cond = (TheMSys.stats.alloc != TheMSys.stats.free ||</span>
+                      <span class="s1">TheMSys.stats.mi_alloc != TheMSys.stats.mi_free);</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">((malloc_func != TheMSys.allocator.malloc ||</span>
+         <span class="s1">realloc_func != TheMSys.allocator.realloc ||</span>
+         <span class="s1">free_func != TheMSys.allocator.free) &amp;&amp;</span>
+         <span class="s1">stats_cond) {</span>
+        <span class="s1">nrt_fatal_error(</span><span class="s3">&quot;cannot change allocator while blocks are allocated&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s1">TheMSys.allocator.malloc = malloc_func;</span>
+    <span class="s1">TheMSys.allocator.realloc = realloc_func;</span>
+    <span class="s1">TheMSys.allocator.free = free_func;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* This value is used as a marker for &quot;stats are disabled&quot;, it's ASCII &quot;AAAA&quot; */</span>
+<span class="s2">static </span><span class="s1">size_t _DISABLED_STATS_VALUE = </span><span class="s4">0x41414141</span><span class="s1">;</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s1">size_t NRT_MemSys_get_stats_alloc() {</span>
+    <span class="s2">if </span><span class="s1">(TheMSys.stats.enabled)</span>
+    <span class="s1">{</span>
+        <span class="s2">return </span><span class="s1">TheMSys.stats.alloc.load();</span>
+    <span class="s1">} </span><span class="s2">else  </span><span class="s1">{</span>
+        <span class="s2">return </span><span class="s1">_DISABLED_STATS_VALUE;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s1">size_t NRT_MemSys_get_stats_free() {</span>
+    <span class="s2">if </span><span class="s1">(TheMSys.stats.enabled)</span>
+    <span class="s1">{</span>
+        <span class="s2">return </span><span class="s1">TheMSys.stats.free.load();</span>
+    <span class="s1">} </span><span class="s2">else  </span><span class="s1">{</span>
+        <span class="s2">return </span><span class="s1">_DISABLED_STATS_VALUE;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s1">size_t NRT_MemSys_get_stats_mi_alloc() {</span>
+    <span class="s2">if </span><span class="s1">(TheMSys.stats.enabled)</span>
+    <span class="s1">{</span>
+        <span class="s2">return </span><span class="s1">TheMSys.stats.mi_alloc.load();</span>
+    <span class="s1">} </span><span class="s2">else  </span><span class="s1">{</span>
+        <span class="s2">return </span><span class="s1">_DISABLED_STATS_VALUE;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s1">size_t NRT_MemSys_get_stats_mi_free() {</span>
+    <span class="s2">if </span><span class="s1">(TheMSys.stats.enabled)</span>
+    <span class="s1">{</span>
+        <span class="s2">return </span><span class="s1">TheMSys.stats.mi_free.load();</span>
+    <span class="s1">} </span><span class="s2">else  </span><span class="s1">{</span>
+        <span class="s2">return </span><span class="s1">_DISABLED_STATS_VALUE;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * The MemInfo structure. 
+ */</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">NRT_MemInfo_init(NRT_MemInfo *mi,</span><span class="s2">void </span><span class="s1">*data, size_t size,</span>
+                      <span class="s1">NRT_dtor_function dtor, </span><span class="s2">void </span><span class="s1">*dtor_info,</span>
+                      <span class="s1">NRT_ExternalAllocator *external_allocator)</span>
+<span class="s1">{</span>
+    <span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">refct = </span><span class="s4">1</span><span class="s1">;  </span><span class="s0">/* starts with 1 refct */</span>
+    <span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">dtor = dtor;</span>
+    <span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">dtor_info = dtor_info;</span>
+    <span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">data = data;</span>
+    <span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">size = size;</span>
+    <span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">external_allocator = external_allocator;</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_MemInfo_init mi=%p external_allocator=%p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, mi, external_allocator));</span>
+    <span class="s0">/* Update stats */</span>
+    <span class="s2">if </span><span class="s1">(TheMSys.stats.enabled)</span>
+    <span class="s1">{</span>
+        <span class="s1">TheMSys.stats.mi_alloc++;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">NRT_MemInfo *NRT_MemInfo_new(</span><span class="s2">void </span><span class="s1">*data, size_t size,</span>
+                             <span class="s1">NRT_dtor_function dtor, </span><span class="s2">void </span><span class="s1">*dtor_info)</span>
+<span class="s1">{</span>
+    <span class="s1">NRT_MemInfo *mi = (NRT_MemInfo *)NRT_Allocate(</span><span class="s2">sizeof</span><span class="s1">(NRT_MemInfo));</span>
+    <span class="s2">if </span><span class="s1">(mi != NULL) {</span>
+        <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_MemInfo_new mi=%p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, mi));</span>
+        <span class="s1">NRT_MemInfo_init(mi, data, size, dtor, dtor_info, NULL);</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">mi;</span>
+<span class="s1">}</span>
+
+<span class="s1">size_t NRT_MemInfo_refcount(NRT_MemInfo *mi) {</span>
+    <span class="s0">/* Should never returns 0 for a valid MemInfo */</span>
+    <span class="s2">if </span><span class="s1">(mi &amp;&amp; mi</span><span class="s6">-&gt;</span><span class="s1">data)</span>
+        <span class="s2">return </span><span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">refct;</span>
+    <span class="s2">else</span><span class="s1">{</span>
+        <span class="s2">return </span><span class="s1">(size_t)-</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">static</span>
+<span class="s2">void </span><span class="s1">nrt_internal_dtor_safe(</span><span class="s2">void </span><span class="s1">*ptr, size_t size, </span><span class="s2">void </span><span class="s1">*info) {</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;nrt_internal_dtor_safe %p, %p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, ptr, info));</span>
+    <span class="s0">/* See NRT_MemInfo_alloc_safe() */</span>
+    <span class="s0">/* Fill region with debug markers */</span>
+    <span class="s1">memset(ptr, </span><span class="s4">0xDE</span><span class="s1">, size);</span>
+<span class="s1">}</span>
+
+<span class="s2">static</span>
+<span class="s2">void </span><span class="s1">*nrt_allocate_meminfo_and_data(size_t size, NRT_MemInfo **mi_out, NRT_ExternalAllocator *allocator) {</span>
+    <span class="s1">NRT_MemInfo *mi = NULL;</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;nrt_allocate_meminfo_and_data %p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, allocator));</span>
+    <span class="s2">char </span><span class="s1">*base = (</span><span class="s2">char </span><span class="s1">*)NRT_Allocate_External(</span><span class="s2">sizeof</span><span class="s1">(NRT_MemInfo) + size, allocator);</span>
+    <span class="s2">if </span><span class="s1">(base == NULL) {</span>
+        <span class="s1">*mi_out = NULL; </span><span class="s0">/* set meminfo to NULL as allocation failed */</span>
+        <span class="s2">return </span><span class="s1">NULL; </span><span class="s0">/* return early as allocation failed */</span>
+    <span class="s1">}</span>
+    <span class="s1">mi = (NRT_MemInfo *) base;</span>
+    <span class="s1">*mi_out = mi;</span>
+    <span class="s2">return </span><span class="s1">(</span><span class="s2">void</span><span class="s1">*)((</span><span class="s2">char </span><span class="s1">*)base + </span><span class="s2">sizeof</span><span class="s1">(NRT_MemInfo));</span>
+<span class="s1">}</span>
+
+
+<span class="s2">static</span>
+<span class="s2">void </span><span class="s1">nrt_internal_custom_dtor_safe(</span><span class="s2">void </span><span class="s1">*ptr, size_t size, </span><span class="s2">void </span><span class="s1">*info) {</span>
+    <span class="s1">NRT_dtor_function dtor = (NRT_dtor_function)info;</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;nrt_internal_custom_dtor_safe %p, %p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">,</span>
+                              <span class="s1">ptr, info));</span>
+    <span class="s2">if </span><span class="s1">(dtor) {</span>
+        <span class="s1">dtor(ptr, size, NULL);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">nrt_internal_dtor_safe(ptr, size, NULL);</span>
+<span class="s1">}</span>
+
+<span class="s2">static</span>
+<span class="s2">void </span><span class="s1">nrt_internal_custom_dtor(</span><span class="s2">void </span><span class="s1">*ptr, size_t size, </span><span class="s2">void </span><span class="s1">*info) {</span>
+    <span class="s1">NRT_dtor_function dtor = (NRT_dtor_function)info;</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;nrt_internal_custom_dtor %p, %p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">,</span>
+                              <span class="s1">ptr, info));</span>
+    <span class="s2">if </span><span class="s1">(dtor) {</span>
+        <span class="s1">dtor(ptr, size, NULL);</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">NRT_MemInfo *NRT_MemInfo_alloc(size_t size) {</span>
+    <span class="s1">NRT_MemInfo *mi = NULL;</span>
+    <span class="s2">void </span><span class="s1">*data = nrt_allocate_meminfo_and_data(size, &amp;mi, NULL);</span>
+    <span class="s2">if </span><span class="s1">(data == NULL) {</span>
+        <span class="s2">return </span><span class="s1">NULL; </span><span class="s0">/* return early as allocation failed */</span>
+    <span class="s1">}</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_MemInfo_alloc %p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, data));</span>
+    <span class="s1">NRT_MemInfo_init(mi, data, size, NULL, NULL, NULL);</span>
+    <span class="s2">return </span><span class="s1">mi;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s1">NRT_MemInfo *NRT_MemInfo_alloc_external(size_t size, NRT_ExternalAllocator *allocator) {</span>
+    <span class="s1">NRT_MemInfo *mi = NULL;</span>
+    <span class="s2">void </span><span class="s1">*data = nrt_allocate_meminfo_and_data(size, &amp;mi, allocator);</span>
+    <span class="s2">if </span><span class="s1">(data == NULL) {</span>
+        <span class="s2">return </span><span class="s1">NULL; </span><span class="s0">/* return early as allocation failed */</span>
+    <span class="s1">}</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_MemInfo_alloc %p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, data));</span>
+    <span class="s1">NRT_MemInfo_init(mi, data, size, NULL, NULL, allocator);</span>
+    <span class="s2">return </span><span class="s1">mi;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s1">NRT_MemInfo *NRT_MemInfo_alloc_safe(size_t size) {</span>
+    <span class="s2">return </span><span class="s1">NRT_MemInfo_alloc_dtor_safe(size, NULL);</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s1">NRT_MemInfo* NRT_MemInfo_alloc_dtor_safe(size_t size, NRT_dtor_function dtor) {</span>
+    <span class="s1">NRT_MemInfo *mi = NULL;</span>
+    <span class="s2">void </span><span class="s1">*data = nrt_allocate_meminfo_and_data(size, &amp;mi, NULL);</span>
+    <span class="s2">if </span><span class="s1">(data == NULL) {</span>
+        <span class="s2">return </span><span class="s1">NULL; </span><span class="s0">/* return early as allocation failed */</span>
+    <span class="s1">}</span>
+    <span class="s0">/* Fill region with debug markers */</span>
+    <span class="s1">memset(data, </span><span class="s4">0xCB</span><span class="s1">, size);</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_MemInfo_alloc_dtor_safe %p %zu</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, data, size));</span>
+    <span class="s1">NRT_MemInfo_init(mi, data, size, nrt_internal_custom_dtor_safe, (</span><span class="s2">void</span><span class="s1">*)dtor, NULL);</span>
+    <span class="s2">return </span><span class="s1">mi;</span>
+<span class="s1">}</span>
+
+<span class="s1">NRT_MemInfo* NRT_MemInfo_alloc_dtor(size_t size, NRT_dtor_function dtor) {</span>
+    <span class="s1">NRT_MemInfo *mi = NULL;</span>
+    <span class="s2">void </span><span class="s1">*data = (</span><span class="s2">void </span><span class="s1">*)nrt_allocate_meminfo_and_data(size, &amp;mi, NULL);</span>
+    <span class="s2">if </span><span class="s1">(data == NULL) {</span>
+        <span class="s2">return </span><span class="s1">NULL; </span><span class="s0">/* return early as allocation failed */</span>
+    <span class="s1">}</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_MemInfo_alloc_dtor %p %zu</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, data, size));</span>
+    <span class="s1">NRT_MemInfo_init(mi, data, size, nrt_internal_custom_dtor, (</span><span class="s2">void </span><span class="s1">*)dtor, NULL);</span>
+    <span class="s2">return </span><span class="s1">mi;</span>
+<span class="s1">}</span>
+
+<span class="s2">static</span>
+<span class="s2">void </span><span class="s1">*nrt_allocate_meminfo_and_data_align(size_t size, </span><span class="s2">unsigned </span><span class="s1">align,</span>
+                                          <span class="s1">NRT_MemInfo **mi, NRT_ExternalAllocator *allocator)</span>
+<span class="s1">{</span>
+    <span class="s1">size_t offset = </span><span class="s4">0</span><span class="s1">, intptr = </span><span class="s4">0</span><span class="s1">, remainder = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;nrt_allocate_meminfo_and_data_align %p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, allocator));</span>
+    <span class="s2">char </span><span class="s1">*base = (</span><span class="s2">char </span><span class="s1">*)nrt_allocate_meminfo_and_data(size + </span><span class="s4">2 </span><span class="s1">* align, mi, allocator);</span>
+    <span class="s2">if </span><span class="s1">(base == NULL) {</span>
+        <span class="s2">return </span><span class="s1">NULL; </span><span class="s0">/* return early as allocation failed */</span>
+    <span class="s1">}</span>
+    <span class="s1">intptr = (size_t) base;</span>
+    <span class="s0">/* 
+     * See if the allocation is aligned already... 
+     * Check if align is a power of 2, if so the modulo can be avoided. 
+     */</span>
+    <span class="s2">if</span><span class="s1">((align &amp; (align - </span><span class="s4">1</span><span class="s1">)) == </span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">{</span>
+        <span class="s1">remainder = intptr &amp; (align - </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s2">else</span>
+    <span class="s1">{</span>
+        <span class="s1">remainder = intptr % align;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(remainder == </span><span class="s4">0</span><span class="s1">){ </span><span class="s0">/* Yes */</span>
+        <span class="s1">offset = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{ </span><span class="s0">/* No, move forward `offset` bytes */</span>
+        <span class="s1">offset = align - remainder;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">(</span><span class="s2">void</span><span class="s1">*)((</span><span class="s2">char </span><span class="s1">*)base + offset);</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s1">NRT_MemInfo *NRT_MemInfo_alloc_aligned(size_t size, </span><span class="s2">unsigned </span><span class="s1">align) {</span>
+    <span class="s1">NRT_MemInfo *mi = NULL;</span>
+    <span class="s2">void </span><span class="s1">*data = nrt_allocate_meminfo_and_data_align(size, align, &amp;mi, NULL);</span>
+    <span class="s2">if </span><span class="s1">(data == NULL) {</span>
+        <span class="s2">return </span><span class="s1">NULL; </span><span class="s0">/* return early as allocation failed */</span>
+    <span class="s1">}</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_MemInfo_alloc_aligned %p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, data));</span>
+    <span class="s1">NRT_MemInfo_init(mi, data, size, NULL, NULL, NULL);</span>
+    <span class="s2">return </span><span class="s1">mi;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s1">NRT_MemInfo *NRT_MemInfo_alloc_safe_aligned(size_t size, </span><span class="s2">unsigned </span><span class="s1">align) {</span>
+    <span class="s1">NRT_MemInfo *mi = NULL;</span>
+    <span class="s2">void </span><span class="s1">*data = nrt_allocate_meminfo_and_data_align(size, align, &amp;mi, NULL);</span>
+    <span class="s2">if </span><span class="s1">(data == NULL) {</span>
+        <span class="s2">return </span><span class="s1">NULL; </span><span class="s0">/* return early as allocation failed */</span>
+    <span class="s1">}</span>
+    <span class="s0">/* Fill region with debug markers */</span>
+    <span class="s1">memset(data, </span><span class="s4">0xCB</span><span class="s1">, size);</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_MemInfo_alloc_safe_aligned %p %zu</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">,</span>
+                              <span class="s1">data, size));</span>
+    <span class="s1">NRT_MemInfo_init(mi, data, size, nrt_internal_dtor_safe, (</span><span class="s2">void</span><span class="s1">*)size, NULL);</span>
+    <span class="s2">return </span><span class="s1">mi;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s1">NRT_MemInfo *NRT_MemInfo_alloc_safe_aligned_external(size_t size, </span><span class="s2">unsigned </span><span class="s1">align, NRT_ExternalAllocator *allocator) {</span>
+    <span class="s1">NRT_MemInfo *mi = NULL;</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_MemInfo_alloc_safe_aligned_external %p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, allocator));</span>
+    <span class="s2">void </span><span class="s1">*data = nrt_allocate_meminfo_and_data_align(size, align, &amp;mi, allocator);</span>
+    <span class="s2">if </span><span class="s1">(data == NULL) {</span>
+        <span class="s2">return </span><span class="s1">NULL; </span><span class="s0">/* return early as allocation failed */</span>
+    <span class="s1">}</span>
+    <span class="s0">/* Fill region with debug markers */</span>
+    <span class="s1">memset(data, </span><span class="s4">0xCB</span><span class="s1">, size);</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_MemInfo_alloc_safe_aligned %p %zu</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">,</span>
+                              <span class="s1">data, size));</span>
+    <span class="s1">NRT_MemInfo_init(mi, data, size, nrt_internal_dtor_safe, (</span><span class="s2">void</span><span class="s1">*)size, allocator);</span>
+    <span class="s2">return </span><span class="s1">mi;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">NRT_dealloc(NRT_MemInfo *mi) {</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_dealloc meminfo: %p external_allocator: %p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, mi, mi</span><span class="s6">-&gt;</span><span class="s1">external_allocator));</span>
+    <span class="s2">if </span><span class="s1">(mi</span><span class="s6">-&gt;</span><span class="s1">external_allocator) {</span>
+        <span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">external_allocator</span><span class="s6">-&gt;</span><span class="s1">free(mi, mi</span><span class="s6">-&gt;</span><span class="s1">external_allocator</span><span class="s6">-&gt;</span><span class="s1">opaque_data);</span>
+        <span class="s2">if </span><span class="s1">(TheMSys.stats.enabled)</span>
+        <span class="s1">{</span>
+            <span class="s1">TheMSys.stats.free++;</span>
+        <span class="s1">}</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">NRT_Free(mi);</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">NRT_MemInfo_destroy(NRT_MemInfo *mi) {</span>
+    <span class="s1">NRT_dealloc(mi);</span>
+    <span class="s2">if </span><span class="s1">(TheMSys.stats.enabled)</span>
+    <span class="s1">{</span>
+        <span class="s1">TheMSys.stats.mi_free++;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">NRT_MemInfo_acquire(NRT_MemInfo *mi) {</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_MemInfo_acquire %p refct=%zu</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, mi,</span>
+                                                            <span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">refct.load()));</span>
+    <span class="s1">assert(mi</span><span class="s6">-&gt;</span><span class="s1">refct &gt; </span><span class="s4">0 </span><span class="s1">&amp;&amp; </span><span class="s3">&quot;RefCt cannot be zero&quot;</span><span class="s1">);</span>
+    <span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">refct++;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">NRT_MemInfo_call_dtor(NRT_MemInfo *mi) {</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_MemInfo_call_dtor %p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, mi));</span>
+    <span class="s2">if </span><span class="s1">(mi</span><span class="s6">-&gt;</span><span class="s1">dtor &amp;&amp; !TheMSys.shutting)</span>
+        <span class="s0">/* We have a destructor and the system is not shutting down */</span>
+        <span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">dtor(mi</span><span class="s6">-&gt;</span><span class="s1">data, mi</span><span class="s6">-&gt;</span><span class="s1">size, mi</span><span class="s6">-&gt;</span><span class="s1">dtor_info);</span>
+    <span class="s0">/* Clear and release MemInfo */</span>
+    <span class="s1">NRT_MemInfo_destroy(mi);</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">NRT_MemInfo_release(NRT_MemInfo *mi) {</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_MemInfo_release %p refct=%zu</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, mi,</span>
+                                                            <span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">refct.load()));</span>
+    <span class="s1">assert (mi</span><span class="s6">-&gt;</span><span class="s1">refct &gt; </span><span class="s4">0 </span><span class="s1">&amp;&amp; </span><span class="s3">&quot;RefCt cannot be 0&quot;</span><span class="s1">);</span>
+    <span class="s0">/* RefCt drop to zero */</span>
+    <span class="s2">if </span><span class="s1">((--(mi</span><span class="s6">-&gt;</span><span class="s1">refct)) == </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s1">NRT_MemInfo_call_dtor(mi);</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void</span><span class="s1">* NRT_MemInfo_data(NRT_MemInfo* mi) {</span>
+    <span class="s2">return </span><span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">data;</span>
+<span class="s1">}</span>
+
+<span class="s1">size_t NRT_MemInfo_size(NRT_MemInfo* mi) {</span>
+    <span class="s2">return </span><span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">size;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">* NRT_MemInfo_external_allocator(NRT_MemInfo *mi) {</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_MemInfo_external_allocator meminfo: %p external_allocator: %p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, mi, mi</span><span class="s6">-&gt;</span><span class="s1">external_allocator));</span>
+    <span class="s2">return </span><span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">external_allocator;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">*NRT_MemInfo_parent(NRT_MemInfo *mi) {</span>
+    <span class="s2">return </span><span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">dtor_info;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">NRT_MemInfo_dump(NRT_MemInfo *mi, FILE *out) {</span>
+    <span class="s1">fprintf(out, </span><span class="s3">&quot;MemInfo %p refcount %zu</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, mi, mi</span><span class="s6">-&gt;</span><span class="s1">refct.load());</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Resizable buffer API. 
+ */</span>
+
+<span class="s2">static void</span>
+<span class="s1">nrt_varsize_dtor(</span><span class="s2">void </span><span class="s1">*ptr, size_t size, </span><span class="s2">void </span><span class="s1">*info) {</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;nrt_varsize_dtor %p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, ptr));</span>
+    <span class="s2">if </span><span class="s1">(info) {</span>
+        <span class="s0">/* call element dtor */</span>
+        <span class="s2">typedef void </span><span class="s1">dtor_fn_t(</span><span class="s2">void </span><span class="s1">*ptr);</span>
+        <span class="s1">dtor_fn_t *dtor = (dtor_fn_t *)info;</span>
+        <span class="s1">dtor(ptr);</span>
+    <span class="s1">}</span>
+    <span class="s1">NRT_Free(ptr);</span>
+<span class="s1">}</span>
+
+<span class="s1">NRT_MemInfo *NRT_MemInfo_new_varsize(size_t size)</span>
+<span class="s1">{</span>
+    <span class="s1">NRT_MemInfo *mi = NULL;</span>
+    <span class="s2">void </span><span class="s1">*data = NRT_Allocate(size);</span>
+    <span class="s2">if </span><span class="s1">(data == NULL) {</span>
+        <span class="s2">return </span><span class="s1">NULL; </span><span class="s0">/* return early as allocation failed */</span>
+    <span class="s1">}</span>
+
+    <span class="s1">mi = NRT_MemInfo_new(data, size, nrt_varsize_dtor, NULL);</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_MemInfo_new_varsize size=%zu &quot;</span>
+                              <span class="s3">&quot;-&gt; meminfo=%p, data=%p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, size, mi, data));</span>
+    <span class="s2">return </span><span class="s1">mi;</span>
+<span class="s1">}</span>
+
+<span class="s1">NRT_MemInfo *NRT_MemInfo_new_varsize_dtor(size_t size, NRT_dtor_function dtor) {</span>
+    <span class="s1">NRT_MemInfo *mi = NRT_MemInfo_new_varsize(size);</span>
+    <span class="s2">if </span><span class="s1">(mi) {</span>
+        <span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">dtor_info = (</span><span class="s2">void</span><span class="s1">*)dtor;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">mi;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">*NRT_MemInfo_varsize_alloc(NRT_MemInfo *mi, size_t size)</span>
+<span class="s1">{</span>
+    <span class="s2">if </span><span class="s1">(mi</span><span class="s6">-&gt;</span><span class="s1">dtor != nrt_varsize_dtor) {</span>
+        <span class="s1">nrt_fatal_error(</span><span class="s3">&quot;ERROR: NRT_MemInfo_varsize_alloc called &quot;</span>
+                        <span class="s3">&quot;with a non varsize-allocated meminfo&quot;</span><span class="s1">);</span>
+        <span class="s2">return </span><span class="s1">NULL;  </span><span class="s0">/* unreachable */</span>
+    <span class="s1">}</span>
+    <span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">data = NRT_Allocate(size);</span>
+    <span class="s2">if </span><span class="s1">(mi</span><span class="s6">-&gt;</span><span class="s1">data == NULL)</span>
+        <span class="s2">return </span><span class="s1">NULL;</span>
+    <span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">size = size;</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_MemInfo_varsize_alloc %p size=%zu &quot;</span>
+                              <span class="s3">&quot;-&gt; data=%p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, mi, size, mi</span><span class="s6">-&gt;</span><span class="s1">data));</span>
+    <span class="s2">return </span><span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">data;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">*NRT_MemInfo_varsize_realloc(NRT_MemInfo *mi, size_t size)</span>
+<span class="s1">{</span>
+    <span class="s2">if </span><span class="s1">(mi</span><span class="s6">-&gt;</span><span class="s1">dtor != nrt_varsize_dtor) {</span>
+        <span class="s1">nrt_fatal_error(</span><span class="s3">&quot;ERROR: NRT_MemInfo_varsize_realloc called &quot;</span>
+                        <span class="s3">&quot;with a non varsize-allocated meminfo&quot;</span><span class="s1">);</span>
+        <span class="s2">return </span><span class="s1">NULL;  </span><span class="s0">/* unreachable */</span>
+    <span class="s1">}</span>
+    <span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">data = NRT_Reallocate(mi</span><span class="s6">-&gt;</span><span class="s1">data, size);</span>
+    <span class="s2">if </span><span class="s1">(mi</span><span class="s6">-&gt;</span><span class="s1">data == NULL)</span>
+        <span class="s2">return </span><span class="s1">NULL;</span>
+    <span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">size = size;</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_MemInfo_varsize_realloc %p size=%zu &quot;</span>
+                              <span class="s3">&quot;-&gt; data=%p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, mi, size, mi</span><span class="s6">-&gt;</span><span class="s1">data));</span>
+    <span class="s2">return </span><span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">data;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">NRT_MemInfo_varsize_free(NRT_MemInfo *mi, </span><span class="s2">void </span><span class="s1">*ptr)</span>
+<span class="s1">{</span>
+    <span class="s1">NRT_Free(ptr);</span>
+    <span class="s2">if </span><span class="s1">(ptr == mi</span><span class="s6">-&gt;</span><span class="s1">data)</span>
+        <span class="s1">mi</span><span class="s6">-&gt;</span><span class="s1">data = NULL;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Low-level allocation wrappers. 
+ */</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void</span><span class="s1">* NRT_Allocate(size_t size) {</span>
+    <span class="s2">return </span><span class="s1">NRT_Allocate_External(size, NULL);</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void</span><span class="s1">* NRT_Allocate_External(size_t size, NRT_ExternalAllocator *allocator) {</span>
+    <span class="s2">void </span><span class="s1">*ptr = NULL;</span>
+    <span class="s2">if </span><span class="s1">(allocator) {</span>
+        <span class="s1">ptr = allocator</span><span class="s6">-&gt;</span><span class="s1">malloc(size, allocator</span><span class="s6">-&gt;</span><span class="s1">opaque_data);</span>
+        <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_Allocate_External custom bytes=%zu ptr=%p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, size, ptr));</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">ptr = TheMSys.allocator.malloc(size);</span>
+        <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_Allocate_External bytes=%zu ptr=%p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, size, ptr));</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(TheMSys.stats.enabled)</span>
+    <span class="s1">{</span>
+        <span class="s1">TheMSys.stats.alloc++;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">ptr;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">*NRT_Reallocate(</span><span class="s2">void </span><span class="s1">*ptr, size_t size) {</span>
+    <span class="s2">void </span><span class="s1">*new_ptr = TheMSys.allocator.realloc(ptr, size);</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_Reallocate bytes=%zu ptr=%p -&gt; %p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">,</span>
+                              <span class="s1">size, ptr, new_ptr));</span>
+    <span class="s2">return </span><span class="s1">new_ptr;</span>
+<span class="s1">}</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">void </span><span class="s1">NRT_Free(</span><span class="s2">void </span><span class="s1">*ptr) {</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_Free %p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, ptr));</span>
+    <span class="s1">TheMSys.allocator.free(ptr);</span>
+    <span class="s2">if </span><span class="s1">(TheMSys.stats.enabled)</span>
+    <span class="s1">{</span>
+        <span class="s1">TheMSys.stats.free++;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Sample external allocator implementation for internal testing. 
+ */</span>
+
+<span class="s2">static int </span><span class="s1">sample_external_opaque_data = </span><span class="s4">0xabacad</span><span class="s1">;</span>
+
+<span class="s2">static</span>
+<span class="s2">void</span><span class="s1">* sample_external_malloc(size_t size, </span><span class="s2">void</span><span class="s1">* opaque_data) {</span>
+    <span class="s2">if </span><span class="s1">(opaque_data != &amp;sample_external_opaque_data) </span><span class="s2">return </span><span class="s1">NULL;</span>
+    <span class="s2">return </span><span class="s1">TheMSys.allocator.malloc(size);</span>
+<span class="s1">}</span>
+
+<span class="s2">static</span>
+<span class="s2">void</span><span class="s1">* sample_external_realloc(</span><span class="s2">void </span><span class="s1">*ptr, size_t new_size, </span><span class="s2">void </span><span class="s1">*opaque_data) {</span>
+    <span class="s2">if </span><span class="s1">(opaque_data != &amp;sample_external_opaque_data) </span><span class="s2">return </span><span class="s1">NULL;</span>
+    <span class="s2">return </span><span class="s1">TheMSys.allocator.realloc(ptr, new_size);</span>
+<span class="s1">}</span>
+
+<span class="s2">static</span>
+<span class="s2">void </span><span class="s1">sample_external_free(</span><span class="s2">void </span><span class="s1">*ptr, </span><span class="s2">void</span><span class="s1">* opaque_data) {</span>
+    <span class="s1">TheMSys.allocator.free(ptr);</span>
+<span class="s1">}</span>
+
+<span class="s2">static </span><span class="s1">NRT_ExternalAllocator sample_external_allocator = {</span>
+    <span class="s0">// malloc</span>
+    <span class="s1">sample_external_malloc,</span>
+    <span class="s0">// realloc</span>
+    <span class="s1">sample_external_realloc,</span>
+    <span class="s0">// free</span>
+    <span class="s1">sample_external_free,</span>
+    <span class="s0">// opaque_data</span>
+    <span class="s1">&amp;sample_external_opaque_data</span>
+<span class="s1">};</span>
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s1">NRT_ExternalAllocator* _nrt_get_sample_external_allocator() {</span>
+    <span class="s2">return </span><span class="s1">&amp;sample_external_allocator;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Debugging printf function used internally 
+ */</span>
+<span class="s2">void </span><span class="s1">nrt_debug_print(</span><span class="s2">const char </span><span class="s1">*fmt, ...) {</span>
+   <span class="s1">va_list args;</span>
+
+   <span class="s1">va_start(args, fmt);</span>
+   <span class="s1">vfprintf(stderr, fmt, args);</span>
+   <span class="s1">va_end(args);</span>
+<span class="s1">}</span>
+
+
+<span class="s2">static</span>
+<span class="s2">void </span><span class="s1">nrt_manage_memory_dtor(</span><span class="s2">void </span><span class="s1">*data, size_t size, </span><span class="s2">void </span><span class="s1">*info) {</span>
+    <span class="s1">NRT_managed_dtor* dtor = (NRT_managed_dtor*)info;</span>
+    <span class="s1">dtor(data);</span>
+<span class="s1">}</span>
+
+<span class="s2">static</span>
+<span class="s1">NRT_MemInfo* nrt_manage_memory(</span><span class="s2">void </span><span class="s1">*data, NRT_managed_dtor dtor) {</span>
+    <span class="s2">return </span><span class="s1">(NRT_MemInfo*)(NRT_MemInfo_new(data, </span><span class="s4">0</span><span class="s1">, nrt_manage_memory_dtor, (</span><span class="s2">void</span><span class="s1">*)dtor));</span>
+<span class="s1">}</span>
+
+
+<span class="s2">static const</span>
+<span class="s1">NRT_api_functions nrt_functions_table = {</span>
+    <span class="s1">NRT_MemInfo_alloc,</span>
+    <span class="s1">NRT_MemInfo_alloc_external,</span>
+    <span class="s1">nrt_manage_memory,</span>
+    <span class="s1">NRT_MemInfo_acquire,</span>
+    <span class="s1">NRT_MemInfo_release,</span>
+    <span class="s1">NRT_MemInfo_data</span>
+<span class="s1">};</span>
+
+
+<span class="s2">extern </span><span class="s3">&quot;C&quot; </span><span class="s2">const </span><span class="s1">NRT_api_functions* NRT_get_api(</span><span class="s2">void</span><span class="s1">) {</span>
+    <span class="s2">return </span><span class="s1">&amp;nrt_functions_table;</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

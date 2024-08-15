@@ -1,0 +1,282 @@
+<html>
+<head>
+<title>serialize.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #7a7e85;}
+.s4 { color: #bcbec4;}
+.s5 { color: #2aacb8;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+serialize.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Serialization support for compiled functions. 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">import </span><span class="s1">abc</span>
+<span class="s2">import </span><span class="s1">io</span>
+<span class="s2">import </span><span class="s1">copyreg</span>
+
+
+<span class="s2">import </span><span class="s1">pickle</span>
+<span class="s2">from </span><span class="s1">numba </span><span class="s2">import </span><span class="s1">cloudpickle</span>
+<span class="s2">from </span><span class="s1">llvmlite </span><span class="s2">import </span><span class="s1">ir</span>
+
+
+<span class="s3">#</span>
+<span class="s3"># Pickle support</span>
+<span class="s3">#</span>
+
+<span class="s2">def </span><span class="s1">_rebuild_reduction</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Global hook to rebuild a given class from its __reduce__ arguments. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">cls</span><span class="s4">.</span><span class="s1">_rebuild</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">)</span>
+
+
+<span class="s3"># Keep unpickled object via `numba_unpickle` alive.</span>
+<span class="s1">_unpickled_memo </span><span class="s4">= {}</span>
+
+
+<span class="s2">def </span><span class="s1">_numba_unpickle</span><span class="s4">(</span><span class="s1">address</span><span class="s4">, </span><span class="s1">bytedata</span><span class="s4">, </span><span class="s1">hashed</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Used by `numba_unpickle` from _helperlib.c 
+ 
+    Parameters 
+    ---------- 
+    address : int 
+    bytedata : bytes 
+    hashed : bytes 
+ 
+    Returns 
+    ------- 
+    obj : object 
+        unpickled object 
+    &quot;&quot;&quot;</span>
+    <span class="s1">key </span><span class="s4">= (</span><span class="s1">address</span><span class="s4">, </span><span class="s1">hashed</span><span class="s4">)</span>
+    <span class="s2">try</span><span class="s4">:</span>
+        <span class="s1">obj </span><span class="s4">= </span><span class="s1">_unpickled_memo</span><span class="s4">[</span><span class="s1">key</span><span class="s4">]</span>
+    <span class="s2">except </span><span class="s1">KeyError</span><span class="s4">:</span>
+        <span class="s1">_unpickled_memo</span><span class="s4">[</span><span class="s1">key</span><span class="s4">] = </span><span class="s1">obj </span><span class="s4">= </span><span class="s1">cloudpickle</span><span class="s4">.</span><span class="s1">loads</span><span class="s4">(</span><span class="s1">bytedata</span><span class="s4">)</span>
+    <span class="s2">return </span><span class="s1">obj</span>
+
+
+<span class="s2">def </span><span class="s1">dumps</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Similar to `pickle.dumps()`. Returns the serialized object in bytes. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">pickler </span><span class="s4">= </span><span class="s1">NumbaPickler</span>
+    <span class="s2">with </span><span class="s1">io</span><span class="s4">.</span><span class="s1">BytesIO</span><span class="s4">() </span><span class="s2">as </span><span class="s1">buf</span><span class="s4">:</span>
+        <span class="s1">p </span><span class="s4">= </span><span class="s1">pickler</span><span class="s4">(</span><span class="s1">buf</span><span class="s4">, </span><span class="s1">protocol</span><span class="s4">=</span><span class="s5">4</span><span class="s4">)</span>
+        <span class="s1">p</span><span class="s4">.</span><span class="s1">dump</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">)</span>
+        <span class="s1">pickled </span><span class="s4">= </span><span class="s1">buf</span><span class="s4">.</span><span class="s1">getvalue</span><span class="s4">()</span>
+
+    <span class="s2">return </span><span class="s1">pickled</span>
+
+
+<span class="s2">def </span><span class="s1">runtime_build_excinfo_struct</span><span class="s4">(</span><span class="s1">static_exc</span><span class="s4">, </span><span class="s1">exc_args</span><span class="s4">):</span>
+    <span class="s1">exc</span><span class="s4">, </span><span class="s1">static_args</span><span class="s4">, </span><span class="s1">locinfo </span><span class="s4">= </span><span class="s1">cloudpickle</span><span class="s4">.</span><span class="s1">loads</span><span class="s4">(</span><span class="s1">static_exc</span><span class="s4">)</span>
+    <span class="s1">real_args </span><span class="s4">= []</span>
+    <span class="s1">exc_args_iter </span><span class="s4">= </span><span class="s1">iter</span><span class="s4">(</span><span class="s1">exc_args</span><span class="s4">)</span>
+    <span class="s2">for </span><span class="s1">arg </span><span class="s2">in </span><span class="s1">static_args</span><span class="s4">:</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">arg</span><span class="s4">, </span><span class="s1">ir</span><span class="s4">.</span><span class="s1">Value</span><span class="s4">):</span>
+            <span class="s1">real_args</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">next</span><span class="s4">(</span><span class="s1">exc_args_iter</span><span class="s4">))</span>
+        <span class="s2">else</span><span class="s4">:</span>
+            <span class="s1">real_args</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">arg</span><span class="s4">)</span>
+    <span class="s2">return </span><span class="s4">(</span><span class="s1">exc</span><span class="s4">, </span><span class="s1">tuple</span><span class="s4">(</span><span class="s1">real_args</span><span class="s4">), </span><span class="s1">locinfo</span><span class="s4">)</span>
+
+
+<span class="s3"># Alias to pickle.loads to allow `serialize.loads()`</span>
+<span class="s1">loads </span><span class="s4">= </span><span class="s1">cloudpickle</span><span class="s4">.</span><span class="s1">loads</span>
+
+
+<span class="s2">class </span><span class="s1">_CustomPickled</span><span class="s4">:</span>
+    <span class="s0">&quot;&quot;&quot;A wrapper for objects that must be pickled with `NumbaPickler`. 
+ 
+    Standard `pickle` will pick up the implementation registered via `copyreg`. 
+    This will spawn a `NumbaPickler` instance to serialize the data. 
+ 
+    `NumbaPickler` overrides the handling of this type so as not to spawn a 
+    new pickler for the object when it is already being pickled by a 
+    `NumbaPickler`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">__slots__ </span><span class="s4">= </span><span class="s6">'ctor'</span><span class="s4">, </span><span class="s6">'states'</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">ctor</span><span class="s4">, </span><span class="s1">states</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">ctor </span><span class="s4">= </span><span class="s1">ctor</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">states </span><span class="s4">= </span><span class="s1">states</span>
+
+    <span class="s2">def </span><span class="s1">_reduce</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s2">return </span><span class="s1">_CustomPickled</span><span class="s4">.</span><span class="s1">_rebuild</span><span class="s4">, (</span><span class="s1">self</span><span class="s4">.</span><span class="s1">ctor</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">states</span><span class="s4">)</span>
+
+    <span class="s4">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">_rebuild</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, </span><span class="s1">ctor</span><span class="s4">, </span><span class="s1">states</span><span class="s4">):</span>
+        <span class="s2">return </span><span class="s1">cls</span><span class="s4">(</span><span class="s1">ctor</span><span class="s4">, </span><span class="s1">states</span><span class="s4">)</span>
+
+
+<span class="s2">def </span><span class="s1">_unpickle__CustomPickled</span><span class="s4">(</span><span class="s1">serialized</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;standard unpickling for `_CustomPickled`. 
+ 
+    Uses `NumbaPickler` to load. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">ctor</span><span class="s4">, </span><span class="s1">states </span><span class="s4">= </span><span class="s1">loads</span><span class="s4">(</span><span class="s1">serialized</span><span class="s4">)</span>
+    <span class="s2">return </span><span class="s1">_CustomPickled</span><span class="s4">(</span><span class="s1">ctor</span><span class="s4">, </span><span class="s1">states</span><span class="s4">)</span>
+
+
+<span class="s2">def </span><span class="s1">_pickle__CustomPickled</span><span class="s4">(</span><span class="s1">cp</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;standard pickling for `_CustomPickled`. 
+ 
+    Uses `NumbaPickler` to dump. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">serialized </span><span class="s4">= </span><span class="s1">dumps</span><span class="s4">((</span><span class="s1">cp</span><span class="s4">.</span><span class="s1">ctor</span><span class="s4">, </span><span class="s1">cp</span><span class="s4">.</span><span class="s1">states</span><span class="s4">))</span>
+    <span class="s2">return </span><span class="s1">_unpickle__CustomPickled</span><span class="s4">, (</span><span class="s1">serialized</span><span class="s4">,)</span>
+
+
+<span class="s3"># Register custom pickling for the standard pickler.</span>
+<span class="s1">copyreg</span><span class="s4">.</span><span class="s1">pickle</span><span class="s4">(</span><span class="s1">_CustomPickled</span><span class="s4">, </span><span class="s1">_pickle__CustomPickled</span><span class="s4">)</span>
+
+
+<span class="s2">def </span><span class="s1">custom_reduce</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, </span><span class="s1">states</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;For customizing object serialization in `__reduce__`. 
+ 
+    Object states provided here are used as keyword arguments to the 
+    `._rebuild()` class method. 
+ 
+    Parameters 
+    ---------- 
+    states : dict 
+        Dictionary of object states to be serialized. 
+ 
+    Returns 
+    ------- 
+    result : tuple 
+        This tuple conforms to the return type requirement for `__reduce__`. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">custom_rebuild</span><span class="s4">, (</span><span class="s1">_CustomPickled</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, </span><span class="s1">states</span><span class="s4">),)</span>
+
+
+<span class="s2">def </span><span class="s1">custom_rebuild</span><span class="s4">(</span><span class="s1">custom_pickled</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Customized object deserialization. 
+ 
+    This function is referenced internally by `custom_reduce()`. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">cls</span><span class="s4">, </span><span class="s1">states </span><span class="s4">= </span><span class="s1">custom_pickled</span><span class="s4">.</span><span class="s1">ctor</span><span class="s4">, </span><span class="s1">custom_pickled</span><span class="s4">.</span><span class="s1">states</span>
+    <span class="s2">return </span><span class="s1">cls</span><span class="s4">.</span><span class="s1">_rebuild</span><span class="s4">(**</span><span class="s1">states</span><span class="s4">)</span>
+
+
+<span class="s2">def </span><span class="s1">is_serialiable</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Check if *obj* can be serialized. 
+ 
+    Parameters 
+    ---------- 
+    obj : object 
+ 
+    Returns 
+    -------- 
+    can_serialize : bool 
+    &quot;&quot;&quot;</span>
+    <span class="s2">with </span><span class="s1">io</span><span class="s4">.</span><span class="s1">BytesIO</span><span class="s4">() </span><span class="s2">as </span><span class="s1">fout</span><span class="s4">:</span>
+        <span class="s1">pickler </span><span class="s4">= </span><span class="s1">NumbaPickler</span><span class="s4">(</span><span class="s1">fout</span><span class="s4">)</span>
+        <span class="s2">try</span><span class="s4">:</span>
+            <span class="s1">pickler</span><span class="s4">.</span><span class="s1">dump</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">)</span>
+        <span class="s2">except </span><span class="s1">pickle</span><span class="s4">.</span><span class="s1">PicklingError</span><span class="s4">:</span>
+            <span class="s2">return False</span>
+        <span class="s2">else</span><span class="s4">:</span>
+            <span class="s2">return True</span>
+
+
+<span class="s2">def </span><span class="s1">_no_pickle</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">):</span>
+    <span class="s2">raise </span><span class="s1">pickle</span><span class="s4">.</span><span class="s1">PicklingError</span><span class="s4">(</span><span class="s6">f&quot;Pickling of </span><span class="s2">{</span><span class="s1">type</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">)</span><span class="s2">} </span><span class="s6">is unsupported&quot;</span><span class="s4">)</span>
+
+
+<span class="s2">def </span><span class="s1">disable_pickling</span><span class="s4">(</span><span class="s1">typ</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;This is called on a type to disable pickling 
+    &quot;&quot;&quot;</span>
+    <span class="s1">NumbaPickler</span><span class="s4">.</span><span class="s1">disabled_types</span><span class="s4">.</span><span class="s1">add</span><span class="s4">(</span><span class="s1">typ</span><span class="s4">)</span>
+    <span class="s3"># Return `typ` to allow use as a decorator</span>
+    <span class="s2">return </span><span class="s1">typ</span>
+
+
+<span class="s2">class </span><span class="s1">NumbaPickler</span><span class="s4">(</span><span class="s1">cloudpickle</span><span class="s4">.</span><span class="s1">CloudPickler</span><span class="s4">):</span>
+    <span class="s1">disabled_types </span><span class="s4">= </span><span class="s1">set</span><span class="s4">()</span>
+    <span class="s6">&quot;&quot;&quot;A set of types that pickling cannot is disabled. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">reducer_override</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">obj</span><span class="s4">):</span>
+        <span class="s3"># Overridden to disable pickling of certain types</span>
+        <span class="s2">if </span><span class="s1">type</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">) </span><span class="s2">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">disabled_types</span><span class="s4">:</span>
+            <span class="s1">_no_pickle</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">)  </span><span class="s3"># noreturn</span>
+        <span class="s2">return </span><span class="s1">super</span><span class="s4">().</span><span class="s1">reducer_override</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">)</span>
+
+
+<span class="s2">def </span><span class="s1">_custom_reduce__custompickled</span><span class="s4">(</span><span class="s1">cp</span><span class="s4">):</span>
+    <span class="s2">return </span><span class="s1">cp</span><span class="s4">.</span><span class="s1">_reduce</span><span class="s4">()</span>
+
+
+<span class="s1">NumbaPickler</span><span class="s4">.</span><span class="s1">dispatch_table</span><span class="s4">[</span><span class="s1">_CustomPickled</span><span class="s4">] = </span><span class="s1">_custom_reduce__custompickled</span>
+
+
+<span class="s2">class </span><span class="s1">ReduceMixin</span><span class="s4">(</span><span class="s1">abc</span><span class="s4">.</span><span class="s1">ABC</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;A mixin class for objects that should be reduced by the NumbaPickler 
+    instead of the standard pickler. 
+    &quot;&quot;&quot;</span>
+    <span class="s3"># Subclass MUST override the below methods</span>
+
+    <span class="s4">@</span><span class="s1">abc</span><span class="s4">.</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">_reduce_states</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s4">@</span><span class="s1">abc</span><span class="s4">.</span><span class="s1">abstractclassmethod</span>
+    <span class="s2">def </span><span class="s1">_rebuild</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s3"># Subclass can override the below methods</span>
+
+    <span class="s2">def </span><span class="s1">_reduce_class</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">__class__</span>
+
+    <span class="s3"># Private methods</span>
+
+    <span class="s2">def </span><span class="s1">__reduce__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s2">return </span><span class="s1">custom_reduce</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_reduce_class</span><span class="s4">(), </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_reduce_states</span><span class="s4">())</span>
+
+
+<span class="s2">class </span><span class="s1">PickleCallableByPath</span><span class="s4">:</span>
+    <span class="s0">&quot;&quot;&quot;Wrap a callable object to be pickled by path to workaround limitation 
+    in pickling due to non-pickleable objects in function non-locals. 
+ 
+    Note: 
+    - Do not use this as a decorator. 
+    - Wrapped object must be a global that exist in its parent module and it 
+      can be imported by `from the_module import the_object`. 
+ 
+    Usage: 
+ 
+    &gt;&gt;&gt; def my_fn(x): 
+    &gt;&gt;&gt;     ... 
+    &gt;&gt;&gt; wrapped_fn = PickleCallableByPath(my_fn) 
+    &gt;&gt;&gt; # refer to `wrapped_fn` instead of `my_fn` 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">fn</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_fn </span><span class="s4">= </span><span class="s1">fn</span>
+
+    <span class="s2">def </span><span class="s1">__call__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_fn</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">)</span>
+
+    <span class="s2">def </span><span class="s1">__reduce__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s2">return </span><span class="s1">type</span><span class="s4">(</span><span class="s1">self</span><span class="s4">).</span><span class="s1">_rebuild</span><span class="s4">, (</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_fn</span><span class="s4">.</span><span class="s1">__module__</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_fn</span><span class="s4">.</span><span class="s1">__name__</span><span class="s4">,)</span>
+
+    <span class="s4">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">_rebuild</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, </span><span class="s1">modname</span><span class="s4">, </span><span class="s1">fn_path</span><span class="s4">):</span>
+        <span class="s2">return </span><span class="s1">cls</span><span class="s4">(</span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">sys</span><span class="s4">.</span><span class="s1">modules</span><span class="s4">[</span><span class="s1">modname</span><span class="s4">], </span><span class="s1">fn_path</span><span class="s4">))</span>
+</pre>
+</body>
+</html>

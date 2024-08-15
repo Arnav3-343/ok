@@ -1,0 +1,745 @@
+<html>
+<head>
+<title>analysis.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+analysis.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Utils for IR analysis 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">operator</span>
+<span class="s2">from </span><span class="s1">functools </span><span class="s2">import </span><span class="s1">reduce</span>
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">namedtuple</span><span class="s3">, </span><span class="s1">defaultdict</span>
+
+<span class="s2">from </span><span class="s3">.</span><span class="s1">controlflow </span><span class="s2">import </span><span class="s1">CFGraph</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">types</span><span class="s3">, </span><span class="s1">errors</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">, </span><span class="s1">consts</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">misc </span><span class="s2">import </span><span class="s1">special</span>
+
+<span class="s4">#</span>
+<span class="s4"># Analysis related to variable lifetime</span>
+<span class="s4">#</span>
+
+<span class="s1">_use_defs_result </span><span class="s3">= </span><span class="s1">namedtuple</span><span class="s3">(</span><span class="s5">'use_defs_result'</span><span class="s3">, </span><span class="s5">'usemap,defmap'</span><span class="s3">)</span>
+
+<span class="s4"># other packages that define new nodes add calls for finding defs</span>
+<span class="s4"># format: {type:function}</span>
+<span class="s1">ir_extension_usedefs </span><span class="s3">= {}</span>
+
+
+<span class="s2">def </span><span class="s1">compute_use_defs</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Find variable use/def per block. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">var_use_map </span><span class="s3">= {}   </span><span class="s4"># { block offset -&gt; set of vars }</span>
+    <span class="s1">var_def_map </span><span class="s3">= {}   </span><span class="s4"># { block offset -&gt; set of vars }</span>
+    <span class="s2">for </span><span class="s1">offset</span><span class="s3">, </span><span class="s1">ir_block </span><span class="s2">in </span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+        <span class="s1">var_use_map</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">] = </span><span class="s1">use_set </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+        <span class="s1">var_def_map</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">] = </span><span class="s1">def_set </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+        <span class="s2">for </span><span class="s1">stmt </span><span class="s2">in </span><span class="s1">ir_block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">type</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">) </span><span class="s2">in </span><span class="s1">ir_extension_usedefs</span><span class="s3">:</span>
+                <span class="s1">func </span><span class="s3">= </span><span class="s1">ir_extension_usedefs</span><span class="s3">[</span><span class="s1">type</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">)]</span>
+                <span class="s1">func</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">, </span><span class="s1">use_set</span><span class="s3">, </span><span class="s1">def_set</span><span class="s3">)</span>
+                <span class="s2">continue</span>
+            <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Assign</span><span class="s3">):</span>
+                <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">value</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Inst</span><span class="s3">):</span>
+                    <span class="s1">rhs_set </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">var</span><span class="s3">.</span><span class="s1">name </span><span class="s2">for </span><span class="s1">var </span><span class="s2">in </span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">list_vars</span><span class="s3">())</span>
+                <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">value</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Var</span><span class="s3">):</span>
+                    <span class="s1">rhs_set </span><span class="s3">= </span><span class="s1">set</span><span class="s3">([</span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">])</span>
+                <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">value</span><span class="s3">, (</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Arg</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Const</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Global</span><span class="s3">,</span>
+                                             <span class="s1">ir</span><span class="s3">.</span><span class="s1">FreeVar</span><span class="s3">)):</span>
+                    <span class="s1">rhs_set </span><span class="s3">= ()</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s2">raise </span><span class="s1">AssertionError</span><span class="s3">(</span><span class="s5">'unreachable'</span><span class="s3">, </span><span class="s1">type</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">value</span><span class="s3">))</span>
+                <span class="s4"># If lhs not in rhs of the assignment</span>
+                <span class="s2">if </span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name </span><span class="s2">not in </span><span class="s1">rhs_set</span><span class="s3">:</span>
+                    <span class="s1">def_set</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+
+            <span class="s2">for </span><span class="s1">var </span><span class="s2">in </span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">list_vars</span><span class="s3">():</span>
+                <span class="s4"># do not include locally defined vars to use-map</span>
+                <span class="s2">if </span><span class="s1">var</span><span class="s3">.</span><span class="s1">name </span><span class="s2">not in </span><span class="s1">def_set</span><span class="s3">:</span>
+                    <span class="s1">use_set</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">var</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">_use_defs_result</span><span class="s3">(</span><span class="s1">usemap</span><span class="s3">=</span><span class="s1">var_use_map</span><span class="s3">, </span><span class="s1">defmap</span><span class="s3">=</span><span class="s1">var_def_map</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">compute_live_map</span><span class="s3">(</span><span class="s1">cfg</span><span class="s3">, </span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">var_use_map</span><span class="s3">, </span><span class="s1">var_def_map</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Find variables that must be alive at the ENTRY of each block. 
+    We use a simple fix-point algorithm that iterates until the set of 
+    live variables is unchanged for each block. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">fix_point_progress</span><span class="s3">(</span><span class="s1">dct</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Helper function to determine if a fix-point has been reached. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">v</span><span class="s3">) </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">dct</span><span class="s3">.</span><span class="s1">values</span><span class="s3">())</span>
+
+    <span class="s2">def </span><span class="s1">fix_point</span><span class="s3">(</span><span class="s1">fn</span><span class="s3">, </span><span class="s1">dct</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Helper function to run fix-point algorithm. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">old_point </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s1">new_point </span><span class="s3">= </span><span class="s1">fix_point_progress</span><span class="s3">(</span><span class="s1">dct</span><span class="s3">)</span>
+        <span class="s2">while </span><span class="s1">old_point </span><span class="s3">!= </span><span class="s1">new_point</span><span class="s3">:</span>
+            <span class="s1">fn</span><span class="s3">(</span><span class="s1">dct</span><span class="s3">)</span>
+            <span class="s1">old_point </span><span class="s3">= </span><span class="s1">new_point</span>
+            <span class="s1">new_point </span><span class="s3">= </span><span class="s1">fix_point_progress</span><span class="s3">(</span><span class="s1">dct</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">def_reach</span><span class="s3">(</span><span class="s1">dct</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Find all variable definition reachable at the entry of a block 
+        &quot;&quot;&quot;</span>
+        <span class="s2">for </span><span class="s1">offset </span><span class="s2">in </span><span class="s1">var_def_map</span><span class="s3">:</span>
+            <span class="s1">used_or_defined </span><span class="s3">= </span><span class="s1">var_def_map</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">] | </span><span class="s1">var_use_map</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">]</span>
+            <span class="s1">dct</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">] |= </span><span class="s1">used_or_defined</span>
+            <span class="s4"># Propagate to outgoing nodes</span>
+            <span class="s2">for </span><span class="s1">out_blk</span><span class="s3">, </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">successors</span><span class="s3">(</span><span class="s1">offset</span><span class="s3">):</span>
+                <span class="s1">dct</span><span class="s3">[</span><span class="s1">out_blk</span><span class="s3">] |= </span><span class="s1">dct</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">]</span>
+
+    <span class="s2">def </span><span class="s1">liveness</span><span class="s3">(</span><span class="s1">dct</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Find live variables. 
+ 
+        Push var usage backward. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">for </span><span class="s1">offset </span><span class="s2">in </span><span class="s1">dct</span><span class="s3">:</span>
+            <span class="s4"># Live vars here</span>
+            <span class="s1">live_vars </span><span class="s3">= </span><span class="s1">dct</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">]</span>
+            <span class="s2">for </span><span class="s1">inc_blk</span><span class="s3">, </span><span class="s1">_data </span><span class="s2">in </span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">predecessors</span><span class="s3">(</span><span class="s1">offset</span><span class="s3">):</span>
+                <span class="s4"># Reachable at the predecessor</span>
+                <span class="s1">reachable </span><span class="s3">= </span><span class="s1">live_vars </span><span class="s3">&amp; </span><span class="s1">def_reach_map</span><span class="s3">[</span><span class="s1">inc_blk</span><span class="s3">]</span>
+                <span class="s4"># But not defined in the predecessor</span>
+                <span class="s1">dct</span><span class="s3">[</span><span class="s1">inc_blk</span><span class="s3">] |= </span><span class="s1">reachable </span><span class="s3">- </span><span class="s1">var_def_map</span><span class="s3">[</span><span class="s1">inc_blk</span><span class="s3">]</span>
+
+    <span class="s1">live_map </span><span class="s3">= {}</span>
+    <span class="s2">for </span><span class="s1">offset </span><span class="s2">in </span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">():</span>
+        <span class="s1">live_map</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">] = </span><span class="s1">set</span><span class="s3">(</span><span class="s1">var_use_map</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">])</span>
+
+    <span class="s1">def_reach_map </span><span class="s3">= </span><span class="s1">defaultdict</span><span class="s3">(</span><span class="s1">set</span><span class="s3">)</span>
+    <span class="s1">fix_point</span><span class="s3">(</span><span class="s1">def_reach</span><span class="s3">, </span><span class="s1">def_reach_map</span><span class="s3">)</span>
+    <span class="s1">fix_point</span><span class="s3">(</span><span class="s1">liveness</span><span class="s3">, </span><span class="s1">live_map</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">live_map</span>
+
+
+<span class="s1">_dead_maps_result </span><span class="s3">= </span><span class="s1">namedtuple</span><span class="s3">(</span><span class="s5">'dead_maps_result'</span><span class="s3">, </span><span class="s5">'internal,escaping,combined'</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">compute_dead_maps</span><span class="s3">(</span><span class="s1">cfg</span><span class="s3">, </span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">live_map</span><span class="s3">, </span><span class="s1">var_def_map</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Compute the end-of-live information for variables. 
+    `live_map` contains a mapping of block offset to all the living 
+    variables at the ENTRY of the block. 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># The following three dictionaries will be</span>
+    <span class="s4"># { block offset -&gt; set of variables to delete }</span>
+    <span class="s4"># all vars that should be deleted at the start of the successors</span>
+    <span class="s1">escaping_dead_map </span><span class="s3">= </span><span class="s1">defaultdict</span><span class="s3">(</span><span class="s1">set</span><span class="s3">)</span>
+    <span class="s4"># all vars that should be deleted within this block</span>
+    <span class="s1">internal_dead_map </span><span class="s3">= </span><span class="s1">defaultdict</span><span class="s3">(</span><span class="s1">set</span><span class="s3">)</span>
+    <span class="s4"># all vars that should be deleted after the function exit</span>
+    <span class="s1">exit_dead_map </span><span class="s3">= </span><span class="s1">defaultdict</span><span class="s3">(</span><span class="s1">set</span><span class="s3">)</span>
+
+    <span class="s2">for </span><span class="s1">offset</span><span class="s3">, </span><span class="s1">ir_block </span><span class="s2">in </span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+        <span class="s4"># live vars WITHIN the block will include all the locally</span>
+        <span class="s4"># defined variables</span>
+        <span class="s1">cur_live_set </span><span class="s3">= </span><span class="s1">live_map</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">] | </span><span class="s1">var_def_map</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">]</span>
+        <span class="s4"># vars alive in the outgoing blocks</span>
+        <span class="s1">outgoing_live_map </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">((</span><span class="s1">out_blk</span><span class="s3">, </span><span class="s1">live_map</span><span class="s3">[</span><span class="s1">out_blk</span><span class="s3">])</span>
+                                 <span class="s2">for </span><span class="s1">out_blk</span><span class="s3">, </span><span class="s1">_data </span><span class="s2">in </span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">successors</span><span class="s3">(</span><span class="s1">offset</span><span class="s3">))</span>
+        <span class="s4"># vars to keep alive for the terminator</span>
+        <span class="s1">terminator_liveset </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">v</span><span class="s3">.</span><span class="s1">name</span>
+                                 <span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">ir_block</span><span class="s3">.</span><span class="s1">terminator</span><span class="s3">.</span><span class="s1">list_vars</span><span class="s3">())</span>
+        <span class="s4"># vars to keep alive in the successors</span>
+        <span class="s1">combined_liveset </span><span class="s3">= </span><span class="s1">reduce</span><span class="s3">(</span><span class="s1">operator</span><span class="s3">.</span><span class="s1">or_</span><span class="s3">, </span><span class="s1">outgoing_live_map</span><span class="s3">.</span><span class="s1">values</span><span class="s3">(),</span>
+                                  <span class="s1">set</span><span class="s3">())</span>
+        <span class="s4"># include variables used in terminator</span>
+        <span class="s1">combined_liveset </span><span class="s3">|= </span><span class="s1">terminator_liveset</span>
+        <span class="s4"># vars that are dead within the block because they are not</span>
+        <span class="s4"># propagated to any outgoing blocks</span>
+        <span class="s1">internal_set </span><span class="s3">= </span><span class="s1">cur_live_set </span><span class="s3">- </span><span class="s1">combined_liveset</span>
+        <span class="s1">internal_dead_map</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">] = </span><span class="s1">internal_set</span>
+        <span class="s4"># vars that escape this block</span>
+        <span class="s1">escaping_live_set </span><span class="s3">= </span><span class="s1">cur_live_set </span><span class="s3">- </span><span class="s1">internal_set</span>
+        <span class="s2">for </span><span class="s1">out_blk</span><span class="s3">, </span><span class="s1">new_live_set </span><span class="s2">in </span><span class="s1">outgoing_live_map</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+            <span class="s4"># successor should delete the unused escaped vars</span>
+            <span class="s1">new_live_set </span><span class="s3">= </span><span class="s1">new_live_set </span><span class="s3">| </span><span class="s1">var_def_map</span><span class="s3">[</span><span class="s1">out_blk</span><span class="s3">]</span>
+            <span class="s1">escaping_dead_map</span><span class="s3">[</span><span class="s1">out_blk</span><span class="s3">] |= </span><span class="s1">escaping_live_set </span><span class="s3">- </span><span class="s1">new_live_set</span>
+
+        <span class="s4"># if no outgoing blocks</span>
+        <span class="s2">if not </span><span class="s1">outgoing_live_map</span><span class="s3">:</span>
+            <span class="s4"># insert var used by terminator</span>
+            <span class="s1">exit_dead_map</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">] = </span><span class="s1">terminator_liveset</span>
+
+    <span class="s4"># Verify that the dead maps cover all live variables</span>
+    <span class="s1">all_vars </span><span class="s3">= </span><span class="s1">reduce</span><span class="s3">(</span><span class="s1">operator</span><span class="s3">.</span><span class="s1">or_</span><span class="s3">, </span><span class="s1">live_map</span><span class="s3">.</span><span class="s1">values</span><span class="s3">(), </span><span class="s1">set</span><span class="s3">())</span>
+    <span class="s1">internal_dead_vars </span><span class="s3">= </span><span class="s1">reduce</span><span class="s3">(</span><span class="s1">operator</span><span class="s3">.</span><span class="s1">or_</span><span class="s3">, </span><span class="s1">internal_dead_map</span><span class="s3">.</span><span class="s1">values</span><span class="s3">(),</span>
+                                <span class="s1">set</span><span class="s3">())</span>
+    <span class="s1">escaping_dead_vars </span><span class="s3">= </span><span class="s1">reduce</span><span class="s3">(</span><span class="s1">operator</span><span class="s3">.</span><span class="s1">or_</span><span class="s3">, </span><span class="s1">escaping_dead_map</span><span class="s3">.</span><span class="s1">values</span><span class="s3">(),</span>
+                                <span class="s1">set</span><span class="s3">())</span>
+    <span class="s1">exit_dead_vars </span><span class="s3">= </span><span class="s1">reduce</span><span class="s3">(</span><span class="s1">operator</span><span class="s3">.</span><span class="s1">or_</span><span class="s3">, </span><span class="s1">exit_dead_map</span><span class="s3">.</span><span class="s1">values</span><span class="s3">(), </span><span class="s1">set</span><span class="s3">())</span>
+    <span class="s1">dead_vars </span><span class="s3">= (</span><span class="s1">internal_dead_vars </span><span class="s3">| </span><span class="s1">escaping_dead_vars </span><span class="s3">| </span><span class="s1">exit_dead_vars</span><span class="s3">)</span>
+    <span class="s1">missing_vars </span><span class="s3">= </span><span class="s1">all_vars </span><span class="s3">- </span><span class="s1">dead_vars</span>
+    <span class="s2">if </span><span class="s1">missing_vars</span><span class="s3">:</span>
+        <span class="s4"># There are no exit points</span>
+        <span class="s2">if not </span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">exit_points</span><span class="s3">():</span>
+            <span class="s4"># We won't be able to verify this</span>
+            <span class="s2">pass</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">msg </span><span class="s3">= </span><span class="s5">'liveness info missing for vars: {0}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">missing_vars</span><span class="s3">)</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+
+    <span class="s1">combined </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">((</span><span class="s1">k</span><span class="s3">, </span><span class="s1">internal_dead_map</span><span class="s3">[</span><span class="s1">k</span><span class="s3">] | </span><span class="s1">escaping_dead_map</span><span class="s3">[</span><span class="s1">k</span><span class="s3">])</span>
+                    <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">blocks</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">_dead_maps_result</span><span class="s3">(</span><span class="s1">internal</span><span class="s3">=</span><span class="s1">internal_dead_map</span><span class="s3">,</span>
+                             <span class="s1">escaping</span><span class="s3">=</span><span class="s1">escaping_dead_map</span><span class="s3">,</span>
+                             <span class="s1">combined</span><span class="s3">=</span><span class="s1">combined</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">compute_live_variables</span><span class="s3">(</span><span class="s1">cfg</span><span class="s3">, </span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">var_def_map</span><span class="s3">, </span><span class="s1">var_dead_map</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Compute the live variables at the beginning of each block 
+    and at each yield point. 
+    The ``var_def_map`` and ``var_dead_map`` indicates the variable defined 
+    and deleted at each block, respectively. 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># live var at the entry per block</span>
+    <span class="s1">block_entry_vars </span><span class="s3">= </span><span class="s1">defaultdict</span><span class="s3">(</span><span class="s1">set</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">fix_point_progress</span><span class="s3">():</span>
+        <span class="s2">return </span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">map</span><span class="s3">(</span><span class="s1">len</span><span class="s3">, </span><span class="s1">block_entry_vars</span><span class="s3">.</span><span class="s1">values</span><span class="s3">()))</span>
+
+    <span class="s1">old_point </span><span class="s3">= </span><span class="s2">None</span>
+    <span class="s1">new_point </span><span class="s3">= </span><span class="s1">fix_point_progress</span><span class="s3">()</span>
+
+    <span class="s4"># Propagate defined variables and still live the successors.</span>
+    <span class="s4"># (note the entry block automatically gets an empty set)</span>
+
+    <span class="s4"># Note: This is finding the actual available variables at the entry</span>
+    <span class="s4">#       of each block. The algorithm in compute_live_map() is finding</span>
+    <span class="s4">#       the variable that must be available at the entry of each block.</span>
+    <span class="s4">#       This is top-down in the dataflow.  The other one is bottom-up.</span>
+    <span class="s2">while </span><span class="s1">old_point </span><span class="s3">!= </span><span class="s1">new_point</span><span class="s3">:</span>
+        <span class="s4"># We iterate until the result stabilizes.  This is necessary</span>
+        <span class="s4"># because of loops in the graphself.</span>
+        <span class="s2">for </span><span class="s1">offset </span><span class="s2">in </span><span class="s1">blocks</span><span class="s3">:</span>
+            <span class="s4"># vars available + variable defined</span>
+            <span class="s1">avail </span><span class="s3">= </span><span class="s1">block_entry_vars</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">] | </span><span class="s1">var_def_map</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">]</span>
+            <span class="s4"># subtract variables deleted</span>
+            <span class="s1">avail </span><span class="s3">-= </span><span class="s1">var_dead_map</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">]</span>
+            <span class="s4"># add ``avail`` to each successors</span>
+            <span class="s2">for </span><span class="s1">succ</span><span class="s3">, </span><span class="s1">_data </span><span class="s2">in </span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">successors</span><span class="s3">(</span><span class="s1">offset</span><span class="s3">):</span>
+                <span class="s1">block_entry_vars</span><span class="s3">[</span><span class="s1">succ</span><span class="s3">] |= </span><span class="s1">avail</span>
+
+        <span class="s1">old_point </span><span class="s3">= </span><span class="s1">new_point</span>
+        <span class="s1">new_point </span><span class="s3">= </span><span class="s1">fix_point_progress</span><span class="s3">()</span>
+
+    <span class="s2">return </span><span class="s1">block_entry_vars</span>
+
+
+<span class="s4">#</span>
+<span class="s4"># Analysis related to controlflow</span>
+<span class="s4">#</span>
+
+<span class="s2">def </span><span class="s1">compute_cfg_from_blocks</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">):</span>
+    <span class="s1">cfg </span><span class="s3">= </span><span class="s1">CFGraph</span><span class="s3">()</span>
+    <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">blocks</span><span class="s3">:</span>
+        <span class="s1">cfg</span><span class="s3">.</span><span class="s1">add_node</span><span class="s3">(</span><span class="s1">k</span><span class="s3">)</span>
+
+    <span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">b </span><span class="s2">in </span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+        <span class="s1">term </span><span class="s3">= </span><span class="s1">b</span><span class="s3">.</span><span class="s1">terminator</span>
+        <span class="s2">for </span><span class="s1">target </span><span class="s2">in </span><span class="s1">term</span><span class="s3">.</span><span class="s1">get_targets</span><span class="s3">():</span>
+            <span class="s1">cfg</span><span class="s3">.</span><span class="s1">add_edge</span><span class="s3">(</span><span class="s1">k</span><span class="s3">, </span><span class="s1">target</span><span class="s3">)</span>
+
+    <span class="s1">cfg</span><span class="s3">.</span><span class="s1">set_entry_point</span><span class="s3">(</span><span class="s1">min</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">))</span>
+    <span class="s1">cfg</span><span class="s3">.</span><span class="s1">process</span><span class="s3">()</span>
+    <span class="s2">return </span><span class="s1">cfg</span>
+
+
+<span class="s2">def </span><span class="s1">find_top_level_loops</span><span class="s3">(</span><span class="s1">cfg</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A generator that yields toplevel loops given a control-flow-graph 
+    &quot;&quot;&quot;</span>
+    <span class="s1">blocks_in_loop </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+    <span class="s4"># get loop bodies</span>
+    <span class="s2">for </span><span class="s1">loop </span><span class="s2">in </span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">loops</span><span class="s3">().</span><span class="s1">values</span><span class="s3">():</span>
+        <span class="s1">insiders </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">.</span><span class="s1">body</span><span class="s3">) | </span><span class="s1">set</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">.</span><span class="s1">entries</span><span class="s3">) | </span><span class="s1">set</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">.</span><span class="s1">exits</span><span class="s3">)</span>
+        <span class="s1">insiders</span><span class="s3">.</span><span class="s1">discard</span><span class="s3">(</span><span class="s1">loop</span><span class="s3">.</span><span class="s1">header</span><span class="s3">)</span>
+        <span class="s1">blocks_in_loop </span><span class="s3">|= </span><span class="s1">insiders</span>
+    <span class="s4"># find loop that is not part of other loops</span>
+    <span class="s2">for </span><span class="s1">loop </span><span class="s2">in </span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">loops</span><span class="s3">().</span><span class="s1">values</span><span class="s3">():</span>
+        <span class="s2">if </span><span class="s1">loop</span><span class="s3">.</span><span class="s1">header </span><span class="s2">not in </span><span class="s1">blocks_in_loop</span><span class="s3">:</span>
+            <span class="s2">yield </span><span class="s1">_fix_loop_exit</span><span class="s3">(</span><span class="s1">cfg</span><span class="s3">, </span><span class="s1">loop</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_fix_loop_exit</span><span class="s3">(</span><span class="s1">cfg</span><span class="s3">, </span><span class="s1">loop</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Fixes loop.exits for Py3.8+ bytecode CFG changes. 
+    This is to handle `break` inside loops. 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># Computes the common postdoms of exit nodes</span>
+    <span class="s1">postdoms </span><span class="s3">= </span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">post_dominators</span><span class="s3">()</span>
+    <span class="s1">exits </span><span class="s3">= </span><span class="s1">reduce</span><span class="s3">(</span>
+        <span class="s1">operator</span><span class="s3">.</span><span class="s1">and_</span><span class="s3">,</span>
+        <span class="s3">[</span><span class="s1">postdoms</span><span class="s3">[</span><span class="s1">b</span><span class="s3">] </span><span class="s2">for </span><span class="s1">b </span><span class="s2">in </span><span class="s1">loop</span><span class="s3">.</span><span class="s1">exits</span><span class="s3">],</span>
+        <span class="s1">loop</span><span class="s3">.</span><span class="s1">exits</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">exits</span><span class="s3">:</span>
+        <span class="s4"># Put the non-common-exits as body nodes</span>
+        <span class="s1">body </span><span class="s3">= </span><span class="s1">loop</span><span class="s3">.</span><span class="s1">body </span><span class="s3">| </span><span class="s1">loop</span><span class="s3">.</span><span class="s1">exits </span><span class="s3">- </span><span class="s1">exits</span>
+        <span class="s2">return </span><span class="s1">loop</span><span class="s3">.</span><span class="s1">_replace</span><span class="s3">(</span><span class="s1">exits</span><span class="s3">=</span><span class="s1">exits</span><span class="s3">, </span><span class="s1">body</span><span class="s3">=</span><span class="s1">body</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">loop</span>
+
+
+<span class="s4"># Used to describe a nullified condition in dead branch pruning</span>
+<span class="s1">nullified </span><span class="s3">= </span><span class="s1">namedtuple</span><span class="s3">(</span><span class="s5">'nullified'</span><span class="s3">, </span><span class="s5">'condition, taken_br, rewrite_stmt'</span><span class="s3">)</span>
+
+
+<span class="s4"># Functions to manipulate IR</span>
+<span class="s2">def </span><span class="s1">dead_branch_prune</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">called_args</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Removes dead branches based on constant inference from function args. 
+    This directly mutates the IR. 
+ 
+    func_ir is the IR 
+    called_args are the actual arguments with which the function is called 
+    &quot;&quot;&quot;</span>
+    <span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">ir_utils </span><span class="s2">import </span><span class="s3">(</span><span class="s1">get_definition</span><span class="s3">, </span><span class="s1">guard</span><span class="s3">, </span><span class="s1">find_const</span><span class="s3">,</span>
+                                     <span class="s1">GuardException</span><span class="s3">)</span>
+
+    <span class="s1">DEBUG </span><span class="s3">= </span><span class="s6">0</span>
+
+    <span class="s2">def </span><span class="s1">find_branches</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">):</span>
+        <span class="s4"># find *all* branches</span>
+        <span class="s1">branches </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">blk </span><span class="s2">in </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">values</span><span class="s3">():</span>
+            <span class="s1">branch_or_jump </span><span class="s3">= </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">body</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">branch_or_jump</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Branch</span><span class="s3">):</span>
+                <span class="s1">branch </span><span class="s3">= </span><span class="s1">branch_or_jump</span>
+                <span class="s1">pred </span><span class="s3">= </span><span class="s1">guard</span><span class="s3">(</span><span class="s1">get_definition</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">branch</span><span class="s3">.</span><span class="s1">cond</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">pred </span><span class="s2">is not None and </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">pred</span><span class="s3">, </span><span class="s5">&quot;op&quot;</span><span class="s3">, </span><span class="s2">None</span><span class="s3">) == </span><span class="s5">&quot;call&quot;</span><span class="s3">:</span>
+                    <span class="s1">function </span><span class="s3">= </span><span class="s1">guard</span><span class="s3">(</span><span class="s1">get_definition</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">pred</span><span class="s3">.</span><span class="s1">func</span><span class="s3">)</span>
+                    <span class="s2">if </span><span class="s3">(</span><span class="s1">function </span><span class="s2">is not None and</span>
+                        <span class="s1">isinstance</span><span class="s3">(</span><span class="s1">function</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Global</span><span class="s3">) </span><span class="s2">and</span>
+                            <span class="s1">function</span><span class="s3">.</span><span class="s1">value </span><span class="s2">is </span><span class="s1">bool</span><span class="s3">):</span>
+                        <span class="s1">condition </span><span class="s3">= </span><span class="s1">guard</span><span class="s3">(</span><span class="s1">get_definition</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">pred</span><span class="s3">.</span><span class="s1">args</span><span class="s3">[</span><span class="s6">0</span><span class="s3">])</span>
+                        <span class="s2">if </span><span class="s1">condition </span><span class="s2">is not None</span><span class="s3">:</span>
+                            <span class="s1">branches</span><span class="s3">.</span><span class="s1">append</span><span class="s3">((</span><span class="s1">branch</span><span class="s3">, </span><span class="s1">condition</span><span class="s3">, </span><span class="s1">blk</span><span class="s3">))</span>
+        <span class="s2">return </span><span class="s1">branches</span>
+
+    <span class="s2">def </span><span class="s1">do_prune</span><span class="s3">(</span><span class="s1">take_truebr</span><span class="s3">, </span><span class="s1">blk</span><span class="s3">):</span>
+        <span class="s1">keep </span><span class="s3">= </span><span class="s1">branch</span><span class="s3">.</span><span class="s1">truebr </span><span class="s2">if </span><span class="s1">take_truebr </span><span class="s2">else </span><span class="s1">branch</span><span class="s3">.</span><span class="s1">falsebr</span>
+        <span class="s4"># replace the branch with a direct jump</span>
+        <span class="s1">jmp </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Jump</span><span class="s3">(</span><span class="s1">keep</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">branch</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">)</span>
+        <span class="s1">blk</span><span class="s3">.</span><span class="s1">body</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">] = </span><span class="s1">jmp</span>
+        <span class="s2">return </span><span class="s6">1 </span><span class="s2">if </span><span class="s1">keep </span><span class="s3">== </span><span class="s1">branch</span><span class="s3">.</span><span class="s1">truebr </span><span class="s2">else </span><span class="s6">0</span>
+
+    <span class="s2">def </span><span class="s1">prune_by_type</span><span class="s3">(</span><span class="s1">branch</span><span class="s3">, </span><span class="s1">condition</span><span class="s3">, </span><span class="s1">blk</span><span class="s3">, *</span><span class="s1">conds</span><span class="s3">):</span>
+        <span class="s4"># this prunes a given branch and fixes up the IR</span>
+        <span class="s4"># at least one needs to be a NoneType</span>
+        <span class="s1">lhs_cond</span><span class="s3">, </span><span class="s1">rhs_cond </span><span class="s3">= </span><span class="s1">conds</span>
+        <span class="s1">lhs_none </span><span class="s3">= </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">lhs_cond</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">)</span>
+        <span class="s1">rhs_none </span><span class="s3">= </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">rhs_cond</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">lhs_none </span><span class="s2">or </span><span class="s1">rhs_none</span><span class="s3">:</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s1">take_truebr </span><span class="s3">= </span><span class="s1">condition</span><span class="s3">.</span><span class="s1">fn</span><span class="s3">(</span><span class="s1">lhs_cond</span><span class="s3">, </span><span class="s1">rhs_cond</span><span class="s3">)</span>
+            <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+                <span class="s2">return False</span><span class="s3">, </span><span class="s2">None</span>
+            <span class="s2">if </span><span class="s1">DEBUG </span><span class="s3">&gt; </span><span class="s6">0</span><span class="s3">:</span>
+                <span class="s1">kill </span><span class="s3">= </span><span class="s1">branch</span><span class="s3">.</span><span class="s1">falsebr </span><span class="s2">if </span><span class="s1">take_truebr </span><span class="s2">else </span><span class="s1">branch</span><span class="s3">.</span><span class="s1">truebr</span>
+                <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;Pruning %s&quot; </span><span class="s3">% </span><span class="s1">kill</span><span class="s3">, </span><span class="s1">branch</span><span class="s3">, </span><span class="s1">lhs_cond</span><span class="s3">, </span><span class="s1">rhs_cond</span><span class="s3">,</span>
+                      <span class="s1">condition</span><span class="s3">.</span><span class="s1">fn</span><span class="s3">)</span>
+            <span class="s1">taken </span><span class="s3">= </span><span class="s1">do_prune</span><span class="s3">(</span><span class="s1">take_truebr</span><span class="s3">, </span><span class="s1">blk</span><span class="s3">)</span>
+            <span class="s2">return True</span><span class="s3">, </span><span class="s1">taken</span>
+        <span class="s2">return False</span><span class="s3">, </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">prune_by_value</span><span class="s3">(</span><span class="s1">branch</span><span class="s3">, </span><span class="s1">condition</span><span class="s3">, </span><span class="s1">blk</span><span class="s3">, *</span><span class="s1">conds</span><span class="s3">):</span>
+        <span class="s1">lhs_cond</span><span class="s3">, </span><span class="s1">rhs_cond </span><span class="s3">= </span><span class="s1">conds</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">take_truebr </span><span class="s3">= </span><span class="s1">condition</span><span class="s3">.</span><span class="s1">fn</span><span class="s3">(</span><span class="s1">lhs_cond</span><span class="s3">, </span><span class="s1">rhs_cond</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+            <span class="s2">return False</span><span class="s3">, </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">DEBUG </span><span class="s3">&gt; </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s1">kill </span><span class="s3">= </span><span class="s1">branch</span><span class="s3">.</span><span class="s1">falsebr </span><span class="s2">if </span><span class="s1">take_truebr </span><span class="s2">else </span><span class="s1">branch</span><span class="s3">.</span><span class="s1">truebr</span>
+            <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;Pruning %s&quot; </span><span class="s3">% </span><span class="s1">kill</span><span class="s3">, </span><span class="s1">branch</span><span class="s3">, </span><span class="s1">lhs_cond</span><span class="s3">, </span><span class="s1">rhs_cond</span><span class="s3">, </span><span class="s1">condition</span><span class="s3">.</span><span class="s1">fn</span><span class="s3">)</span>
+        <span class="s1">taken </span><span class="s3">= </span><span class="s1">do_prune</span><span class="s3">(</span><span class="s1">take_truebr</span><span class="s3">, </span><span class="s1">blk</span><span class="s3">)</span>
+        <span class="s2">return True</span><span class="s3">, </span><span class="s1">taken</span>
+
+    <span class="s2">def </span><span class="s1">prune_by_predicate</span><span class="s3">(</span><span class="s1">branch</span><span class="s3">, </span><span class="s1">pred</span><span class="s3">, </span><span class="s1">blk</span><span class="s3">):</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s4"># Just to prevent accidents, whilst already guarded, ensure this</span>
+            <span class="s4"># is an ir.Const</span>
+            <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">pred</span><span class="s3">, (</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Const</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">FreeVar</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Global</span><span class="s3">)):</span>
+                <span class="s2">raise </span><span class="s1">TypeError</span><span class="s3">(</span><span class="s5">'Expected constant Numba IR node'</span><span class="s3">)</span>
+            <span class="s1">take_truebr </span><span class="s3">= </span><span class="s1">bool</span><span class="s3">(</span><span class="s1">pred</span><span class="s3">.</span><span class="s1">value</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">TypeError</span><span class="s3">:</span>
+            <span class="s2">return False</span><span class="s3">, </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">DEBUG </span><span class="s3">&gt; </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s1">kill </span><span class="s3">= </span><span class="s1">branch</span><span class="s3">.</span><span class="s1">falsebr </span><span class="s2">if </span><span class="s1">take_truebr </span><span class="s2">else </span><span class="s1">branch</span><span class="s3">.</span><span class="s1">truebr</span>
+            <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;Pruning %s&quot; </span><span class="s3">% </span><span class="s1">kill</span><span class="s3">, </span><span class="s1">branch</span><span class="s3">, </span><span class="s1">pred</span><span class="s3">)</span>
+        <span class="s1">taken </span><span class="s3">= </span><span class="s1">do_prune</span><span class="s3">(</span><span class="s1">take_truebr</span><span class="s3">, </span><span class="s1">blk</span><span class="s3">)</span>
+        <span class="s2">return True</span><span class="s3">, </span><span class="s1">taken</span>
+
+    <span class="s2">class </span><span class="s1">Unknown</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">resolve_input_arg_const</span><span class="s3">(</span><span class="s1">input_arg_idx</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Resolves an input arg to a constant (if possible) 
+        &quot;&quot;&quot;</span>
+        <span class="s1">input_arg_ty </span><span class="s3">= </span><span class="s1">called_args</span><span class="s3">[</span><span class="s1">input_arg_idx</span><span class="s3">]</span>
+
+        <span class="s4"># comparing to None?</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">input_arg_ty</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">input_arg_ty</span>
+
+        <span class="s4"># is it a kwarg default</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">input_arg_ty</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">Omitted</span><span class="s3">):</span>
+            <span class="s1">val </span><span class="s3">= </span><span class="s1">input_arg_ty</span><span class="s3">.</span><span class="s1">value</span>
+            <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">val</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">):</span>
+                <span class="s2">return </span><span class="s1">val</span>
+            <span class="s2">elif </span><span class="s1">val </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">)</span>
+
+        <span class="s4"># literal type, return the type itself so comparisons like `x == None`</span>
+        <span class="s4"># still work as e.g. x = types.int64 will never be None/NoneType so</span>
+        <span class="s4"># the branch can still be pruned</span>
+        <span class="s2">return </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">input_arg_ty</span><span class="s3">, </span><span class="s5">'literal_type'</span><span class="s3">, </span><span class="s1">Unknown</span><span class="s3">())</span>
+
+    <span class="s2">if </span><span class="s1">DEBUG </span><span class="s3">&gt; </span><span class="s6">1</span><span class="s3">:</span>
+        <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;before&quot;</span><span class="s3">.</span><span class="s1">center</span><span class="s3">(</span><span class="s6">80</span><span class="s3">, </span><span class="s5">'-'</span><span class="s3">))</span>
+        <span class="s1">print</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">())</span>
+
+    <span class="s1">phi2lbl </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">()</span>
+    <span class="s1">phi2asgn </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">()</span>
+    <span class="s2">for </span><span class="s1">lbl</span><span class="s3">, </span><span class="s1">blk </span><span class="s2">in </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+        <span class="s2">for </span><span class="s1">stmt </span><span class="s2">in </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">body</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Assign</span><span class="s3">):</span>
+                <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">value</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Expr</span><span class="s3">) </span><span class="s2">and </span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'phi'</span><span class="s3">:</span>
+                    <span class="s1">phi2lbl</span><span class="s3">[</span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">value</span><span class="s3">] = </span><span class="s1">lbl</span>
+                    <span class="s1">phi2asgn</span><span class="s3">[</span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">value</span><span class="s3">] = </span><span class="s1">stmt</span>
+
+    <span class="s4"># This looks for branches where:</span>
+    <span class="s4"># at least one arg of the condition is in input args and const</span>
+    <span class="s4"># at least one an arg of the condition is a const</span>
+    <span class="s4"># if the condition is met it will replace the branch with a jump</span>
+    <span class="s1">branch_info </span><span class="s3">= </span><span class="s1">find_branches</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">)</span>
+    <span class="s4"># stores conditions that have no impact post prune</span>
+    <span class="s1">nullified_conditions </span><span class="s3">= []</span>
+
+    <span class="s2">for </span><span class="s1">branch</span><span class="s3">, </span><span class="s1">condition</span><span class="s3">, </span><span class="s1">blk </span><span class="s2">in </span><span class="s1">branch_info</span><span class="s3">:</span>
+        <span class="s1">const_conds </span><span class="s3">= []</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">condition</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Expr</span><span class="s3">) </span><span class="s2">and </span><span class="s1">condition</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'binop'</span><span class="s3">:</span>
+            <span class="s1">prune </span><span class="s3">= </span><span class="s1">prune_by_value</span>
+            <span class="s2">for </span><span class="s1">arg </span><span class="s2">in </span><span class="s3">[</span><span class="s1">condition</span><span class="s3">.</span><span class="s1">lhs</span><span class="s3">, </span><span class="s1">condition</span><span class="s3">.</span><span class="s1">rhs</span><span class="s3">]:</span>
+                <span class="s1">resolved_const </span><span class="s3">= </span><span class="s1">Unknown</span><span class="s3">()</span>
+                <span class="s1">arg_def </span><span class="s3">= </span><span class="s1">guard</span><span class="s3">(</span><span class="s1">get_definition</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">arg</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">arg_def</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Arg</span><span class="s3">):</span>
+                    <span class="s4"># it's an e.g. literal argument to the function</span>
+                    <span class="s1">resolved_const </span><span class="s3">= </span><span class="s1">resolve_input_arg_const</span><span class="s3">(</span><span class="s1">arg_def</span><span class="s3">.</span><span class="s1">index</span><span class="s3">)</span>
+                    <span class="s1">prune </span><span class="s3">= </span><span class="s1">prune_by_type</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s4"># it's some const argument to the function, cannot use guard</span>
+                    <span class="s4"># here as the const itself may be None</span>
+                    <span class="s2">try</span><span class="s3">:</span>
+                        <span class="s1">resolved_const </span><span class="s3">= </span><span class="s1">find_const</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">arg</span><span class="s3">)</span>
+                        <span class="s2">if </span><span class="s1">resolved_const </span><span class="s2">is None</span><span class="s3">:</span>
+                            <span class="s1">resolved_const </span><span class="s3">= </span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">)</span>
+                    <span class="s2">except </span><span class="s1">GuardException</span><span class="s3">:</span>
+                        <span class="s2">pass</span>
+
+                <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">resolved_const</span><span class="s3">, </span><span class="s1">Unknown</span><span class="s3">):</span>
+                    <span class="s1">const_conds</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">resolved_const</span><span class="s3">)</span>
+
+            <span class="s4"># lhs/rhs are consts</span>
+            <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">const_conds</span><span class="s3">) == </span><span class="s6">2</span><span class="s3">:</span>
+                <span class="s4"># prune the branch, switch the branch for an unconditional jump</span>
+                <span class="s1">prune_stat</span><span class="s3">, </span><span class="s1">taken </span><span class="s3">= </span><span class="s1">prune</span><span class="s3">(</span><span class="s1">branch</span><span class="s3">, </span><span class="s1">condition</span><span class="s3">, </span><span class="s1">blk</span><span class="s3">, *</span><span class="s1">const_conds</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s3">(</span><span class="s1">prune_stat</span><span class="s3">):</span>
+                    <span class="s4"># add the condition to the list of nullified conditions</span>
+                    <span class="s1">nullified_conditions</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">nullified</span><span class="s3">(</span><span class="s1">condition</span><span class="s3">, </span><span class="s1">taken</span><span class="s3">,</span>
+                                                          <span class="s2">True</span><span class="s3">))</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s4"># see if this is a branch on a constant value predicate</span>
+            <span class="s1">resolved_const </span><span class="s3">= </span><span class="s1">Unknown</span><span class="s3">()</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s1">pred_call </span><span class="s3">= </span><span class="s1">get_definition</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">branch</span><span class="s3">.</span><span class="s1">cond</span><span class="s3">)</span>
+                <span class="s1">resolved_const </span><span class="s3">= </span><span class="s1">find_const</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">pred_call</span><span class="s3">.</span><span class="s1">args</span><span class="s3">[</span><span class="s6">0</span><span class="s3">])</span>
+                <span class="s2">if </span><span class="s1">resolved_const </span><span class="s2">is None</span><span class="s3">:</span>
+                    <span class="s1">resolved_const </span><span class="s3">= </span><span class="s1">types</span><span class="s3">.</span><span class="s1">NoneType</span><span class="s3">(</span><span class="s5">'none'</span><span class="s3">)</span>
+            <span class="s2">except </span><span class="s1">GuardException</span><span class="s3">:</span>
+                <span class="s2">pass</span>
+
+            <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">resolved_const</span><span class="s3">, </span><span class="s1">Unknown</span><span class="s3">):</span>
+                <span class="s1">prune_stat</span><span class="s3">, </span><span class="s1">taken </span><span class="s3">= </span><span class="s1">prune_by_predicate</span><span class="s3">(</span><span class="s1">branch</span><span class="s3">, </span><span class="s1">condition</span><span class="s3">, </span><span class="s1">blk</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s3">(</span><span class="s1">prune_stat</span><span class="s3">):</span>
+                    <span class="s4"># add the condition to the list of nullified conditions</span>
+                    <span class="s1">nullified_conditions</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">nullified</span><span class="s3">(</span><span class="s1">condition</span><span class="s3">, </span><span class="s1">taken</span><span class="s3">,</span>
+                                                          <span class="s2">False</span><span class="s3">))</span>
+
+    <span class="s4"># 'ERE BE DRAGONS...</span>
+    <span class="s4"># It is the evaluation of the condition expression that often trips up type</span>
+    <span class="s4"># inference, so ideally it would be removed as it is effectively rendered</span>
+    <span class="s4"># dead by the unconditional jump if a branch was pruned. However, there may</span>
+    <span class="s4"># be references to the condition that exist in multiple places (e.g. dels)</span>
+    <span class="s4"># and we cannot run DCE here as typing has not taken place to give enough</span>
+    <span class="s4"># information to run DCE safely. Upshot of all this is the condition gets</span>
+    <span class="s4"># rewritten below into a benign const that typing will be happy with and DCE</span>
+    <span class="s4"># can remove it and its reference post typing when it is safe to do so</span>
+    <span class="s4"># (if desired). It is required that the const is assigned a value that</span>
+    <span class="s4"># indicates the branch taken as its mutated value would be read in the case</span>
+    <span class="s4"># of object mode fall back in place of the condition itself. For</span>
+    <span class="s4"># completeness the func_ir._definitions and ._consts are also updated to</span>
+    <span class="s4"># make the IR state self consistent.</span>
+
+    <span class="s1">deadcond </span><span class="s3">= [</span><span class="s1">x</span><span class="s3">.</span><span class="s1">condition </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">nullified_conditions</span><span class="s3">]</span>
+    <span class="s2">for </span><span class="s1">_</span><span class="s3">, </span><span class="s1">cond</span><span class="s3">, </span><span class="s1">blk </span><span class="s2">in </span><span class="s1">branch_info</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">cond </span><span class="s2">in </span><span class="s1">deadcond</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">body</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Assign</span><span class="s3">) </span><span class="s2">and </span><span class="s1">x</span><span class="s3">.</span><span class="s1">value </span><span class="s2">is </span><span class="s1">cond</span><span class="s3">:</span>
+                    <span class="s4"># rewrite the condition as a true/false bit</span>
+                    <span class="s1">nullified_info </span><span class="s3">= </span><span class="s1">nullified_conditions</span><span class="s3">[</span><span class="s1">deadcond</span><span class="s3">.</span><span class="s1">index</span><span class="s3">(</span><span class="s1">cond</span><span class="s3">)]</span>
+                    <span class="s4"># only do a rewrite of conditions, predicates need to retain</span>
+                    <span class="s4"># their value as they may be used later.</span>
+                    <span class="s2">if </span><span class="s1">nullified_info</span><span class="s3">.</span><span class="s1">rewrite_stmt</span><span class="s3">:</span>
+                        <span class="s1">branch_bit </span><span class="s3">= </span><span class="s1">nullified_info</span><span class="s3">.</span><span class="s1">taken_br</span>
+                        <span class="s1">x</span><span class="s3">.</span><span class="s1">value </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Const</span><span class="s3">(</span><span class="s1">branch_bit</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">x</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">)</span>
+                        <span class="s4"># update the specific definition to the new const</span>
+                        <span class="s1">defns </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">_definitions</span><span class="s3">[</span><span class="s1">x</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name</span><span class="s3">]</span>
+                        <span class="s1">repl_idx </span><span class="s3">= </span><span class="s1">defns</span><span class="s3">.</span><span class="s1">index</span><span class="s3">(</span><span class="s1">cond</span><span class="s3">)</span>
+                        <span class="s1">defns</span><span class="s3">[</span><span class="s1">repl_idx</span><span class="s3">] = </span><span class="s1">x</span><span class="s3">.</span><span class="s1">value</span>
+
+    <span class="s4"># Check post dominators of dead nodes from in the original CFG for use of</span>
+    <span class="s4"># vars that are being removed in the dead blocks which might be referred to</span>
+    <span class="s4"># by phi nodes.</span>
+    <span class="s4">#</span>
+    <span class="s4"># Multiple things to fix up:</span>
+    <span class="s4">#</span>
+    <span class="s4"># 1. Cases like:</span>
+    <span class="s4">#</span>
+    <span class="s4"># A        A</span>
+    <span class="s4"># |\       |</span>
+    <span class="s4"># | B  --&gt; B</span>
+    <span class="s4"># |/       |</span>
+    <span class="s4"># C        C</span>
+    <span class="s4">#</span>
+    <span class="s4"># i.e. the branch is dead but the block is still alive. In this case CFG</span>
+    <span class="s4"># simplification will fuse A-B-C and any phi in C can be updated as an</span>
+    <span class="s4"># direct assignment from the last assigned version in the dominators of the</span>
+    <span class="s4"># fused block.</span>
+    <span class="s4">#</span>
+    <span class="s4"># 2. Cases like:</span>
+    <span class="s4">#</span>
+    <span class="s4">#   A        A</span>
+    <span class="s4">#  / \       |</span>
+    <span class="s4"># B   C  --&gt; B</span>
+    <span class="s4">#  \ /       |</span>
+    <span class="s4">#   D        D</span>
+    <span class="s4">#</span>
+    <span class="s4"># i.e. the block C is dead. In this case the phis in D need updating to</span>
+    <span class="s4"># reflect the collapse of the phi condition. This should result in a direct</span>
+    <span class="s4"># assignment of the surviving version in B to the LHS of the phi in D.</span>
+
+    <span class="s1">new_cfg </span><span class="s3">= </span><span class="s1">compute_cfg_from_blocks</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">)</span>
+    <span class="s1">dead_blocks </span><span class="s3">= </span><span class="s1">new_cfg</span><span class="s3">.</span><span class="s1">dead_nodes</span><span class="s3">()</span>
+
+    <span class="s4"># for all phis that are still in live blocks.</span>
+    <span class="s2">for </span><span class="s1">phi</span><span class="s3">, </span><span class="s1">lbl </span><span class="s2">in </span><span class="s1">phi2lbl</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+        <span class="s2">if </span><span class="s1">lbl </span><span class="s2">in </span><span class="s1">dead_blocks</span><span class="s3">:</span>
+            <span class="s2">continue</span>
+        <span class="s1">new_incoming </span><span class="s3">= [</span><span class="s1">x</span><span class="s3">[</span><span class="s6">0</span><span class="s3">] </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">new_cfg</span><span class="s3">.</span><span class="s1">predecessors</span><span class="s3">(</span><span class="s1">lbl</span><span class="s3">)]</span>
+        <span class="s2">if </span><span class="s1">set</span><span class="s3">(</span><span class="s1">new_incoming</span><span class="s3">) != </span><span class="s1">set</span><span class="s3">(</span><span class="s1">phi</span><span class="s3">.</span><span class="s1">incoming_blocks</span><span class="s3">):</span>
+            <span class="s4"># Something has changed in the CFG...</span>
+            <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">new_incoming</span><span class="s3">) == </span><span class="s6">1</span><span class="s3">:</span>
+                <span class="s4"># There's now just one incoming. Replace the PHI node by a</span>
+                <span class="s4"># direct assignment</span>
+                <span class="s1">idx </span><span class="s3">= </span><span class="s1">phi</span><span class="s3">.</span><span class="s1">incoming_blocks</span><span class="s3">.</span><span class="s1">index</span><span class="s3">(</span><span class="s1">new_incoming</span><span class="s3">[</span><span class="s6">0</span><span class="s3">])</span>
+                <span class="s1">phi2asgn</span><span class="s3">[</span><span class="s1">phi</span><span class="s3">].</span><span class="s1">value </span><span class="s3">= </span><span class="s1">phi</span><span class="s3">.</span><span class="s1">incoming_values</span><span class="s3">[</span><span class="s1">idx</span><span class="s3">]</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s4"># There's more than one incoming still, then look through the</span>
+                <span class="s4"># incoming and remove dead</span>
+                <span class="s1">ic_val_tmp </span><span class="s3">= []</span>
+                <span class="s1">ic_blk_tmp </span><span class="s3">= []</span>
+                <span class="s2">for </span><span class="s1">ic_val</span><span class="s3">, </span><span class="s1">ic_blk </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">phi</span><span class="s3">.</span><span class="s1">incoming_values</span><span class="s3">,</span>
+                                          <span class="s1">phi</span><span class="s3">.</span><span class="s1">incoming_blocks</span><span class="s3">):</span>
+                    <span class="s2">if </span><span class="s1">ic_blk </span><span class="s2">in </span><span class="s1">dead_blocks</span><span class="s3">:</span>
+                        <span class="s2">continue</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s1">ic_val_tmp</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">ic_val</span><span class="s3">)</span>
+                        <span class="s1">ic_blk_tmp</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">ic_blk</span><span class="s3">)</span>
+                <span class="s1">phi</span><span class="s3">.</span><span class="s1">incoming_values</span><span class="s3">.</span><span class="s1">clear</span><span class="s3">()</span>
+                <span class="s1">phi</span><span class="s3">.</span><span class="s1">incoming_values</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">(</span><span class="s1">ic_val_tmp</span><span class="s3">)</span>
+                <span class="s1">phi</span><span class="s3">.</span><span class="s1">incoming_blocks</span><span class="s3">.</span><span class="s1">clear</span><span class="s3">()</span>
+                <span class="s1">phi</span><span class="s3">.</span><span class="s1">incoming_blocks</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">(</span><span class="s1">ic_blk_tmp</span><span class="s3">)</span>
+
+    <span class="s4"># Remove dead blocks, this is safe as it relies on the CFG only.</span>
+    <span class="s2">for </span><span class="s1">dead </span><span class="s2">in </span><span class="s1">dead_blocks</span><span class="s3">:</span>
+        <span class="s2">del </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">[</span><span class="s1">dead</span><span class="s3">]</span>
+
+    <span class="s4"># if conditions were nullified then consts were rewritten, update</span>
+    <span class="s2">if </span><span class="s1">nullified_conditions</span><span class="s3">:</span>
+        <span class="s1">func_ir</span><span class="s3">.</span><span class="s1">_consts </span><span class="s3">= </span><span class="s1">consts</span><span class="s3">.</span><span class="s1">ConstantInference</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">DEBUG </span><span class="s3">&gt; </span><span class="s6">1</span><span class="s3">:</span>
+        <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;after&quot;</span><span class="s3">.</span><span class="s1">center</span><span class="s3">(</span><span class="s6">80</span><span class="s3">, </span><span class="s5">'-'</span><span class="s3">))</span>
+        <span class="s1">print</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">())</span>
+
+
+<span class="s2">def </span><span class="s1">rewrite_semantic_constants</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">called_args</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    This rewrites values known to be constant by their semantics as ir.Const 
+    nodes, this is to give branch pruning the best chance possible of killing 
+    branches. An example might be rewriting len(tuple) as the literal length. 
+ 
+    func_ir is the IR 
+    called_args are the actual arguments with which the function is called 
+    &quot;&quot;&quot;</span>
+    <span class="s1">DEBUG </span><span class="s3">= </span><span class="s6">0</span>
+
+    <span class="s2">if </span><span class="s1">DEBUG </span><span class="s3">&gt; </span><span class="s6">1</span><span class="s3">:</span>
+        <span class="s1">print</span><span class="s3">((</span><span class="s5">&quot;rewrite_semantic_constants: &quot; </span><span class="s3">+</span>
+               <span class="s1">func_ir</span><span class="s3">.</span><span class="s1">func_id</span><span class="s3">.</span><span class="s1">func_name</span><span class="s3">).</span><span class="s1">center</span><span class="s3">(</span><span class="s6">80</span><span class="s3">, </span><span class="s5">'-'</span><span class="s3">))</span>
+        <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;before&quot;</span><span class="s3">.</span><span class="s1">center</span><span class="s3">(</span><span class="s6">80</span><span class="s3">, </span><span class="s5">'*'</span><span class="s3">))</span>
+        <span class="s1">func_ir</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">rewrite_statement</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">stmt</span><span class="s3">, </span><span class="s1">new_val</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Rewrites the stmt as a ir.Const new_val and fixes up the entries in 
+        func_ir._definitions 
+        &quot;&quot;&quot;</span>
+        <span class="s1">stmt</span><span class="s3">.</span><span class="s1">value </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Const</span><span class="s3">(</span><span class="s1">new_val</span><span class="s3">, </span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">)</span>
+        <span class="s1">defns </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">_definitions</span><span class="s3">[</span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name</span><span class="s3">]</span>
+        <span class="s1">repl_idx </span><span class="s3">= </span><span class="s1">defns</span><span class="s3">.</span><span class="s1">index</span><span class="s3">(</span><span class="s1">val</span><span class="s3">)</span>
+        <span class="s1">defns</span><span class="s3">[</span><span class="s1">repl_idx</span><span class="s3">] = </span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">value</span>
+
+    <span class="s2">def </span><span class="s1">rewrite_array_ndim</span><span class="s3">(</span><span class="s1">val</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">called_args</span><span class="s3">):</span>
+        <span class="s4"># rewrite Array.ndim as const(ndim)</span>
+        <span class="s2">if </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">val</span><span class="s3">, </span><span class="s5">'op'</span><span class="s3">, </span><span class="s2">None</span><span class="s3">) == </span><span class="s5">'getattr'</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">val</span><span class="s3">.</span><span class="s1">attr </span><span class="s3">== </span><span class="s5">'ndim'</span><span class="s3">:</span>
+                <span class="s1">arg_def </span><span class="s3">= </span><span class="s1">guard</span><span class="s3">(</span><span class="s1">get_definition</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">val</span><span class="s3">.</span><span class="s1">value</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">arg_def</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Arg</span><span class="s3">):</span>
+                    <span class="s1">argty </span><span class="s3">= </span><span class="s1">called_args</span><span class="s3">[</span><span class="s1">arg_def</span><span class="s3">.</span><span class="s1">index</span><span class="s3">]</span>
+                    <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">argty</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">Array</span><span class="s3">):</span>
+                        <span class="s1">rewrite_statement</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">stmt</span><span class="s3">, </span><span class="s1">argty</span><span class="s3">.</span><span class="s1">ndim</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">rewrite_tuple_len</span><span class="s3">(</span><span class="s1">val</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">called_args</span><span class="s3">):</span>
+        <span class="s4"># rewrite len(tuple) as const(len(tuple))</span>
+        <span class="s2">if </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">val</span><span class="s3">, </span><span class="s5">'op'</span><span class="s3">, </span><span class="s2">None</span><span class="s3">) == </span><span class="s5">'call'</span><span class="s3">:</span>
+            <span class="s1">func </span><span class="s3">= </span><span class="s1">guard</span><span class="s3">(</span><span class="s1">get_definition</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">val</span><span class="s3">.</span><span class="s1">func</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s3">(</span><span class="s1">func </span><span class="s2">is not None and </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">func</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Global</span><span class="s3">) </span><span class="s2">and</span>
+                    <span class="s1">getattr</span><span class="s3">(</span><span class="s1">func</span><span class="s3">, </span><span class="s5">'value'</span><span class="s3">, </span><span class="s2">None</span><span class="s3">) </span><span class="s2">is </span><span class="s1">len</span><span class="s3">):</span>
+
+                <span class="s3">(</span><span class="s1">arg</span><span class="s3">,) = </span><span class="s1">val</span><span class="s3">.</span><span class="s1">args</span>
+                <span class="s1">arg_def </span><span class="s3">= </span><span class="s1">guard</span><span class="s3">(</span><span class="s1">get_definition</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">arg</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">arg_def</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Arg</span><span class="s3">):</span>
+                    <span class="s1">argty </span><span class="s3">= </span><span class="s1">called_args</span><span class="s3">[</span><span class="s1">arg_def</span><span class="s3">.</span><span class="s1">index</span><span class="s3">]</span>
+                    <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">argty</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">BaseTuple</span><span class="s3">):</span>
+                        <span class="s1">rewrite_statement</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">stmt</span><span class="s3">, </span><span class="s1">argty</span><span class="s3">.</span><span class="s1">count</span><span class="s3">)</span>
+                <span class="s2">elif </span><span class="s3">(</span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">arg_def</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Expr</span><span class="s3">) </span><span class="s2">and</span>
+                      <span class="s1">arg_def</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'typed_getitem'</span><span class="s3">):</span>
+                    <span class="s1">argty </span><span class="s3">= </span><span class="s1">arg_def</span><span class="s3">.</span><span class="s1">dtype</span>
+                    <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">argty</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">BaseTuple</span><span class="s3">):</span>
+                        <span class="s1">rewrite_statement</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">stmt</span><span class="s3">, </span><span class="s1">argty</span><span class="s3">.</span><span class="s1">count</span><span class="s3">)</span>
+
+    <span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">ir_utils </span><span class="s2">import </span><span class="s1">get_definition</span><span class="s3">, </span><span class="s1">guard</span>
+    <span class="s2">for </span><span class="s1">blk </span><span class="s2">in </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">values</span><span class="s3">():</span>
+        <span class="s2">for </span><span class="s1">stmt </span><span class="s2">in </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">body</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Assign</span><span class="s3">):</span>
+                <span class="s1">val </span><span class="s3">= </span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">value</span>
+                <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">val</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Expr</span><span class="s3">):</span>
+                    <span class="s1">rewrite_array_ndim</span><span class="s3">(</span><span class="s1">val</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">called_args</span><span class="s3">)</span>
+                    <span class="s1">rewrite_tuple_len</span><span class="s3">(</span><span class="s1">val</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">called_args</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">DEBUG </span><span class="s3">&gt; </span><span class="s6">1</span><span class="s3">:</span>
+        <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;after&quot;</span><span class="s3">.</span><span class="s1">center</span><span class="s3">(</span><span class="s6">80</span><span class="s3">, </span><span class="s5">'*'</span><span class="s3">))</span>
+        <span class="s1">func_ir</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">()</span>
+        <span class="s1">print</span><span class="s3">(</span><span class="s5">'-' </span><span class="s3">* </span><span class="s6">80</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">find_literally_calls</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">argtypes</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;An analysis to find `numba.literally` call inside the given IR. 
+    When an unsatisfied literal typing request is found, a `ForceLiteralArg` 
+    exception is raised. 
+ 
+    Parameters 
+    ---------- 
+ 
+    func_ir : numba.ir.FunctionIR 
+ 
+    argtypes : Sequence[numba.types.Type] 
+        The argument types. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">ir_utils</span>
+
+    <span class="s1">marked_args </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+    <span class="s1">first_loc </span><span class="s3">= {}</span>
+    <span class="s4"># Scan for literally calls</span>
+    <span class="s2">for </span><span class="s1">blk </span><span class="s2">in </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">values</span><span class="s3">():</span>
+        <span class="s2">for </span><span class="s1">assign </span><span class="s2">in </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">find_exprs</span><span class="s3">(</span><span class="s1">op</span><span class="s3">=</span><span class="s5">'call'</span><span class="s3">):</span>
+            <span class="s1">var </span><span class="s3">= </span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">guard</span><span class="s3">(</span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">get_definition</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">assign</span><span class="s3">.</span><span class="s1">func</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">var</span><span class="s3">, (</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Global</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">FreeVar</span><span class="s3">)):</span>
+                <span class="s1">fnobj </span><span class="s3">= </span><span class="s1">var</span><span class="s3">.</span><span class="s1">value</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">fnobj </span><span class="s3">= </span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">guard</span><span class="s3">(</span><span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">resolve_func_from_module</span><span class="s3">,</span>
+                                       <span class="s1">func_ir</span><span class="s3">, </span><span class="s1">var</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">fnobj </span><span class="s2">is </span><span class="s1">special</span><span class="s3">.</span><span class="s1">literally</span><span class="s3">:</span>
+                <span class="s4"># Found</span>
+                <span class="s3">[</span><span class="s1">arg</span><span class="s3">] = </span><span class="s1">assign</span><span class="s3">.</span><span class="s1">args</span>
+                <span class="s1">defarg </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">get_definition</span><span class="s3">(</span><span class="s1">arg</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">defarg</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Arg</span><span class="s3">):</span>
+                    <span class="s1">argindex </span><span class="s3">= </span><span class="s1">defarg</span><span class="s3">.</span><span class="s1">index</span>
+                    <span class="s1">marked_args</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">argindex</span><span class="s3">)</span>
+                    <span class="s1">first_loc</span><span class="s3">.</span><span class="s1">setdefault</span><span class="s3">(</span><span class="s1">argindex</span><span class="s3">, </span><span class="s1">assign</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">)</span>
+    <span class="s4"># Signal the dispatcher to force literal typing</span>
+    <span class="s2">for </span><span class="s1">pos </span><span class="s2">in </span><span class="s1">marked_args</span><span class="s3">:</span>
+        <span class="s1">query_arg </span><span class="s3">= </span><span class="s1">argtypes</span><span class="s3">[</span><span class="s1">pos</span><span class="s3">]</span>
+        <span class="s1">do_raise </span><span class="s3">= (</span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">query_arg</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">InitialValue</span><span class="s3">) </span><span class="s2">and</span>
+                    <span class="s1">query_arg</span><span class="s3">.</span><span class="s1">initial_value </span><span class="s2">is None</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">do_raise</span><span class="s3">:</span>
+            <span class="s1">loc </span><span class="s3">= </span><span class="s1">first_loc</span><span class="s3">[</span><span class="s1">pos</span><span class="s3">]</span>
+            <span class="s2">raise </span><span class="s1">errors</span><span class="s3">.</span><span class="s1">ForceLiteralArg</span><span class="s3">(</span><span class="s1">marked_args</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">)</span>
+
+        <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">query_arg</span><span class="s3">, (</span><span class="s1">types</span><span class="s3">.</span><span class="s1">Literal</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">InitialValue</span><span class="s3">)):</span>
+            <span class="s1">loc </span><span class="s3">= </span><span class="s1">first_loc</span><span class="s3">[</span><span class="s1">pos</span><span class="s3">]</span>
+            <span class="s2">raise </span><span class="s1">errors</span><span class="s3">.</span><span class="s1">ForceLiteralArg</span><span class="s3">(</span><span class="s1">marked_args</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">)</span>
+
+
+<span class="s1">ir_extension_use_alloca </span><span class="s3">= {}</span>
+
+
+<span class="s2">def </span><span class="s1">must_use_alloca</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Analyzes a dictionary of blocks to find variables that must be 
+    stack allocated with alloca.  For each statement in the blocks, 
+    determine if that statement requires certain variables to be 
+    stack allocated.  This function uses the extension point 
+    ir_extension_use_alloca to allow other IR node types like parfors 
+    to register to be processed by this analysis function.  At the 
+    moment, parfors are the only IR node types that may require 
+    something to be stack allocated. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">use_alloca_vars </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+
+    <span class="s2">for </span><span class="s1">ir_block </span><span class="s2">in </span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">values</span><span class="s3">():</span>
+        <span class="s2">for </span><span class="s1">stmt </span><span class="s2">in </span><span class="s1">ir_block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">type</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">) </span><span class="s2">in </span><span class="s1">ir_extension_use_alloca</span><span class="s3">:</span>
+                <span class="s1">func </span><span class="s3">= </span><span class="s1">ir_extension_use_alloca</span><span class="s3">[</span><span class="s1">type</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">)]</span>
+                <span class="s1">func</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">, </span><span class="s1">use_alloca_vars</span><span class="s3">)</span>
+                <span class="s2">continue</span>
+
+    <span class="s2">return </span><span class="s1">use_alloca_vars</span>
+</pre>
+</body>
+</html>

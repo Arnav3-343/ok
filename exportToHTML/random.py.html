@@ -1,0 +1,315 @@
+<html>
+<head>
+<title>random.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #7a7e85;}
+.s4 { color: #6aab73;}
+.s5 { color: #5f826b; font-style: italic;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+random.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">math</span>
+
+<span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s2">(</span><span class="s1">config</span><span class="s2">, </span><span class="s1">cuda</span><span class="s2">, </span><span class="s1">float32</span><span class="s2">, </span><span class="s1">float64</span><span class="s2">, </span><span class="s1">uint32</span><span class="s2">, </span><span class="s1">int64</span><span class="s2">, </span><span class="s1">uint64</span><span class="s2">,</span>
+                   <span class="s1">from_dtype</span><span class="s2">, </span><span class="s1">jit</span><span class="s2">)</span>
+
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+
+<span class="s3"># This implementation is based upon the xoroshiro128+ and splitmix64 algorithms</span>
+<span class="s3"># described at:</span>
+<span class="s3">#</span>
+<span class="s3">#     http://xoroshiro.di.unimi.it/</span>
+<span class="s3">#</span>
+<span class="s3"># and originally implemented by David Blackman and Sebastiano Vigna.</span>
+<span class="s3">#</span>
+<span class="s3"># The implementations below are based on the C source code:</span>
+<span class="s3">#</span>
+<span class="s3">#  * http://xoroshiro.di.unimi.it/xoroshiro128plus.c</span>
+<span class="s3">#  * http://xoroshiro.di.unimi.it/splitmix64.c</span>
+<span class="s3">#</span>
+<span class="s3"># Splitmix64 is used to generate the initial state of the xoroshiro128+</span>
+<span class="s3"># generator to ensure that small seeds don't result in predictable output.</span>
+
+<span class="s3"># **WARNING**: There is a lot of verbose casting in this file to ensure that</span>
+<span class="s3"># NumPy casting conventions (which cast uint64 [op] int32 to float64) don't</span>
+<span class="s3"># turn integers into floats when using these functions in the CUDA simulator.</span>
+<span class="s3">#</span>
+<span class="s3"># There are also no function type signatures to ensure that compilation is</span>
+<span class="s3"># deferred so that import is quick, and Sphinx autodoc works.  We are also</span>
+<span class="s3"># using the CPU @jit decorator everywhere to create functions that work as</span>
+<span class="s3"># both CPU and CUDA device functions.</span>
+
+<span class="s1">xoroshiro128p_dtype </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">([(</span><span class="s4">'s0'</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">uint64</span><span class="s2">), (</span><span class="s4">'s1'</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">uint64</span><span class="s2">)],</span>
+                               <span class="s1">align</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+<span class="s1">xoroshiro128p_type </span><span class="s2">= </span><span class="s1">from_dtype</span><span class="s2">(</span><span class="s1">xoroshiro128p_dtype</span><span class="s2">)</span>
+
+<span class="s3"># When cudasim is enabled, Fake CUDA arrays are passed to some of the</span>
+<span class="s3"># @jit-decorated functions. This required fallback to object mode. With</span>
+<span class="s3"># Numba 0.59.0 object mode must be explicitly enabled.</span>
+<span class="s3"># https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-object-mode-fall-back-behaviour-when-using-jit</span>
+<span class="s3"># In order to avoid the warning / future error, we explicitly specify that</span>
+<span class="s3"># object mode with loop lifting is acceptable when using the simulator.</span>
+<span class="s1">_forceobj </span><span class="s2">= </span><span class="s1">_looplift </span><span class="s2">= </span><span class="s1">config</span><span class="s2">.</span><span class="s1">ENABLE_CUDASIM</span>
+<span class="s1">_nopython </span><span class="s2">= </span><span class="s0">not </span><span class="s1">config</span><span class="s2">.</span><span class="s1">ENABLE_CUDASIM</span>
+
+
+<span class="s2">@</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">forceobj</span><span class="s2">=</span><span class="s1">_forceobj</span><span class="s2">, </span><span class="s1">looplift</span><span class="s2">=</span><span class="s1">_looplift</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s1">_nopython</span><span class="s2">)</span>
+<span class="s0">def </span><span class="s1">init_xoroshiro128p_state</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s1">index</span><span class="s2">, </span><span class="s1">seed</span><span class="s2">):</span>
+    <span class="s5">'''Use SplitMix64 to generate an xoroshiro128p state from 64-bit seed. 
+ 
+    This ensures that manually set small seeds don't result in a predictable 
+    initial sequence from the random number generator. 
+ 
+    :type states: 1D array, dtype=xoroshiro128p_dtype 
+    :param states: array of RNG states 
+    :type index: uint64 
+    :param index: offset in states to update 
+    :type seed: int64 
+    :param seed: seed value to use when initializing state 
+    '''</span>
+    <span class="s1">index </span><span class="s2">= </span><span class="s1">int64</span><span class="s2">(</span><span class="s1">index</span><span class="s2">)</span>
+    <span class="s1">seed </span><span class="s2">= </span><span class="s1">uint64</span><span class="s2">(</span><span class="s1">seed</span><span class="s2">)</span>
+
+    <span class="s1">z </span><span class="s2">= </span><span class="s1">seed </span><span class="s2">+ </span><span class="s1">uint64</span><span class="s2">(</span><span class="s6">0x9E3779B97F4A7C15</span><span class="s2">)</span>
+    <span class="s1">z </span><span class="s2">= (</span><span class="s1">z </span><span class="s2">^ (</span><span class="s1">z </span><span class="s2">&gt;&gt; </span><span class="s1">uint32</span><span class="s2">(</span><span class="s6">30</span><span class="s2">))) * </span><span class="s1">uint64</span><span class="s2">(</span><span class="s6">0xBF58476D1CE4E5B9</span><span class="s2">)</span>
+    <span class="s1">z </span><span class="s2">= (</span><span class="s1">z </span><span class="s2">^ (</span><span class="s1">z </span><span class="s2">&gt;&gt; </span><span class="s1">uint32</span><span class="s2">(</span><span class="s6">27</span><span class="s2">))) * </span><span class="s1">uint64</span><span class="s2">(</span><span class="s6">0x94D049BB133111EB</span><span class="s2">)</span>
+    <span class="s1">z </span><span class="s2">= </span><span class="s1">z </span><span class="s2">^ (</span><span class="s1">z </span><span class="s2">&gt;&gt; </span><span class="s1">uint32</span><span class="s2">(</span><span class="s6">31</span><span class="s2">))</span>
+
+    <span class="s1">states</span><span class="s2">[</span><span class="s1">index</span><span class="s2">][</span><span class="s4">'s0'</span><span class="s2">] = </span><span class="s1">z</span>
+    <span class="s1">states</span><span class="s2">[</span><span class="s1">index</span><span class="s2">][</span><span class="s4">'s1'</span><span class="s2">] = </span><span class="s1">z</span>
+
+
+<span class="s2">@</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">forceobj</span><span class="s2">=</span><span class="s1">_forceobj</span><span class="s2">, </span><span class="s1">looplift</span><span class="s2">=</span><span class="s1">_looplift</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s1">_nopython</span><span class="s2">)</span>
+<span class="s0">def </span><span class="s1">rotl</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">k</span><span class="s2">):</span>
+    <span class="s5">'''Left rotate x by k bits.'''</span>
+    <span class="s1">x </span><span class="s2">= </span><span class="s1">uint64</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+    <span class="s1">k </span><span class="s2">= </span><span class="s1">uint32</span><span class="s2">(</span><span class="s1">k</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s2">(</span><span class="s1">x </span><span class="s2">&lt;&lt; </span><span class="s1">k</span><span class="s2">) | (</span><span class="s1">x </span><span class="s2">&gt;&gt; </span><span class="s1">uint32</span><span class="s2">(</span><span class="s6">64 </span><span class="s2">- </span><span class="s1">k</span><span class="s2">))</span>
+
+
+<span class="s2">@</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">forceobj</span><span class="s2">=</span><span class="s1">_forceobj</span><span class="s2">, </span><span class="s1">looplift</span><span class="s2">=</span><span class="s1">_looplift</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s1">_nopython</span><span class="s2">)</span>
+<span class="s0">def </span><span class="s1">xoroshiro128p_next</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s1">index</span><span class="s2">):</span>
+    <span class="s5">'''Return the next random uint64 and advance the RNG in states[index]. 
+ 
+    :type states: 1D array, dtype=xoroshiro128p_dtype 
+    :param states: array of RNG states 
+    :type index: int64 
+    :param index: offset in states to update 
+    :rtype: uint64 
+    '''</span>
+    <span class="s1">index </span><span class="s2">= </span><span class="s1">int64</span><span class="s2">(</span><span class="s1">index</span><span class="s2">)</span>
+    <span class="s1">s0 </span><span class="s2">= </span><span class="s1">states</span><span class="s2">[</span><span class="s1">index</span><span class="s2">][</span><span class="s4">'s0'</span><span class="s2">]</span>
+    <span class="s1">s1 </span><span class="s2">= </span><span class="s1">states</span><span class="s2">[</span><span class="s1">index</span><span class="s2">][</span><span class="s4">'s1'</span><span class="s2">]</span>
+    <span class="s1">result </span><span class="s2">= </span><span class="s1">s0 </span><span class="s2">+ </span><span class="s1">s1</span>
+
+    <span class="s1">s1 </span><span class="s2">^= </span><span class="s1">s0</span>
+    <span class="s1">states</span><span class="s2">[</span><span class="s1">index</span><span class="s2">][</span><span class="s4">'s0'</span><span class="s2">] = </span><span class="s1">uint64</span><span class="s2">(</span><span class="s1">rotl</span><span class="s2">(</span><span class="s1">s0</span><span class="s2">, </span><span class="s1">uint32</span><span class="s2">(</span><span class="s6">55</span><span class="s2">))) ^ </span><span class="s1">s1 </span><span class="s2">^ (</span><span class="s1">s1 </span><span class="s2">&lt;&lt; </span><span class="s1">uint32</span><span class="s2">(</span><span class="s6">14</span><span class="s2">))</span>
+    <span class="s1">states</span><span class="s2">[</span><span class="s1">index</span><span class="s2">][</span><span class="s4">'s1'</span><span class="s2">] = </span><span class="s1">uint64</span><span class="s2">(</span><span class="s1">rotl</span><span class="s2">(</span><span class="s1">s1</span><span class="s2">, </span><span class="s1">uint32</span><span class="s2">(</span><span class="s6">36</span><span class="s2">)))</span>
+
+    <span class="s0">return </span><span class="s1">result</span>
+
+
+<span class="s2">@</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">forceobj</span><span class="s2">=</span><span class="s1">_forceobj</span><span class="s2">, </span><span class="s1">looplift</span><span class="s2">=</span><span class="s1">_looplift</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s1">_nopython</span><span class="s2">)</span>
+<span class="s0">def </span><span class="s1">xoroshiro128p_jump</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s1">index</span><span class="s2">):</span>
+    <span class="s5">'''Advance the RNG in ``states[index]`` by 2**64 steps. 
+ 
+    :type states: 1D array, dtype=xoroshiro128p_dtype 
+    :param states: array of RNG states 
+    :type index: int64 
+    :param index: offset in states to update 
+    '''</span>
+    <span class="s1">index </span><span class="s2">= </span><span class="s1">int64</span><span class="s2">(</span><span class="s1">index</span><span class="s2">)</span>
+
+    <span class="s1">jump </span><span class="s2">= (</span><span class="s1">uint64</span><span class="s2">(</span><span class="s6">0xbeac0467eba5facb</span><span class="s2">), </span><span class="s1">uint64</span><span class="s2">(</span><span class="s6">0xd86b048b86aa9922</span><span class="s2">))</span>
+
+    <span class="s1">s0 </span><span class="s2">= </span><span class="s1">uint64</span><span class="s2">(</span><span class="s6">0</span><span class="s2">)</span>
+    <span class="s1">s1 </span><span class="s2">= </span><span class="s1">uint64</span><span class="s2">(</span><span class="s6">0</span><span class="s2">)</span>
+
+    <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s6">2</span><span class="s2">):</span>
+        <span class="s0">for </span><span class="s1">b </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s6">64</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s1">jump</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] &amp; (</span><span class="s1">uint64</span><span class="s2">(</span><span class="s6">1</span><span class="s2">) &lt;&lt; </span><span class="s1">uint32</span><span class="s2">(</span><span class="s1">b</span><span class="s2">)):</span>
+                <span class="s1">s0 </span><span class="s2">^= </span><span class="s1">states</span><span class="s2">[</span><span class="s1">index</span><span class="s2">][</span><span class="s4">'s0'</span><span class="s2">]</span>
+                <span class="s1">s1 </span><span class="s2">^= </span><span class="s1">states</span><span class="s2">[</span><span class="s1">index</span><span class="s2">][</span><span class="s4">'s1'</span><span class="s2">]</span>
+            <span class="s1">xoroshiro128p_next</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s1">index</span><span class="s2">)</span>
+
+    <span class="s1">states</span><span class="s2">[</span><span class="s1">index</span><span class="s2">][</span><span class="s4">'s0'</span><span class="s2">] = </span><span class="s1">s0</span>
+    <span class="s1">states</span><span class="s2">[</span><span class="s1">index</span><span class="s2">][</span><span class="s4">'s1'</span><span class="s2">] = </span><span class="s1">s1</span>
+
+
+<span class="s2">@</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">forceobj</span><span class="s2">=</span><span class="s1">_forceobj</span><span class="s2">, </span><span class="s1">looplift</span><span class="s2">=</span><span class="s1">_looplift</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s1">_nopython</span><span class="s2">)</span>
+<span class="s0">def </span><span class="s1">uint64_to_unit_float64</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+    <span class="s5">'''Convert uint64 to float64 value in the range [0.0, 1.0)'''</span>
+    <span class="s1">x </span><span class="s2">= </span><span class="s1">uint64</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s2">(</span><span class="s1">x </span><span class="s2">&gt;&gt; </span><span class="s1">uint32</span><span class="s2">(</span><span class="s6">11</span><span class="s2">)) * (</span><span class="s1">float64</span><span class="s2">(</span><span class="s6">1</span><span class="s2">) / (</span><span class="s1">uint64</span><span class="s2">(</span><span class="s6">1</span><span class="s2">) &lt;&lt; </span><span class="s1">uint32</span><span class="s2">(</span><span class="s6">53</span><span class="s2">)))</span>
+
+
+<span class="s2">@</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">forceobj</span><span class="s2">=</span><span class="s1">_forceobj</span><span class="s2">, </span><span class="s1">looplift</span><span class="s2">=</span><span class="s1">_looplift</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s1">_nopython</span><span class="s2">)</span>
+<span class="s0">def </span><span class="s1">uint64_to_unit_float32</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+    <span class="s5">'''Convert uint64 to float32 value in the range [0.0, 1.0)'''</span>
+    <span class="s1">x </span><span class="s2">= </span><span class="s1">uint64</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">float32</span><span class="s2">(</span><span class="s1">uint64_to_unit_float64</span><span class="s2">(</span><span class="s1">x</span><span class="s2">))</span>
+
+
+<span class="s2">@</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">forceobj</span><span class="s2">=</span><span class="s1">_forceobj</span><span class="s2">, </span><span class="s1">looplift</span><span class="s2">=</span><span class="s1">_looplift</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s1">_nopython</span><span class="s2">)</span>
+<span class="s0">def </span><span class="s1">xoroshiro128p_uniform_float32</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s1">index</span><span class="s2">):</span>
+    <span class="s5">'''Return a float32 in range [0.0, 1.0) and advance ``states[index]``. 
+ 
+    :type states: 1D array, dtype=xoroshiro128p_dtype 
+    :param states: array of RNG states 
+    :type index: int64 
+    :param index: offset in states to update 
+    :rtype: float32 
+    '''</span>
+    <span class="s1">index </span><span class="s2">= </span><span class="s1">int64</span><span class="s2">(</span><span class="s1">index</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">uint64_to_unit_float32</span><span class="s2">(</span><span class="s1">xoroshiro128p_next</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s1">index</span><span class="s2">))</span>
+
+
+<span class="s2">@</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">forceobj</span><span class="s2">=</span><span class="s1">_forceobj</span><span class="s2">, </span><span class="s1">looplift</span><span class="s2">=</span><span class="s1">_looplift</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s1">_nopython</span><span class="s2">)</span>
+<span class="s0">def </span><span class="s1">xoroshiro128p_uniform_float64</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s1">index</span><span class="s2">):</span>
+    <span class="s5">'''Return a float64 in range [0.0, 1.0) and advance ``states[index]``. 
+ 
+    :type states: 1D array, dtype=xoroshiro128p_dtype 
+    :param states: array of RNG states 
+    :type index: int64 
+    :param index: offset in states to update 
+    :rtype: float64 
+    '''</span>
+    <span class="s1">index </span><span class="s2">= </span><span class="s1">int64</span><span class="s2">(</span><span class="s1">index</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">uint64_to_unit_float64</span><span class="s2">(</span><span class="s1">xoroshiro128p_next</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s1">index</span><span class="s2">))</span>
+
+
+<span class="s1">TWO_PI_FLOAT32 </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">(</span><span class="s6">2 </span><span class="s2">* </span><span class="s1">math</span><span class="s2">.</span><span class="s1">pi</span><span class="s2">)</span>
+<span class="s1">TWO_PI_FLOAT64 </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">(</span><span class="s6">2 </span><span class="s2">* </span><span class="s1">math</span><span class="s2">.</span><span class="s1">pi</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">forceobj</span><span class="s2">=</span><span class="s1">_forceobj</span><span class="s2">, </span><span class="s1">looplift</span><span class="s2">=</span><span class="s1">_looplift</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s1">_nopython</span><span class="s2">)</span>
+<span class="s0">def </span><span class="s1">xoroshiro128p_normal_float32</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s1">index</span><span class="s2">):</span>
+    <span class="s5">'''Return a normally distributed float32 and advance ``states[index]``. 
+ 
+    The return value is drawn from a Gaussian of mean=0 and sigma=1 using the 
+    Box-Muller transform.  This advances the RNG sequence by two steps. 
+ 
+    :type states: 1D array, dtype=xoroshiro128p_dtype 
+    :param states: array of RNG states 
+    :type index: int64 
+    :param index: offset in states to update 
+    :rtype: float32 
+    '''</span>
+    <span class="s1">index </span><span class="s2">= </span><span class="s1">int64</span><span class="s2">(</span><span class="s1">index</span><span class="s2">)</span>
+
+    <span class="s1">u1 </span><span class="s2">= </span><span class="s1">xoroshiro128p_uniform_float32</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s1">index</span><span class="s2">)</span>
+    <span class="s1">u2 </span><span class="s2">= </span><span class="s1">xoroshiro128p_uniform_float32</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s1">index</span><span class="s2">)</span>
+
+    <span class="s1">z0 </span><span class="s2">= </span><span class="s1">math</span><span class="s2">.</span><span class="s1">sqrt</span><span class="s2">(-</span><span class="s1">float32</span><span class="s2">(</span><span class="s6">2.0</span><span class="s2">) * </span><span class="s1">math</span><span class="s2">.</span><span class="s1">log</span><span class="s2">(</span><span class="s1">u1</span><span class="s2">)) * </span><span class="s1">math</span><span class="s2">.</span><span class="s1">cos</span><span class="s2">(</span><span class="s1">TWO_PI_FLOAT32 </span><span class="s2">* </span><span class="s1">u2</span><span class="s2">)</span>
+    <span class="s3"># discarding second normal value</span>
+    <span class="s3"># z1 = math.sqrt(-float32(2.0) * math.log(u1))</span>
+    <span class="s3">#                * math.sin(TWO_PI_FLOAT32 * u2)</span>
+    <span class="s0">return </span><span class="s1">z0</span>
+
+
+<span class="s2">@</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">forceobj</span><span class="s2">=</span><span class="s1">_forceobj</span><span class="s2">, </span><span class="s1">looplift</span><span class="s2">=</span><span class="s1">_looplift</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s1">_nopython</span><span class="s2">)</span>
+<span class="s0">def </span><span class="s1">xoroshiro128p_normal_float64</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s1">index</span><span class="s2">):</span>
+    <span class="s5">'''Return a normally distributed float32 and advance ``states[index]``. 
+ 
+    The return value is drawn from a Gaussian of mean=0 and sigma=1 using the 
+    Box-Muller transform.  This advances the RNG sequence by two steps. 
+ 
+    :type states: 1D array, dtype=xoroshiro128p_dtype 
+    :param states: array of RNG states 
+    :type index: int64 
+    :param index: offset in states to update 
+    :rtype: float64 
+    '''</span>
+    <span class="s1">index </span><span class="s2">= </span><span class="s1">int64</span><span class="s2">(</span><span class="s1">index</span><span class="s2">)</span>
+
+    <span class="s1">u1 </span><span class="s2">= </span><span class="s1">xoroshiro128p_uniform_float32</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s1">index</span><span class="s2">)</span>
+    <span class="s1">u2 </span><span class="s2">= </span><span class="s1">xoroshiro128p_uniform_float32</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s1">index</span><span class="s2">)</span>
+
+    <span class="s1">z0 </span><span class="s2">= </span><span class="s1">math</span><span class="s2">.</span><span class="s1">sqrt</span><span class="s2">(-</span><span class="s1">float64</span><span class="s2">(</span><span class="s6">2.0</span><span class="s2">) * </span><span class="s1">math</span><span class="s2">.</span><span class="s1">log</span><span class="s2">(</span><span class="s1">u1</span><span class="s2">)) * </span><span class="s1">math</span><span class="s2">.</span><span class="s1">cos</span><span class="s2">(</span><span class="s1">TWO_PI_FLOAT64 </span><span class="s2">* </span><span class="s1">u2</span><span class="s2">)</span>
+    <span class="s3"># discarding second normal value</span>
+    <span class="s3"># z1 = math.sqrt(-float64(2.0) * math.log(u1))</span>
+    <span class="s3">#                * math.sin(TWO_PI_FLOAT64 * u2)</span>
+    <span class="s0">return </span><span class="s1">z0</span>
+
+
+<span class="s2">@</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">forceobj</span><span class="s2">=</span><span class="s1">_forceobj</span><span class="s2">, </span><span class="s1">looplift</span><span class="s2">=</span><span class="s1">_looplift</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s1">_nopython</span><span class="s2">)</span>
+<span class="s0">def </span><span class="s1">init_xoroshiro128p_states_cpu</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s1">seed</span><span class="s2">, </span><span class="s1">subsequence_start</span><span class="s2">):</span>
+    <span class="s1">n </span><span class="s2">= </span><span class="s1">states</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s6">0</span><span class="s2">]</span>
+    <span class="s1">seed </span><span class="s2">= </span><span class="s1">uint64</span><span class="s2">(</span><span class="s1">seed</span><span class="s2">)</span>
+    <span class="s1">subsequence_start </span><span class="s2">= </span><span class="s1">uint64</span><span class="s2">(</span><span class="s1">subsequence_start</span><span class="s2">)</span>
+
+    <span class="s0">if </span><span class="s1">n </span><span class="s2">&gt;= </span><span class="s6">1</span><span class="s2">:</span>
+        <span class="s1">init_xoroshiro128p_state</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s6">0</span><span class="s2">, </span><span class="s1">seed</span><span class="s2">)</span>
+
+        <span class="s3"># advance to starting subsequence number</span>
+        <span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">subsequence_start</span><span class="s2">):</span>
+            <span class="s1">xoroshiro128p_jump</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s6">0</span><span class="s2">)</span>
+
+        <span class="s3"># populate the rest of the array</span>
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s6">1</span><span class="s2">, </span><span class="s1">n</span><span class="s2">):</span>
+            <span class="s1">states</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] = </span><span class="s1">states</span><span class="s2">[</span><span class="s1">i </span><span class="s2">- </span><span class="s6">1</span><span class="s2">]  </span><span class="s3"># take state of previous generator</span>
+            <span class="s1">xoroshiro128p_jump</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s1">i</span><span class="s2">)  </span><span class="s3"># and jump forward 2**64 steps</span>
+
+
+<span class="s0">def </span><span class="s1">init_xoroshiro128p_states</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s1">seed</span><span class="s2">, </span><span class="s1">subsequence_start</span><span class="s2">=</span><span class="s6">0</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s6">0</span><span class="s2">):</span>
+    <span class="s5">'''Initialize RNG states on the GPU for parallel generators. 
+ 
+    This initializes the RNG states so that each state in the array corresponds 
+    subsequences in the separated by 2**64 steps from each other in the main 
+    sequence.  Therefore, as long no CUDA thread requests more than 2**64 
+    random numbers, all of the RNG states produced by this function are 
+    guaranteed to be independent. 
+ 
+    The subsequence_start parameter can be used to advance the first RNG state 
+    by a multiple of 2**64 steps. 
+ 
+    :type states: 1D DeviceNDArray, dtype=xoroshiro128p_dtype 
+    :param states: array of RNG states 
+    :type seed: uint64 
+    :param seed: starting seed for list of generators 
+    '''</span>
+
+    <span class="s3"># Initialization on CPU is much faster than the GPU</span>
+    <span class="s1">states_cpu </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">empty</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">=</span><span class="s1">states</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">xoroshiro128p_dtype</span><span class="s2">)</span>
+    <span class="s1">init_xoroshiro128p_states_cpu</span><span class="s2">(</span><span class="s1">states_cpu</span><span class="s2">, </span><span class="s1">seed</span><span class="s2">, </span><span class="s1">subsequence_start</span><span class="s2">)</span>
+
+    <span class="s1">states</span><span class="s2">.</span><span class="s1">copy_to_device</span><span class="s2">(</span><span class="s1">states_cpu</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">stream</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">create_xoroshiro128p_states</span><span class="s2">(</span><span class="s1">n</span><span class="s2">, </span><span class="s1">seed</span><span class="s2">, </span><span class="s1">subsequence_start</span><span class="s2">=</span><span class="s6">0</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s6">0</span><span class="s2">):</span>
+    <span class="s5">'''Returns a new device array initialized for n random number generators. 
+ 
+    This initializes the RNG states so that each state in the array corresponds 
+    subsequences in the separated by 2**64 steps from each other in the main 
+    sequence.  Therefore, as long no CUDA thread requests more than 2**64 
+    random numbers, all of the RNG states produced by this function are 
+    guaranteed to be independent. 
+ 
+    The subsequence_start parameter can be used to advance the first RNG state 
+    by a multiple of 2**64 steps. 
+ 
+    :type n: int 
+    :param n: number of RNG states to create 
+    :type seed: uint64 
+    :param seed: starting seed for list of generators 
+    :type subsequence_start: uint64 
+    :param subsequence_start: 
+    :type stream: CUDA stream 
+    :param stream: stream to run initialization kernel on 
+    '''</span>
+    <span class="s1">states </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">device_array</span><span class="s2">(</span><span class="s1">n</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">xoroshiro128p_dtype</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">stream</span><span class="s2">)</span>
+    <span class="s1">init_xoroshiro128p_states</span><span class="s2">(</span><span class="s1">states</span><span class="s2">, </span><span class="s1">seed</span><span class="s2">, </span><span class="s1">subsequence_start</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">states</span>
+</pre>
+</body>
+</html>

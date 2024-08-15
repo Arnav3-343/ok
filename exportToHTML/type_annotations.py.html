@@ -1,0 +1,306 @@
+<html>
+<head>
+<title>type_annotations.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #2aacb8;}
+.s4 { color: #6aab73;}
+.s5 { color: #7a7e85;}
+.s6 { color: #5f826b; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+type_annotations.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">defaultdict</span><span class="s2">, </span><span class="s1">OrderedDict</span>
+<span class="s0">from </span><span class="s1">collections</span><span class="s2">.</span><span class="s1">abc </span><span class="s0">import </span><span class="s1">Mapping</span>
+<span class="s0">from </span><span class="s1">contextlib </span><span class="s0">import </span><span class="s1">closing</span>
+<span class="s0">import </span><span class="s1">copy</span>
+<span class="s0">import </span><span class="s1">inspect</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">re</span>
+<span class="s0">import </span><span class="s1">sys</span>
+<span class="s0">import </span><span class="s1">textwrap</span>
+<span class="s0">from </span><span class="s1">io </span><span class="s0">import </span><span class="s1">StringIO</span>
+
+<span class="s0">import </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">dispatcher</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">ir</span>
+
+
+<span class="s0">class </span><span class="s1">SourceLines</span><span class="s2">(</span><span class="s1">Mapping</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func</span><span class="s2">):</span>
+
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s1">lines</span><span class="s2">, </span><span class="s1">startno </span><span class="s2">= </span><span class="s1">inspect</span><span class="s2">.</span><span class="s1">getsourcelines</span><span class="s2">(</span><span class="s1">func</span><span class="s2">)</span>
+        <span class="s0">except </span><span class="s1">OSError</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">lines </span><span class="s2">= ()</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">startno </span><span class="s2">= </span><span class="s3">0</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">lines </span><span class="s2">= </span><span class="s1">textwrap</span><span class="s2">.</span><span class="s1">dedent</span><span class="s2">(</span><span class="s4">''</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">lines</span><span class="s2">)).</span><span class="s1">splitlines</span><span class="s2">()</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">startno </span><span class="s2">= </span><span class="s1">startno</span>
+
+    <span class="s0">def </span><span class="s1">__getitem__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">lineno</span><span class="s2">):</span>
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">lines</span><span class="s2">[</span><span class="s1">lineno </span><span class="s2">- </span><span class="s1">self</span><span class="s2">.</span><span class="s1">startno</span><span class="s2">].</span><span class="s1">rstrip</span><span class="s2">()</span>
+        <span class="s0">except </span><span class="s1">IndexError</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s4">''</span>
+
+    <span class="s0">def </span><span class="s1">__iter__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">iter</span><span class="s2">((</span><span class="s1">self</span><span class="s2">.</span><span class="s1">startno </span><span class="s2">+ </span><span class="s1">i</span><span class="s2">) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">lines</span><span class="s2">)))</span>
+
+    <span class="s0">def </span><span class="s1">__len__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">lines</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">avail</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">bool</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">lines</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">TypeAnnotation</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+
+    <span class="s5"># func_data dict stores annotation data for all functions that are</span>
+    <span class="s5"># compiled. We store the data in the TypeAnnotation class since a new</span>
+    <span class="s5"># TypeAnnotation instance is created for each function that is compiled.</span>
+    <span class="s5"># For every function that is compiled, we add the type annotation data to</span>
+    <span class="s5"># this dict and write the html annotation file to disk (rewrite the html</span>
+    <span class="s5"># file for every function since we don't know if this is the last function</span>
+    <span class="s5"># to be compiled).</span>
+    <span class="s1">func_data </span><span class="s2">= </span><span class="s1">OrderedDict</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func_ir</span><span class="s2">, </span><span class="s1">typemap</span><span class="s2">, </span><span class="s1">calltypes</span><span class="s2">, </span><span class="s1">lifted</span><span class="s2">, </span><span class="s1">lifted_from</span><span class="s2">,</span>
+                 <span class="s1">args</span><span class="s2">, </span><span class="s1">return_type</span><span class="s2">, </span><span class="s1">html_output</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">func_id </span><span class="s2">= </span><span class="s1">func_ir</span><span class="s2">.</span><span class="s1">func_id</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">blocks </span><span class="s2">= </span><span class="s1">func_ir</span><span class="s2">.</span><span class="s1">blocks</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">typemap </span><span class="s2">= </span><span class="s1">typemap</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">calltypes </span><span class="s2">= </span><span class="s1">calltypes</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">filename </span><span class="s2">= </span><span class="s1">func_ir</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">.</span><span class="s1">filename</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">linenum </span><span class="s2">= </span><span class="s1">str</span><span class="s2">(</span><span class="s1">func_ir</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">.</span><span class="s1">line</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">signature </span><span class="s2">= </span><span class="s1">str</span><span class="s2">(</span><span class="s1">args</span><span class="s2">) + </span><span class="s4">' -&gt; ' </span><span class="s2">+ </span><span class="s1">str</span><span class="s2">(</span><span class="s1">return_type</span><span class="s2">)</span>
+
+        <span class="s5"># lifted loop information</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">lifted </span><span class="s2">= </span><span class="s1">lifted</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">num_lifted_loops </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">lifted</span><span class="s2">)</span>
+
+        <span class="s5"># If this is a lifted loop function that is being compiled, lifted_from</span>
+        <span class="s5"># points to annotation data from function that this loop lifted function</span>
+        <span class="s5"># was lifted from. This is used to stick lifted loop annotations back</span>
+        <span class="s5"># into original function.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">lifted_from </span><span class="s2">= </span><span class="s1">lifted_from</span>
+
+    <span class="s0">def </span><span class="s1">prepare_annotations</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Prepare annotations</span>
+        <span class="s1">groupedinst </span><span class="s2">= </span><span class="s1">defaultdict</span><span class="s2">(</span><span class="s1">list</span><span class="s2">)</span>
+        <span class="s1">found_lifted_loop </span><span class="s2">= </span><span class="s0">False</span>
+        <span class="s5">#for blkid, blk in self.blocks.items():</span>
+        <span class="s0">for </span><span class="s1">blkid </span><span class="s0">in </span><span class="s1">sorted</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">blocks</span><span class="s2">.</span><span class="s1">keys</span><span class="s2">()):</span>
+            <span class="s1">blk </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">blocks</span><span class="s2">[</span><span class="s1">blkid</span><span class="s2">]</span>
+            <span class="s1">groupedinst</span><span class="s2">[</span><span class="s1">blk</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">.</span><span class="s1">line</span><span class="s2">].</span><span class="s1">append</span><span class="s2">(</span><span class="s4">&quot;label %s&quot; </span><span class="s2">% </span><span class="s1">blkid</span><span class="s2">)</span>
+            <span class="s0">for </span><span class="s1">inst </span><span class="s0">in </span><span class="s1">blk</span><span class="s2">.</span><span class="s1">body</span><span class="s2">:</span>
+                <span class="s1">lineno </span><span class="s2">= </span><span class="s1">inst</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">.</span><span class="s1">line</span>
+
+                <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Assign</span><span class="s2">):</span>
+                    <span class="s0">if </span><span class="s1">found_lifted_loop</span><span class="s2">:</span>
+                        <span class="s1">atype </span><span class="s2">= </span><span class="s4">'XXX Lifted Loop XXX'</span>
+                        <span class="s1">found_lifted_loop </span><span class="s2">= </span><span class="s0">False</span>
+                    <span class="s0">elif </span><span class="s2">(</span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">value</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Expr</span><span class="s2">) </span><span class="s0">and</span>
+                            <span class="s1">inst</span><span class="s2">.</span><span class="s1">value</span><span class="s2">.</span><span class="s1">op </span><span class="s2">==  </span><span class="s4">'call'</span><span class="s2">):</span>
+                        <span class="s1">atype </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">calltypes</span><span class="s2">[</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">value</span><span class="s2">]</span>
+                    <span class="s0">elif </span><span class="s2">(</span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">value</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Const</span><span class="s2">) </span><span class="s0">and</span>
+                            <span class="s1">isinstance</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">value</span><span class="s2">.</span><span class="s1">value</span><span class="s2">, </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">dispatcher</span><span class="s2">.</span><span class="s1">LiftedLoop</span><span class="s2">)):</span>
+                        <span class="s1">atype </span><span class="s2">= </span><span class="s4">'XXX Lifted Loop XXX'</span>
+                        <span class="s1">found_lifted_loop </span><span class="s2">= </span><span class="s0">True</span>
+                    <span class="s0">else</span><span class="s2">:</span>
+                        <span class="s5"># TODO: fix parfor lowering so that typemap is valid.</span>
+                        <span class="s1">atype </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">typemap</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">target</span><span class="s2">.</span><span class="s1">name</span><span class="s2">, </span><span class="s4">&quot;&lt;missing&gt;&quot;</span><span class="s2">)</span>
+
+                    <span class="s1">aline </span><span class="s2">= </span><span class="s4">&quot;%s = %s  :: %s&quot; </span><span class="s2">% (</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">target</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">.</span><span class="s1">value</span><span class="s2">, </span><span class="s1">atype</span><span class="s2">)</span>
+                <span class="s0">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">SetItem</span><span class="s2">):</span>
+                    <span class="s1">atype </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">calltypes</span><span class="s2">[</span><span class="s1">inst</span><span class="s2">]</span>
+                    <span class="s1">aline </span><span class="s2">= </span><span class="s4">&quot;%s  :: %s&quot; </span><span class="s2">% (</span><span class="s1">inst</span><span class="s2">, </span><span class="s1">atype</span><span class="s2">)</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s1">aline </span><span class="s2">= </span><span class="s4">&quot;%s&quot; </span><span class="s2">% </span><span class="s1">inst</span>
+                <span class="s1">groupedinst</span><span class="s2">[</span><span class="s1">lineno</span><span class="s2">].</span><span class="s1">append</span><span class="s2">(</span><span class="s4">&quot;  %s&quot; </span><span class="s2">% </span><span class="s1">aline</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">groupedinst</span>
+
+    <span class="s0">def </span><span class="s1">annotate</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">source </span><span class="s2">= </span><span class="s1">SourceLines</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">func_id</span><span class="s2">.</span><span class="s1">func</span><span class="s2">)</span>
+        <span class="s5"># if not source.avail:</span>
+        <span class="s5">#     return &quot;Source code unavailable&quot;</span>
+
+        <span class="s1">groupedinst </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">prepare_annotations</span><span class="s2">()</span>
+
+        <span class="s5"># Format annotations</span>
+        <span class="s1">io </span><span class="s2">= </span><span class="s1">StringIO</span><span class="s2">()</span>
+        <span class="s0">with </span><span class="s1">closing</span><span class="s2">(</span><span class="s1">io</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s1">source</span><span class="s2">.</span><span class="s1">avail</span><span class="s2">:</span>
+                <span class="s1">print</span><span class="s2">(</span><span class="s4">&quot;# File: %s&quot; </span><span class="s2">% </span><span class="s1">self</span><span class="s2">.</span><span class="s1">filename</span><span class="s2">, </span><span class="s1">file</span><span class="s2">=</span><span class="s1">io</span><span class="s2">)</span>
+                <span class="s0">for </span><span class="s1">num </span><span class="s0">in </span><span class="s1">source</span><span class="s2">:</span>
+                    <span class="s1">srcline </span><span class="s2">= </span><span class="s1">source</span><span class="s2">[</span><span class="s1">num</span><span class="s2">]</span>
+                    <span class="s1">ind </span><span class="s2">= </span><span class="s1">_getindent</span><span class="s2">(</span><span class="s1">srcline</span><span class="s2">)</span>
+                    <span class="s1">print</span><span class="s2">(</span><span class="s4">&quot;%s# --- LINE %d --- &quot; </span><span class="s2">% (</span><span class="s1">ind</span><span class="s2">, </span><span class="s1">num</span><span class="s2">), </span><span class="s1">file</span><span class="s2">=</span><span class="s1">io</span><span class="s2">)</span>
+                    <span class="s0">for </span><span class="s1">inst </span><span class="s0">in </span><span class="s1">groupedinst</span><span class="s2">[</span><span class="s1">num</span><span class="s2">]:</span>
+                        <span class="s1">print</span><span class="s2">(</span><span class="s4">'%s# %s' </span><span class="s2">% (</span><span class="s1">ind</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">), </span><span class="s1">file</span><span class="s2">=</span><span class="s1">io</span><span class="s2">)</span>
+                    <span class="s1">print</span><span class="s2">(</span><span class="s1">file</span><span class="s2">=</span><span class="s1">io</span><span class="s2">)</span>
+                    <span class="s1">print</span><span class="s2">(</span><span class="s1">srcline</span><span class="s2">, </span><span class="s1">file</span><span class="s2">=</span><span class="s1">io</span><span class="s2">)</span>
+                    <span class="s1">print</span><span class="s2">(</span><span class="s1">file</span><span class="s2">=</span><span class="s1">io</span><span class="s2">)</span>
+                <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">lifted</span><span class="s2">:</span>
+                    <span class="s1">print</span><span class="s2">(</span><span class="s4">&quot;# The function contains lifted loops&quot;</span><span class="s2">, </span><span class="s1">file</span><span class="s2">=</span><span class="s1">io</span><span class="s2">)</span>
+                    <span class="s0">for </span><span class="s1">loop </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">lifted</span><span class="s2">:</span>
+                        <span class="s1">print</span><span class="s2">(</span><span class="s4">&quot;# Loop at line %d&quot; </span><span class="s2">% </span><span class="s1">loop</span><span class="s2">.</span><span class="s1">get_source_location</span><span class="s2">(),</span>
+                              <span class="s1">file</span><span class="s2">=</span><span class="s1">io</span><span class="s2">)</span>
+                        <span class="s1">print</span><span class="s2">(</span><span class="s4">&quot;# Has %d overloads&quot; </span><span class="s2">% </span><span class="s1">len</span><span class="s2">(</span><span class="s1">loop</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">),</span>
+                              <span class="s1">file</span><span class="s2">=</span><span class="s1">io</span><span class="s2">)</span>
+                        <span class="s0">for </span><span class="s1">cres </span><span class="s0">in </span><span class="s1">loop</span><span class="s2">.</span><span class="s1">overloads</span><span class="s2">.</span><span class="s1">values</span><span class="s2">():</span>
+                            <span class="s1">print</span><span class="s2">(</span><span class="s1">cres</span><span class="s2">.</span><span class="s1">type_annotation</span><span class="s2">, </span><span class="s1">file</span><span class="s2">=</span><span class="s1">io</span><span class="s2">)</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s1">print</span><span class="s2">(</span><span class="s4">&quot;# Source code unavailable&quot;</span><span class="s2">, </span><span class="s1">file</span><span class="s2">=</span><span class="s1">io</span><span class="s2">)</span>
+                <span class="s0">for </span><span class="s1">num </span><span class="s0">in </span><span class="s1">groupedinst</span><span class="s2">:</span>
+                    <span class="s0">for </span><span class="s1">inst </span><span class="s0">in </span><span class="s1">groupedinst</span><span class="s2">[</span><span class="s1">num</span><span class="s2">]:</span>
+                        <span class="s1">print</span><span class="s2">(</span><span class="s4">'%s' </span><span class="s2">% (</span><span class="s1">inst</span><span class="s2">,), </span><span class="s1">file</span><span class="s2">=</span><span class="s1">io</span><span class="s2">)</span>
+                    <span class="s1">print</span><span class="s2">(</span><span class="s1">file</span><span class="s2">=</span><span class="s1">io</span><span class="s2">)</span>
+
+            <span class="s0">return </span><span class="s1">io</span><span class="s2">.</span><span class="s1">getvalue</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">html_annotate</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">outfile</span><span class="s2">):</span>
+        <span class="s5"># ensure that annotation information is assembled</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">annotate_raw</span><span class="s2">()</span>
+        <span class="s5"># make a deep copy ahead of the pending mutations</span>
+        <span class="s1">func_data </span><span class="s2">= </span><span class="s1">copy</span><span class="s2">.</span><span class="s1">deepcopy</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">func_data</span><span class="s2">)</span>
+
+        <span class="s1">key </span><span class="s2">= </span><span class="s4">'python_indent'</span>
+        <span class="s0">for </span><span class="s1">this_func </span><span class="s0">in </span><span class="s1">func_data</span><span class="s2">.</span><span class="s1">values</span><span class="s2">():</span>
+            <span class="s0">if </span><span class="s1">key </span><span class="s0">in </span><span class="s1">this_func</span><span class="s2">:</span>
+                <span class="s1">idents </span><span class="s2">= {}</span>
+                <span class="s0">for </span><span class="s1">line</span><span class="s2">, </span><span class="s1">amount </span><span class="s0">in </span><span class="s1">this_func</span><span class="s2">[</span><span class="s1">key</span><span class="s2">].</span><span class="s1">items</span><span class="s2">():</span>
+                    <span class="s1">idents</span><span class="s2">[</span><span class="s1">line</span><span class="s2">] = </span><span class="s4">'&amp;nbsp;' </span><span class="s2">* </span><span class="s1">amount</span>
+                <span class="s1">this_func</span><span class="s2">[</span><span class="s1">key</span><span class="s2">] = </span><span class="s1">idents</span>
+
+        <span class="s1">key </span><span class="s2">= </span><span class="s4">'ir_indent'</span>
+        <span class="s0">for </span><span class="s1">this_func </span><span class="s0">in </span><span class="s1">func_data</span><span class="s2">.</span><span class="s1">values</span><span class="s2">():</span>
+            <span class="s0">if </span><span class="s1">key </span><span class="s0">in </span><span class="s1">this_func</span><span class="s2">:</span>
+                <span class="s1">idents </span><span class="s2">= {}</span>
+                <span class="s0">for </span><span class="s1">line</span><span class="s2">, </span><span class="s1">ir_id </span><span class="s0">in </span><span class="s1">this_func</span><span class="s2">[</span><span class="s1">key</span><span class="s2">].</span><span class="s1">items</span><span class="s2">():</span>
+                    <span class="s1">idents</span><span class="s2">[</span><span class="s1">line</span><span class="s2">] = [</span><span class="s4">'&amp;nbsp;' </span><span class="s2">* </span><span class="s1">amount </span><span class="s0">for </span><span class="s1">amount </span><span class="s0">in </span><span class="s1">ir_id</span><span class="s2">]</span>
+                <span class="s1">this_func</span><span class="s2">[</span><span class="s1">key</span><span class="s2">] = </span><span class="s1">idents</span>
+
+
+
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s0">from </span><span class="s1">jinja2 </span><span class="s0">import </span><span class="s1">Template</span>
+        <span class="s0">except </span><span class="s1">ImportError</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ImportError</span><span class="s2">(</span><span class="s4">&quot;please install the 'jinja2' package&quot;</span><span class="s2">)</span>
+
+        <span class="s1">root </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">dirname</span><span class="s2">(</span><span class="s1">__file__</span><span class="s2">))</span>
+        <span class="s1">template_filename </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">root</span><span class="s2">, </span><span class="s4">'template.html'</span><span class="s2">)</span>
+        <span class="s0">with </span><span class="s1">open</span><span class="s2">(</span><span class="s1">template_filename</span><span class="s2">, </span><span class="s4">'r'</span><span class="s2">) </span><span class="s0">as </span><span class="s1">template</span><span class="s2">:</span>
+            <span class="s1">html </span><span class="s2">= </span><span class="s1">template</span><span class="s2">.</span><span class="s1">read</span><span class="s2">()</span>
+
+        <span class="s1">template </span><span class="s2">= </span><span class="s1">Template</span><span class="s2">(</span><span class="s1">html</span><span class="s2">)</span>
+        <span class="s1">rendered </span><span class="s2">= </span><span class="s1">template</span><span class="s2">.</span><span class="s1">render</span><span class="s2">(</span><span class="s1">func_data</span><span class="s2">=</span><span class="s1">func_data</span><span class="s2">)</span>
+        <span class="s1">outfile</span><span class="s2">.</span><span class="s1">write</span><span class="s2">(</span><span class="s1">rendered</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">annotate_raw</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        This returns &quot;raw&quot; annotation information i.e. it has no output format 
+        specific markup included. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">python_source </span><span class="s2">= </span><span class="s1">SourceLines</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">func_id</span><span class="s2">.</span><span class="s1">func</span><span class="s2">)</span>
+        <span class="s1">ir_lines </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">prepare_annotations</span><span class="s2">()</span>
+        <span class="s1">line_nums </span><span class="s2">= [</span><span class="s1">num </span><span class="s0">for </span><span class="s1">num </span><span class="s0">in </span><span class="s1">python_source</span><span class="s2">]</span>
+        <span class="s1">lifted_lines </span><span class="s2">= [</span><span class="s1">l</span><span class="s2">.</span><span class="s1">get_source_location</span><span class="s2">() </span><span class="s0">for </span><span class="s1">l </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">lifted</span><span class="s2">]</span>
+
+        <span class="s0">def </span><span class="s1">add_ir_line</span><span class="s2">(</span><span class="s1">func_data</span><span class="s2">, </span><span class="s1">line</span><span class="s2">):</span>
+            <span class="s1">line_str </span><span class="s2">= </span><span class="s1">line</span><span class="s2">.</span><span class="s1">strip</span><span class="s2">()</span>
+            <span class="s1">line_type </span><span class="s2">= </span><span class="s4">''</span>
+            <span class="s0">if </span><span class="s1">line_str</span><span class="s2">.</span><span class="s1">endswith</span><span class="s2">(</span><span class="s4">'pyobject'</span><span class="s2">):</span>
+                <span class="s1">line_str </span><span class="s2">= </span><span class="s1">line_str</span><span class="s2">.</span><span class="s1">replace</span><span class="s2">(</span><span class="s4">'pyobject'</span><span class="s2">, </span><span class="s4">''</span><span class="s2">)</span>
+                <span class="s1">line_type </span><span class="s2">= </span><span class="s4">'pyobject'</span>
+            <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'ir_lines'</span><span class="s2">][</span><span class="s1">num</span><span class="s2">].</span><span class="s1">append</span><span class="s2">((</span><span class="s1">line_str</span><span class="s2">, </span><span class="s1">line_type</span><span class="s2">))</span>
+            <span class="s1">indent_len </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">_getindent</span><span class="s2">(</span><span class="s1">line</span><span class="s2">))</span>
+            <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'ir_indent'</span><span class="s2">][</span><span class="s1">num</span><span class="s2">].</span><span class="s1">append</span><span class="s2">(</span><span class="s1">indent_len</span><span class="s2">)</span>
+
+        <span class="s1">func_key </span><span class="s2">= (</span><span class="s1">self</span><span class="s2">.</span><span class="s1">func_id</span><span class="s2">.</span><span class="s1">filename </span><span class="s2">+ </span><span class="s4">':' </span><span class="s2">+ </span><span class="s1">str</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">func_id</span><span class="s2">.</span><span class="s1">firstlineno </span><span class="s2">+ </span><span class="s3">1</span><span class="s2">),</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">signature</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">lifted_from </span><span class="s0">is not None and </span><span class="s1">self</span><span class="s2">.</span><span class="s1">lifted_from</span><span class="s2">[</span><span class="s3">1</span><span class="s2">][</span><span class="s4">'num_lifted_loops'</span><span class="s2">] &gt; </span><span class="s3">0</span><span class="s2">:</span>
+            <span class="s5"># This is a lifted loop function that is being compiled. Get the</span>
+            <span class="s5"># numba ir for lines in loop function to use for annotating</span>
+            <span class="s5"># original python function that the loop was lifted from.</span>
+            <span class="s1">func_data </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">lifted_from</span><span class="s2">[</span><span class="s3">1</span><span class="s2">]</span>
+            <span class="s0">for </span><span class="s1">num </span><span class="s0">in </span><span class="s1">line_nums</span><span class="s2">:</span>
+                <span class="s0">if </span><span class="s1">num </span><span class="s0">not in </span><span class="s1">ir_lines</span><span class="s2">.</span><span class="s1">keys</span><span class="s2">():</span>
+                    <span class="s0">continue</span>
+                <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'ir_lines'</span><span class="s2">][</span><span class="s1">num</span><span class="s2">] = []</span>
+                <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'ir_indent'</span><span class="s2">][</span><span class="s1">num</span><span class="s2">] = []</span>
+                <span class="s0">for </span><span class="s1">line </span><span class="s0">in </span><span class="s1">ir_lines</span><span class="s2">[</span><span class="s1">num</span><span class="s2">]:</span>
+                    <span class="s1">add_ir_line</span><span class="s2">(</span><span class="s1">func_data</span><span class="s2">, </span><span class="s1">line</span><span class="s2">)</span>
+                    <span class="s0">if </span><span class="s1">line</span><span class="s2">.</span><span class="s1">strip</span><span class="s2">().</span><span class="s1">endswith</span><span class="s2">(</span><span class="s4">'pyobject'</span><span class="s2">):</span>
+                        <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'python_tags'</span><span class="s2">][</span><span class="s1">num</span><span class="s2">] = </span><span class="s4">'object_tag'</span>
+                        <span class="s5"># If any pyobject line is found, make sure original python</span>
+                        <span class="s5"># line that was marked as a lifted loop start line is tagged</span>
+                        <span class="s5"># as an object line instead. Lifted loop start lines should</span>
+                        <span class="s5"># only be marked as lifted loop lines if the lifted loop</span>
+                        <span class="s5"># was successfully compiled in nopython mode.</span>
+                        <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'python_tags'</span><span class="s2">][</span><span class="s1">self</span><span class="s2">.</span><span class="s1">lifted_from</span><span class="s2">[</span><span class="s3">0</span><span class="s2">]] = </span><span class="s4">'object_tag'</span>
+
+            <span class="s5"># We're done with this lifted loop, so decrement lifted loop counter.</span>
+            <span class="s5"># When lifted loop counter hits zero, that means we're ready to write</span>
+            <span class="s5"># out annotations to html file.</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">lifted_from</span><span class="s2">[</span><span class="s3">1</span><span class="s2">][</span><span class="s4">'num_lifted_loops'</span><span class="s2">] -= </span><span class="s3">1</span>
+
+        <span class="s0">elif </span><span class="s1">func_key </span><span class="s0">not in </span><span class="s1">TypeAnnotation</span><span class="s2">.</span><span class="s1">func_data</span><span class="s2">.</span><span class="s1">keys</span><span class="s2">():</span>
+            <span class="s1">TypeAnnotation</span><span class="s2">.</span><span class="s1">func_data</span><span class="s2">[</span><span class="s1">func_key</span><span class="s2">] = {}</span>
+            <span class="s1">func_data </span><span class="s2">= </span><span class="s1">TypeAnnotation</span><span class="s2">.</span><span class="s1">func_data</span><span class="s2">[</span><span class="s1">func_key</span><span class="s2">]</span>
+
+            <span class="s0">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">loop </span><span class="s0">in </span><span class="s1">enumerate</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">lifted</span><span class="s2">):</span>
+                <span class="s5"># Make sure that when we process each lifted loop function later,</span>
+                <span class="s5"># we'll know where it originally came from.</span>
+                <span class="s1">loop</span><span class="s2">.</span><span class="s1">lifted_from </span><span class="s2">= (</span><span class="s1">lifted_lines</span><span class="s2">[</span><span class="s1">i</span><span class="s2">], </span><span class="s1">func_data</span><span class="s2">)</span>
+            <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'num_lifted_loops'</span><span class="s2">] = </span><span class="s1">self</span><span class="s2">.</span><span class="s1">num_lifted_loops</span>
+
+            <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'filename'</span><span class="s2">] = </span><span class="s1">self</span><span class="s2">.</span><span class="s1">filename</span>
+            <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'funcname'</span><span class="s2">] = </span><span class="s1">self</span><span class="s2">.</span><span class="s1">func_id</span><span class="s2">.</span><span class="s1">func_name</span>
+            <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'python_lines'</span><span class="s2">] = []</span>
+            <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'python_indent'</span><span class="s2">] = {}</span>
+            <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'python_tags'</span><span class="s2">] = {}</span>
+            <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'ir_lines'</span><span class="s2">] = {}</span>
+            <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'ir_indent'</span><span class="s2">] = {}</span>
+
+            <span class="s0">for </span><span class="s1">num </span><span class="s0">in </span><span class="s1">line_nums</span><span class="s2">:</span>
+                <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'python_lines'</span><span class="s2">].</span><span class="s1">append</span><span class="s2">((</span><span class="s1">num</span><span class="s2">, </span><span class="s1">python_source</span><span class="s2">[</span><span class="s1">num</span><span class="s2">].</span><span class="s1">strip</span><span class="s2">()))</span>
+                <span class="s1">indent_len </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">_getindent</span><span class="s2">(</span><span class="s1">python_source</span><span class="s2">[</span><span class="s1">num</span><span class="s2">]))</span>
+                <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'python_indent'</span><span class="s2">][</span><span class="s1">num</span><span class="s2">] = </span><span class="s1">indent_len</span>
+                <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'python_tags'</span><span class="s2">][</span><span class="s1">num</span><span class="s2">] = </span><span class="s4">''</span>
+                <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'ir_lines'</span><span class="s2">][</span><span class="s1">num</span><span class="s2">] = []</span>
+                <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'ir_indent'</span><span class="s2">][</span><span class="s1">num</span><span class="s2">] = []</span>
+
+                <span class="s0">for </span><span class="s1">line </span><span class="s0">in </span><span class="s1">ir_lines</span><span class="s2">[</span><span class="s1">num</span><span class="s2">]:</span>
+                    <span class="s1">add_ir_line</span><span class="s2">(</span><span class="s1">func_data</span><span class="s2">, </span><span class="s1">line</span><span class="s2">)</span>
+                    <span class="s0">if </span><span class="s1">num </span><span class="s0">in </span><span class="s1">lifted_lines</span><span class="s2">:</span>
+                        <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'python_tags'</span><span class="s2">][</span><span class="s1">num</span><span class="s2">] = </span><span class="s4">'lifted_tag'</span>
+                    <span class="s0">elif </span><span class="s1">line</span><span class="s2">.</span><span class="s1">strip</span><span class="s2">().</span><span class="s1">endswith</span><span class="s2">(</span><span class="s4">'pyobject'</span><span class="s2">):</span>
+                        <span class="s1">func_data</span><span class="s2">[</span><span class="s4">'python_tags'</span><span class="s2">][</span><span class="s1">num</span><span class="s2">] = </span><span class="s4">'object_tag'</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">func_data</span>
+
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">annotate</span><span class="s2">()</span>
+
+
+<span class="s1">re_longest_white_prefix </span><span class="s2">= </span><span class="s1">re</span><span class="s2">.</span><span class="s1">compile</span><span class="s2">(</span><span class="s4">r'^\s*'</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">_getindent</span><span class="s2">(</span><span class="s1">text</span><span class="s2">):</span>
+    <span class="s1">m </span><span class="s2">= </span><span class="s1">re_longest_white_prefix</span><span class="s2">.</span><span class="s1">match</span><span class="s2">(</span><span class="s1">text</span><span class="s2">)</span>
+    <span class="s0">if not </span><span class="s1">m</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s4">''</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s4">' ' </span><span class="s2">* </span><span class="s1">len</span><span class="s2">(</span><span class="s1">m</span><span class="s2">.</span><span class="s1">group</span><span class="s2">(</span><span class="s3">0</span><span class="s2">))</span>
+</pre>
+</body>
+</html>

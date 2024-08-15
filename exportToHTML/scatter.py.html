@@ -1,0 +1,668 @@
+<html>
+<head>
+<title>scatter.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #cf8e6d;}
+.s5 { color: #2aacb8;}
+.s6 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+scatter.py</font>
+</center></td></tr></table>
+<pre><span class="s0">''' 
+Scatter 
+======= 
+ 
+.. image:: images/scatter.gif 
+    :align: right 
+ 
+:class:`Scatter` is used to build interactive widgets that can be translated, 
+rotated and scaled with two or more fingers on a multitouch system. 
+ 
+Scatter has its own matrix transformation: the modelview matrix is changed 
+before the children are drawn and the previous matrix is restored when the 
+drawing is finished. That makes it possible to perform rotation, scaling and 
+translation over the entire children tree without changing any widget 
+properties. That specific behavior makes the scatter unique, but there are some 
+advantages / constraints that you should consider: 
+ 
+#. The children are positioned relative to the scatter similarly to a 
+   :mod:`~kivy.uix.relativelayout.RelativeLayout`. So when dragging the 
+   scatter, the position of the children don't change, only the position of 
+   the scatter does. 
+#. The scatter size has no impact on the size of its children. 
+#. If you want to resize the scatter, use scale, not size (read #2). Scale 
+   transforms both the scatter and its children, but does not change size. 
+#. The scatter is not a layout. You must manage the size of the children 
+   yourself. 
+ 
+For touch events, the scatter converts from the parent matrix to the scatter 
+matrix automatically in on_touch_down/move/up events. If you are doing things 
+manually, you will need to use :meth:`~kivy.uix.widget.Widget.to_parent` and 
+:meth:`~kivy.uix.widget.Widget.to_local`. 
+ 
+Usage 
+----- 
+ 
+By default, the Scatter does not have a graphical representation: it is a 
+container only. The idea is to combine the Scatter with another widget, for 
+example an :class:`~kivy.uix.image.Image`:: 
+ 
+    scatter = Scatter() 
+    image = Image(source='sun.jpg') 
+    scatter.add_widget(image) 
+ 
+Control Interactions 
+-------------------- 
+ 
+By default, all interactions are enabled. You can selectively disable 
+them using the do_rotation, do_translation and do_scale properties. 
+ 
+Disable rotation:: 
+ 
+    scatter = Scatter(do_rotation=False) 
+ 
+Allow only translation:: 
+ 
+    scatter = Scatter(do_rotation=False, do_scale=False) 
+ 
+Allow only translation on x axis:: 
+ 
+    scatter = Scatter(do_rotation=False, do_scale=False, 
+                      do_translation_y=False) 
+ 
+ 
+Automatic Bring to Front 
+------------------------ 
+ 
+If the :attr:`Scatter.auto_bring_to_front` property is True, the scatter 
+widget will be removed and re-added to the parent when it is touched 
+(brought to front, above all other widgets in the parent). This is useful 
+when you are manipulating several scatter widgets and don't want the active 
+one to be partially hidden. 
+ 
+Scale Limitation 
+---------------- 
+ 
+We are using a 32-bit matrix in double representation. That means we have 
+a limit for scaling. You cannot do infinite scaling down/up with our 
+implementation. Generally, you don't hit the minimum scale (because you don't 
+see it on the screen), but the maximum scale is 9.99506983235e+19 (2^66). 
+ 
+You can also limit the minimum and maximum scale allowed:: 
+ 
+    scatter = Scatter(scale_min=.5, scale_max=3.) 
+ 
+Behavior 
+-------- 
+ 
+.. versionchanged:: 1.1.0 
+    If no control interactions are enabled, then the touch handler will never 
+    return True. 
+ 
+'''</span>
+
+<span class="s1">__all__ </span><span class="s2">= (</span><span class="s3">'Scatter'</span><span class="s2">, </span><span class="s3">'ScatterPlane'</span><span class="s2">)</span>
+
+<span class="s4">from </span><span class="s1">math </span><span class="s4">import </span><span class="s1">radians</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">properties </span><span class="s4">import </span><span class="s1">BooleanProperty</span><span class="s2">, </span><span class="s1">AliasProperty</span><span class="s2">, </span><span class="s1">\</span>
+    <span class="s1">NumericProperty</span><span class="s2">, </span><span class="s1">ObjectProperty</span><span class="s2">, </span><span class="s1">BoundedNumericProperty</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">vector </span><span class="s4">import </span><span class="s1">Vector</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">uix</span><span class="s2">.</span><span class="s1">widget </span><span class="s4">import </span><span class="s1">Widget</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">graphics</span><span class="s2">.</span><span class="s1">transformation </span><span class="s4">import </span><span class="s1">Matrix</span>
+
+
+<span class="s4">class </span><span class="s1">Scatter</span><span class="s2">(</span><span class="s1">Widget</span><span class="s2">):</span>
+    <span class="s0">'''Scatter class. See module documentation for more information. 
+ 
+    :Events: 
+        `on_transform_with_touch`: 
+            Fired when the scatter has been transformed by user touch 
+            or multitouch, such as panning or zooming. 
+        `on_bring_to_front`: 
+            Fired when the scatter is brought to the front. 
+ 
+    .. versionchanged:: 1.9.0 
+        Event `on_bring_to_front` added. 
+ 
+    .. versionchanged:: 1.8.0 
+        Event `on_transform_with_touch` added. 
+    '''</span>
+
+    <span class="s1">__events__ </span><span class="s2">= (</span><span class="s3">'on_transform_with_touch'</span><span class="s2">, </span><span class="s3">'on_bring_to_front'</span><span class="s2">)</span>
+
+    <span class="s1">auto_bring_to_front </span><span class="s2">= </span><span class="s1">BooleanProperty</span><span class="s2">(</span><span class="s4">True</span><span class="s2">)</span>
+    <span class="s3">'''If True, the widget will be automatically pushed on the top of parent 
+    widget list for drawing. 
+ 
+    :attr:`auto_bring_to_front` is a :class:`~kivy.properties.BooleanProperty` 
+    and defaults to True. 
+    '''</span>
+
+    <span class="s1">do_translation_x </span><span class="s2">= </span><span class="s1">BooleanProperty</span><span class="s2">(</span><span class="s4">True</span><span class="s2">)</span>
+    <span class="s3">'''Allow translation on the X axis. 
+ 
+    :attr:`do_translation_x` is a :class:`~kivy.properties.BooleanProperty` and 
+    defaults to True. 
+    '''</span>
+
+    <span class="s1">do_translation_y </span><span class="s2">= </span><span class="s1">BooleanProperty</span><span class="s2">(</span><span class="s4">True</span><span class="s2">)</span>
+    <span class="s3">'''Allow translation on Y axis. 
+ 
+    :attr:`do_translation_y` is a :class:`~kivy.properties.BooleanProperty` and 
+    defaults to True. 
+    '''</span>
+
+    <span class="s4">def </span><span class="s1">_get_do_translation</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">do_translation_x</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">do_translation_y</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">_set_do_translation</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">value</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">type</span><span class="s2">(</span><span class="s1">value</span><span class="s2">) </span><span class="s4">in </span><span class="s2">(</span><span class="s1">list</span><span class="s2">, </span><span class="s1">tuple</span><span class="s2">):</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">do_translation_x</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">do_translation_y </span><span class="s2">= </span><span class="s1">value</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">do_translation_x </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">do_translation_y </span><span class="s2">= </span><span class="s1">bool</span><span class="s2">(</span><span class="s1">value</span><span class="s2">)</span>
+
+    <span class="s1">do_translation </span><span class="s2">= </span><span class="s1">AliasProperty</span><span class="s2">(</span><span class="s1">_get_do_translation</span><span class="s2">, </span><span class="s1">_set_do_translation</span><span class="s2">,</span>
+                                   <span class="s1">bind</span><span class="s2">=(</span><span class="s3">'do_translation_x'</span><span class="s2">,</span>
+                                         <span class="s3">'do_translation_y'</span><span class="s2">),</span>
+                                   <span class="s1">cache</span><span class="s2">=</span><span class="s4">True</span><span class="s2">)</span>
+    <span class="s3">'''Allow translation on the X or Y axis. 
+ 
+    :attr:`do_translation` is an :class:`~kivy.properties.AliasProperty` of 
+    (:attr:`do_translation_x` + :attr:`do_translation_y`) 
+    '''</span>
+
+    <span class="s1">translation_touches </span><span class="s2">= </span><span class="s1">BoundedNumericProperty</span><span class="s2">(</span><span class="s5">1</span><span class="s2">, </span><span class="s1">min</span><span class="s2">=</span><span class="s5">1</span><span class="s2">)</span>
+    <span class="s3">'''Determine whether translation was triggered by a single or multiple 
+    touches. This only has effect when :attr:`do_translation` = True. 
+ 
+    :attr:`translation_touches` is a :class:`~kivy.properties.NumericProperty` 
+    and defaults to 1. 
+ 
+    .. versionadded:: 1.7.0 
+    '''</span>
+
+    <span class="s1">do_rotation </span><span class="s2">= </span><span class="s1">BooleanProperty</span><span class="s2">(</span><span class="s4">True</span><span class="s2">)</span>
+    <span class="s3">'''Allow rotation. 
+ 
+    :attr:`do_rotation` is a :class:`~kivy.properties.BooleanProperty` and 
+    defaults to True. 
+    '''</span>
+
+    <span class="s1">do_scale </span><span class="s2">= </span><span class="s1">BooleanProperty</span><span class="s2">(</span><span class="s4">True</span><span class="s2">)</span>
+    <span class="s3">'''Allow scaling. 
+ 
+    :attr:`do_scale` is a :class:`~kivy.properties.BooleanProperty` and 
+    defaults to True. 
+    '''</span>
+
+    <span class="s1">do_collide_after_children </span><span class="s2">= </span><span class="s1">BooleanProperty</span><span class="s2">(</span><span class="s4">False</span><span class="s2">)</span>
+    <span class="s3">'''If True, the collision detection for limiting the touch inside the 
+    scatter will be done after dispaching the touch to the children. 
+    You can put children outside the bounding box of the scatter and still be 
+    able to touch them. 
+ 
+    :attr:`do_collide_after_children` is a 
+    :class:`~kivy.properties.BooleanProperty` and defaults to False. 
+ 
+    .. versionadded:: 1.3.0 
+    '''</span>
+
+    <span class="s1">scale_min </span><span class="s2">= </span><span class="s1">NumericProperty</span><span class="s2">(</span><span class="s5">0.01</span><span class="s2">)</span>
+    <span class="s3">'''Minimum scaling factor allowed. 
+ 
+    :attr:`scale_min` is a :class:`~kivy.properties.NumericProperty` and 
+    defaults to 0.01. 
+    '''</span>
+
+    <span class="s1">scale_max </span><span class="s2">= </span><span class="s1">NumericProperty</span><span class="s2">(</span><span class="s5">1e20</span><span class="s2">)</span>
+    <span class="s3">'''Maximum scaling factor allowed. 
+ 
+    :attr:`scale_max` is a :class:`~kivy.properties.NumericProperty` and 
+    defaults to 1e20. 
+    '''</span>
+
+    <span class="s1">transform </span><span class="s2">= </span><span class="s1">ObjectProperty</span><span class="s2">(</span><span class="s1">Matrix</span><span class="s2">())</span>
+    <span class="s3">'''Transformation matrix. 
+ 
+    :attr:`transform` is an :class:`~kivy.properties.ObjectProperty` and 
+    defaults to the identity matrix. 
+ 
+    .. note:: 
+ 
+        This matrix reflects the current state of the transformation matrix 
+        but setting it directly will erase previously applied 
+        transformations. To apply a transformation considering context, 
+        please use the :attr:`~Scatter.apply_transform` method. 
+ 
+    '''</span>
+
+    <span class="s1">transform_inv </span><span class="s2">= </span><span class="s1">ObjectProperty</span><span class="s2">(</span><span class="s1">Matrix</span><span class="s2">())</span>
+    <span class="s3">'''Inverse of the transformation matrix. 
+ 
+    :attr:`transform_inv` is an :class:`~kivy.properties.ObjectProperty` and 
+    defaults to the identity matrix. 
+    '''</span>
+
+    <span class="s4">def </span><span class="s1">_get_bbox</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">xmin</span><span class="s2">, </span><span class="s1">ymin </span><span class="s2">= </span><span class="s1">xmax</span><span class="s2">, </span><span class="s1">ymax </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">to_parent</span><span class="s2">(</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s4">for </span><span class="s1">point </span><span class="s4">in </span><span class="s2">[(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">width</span><span class="s2">, </span><span class="s5">0</span><span class="s2">), (</span><span class="s5">0</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">height</span><span class="s2">), </span><span class="s1">self</span><span class="s2">.</span><span class="s1">size</span><span class="s2">]:</span>
+            <span class="s1">x</span><span class="s2">, </span><span class="s1">y </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">to_parent</span><span class="s2">(*</span><span class="s1">point</span><span class="s2">)</span>
+            <span class="s4">if </span><span class="s1">x </span><span class="s2">&lt; </span><span class="s1">xmin</span><span class="s2">:</span>
+                <span class="s1">xmin </span><span class="s2">= </span><span class="s1">x</span>
+            <span class="s4">if </span><span class="s1">y </span><span class="s2">&lt; </span><span class="s1">ymin</span><span class="s2">:</span>
+                <span class="s1">ymin </span><span class="s2">= </span><span class="s1">y</span>
+            <span class="s4">if </span><span class="s1">x </span><span class="s2">&gt; </span><span class="s1">xmax</span><span class="s2">:</span>
+                <span class="s1">xmax </span><span class="s2">= </span><span class="s1">x</span>
+            <span class="s4">if </span><span class="s1">y </span><span class="s2">&gt; </span><span class="s1">ymax</span><span class="s2">:</span>
+                <span class="s1">ymax </span><span class="s2">= </span><span class="s1">y</span>
+        <span class="s4">return </span><span class="s2">(</span><span class="s1">xmin</span><span class="s2">, </span><span class="s1">ymin</span><span class="s2">), (</span><span class="s1">xmax </span><span class="s2">- </span><span class="s1">xmin</span><span class="s2">, </span><span class="s1">ymax </span><span class="s2">- </span><span class="s1">ymin</span><span class="s2">)</span>
+
+    <span class="s1">bbox </span><span class="s2">= </span><span class="s1">AliasProperty</span><span class="s2">(</span><span class="s1">_get_bbox</span><span class="s2">, </span><span class="s1">bind</span><span class="s2">=(</span><span class="s3">'transform'</span><span class="s2">, </span><span class="s3">'width'</span><span class="s2">, </span><span class="s3">'height'</span><span class="s2">))</span>
+    <span class="s3">'''Bounding box of the widget in parent space:: 
+ 
+        ((x, y), (w, h)) 
+        # x, y = lower left corner 
+ 
+    :attr:`bbox` is an :class:`~kivy.properties.AliasProperty`. 
+    '''</span>
+
+    <span class="s4">def </span><span class="s1">_get_rotation</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">v1 </span><span class="s2">= </span><span class="s1">Vector</span><span class="s2">(</span><span class="s5">0</span><span class="s2">, </span><span class="s5">10</span><span class="s2">)</span>
+        <span class="s1">tp </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">to_parent</span>
+        <span class="s1">v2 </span><span class="s2">= </span><span class="s1">Vector</span><span class="s2">(*</span><span class="s1">tp</span><span class="s2">(*</span><span class="s1">self</span><span class="s2">.</span><span class="s1">pos</span><span class="s2">)) - </span><span class="s1">tp</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">x</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">y </span><span class="s2">+ </span><span class="s5">10</span><span class="s2">)</span>
+        <span class="s4">return </span><span class="s2">-</span><span class="s5">1.0 </span><span class="s2">* (</span><span class="s1">v1</span><span class="s2">.</span><span class="s1">angle</span><span class="s2">(</span><span class="s1">v2</span><span class="s2">) + </span><span class="s5">180</span><span class="s2">) % </span><span class="s5">360</span>
+
+    <span class="s4">def </span><span class="s1">_set_rotation</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">rotation</span><span class="s2">):</span>
+        <span class="s1">angle_change </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">rotation </span><span class="s2">- </span><span class="s1">rotation</span>
+        <span class="s1">r </span><span class="s2">= </span><span class="s1">Matrix</span><span class="s2">().</span><span class="s1">rotate</span><span class="s2">(-</span><span class="s1">radians</span><span class="s2">(</span><span class="s1">angle_change</span><span class="s2">), </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">apply_transform</span><span class="s2">(</span><span class="s1">r</span><span class="s2">, </span><span class="s1">post_multiply</span><span class="s2">=</span><span class="s4">True</span><span class="s2">,</span>
+                             <span class="s1">anchor</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">to_local</span><span class="s2">(*</span><span class="s1">self</span><span class="s2">.</span><span class="s1">center</span><span class="s2">))</span>
+
+    <span class="s1">rotation </span><span class="s2">= </span><span class="s1">AliasProperty</span><span class="s2">(</span><span class="s1">_get_rotation</span><span class="s2">, </span><span class="s1">_set_rotation</span><span class="s2">,</span>
+                             <span class="s1">bind</span><span class="s2">=(</span><span class="s3">'x'</span><span class="s2">, </span><span class="s3">'y'</span><span class="s2">, </span><span class="s3">'transform'</span><span class="s2">))</span>
+    <span class="s3">'''Rotation value of the scatter in degrees moving in a counterclockwise 
+    direction. 
+ 
+    :attr:`rotation` is an :class:`~kivy.properties.AliasProperty` and defaults 
+    to 0.0. 
+    '''</span>
+
+    <span class="s4">def </span><span class="s1">_get_scale</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">p1 </span><span class="s2">= </span><span class="s1">Vector</span><span class="s2">(*</span><span class="s1">self</span><span class="s2">.</span><span class="s1">to_parent</span><span class="s2">(</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">))</span>
+        <span class="s1">p2 </span><span class="s2">= </span><span class="s1">Vector</span><span class="s2">(*</span><span class="s1">self</span><span class="s2">.</span><span class="s1">to_parent</span><span class="s2">(</span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s2">))</span>
+        <span class="s1">scale </span><span class="s2">= </span><span class="s1">p1</span><span class="s2">.</span><span class="s1">distance</span><span class="s2">(</span><span class="s1">p2</span><span class="s2">)</span>
+
+        <span class="s6"># XXX float calculation are not accurate, and then, scale can be</span>
+        <span class="s6"># thrown again even with only the position change. So to</span>
+        <span class="s6"># prevent anything wrong with scale, just avoid to dispatch it</span>
+        <span class="s6"># if the scale &quot;visually&quot; didn't change. #947</span>
+        <span class="s6"># Remove this ugly hack when we'll be Python 3 only.</span>
+        <span class="s4">if </span><span class="s1">hasattr</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s3">'_scale_p'</span><span class="s2">):</span>
+            <span class="s4">if </span><span class="s1">str</span><span class="s2">(</span><span class="s1">scale</span><span class="s2">) == </span><span class="s1">str</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_scale_p</span><span class="s2">):</span>
+                <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_scale_p</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_scale_p </span><span class="s2">= </span><span class="s1">scale</span>
+        <span class="s4">return </span><span class="s1">scale</span>
+
+    <span class="s4">def </span><span class="s1">_set_scale</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">scale</span><span class="s2">):</span>
+        <span class="s1">rescale </span><span class="s2">= </span><span class="s1">scale </span><span class="s2">* </span><span class="s5">1.0 </span><span class="s2">/ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">scale</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">apply_transform</span><span class="s2">(</span><span class="s1">Matrix</span><span class="s2">().</span><span class="s1">scale</span><span class="s2">(</span><span class="s1">rescale</span><span class="s2">, </span><span class="s1">rescale</span><span class="s2">, </span><span class="s1">rescale</span><span class="s2">),</span>
+                             <span class="s1">post_multiply</span><span class="s2">=</span><span class="s4">True</span><span class="s2">,</span>
+                             <span class="s1">anchor</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">to_local</span><span class="s2">(*</span><span class="s1">self</span><span class="s2">.</span><span class="s1">center</span><span class="s2">))</span>
+
+    <span class="s1">scale </span><span class="s2">= </span><span class="s1">AliasProperty</span><span class="s2">(</span><span class="s1">_get_scale</span><span class="s2">, </span><span class="s1">_set_scale</span><span class="s2">, </span><span class="s1">bind</span><span class="s2">=(</span><span class="s3">'x'</span><span class="s2">, </span><span class="s3">'y'</span><span class="s2">, </span><span class="s3">'transform'</span><span class="s2">))</span>
+    <span class="s3">'''Scale value of the scatter. 
+ 
+    :attr:`scale` is an :class:`~kivy.properties.AliasProperty` and defaults to 
+    1.0. 
+    '''</span>
+
+    <span class="s4">def </span><span class="s1">_get_center</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">bbox</span><span class="s2">[</span><span class="s5">0</span><span class="s2">][</span><span class="s5">0</span><span class="s2">] + </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bbox</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">0</span><span class="s2">] / </span><span class="s5">2.0</span><span class="s2">,</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">bbox</span><span class="s2">[</span><span class="s5">0</span><span class="s2">][</span><span class="s5">1</span><span class="s2">] + </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bbox</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">1</span><span class="s2">] / </span><span class="s5">2.0</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">_set_center</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">center</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">center </span><span class="s2">== </span><span class="s1">self</span><span class="s2">.</span><span class="s1">center</span><span class="s2">:</span>
+            <span class="s4">return False</span>
+        <span class="s1">t </span><span class="s2">= </span><span class="s1">Vector</span><span class="s2">(*</span><span class="s1">center</span><span class="s2">) - </span><span class="s1">self</span><span class="s2">.</span><span class="s1">center</span>
+        <span class="s1">trans </span><span class="s2">= </span><span class="s1">Matrix</span><span class="s2">().</span><span class="s1">translate</span><span class="s2">(</span><span class="s1">t</span><span class="s2">.</span><span class="s1">x</span><span class="s2">, </span><span class="s1">t</span><span class="s2">.</span><span class="s1">y</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">apply_transform</span><span class="s2">(</span><span class="s1">trans</span><span class="s2">)</span>
+
+    <span class="s1">center </span><span class="s2">= </span><span class="s1">AliasProperty</span><span class="s2">(</span><span class="s1">_get_center</span><span class="s2">, </span><span class="s1">_set_center</span><span class="s2">, </span><span class="s1">bind</span><span class="s2">=(</span><span class="s3">'bbox'</span><span class="s2">,))</span>
+
+    <span class="s4">def </span><span class="s1">_get_pos</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bbox</span><span class="s2">[</span><span class="s5">0</span><span class="s2">]</span>
+
+    <span class="s4">def </span><span class="s1">_set_pos</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">pos</span><span class="s2">):</span>
+        <span class="s1">_pos </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bbox</span><span class="s2">[</span><span class="s5">0</span><span class="s2">]</span>
+        <span class="s4">if </span><span class="s1">pos </span><span class="s2">== </span><span class="s1">_pos</span><span class="s2">:</span>
+            <span class="s4">return</span>
+        <span class="s1">t </span><span class="s2">= </span><span class="s1">Vector</span><span class="s2">(*</span><span class="s1">pos</span><span class="s2">) - </span><span class="s1">_pos</span>
+        <span class="s1">trans </span><span class="s2">= </span><span class="s1">Matrix</span><span class="s2">().</span><span class="s1">translate</span><span class="s2">(</span><span class="s1">t</span><span class="s2">.</span><span class="s1">x</span><span class="s2">, </span><span class="s1">t</span><span class="s2">.</span><span class="s1">y</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">apply_transform</span><span class="s2">(</span><span class="s1">trans</span><span class="s2">)</span>
+
+    <span class="s1">pos </span><span class="s2">= </span><span class="s1">AliasProperty</span><span class="s2">(</span><span class="s1">_get_pos</span><span class="s2">, </span><span class="s1">_set_pos</span><span class="s2">, </span><span class="s1">bind</span><span class="s2">=(</span><span class="s3">'bbox'</span><span class="s2">,))</span>
+
+    <span class="s4">def </span><span class="s1">_get_x</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bbox</span><span class="s2">[</span><span class="s5">0</span><span class="s2">][</span><span class="s5">0</span><span class="s2">]</span>
+
+    <span class="s4">def </span><span class="s1">_set_x</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">x </span><span class="s2">== </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bbox</span><span class="s2">[</span><span class="s5">0</span><span class="s2">][</span><span class="s5">0</span><span class="s2">]:</span>
+            <span class="s4">return False</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">pos </span><span class="s2">= (</span><span class="s1">x</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">y</span><span class="s2">)</span>
+        <span class="s4">return True</span>
+
+    <span class="s1">x </span><span class="s2">= </span><span class="s1">AliasProperty</span><span class="s2">(</span><span class="s1">_get_x</span><span class="s2">, </span><span class="s1">_set_x</span><span class="s2">, </span><span class="s1">bind</span><span class="s2">=(</span><span class="s3">'bbox'</span><span class="s2">,))</span>
+
+    <span class="s4">def </span><span class="s1">_get_y</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bbox</span><span class="s2">[</span><span class="s5">0</span><span class="s2">][</span><span class="s5">1</span><span class="s2">]</span>
+
+    <span class="s4">def </span><span class="s1">_set_y</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">y</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">y </span><span class="s2">== </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bbox</span><span class="s2">[</span><span class="s5">0</span><span class="s2">][</span><span class="s5">1</span><span class="s2">]:</span>
+            <span class="s4">return False</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">pos </span><span class="s2">= (</span><span class="s1">self</span><span class="s2">.</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">)</span>
+        <span class="s4">return True</span>
+
+    <span class="s1">y </span><span class="s2">= </span><span class="s1">AliasProperty</span><span class="s2">(</span><span class="s1">_get_y</span><span class="s2">, </span><span class="s1">_set_y</span><span class="s2">, </span><span class="s1">bind</span><span class="s2">=(</span><span class="s3">'bbox'</span><span class="s2">,))</span>
+
+    <span class="s4">def </span><span class="s1">get_right</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">x </span><span class="s2">+ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bbox</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">0</span><span class="s2">]</span>
+
+    <span class="s4">def </span><span class="s1">set_right</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">value</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">x </span><span class="s2">= </span><span class="s1">value </span><span class="s2">- </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bbox</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">0</span><span class="s2">]</span>
+
+    <span class="s1">right </span><span class="s2">= </span><span class="s1">AliasProperty</span><span class="s2">(</span><span class="s1">get_right</span><span class="s2">, </span><span class="s1">set_right</span><span class="s2">, </span><span class="s1">bind</span><span class="s2">=(</span><span class="s3">'x'</span><span class="s2">, </span><span class="s3">'bbox'</span><span class="s2">))</span>
+
+    <span class="s4">def </span><span class="s1">get_top</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">y </span><span class="s2">+ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bbox</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">1</span><span class="s2">]</span>
+
+    <span class="s4">def </span><span class="s1">set_top</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">value</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">y </span><span class="s2">= </span><span class="s1">value </span><span class="s2">- </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bbox</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">1</span><span class="s2">]</span>
+
+    <span class="s1">top </span><span class="s2">= </span><span class="s1">AliasProperty</span><span class="s2">(</span><span class="s1">get_top</span><span class="s2">, </span><span class="s1">set_top</span><span class="s2">, </span><span class="s1">bind</span><span class="s2">=(</span><span class="s3">'y'</span><span class="s2">, </span><span class="s3">'bbox'</span><span class="s2">))</span>
+
+    <span class="s4">def </span><span class="s1">get_center_x</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">x </span><span class="s2">+ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bbox</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">0</span><span class="s2">] / </span><span class="s5">2.</span>
+
+    <span class="s4">def </span><span class="s1">set_center_x</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">value</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">x </span><span class="s2">= </span><span class="s1">value </span><span class="s2">- </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bbox</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">0</span><span class="s2">] / </span><span class="s5">2.</span>
+
+    <span class="s1">center_x </span><span class="s2">= </span><span class="s1">AliasProperty</span><span class="s2">(</span><span class="s1">get_center_x</span><span class="s2">, </span><span class="s1">set_center_x</span><span class="s2">, </span><span class="s1">bind</span><span class="s2">=(</span><span class="s3">'x'</span><span class="s2">, </span><span class="s3">'bbox'</span><span class="s2">))</span>
+
+    <span class="s4">def </span><span class="s1">get_center_y</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">y </span><span class="s2">+ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bbox</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">1</span><span class="s2">] / </span><span class="s5">2.</span>
+
+    <span class="s4">def </span><span class="s1">set_center_y</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">value</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">y </span><span class="s2">= </span><span class="s1">value </span><span class="s2">- </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bbox</span><span class="s2">[</span><span class="s5">1</span><span class="s2">][</span><span class="s5">1</span><span class="s2">] / </span><span class="s5">2.</span>
+
+    <span class="s1">center_y </span><span class="s2">= </span><span class="s1">AliasProperty</span><span class="s2">(</span><span class="s1">get_center_y</span><span class="s2">, </span><span class="s1">set_center_y</span><span class="s2">, </span><span class="s1">bind</span><span class="s2">=(</span><span class="s3">'y'</span><span class="s2">, </span><span class="s3">'bbox'</span><span class="s2">))</span>
+
+    <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_touches </span><span class="s2">= []</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_last_touch_pos </span><span class="s2">= {}</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">Scatter</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">(**</span><span class="s1">kwargs</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">on_transform</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">instance</span><span class="s2">, </span><span class="s1">value</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">transform_inv </span><span class="s2">= </span><span class="s1">value</span><span class="s2">.</span><span class="s1">inverse</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">collide_point</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">):</span>
+        <span class="s1">x</span><span class="s2">, </span><span class="s1">y </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">to_local</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">)</span>
+        <span class="s4">return </span><span class="s5">0 </span><span class="s2">&lt;= </span><span class="s1">x </span><span class="s2">&lt;= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">width </span><span class="s4">and </span><span class="s5">0 </span><span class="s2">&lt;= </span><span class="s1">y </span><span class="s2">&lt;= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">height</span>
+
+    <span class="s4">def </span><span class="s1">to_parent</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, **</span><span class="s1">k</span><span class="s2">):</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">transform</span><span class="s2">.</span><span class="s1">transform_point</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s4">return </span><span class="s2">(</span><span class="s1">p</span><span class="s2">[</span><span class="s5">0</span><span class="s2">], </span><span class="s1">p</span><span class="s2">[</span><span class="s5">1</span><span class="s2">])</span>
+
+    <span class="s4">def </span><span class="s1">to_local</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, **</span><span class="s1">k</span><span class="s2">):</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">transform_inv</span><span class="s2">.</span><span class="s1">transform_point</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s4">return </span><span class="s2">(</span><span class="s1">p</span><span class="s2">[</span><span class="s5">0</span><span class="s2">], </span><span class="s1">p</span><span class="s2">[</span><span class="s5">1</span><span class="s2">])</span>
+
+    <span class="s4">def </span><span class="s1">_apply_transform</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">m</span><span class="s2">, </span><span class="s1">pos</span><span class="s2">=</span><span class="s4">None</span><span class="s2">):</span>
+        <span class="s1">m </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">transform</span><span class="s2">.</span><span class="s1">multiply</span><span class="s2">(</span><span class="s1">m</span><span class="s2">)</span>
+        <span class="s4">return </span><span class="s1">super</span><span class="s2">(</span><span class="s1">Scatter</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">_apply_transform</span><span class="s2">(</span><span class="s1">m</span><span class="s2">, (</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">))</span>
+
+    <span class="s4">def </span><span class="s1">apply_transform</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">trans</span><span class="s2">, </span><span class="s1">post_multiply</span><span class="s2">=</span><span class="s4">False</span><span class="s2">, </span><span class="s1">anchor</span><span class="s2">=(</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)):</span>
+        <span class="s0">''' 
+        Transforms the scatter by applying the &quot;trans&quot; transformation 
+        matrix (on top of its current transformation state). The resultant 
+        matrix can be found in the :attr:`~Scatter.transform` property. 
+ 
+        :Parameters: 
+            `trans`: :class:`~kivy.graphics.transformation.Matrix`. 
+                Transformation matrix to be applied to the scatter widget. 
+            `anchor`: tuple, defaults to (0, 0). 
+                The point to use as the origin of the transformation 
+                (uses local widget space). 
+            `post_multiply`: bool, defaults to False. 
+                If True, the transform matrix is post multiplied 
+                (as if applied before the current transform). 
+ 
+        Usage example:: 
+ 
+            from kivy.graphics.transformation import Matrix 
+            mat = Matrix().scale(3, 3, 3) 
+            scatter_instance.apply_transform(mat) 
+ 
+        '''</span>
+        <span class="s1">t </span><span class="s2">= </span><span class="s1">Matrix</span><span class="s2">().</span><span class="s1">translate</span><span class="s2">(</span><span class="s1">anchor</span><span class="s2">[</span><span class="s5">0</span><span class="s2">], </span><span class="s1">anchor</span><span class="s2">[</span><span class="s5">1</span><span class="s2">], </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s1">t </span><span class="s2">= </span><span class="s1">t</span><span class="s2">.</span><span class="s1">multiply</span><span class="s2">(</span><span class="s1">trans</span><span class="s2">)</span>
+        <span class="s1">t </span><span class="s2">= </span><span class="s1">t</span><span class="s2">.</span><span class="s1">multiply</span><span class="s2">(</span><span class="s1">Matrix</span><span class="s2">().</span><span class="s1">translate</span><span class="s2">(-</span><span class="s1">anchor</span><span class="s2">[</span><span class="s5">0</span><span class="s2">], -</span><span class="s1">anchor</span><span class="s2">[</span><span class="s5">1</span><span class="s2">], </span><span class="s5">0</span><span class="s2">))</span>
+
+        <span class="s4">if </span><span class="s1">post_multiply</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">transform </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">transform</span><span class="s2">.</span><span class="s1">multiply</span><span class="s2">(</span><span class="s1">t</span><span class="s2">)</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">transform </span><span class="s2">= </span><span class="s1">t</span><span class="s2">.</span><span class="s1">multiply</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">transform</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">transform_with_touch</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">touch</span><span class="s2">):</span>
+        <span class="s6"># just do a simple one finger drag</span>
+        <span class="s1">changed </span><span class="s2">= </span><span class="s4">False</span>
+        <span class="s4">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_touches</span><span class="s2">) == </span><span class="s1">self</span><span class="s2">.</span><span class="s1">translation_touches</span><span class="s2">:</span>
+            <span class="s6"># _last_touch_pos has last pos in correct parent space,</span>
+            <span class="s6"># just like incoming touch</span>
+            <span class="s1">dx </span><span class="s2">= (</span><span class="s1">touch</span><span class="s2">.</span><span class="s1">x </span><span class="s2">- </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_last_touch_pos</span><span class="s2">[</span><span class="s1">touch</span><span class="s2">][</span><span class="s5">0</span><span class="s2">]) </span><span class="s1">\</span>
+                <span class="s2">* </span><span class="s1">self</span><span class="s2">.</span><span class="s1">do_translation_x</span>
+            <span class="s1">dy </span><span class="s2">= (</span><span class="s1">touch</span><span class="s2">.</span><span class="s1">y </span><span class="s2">- </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_last_touch_pos</span><span class="s2">[</span><span class="s1">touch</span><span class="s2">][</span><span class="s5">1</span><span class="s2">]) </span><span class="s1">\</span>
+                <span class="s2">* </span><span class="s1">self</span><span class="s2">.</span><span class="s1">do_translation_y</span>
+            <span class="s1">dx </span><span class="s2">= </span><span class="s1">dx </span><span class="s2">/ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">translation_touches</span>
+            <span class="s1">dy </span><span class="s2">= </span><span class="s1">dy </span><span class="s2">/ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">translation_touches</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">apply_transform</span><span class="s2">(</span><span class="s1">Matrix</span><span class="s2">().</span><span class="s1">translate</span><span class="s2">(</span><span class="s1">dx</span><span class="s2">, </span><span class="s1">dy</span><span class="s2">, </span><span class="s5">0</span><span class="s2">))</span>
+            <span class="s1">changed </span><span class="s2">= </span><span class="s4">True</span>
+
+        <span class="s4">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_touches</span><span class="s2">) == </span><span class="s5">1</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s1">changed</span>
+
+        <span class="s6"># we have more than one touch... list of last known pos</span>
+        <span class="s1">points </span><span class="s2">= [</span><span class="s1">Vector</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_last_touch_pos</span><span class="s2">[</span><span class="s1">t</span><span class="s2">]) </span><span class="s4">for </span><span class="s1">t </span><span class="s4">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_touches</span>
+                  <span class="s4">if </span><span class="s1">t </span><span class="s4">is not </span><span class="s1">touch</span><span class="s2">]</span>
+        <span class="s6"># add current touch last</span>
+        <span class="s1">points</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">Vector</span><span class="s2">(</span><span class="s1">touch</span><span class="s2">.</span><span class="s1">pos</span><span class="s2">))</span>
+
+        <span class="s6"># we only want to transform if the touch is part of the two touches</span>
+        <span class="s6"># farthest apart! So first we find anchor, the point to transform</span>
+        <span class="s6"># around as another touch farthest away from current touch's pos</span>
+        <span class="s1">anchor </span><span class="s2">= </span><span class="s1">max</span><span class="s2">(</span><span class="s1">points</span><span class="s2">[:-</span><span class="s5">1</span><span class="s2">], </span><span class="s1">key</span><span class="s2">=</span><span class="s4">lambda </span><span class="s1">p</span><span class="s2">: </span><span class="s1">p</span><span class="s2">.</span><span class="s1">distance</span><span class="s2">(</span><span class="s1">touch</span><span class="s2">.</span><span class="s1">pos</span><span class="s2">))</span>
+
+        <span class="s6"># now we find the touch farthest away from anchor, if its not the</span>
+        <span class="s6"># same as touch. Touch is not one of the two touches used to transform</span>
+        <span class="s1">farthest </span><span class="s2">= </span><span class="s1">max</span><span class="s2">(</span><span class="s1">points</span><span class="s2">, </span><span class="s1">key</span><span class="s2">=</span><span class="s1">anchor</span><span class="s2">.</span><span class="s1">distance</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s1">farthest </span><span class="s4">is not </span><span class="s1">points</span><span class="s2">[-</span><span class="s5">1</span><span class="s2">]:</span>
+            <span class="s4">return </span><span class="s1">changed</span>
+
+        <span class="s6"># ok, so we have touch, and anchor, so we can actually compute the</span>
+        <span class="s6"># transformation</span>
+        <span class="s1">old_line </span><span class="s2">= </span><span class="s1">Vector</span><span class="s2">(*</span><span class="s1">touch</span><span class="s2">.</span><span class="s1">ppos</span><span class="s2">) - </span><span class="s1">anchor</span>
+        <span class="s1">new_line </span><span class="s2">= </span><span class="s1">Vector</span><span class="s2">(*</span><span class="s1">touch</span><span class="s2">.</span><span class="s1">pos</span><span class="s2">) - </span><span class="s1">anchor</span>
+        <span class="s4">if not </span><span class="s1">old_line</span><span class="s2">.</span><span class="s1">length</span><span class="s2">():   </span><span class="s6"># div by zero</span>
+            <span class="s4">return </span><span class="s1">changed</span>
+
+        <span class="s1">angle </span><span class="s2">= </span><span class="s1">radians</span><span class="s2">(</span><span class="s1">new_line</span><span class="s2">.</span><span class="s1">angle</span><span class="s2">(</span><span class="s1">old_line</span><span class="s2">)) * </span><span class="s1">self</span><span class="s2">.</span><span class="s1">do_rotation</span>
+        <span class="s4">if </span><span class="s1">angle</span><span class="s2">:</span>
+            <span class="s1">changed </span><span class="s2">= </span><span class="s4">True</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">apply_transform</span><span class="s2">(</span><span class="s1">Matrix</span><span class="s2">().</span><span class="s1">rotate</span><span class="s2">(</span><span class="s1">angle</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s2">), </span><span class="s1">anchor</span><span class="s2">=</span><span class="s1">anchor</span><span class="s2">)</span>
+
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">do_scale</span><span class="s2">:</span>
+            <span class="s1">scale </span><span class="s2">= </span><span class="s1">new_line</span><span class="s2">.</span><span class="s1">length</span><span class="s2">() / </span><span class="s1">old_line</span><span class="s2">.</span><span class="s1">length</span><span class="s2">()</span>
+            <span class="s1">new_scale </span><span class="s2">= </span><span class="s1">scale </span><span class="s2">* </span><span class="s1">self</span><span class="s2">.</span><span class="s1">scale</span>
+            <span class="s4">if </span><span class="s1">new_scale </span><span class="s2">&lt; </span><span class="s1">self</span><span class="s2">.</span><span class="s1">scale_min</span><span class="s2">:</span>
+                <span class="s1">scale </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">scale_min </span><span class="s2">/ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">scale</span>
+            <span class="s4">elif </span><span class="s1">new_scale </span><span class="s2">&gt; </span><span class="s1">self</span><span class="s2">.</span><span class="s1">scale_max</span><span class="s2">:</span>
+                <span class="s1">scale </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">scale_max </span><span class="s2">/ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">scale</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">apply_transform</span><span class="s2">(</span><span class="s1">Matrix</span><span class="s2">().</span><span class="s1">scale</span><span class="s2">(</span><span class="s1">scale</span><span class="s2">, </span><span class="s1">scale</span><span class="s2">, </span><span class="s1">scale</span><span class="s2">),</span>
+                                 <span class="s1">anchor</span><span class="s2">=</span><span class="s1">anchor</span><span class="s2">)</span>
+            <span class="s1">changed </span><span class="s2">= </span><span class="s4">True</span>
+        <span class="s4">return </span><span class="s1">changed</span>
+
+    <span class="s4">def </span><span class="s1">_bring_to_front</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">touch</span><span class="s2">):</span>
+        <span class="s6"># auto bring to front</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">auto_bring_to_front </span><span class="s4">and </span><span class="s1">self</span><span class="s2">.</span><span class="s1">parent</span><span class="s2">:</span>
+            <span class="s1">parent </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">parent</span>
+            <span class="s4">if </span><span class="s1">parent</span><span class="s2">.</span><span class="s1">children</span><span class="s2">[</span><span class="s5">0</span><span class="s2">] </span><span class="s4">is </span><span class="s1">self</span><span class="s2">:</span>
+                <span class="s4">return</span>
+            <span class="s1">parent</span><span class="s2">.</span><span class="s1">remove_widget</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)</span>
+            <span class="s1">parent</span><span class="s2">.</span><span class="s1">add_widget</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_bring_to_front'</span><span class="s2">, </span><span class="s1">touch</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">on_motion</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">etype</span><span class="s2">, </span><span class="s1">me</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">me</span><span class="s2">.</span><span class="s1">type_id </span><span class="s4">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">motion_filter </span><span class="s4">and </span><span class="s3">'pos' </span><span class="s4">in </span><span class="s1">me</span><span class="s2">.</span><span class="s1">profile</span><span class="s2">:</span>
+            <span class="s1">me</span><span class="s2">.</span><span class="s1">push</span><span class="s2">()</span>
+            <span class="s1">me</span><span class="s2">.</span><span class="s1">apply_transform_2d</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">to_local</span><span class="s2">)</span>
+            <span class="s1">ret </span><span class="s2">= </span><span class="s1">super</span><span class="s2">().</span><span class="s1">on_motion</span><span class="s2">(</span><span class="s1">etype</span><span class="s2">, </span><span class="s1">me</span><span class="s2">)</span>
+            <span class="s1">me</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">()</span>
+            <span class="s4">return </span><span class="s1">ret</span>
+        <span class="s4">return </span><span class="s1">super</span><span class="s2">().</span><span class="s1">on_motion</span><span class="s2">(</span><span class="s1">etype</span><span class="s2">, </span><span class="s1">me</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">on_touch_down</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">touch</span><span class="s2">):</span>
+        <span class="s1">x</span><span class="s2">, </span><span class="s1">y </span><span class="s2">= </span><span class="s1">touch</span><span class="s2">.</span><span class="s1">x</span><span class="s2">, </span><span class="s1">touch</span><span class="s2">.</span><span class="s1">y</span>
+
+        <span class="s6"># if the touch isn't on the widget we do nothing</span>
+        <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">do_collide_after_children</span><span class="s2">:</span>
+            <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">collide_point</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">):</span>
+                <span class="s4">return False</span>
+
+        <span class="s6"># let the child widgets handle the event if they want</span>
+        <span class="s1">touch</span><span class="s2">.</span><span class="s1">push</span><span class="s2">()</span>
+        <span class="s1">touch</span><span class="s2">.</span><span class="s1">apply_transform_2d</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">to_local</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s1">super</span><span class="s2">(</span><span class="s1">Scatter</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">on_touch_down</span><span class="s2">(</span><span class="s1">touch</span><span class="s2">):</span>
+            <span class="s1">touch</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">()</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_bring_to_front</span><span class="s2">(</span><span class="s1">touch</span><span class="s2">)</span>
+            <span class="s4">return True</span>
+        <span class="s1">touch</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">()</span>
+
+        <span class="s6"># if our child didn't do anything, and if we don't have any active</span>
+        <span class="s6"># interaction control, then don't accept the touch.</span>
+        <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">do_translation_x </span><span class="s4">and </span><span class="s1">\</span>
+                <span class="s4">not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">do_translation_y </span><span class="s4">and </span><span class="s1">\</span>
+                <span class="s4">not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">do_rotation </span><span class="s4">and </span><span class="s1">\</span>
+                <span class="s4">not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">do_scale</span><span class="s2">:</span>
+            <span class="s4">return False</span>
+
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">do_collide_after_children</span><span class="s2">:</span>
+            <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">collide_point</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">):</span>
+                <span class="s4">return False</span>
+
+        <span class="s4">if </span><span class="s3">'multitouch_sim' </span><span class="s4">in </span><span class="s1">touch</span><span class="s2">.</span><span class="s1">profile</span><span class="s2">:</span>
+            <span class="s1">touch</span><span class="s2">.</span><span class="s1">multitouch_sim </span><span class="s2">= </span><span class="s4">True</span>
+        <span class="s6"># grab the touch so we get all it later move events for sure</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_bring_to_front</span><span class="s2">(</span><span class="s1">touch</span><span class="s2">)</span>
+        <span class="s1">touch</span><span class="s2">.</span><span class="s1">grab</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_touches</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">touch</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_last_touch_pos</span><span class="s2">[</span><span class="s1">touch</span><span class="s2">] = </span><span class="s1">touch</span><span class="s2">.</span><span class="s1">pos</span>
+
+        <span class="s4">return True</span>
+
+    <span class="s4">def </span><span class="s1">on_touch_move</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">touch</span><span class="s2">):</span>
+        <span class="s1">x</span><span class="s2">, </span><span class="s1">y </span><span class="s2">= </span><span class="s1">touch</span><span class="s2">.</span><span class="s1">x</span><span class="s2">, </span><span class="s1">touch</span><span class="s2">.</span><span class="s1">y</span>
+        <span class="s6"># let the child widgets handle the event if they want</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">collide_point</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">) </span><span class="s4">and not </span><span class="s1">touch</span><span class="s2">.</span><span class="s1">grab_current </span><span class="s2">== </span><span class="s1">self</span><span class="s2">:</span>
+            <span class="s1">touch</span><span class="s2">.</span><span class="s1">push</span><span class="s2">()</span>
+            <span class="s1">touch</span><span class="s2">.</span><span class="s1">apply_transform_2d</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">to_local</span><span class="s2">)</span>
+            <span class="s4">if </span><span class="s1">super</span><span class="s2">(</span><span class="s1">Scatter</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">on_touch_move</span><span class="s2">(</span><span class="s1">touch</span><span class="s2">):</span>
+                <span class="s1">touch</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">()</span>
+                <span class="s4">return True</span>
+            <span class="s1">touch</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">()</span>
+
+        <span class="s6"># rotate/scale/translate</span>
+        <span class="s4">if </span><span class="s1">touch </span><span class="s4">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_touches </span><span class="s4">and </span><span class="s1">touch</span><span class="s2">.</span><span class="s1">grab_current </span><span class="s2">== </span><span class="s1">self</span><span class="s2">:</span>
+            <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">transform_with_touch</span><span class="s2">(</span><span class="s1">touch</span><span class="s2">):</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_transform_with_touch'</span><span class="s2">, </span><span class="s1">touch</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_last_touch_pos</span><span class="s2">[</span><span class="s1">touch</span><span class="s2">] = </span><span class="s1">touch</span><span class="s2">.</span><span class="s1">pos</span>
+
+        <span class="s6"># stop propagating if its within our bounds</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">collide_point</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">):</span>
+            <span class="s4">return True</span>
+
+    <span class="s4">def </span><span class="s1">on_transform_with_touch</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">touch</span><span class="s2">):</span>
+        <span class="s0">''' 
+        Called when a touch event has transformed the scatter widget. 
+        By default this does nothing, but can be overridden by derived 
+        classes that need to react to transformations caused by user 
+        input. 
+ 
+        :Parameters: 
+            `touch`: 
+                The touch object which triggered the transformation. 
+ 
+        .. versionadded:: 1.8.0 
+        '''</span>
+        <span class="s4">pass</span>
+
+    <span class="s4">def </span><span class="s1">on_bring_to_front</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">touch</span><span class="s2">):</span>
+        <span class="s0">''' 
+        Called when a touch event causes the scatter to be brought to the 
+        front of the parent (only if :attr:`auto_bring_to_front` is True) 
+ 
+        :Parameters: 
+            `touch`: 
+                The touch object which brought the scatter to front. 
+ 
+        .. versionadded:: 1.9.0 
+        '''</span>
+        <span class="s4">pass</span>
+
+    <span class="s4">def </span><span class="s1">on_touch_up</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">touch</span><span class="s2">):</span>
+        <span class="s1">x</span><span class="s2">, </span><span class="s1">y </span><span class="s2">= </span><span class="s1">touch</span><span class="s2">.</span><span class="s1">x</span><span class="s2">, </span><span class="s1">touch</span><span class="s2">.</span><span class="s1">y</span>
+        <span class="s6"># if the touch isn't on the widget we do nothing, just try children</span>
+        <span class="s4">if not </span><span class="s1">touch</span><span class="s2">.</span><span class="s1">grab_current </span><span class="s2">== </span><span class="s1">self</span><span class="s2">:</span>
+            <span class="s1">touch</span><span class="s2">.</span><span class="s1">push</span><span class="s2">()</span>
+            <span class="s1">touch</span><span class="s2">.</span><span class="s1">apply_transform_2d</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">to_local</span><span class="s2">)</span>
+            <span class="s4">if </span><span class="s1">super</span><span class="s2">(</span><span class="s1">Scatter</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">on_touch_up</span><span class="s2">(</span><span class="s1">touch</span><span class="s2">):</span>
+                <span class="s1">touch</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">()</span>
+                <span class="s4">return True</span>
+            <span class="s1">touch</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">()</span>
+
+        <span class="s6"># remove it from our saved touches</span>
+        <span class="s4">if </span><span class="s1">touch </span><span class="s4">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_touches </span><span class="s4">and </span><span class="s1">touch</span><span class="s2">.</span><span class="s1">grab_state</span><span class="s2">:</span>
+            <span class="s1">touch</span><span class="s2">.</span><span class="s1">ungrab</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)</span>
+            <span class="s4">del </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_last_touch_pos</span><span class="s2">[</span><span class="s1">touch</span><span class="s2">]</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_touches</span><span class="s2">.</span><span class="s1">remove</span><span class="s2">(</span><span class="s1">touch</span><span class="s2">)</span>
+
+        <span class="s6"># stop propagating if its within our bounds</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">collide_point</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">):</span>
+            <span class="s4">return True</span>
+
+
+<span class="s4">class </span><span class="s1">ScatterPlane</span><span class="s2">(</span><span class="s1">Scatter</span><span class="s2">):</span>
+    <span class="s0">'''This is essentially an unbounded Scatter widget. It's a convenience 
+       class to make it easier to handle infinite planes. 
+    '''</span>
+
+    <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s3">'auto_bring_to_front' </span><span class="s4">not in </span><span class="s1">kwargs</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">auto_bring_to_front </span><span class="s2">= </span><span class="s4">False</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">ScatterPlane</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">(**</span><span class="s1">kwargs</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">collide_point</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">):</span>
+        <span class="s4">return True</span>
+</pre>
+</body>
+</html>

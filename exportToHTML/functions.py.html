@@ -1,0 +1,767 @@
+<html>
+<head>
+<title>functions.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #7a7e85;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+.s6 { color: #5f826b; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+functions.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">traceback</span>
+<span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">namedtuple</span><span class="s2">, </span><span class="s1">defaultdict</span>
+<span class="s0">import </span><span class="s1">itertools</span>
+<span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">import </span><span class="s1">textwrap</span>
+<span class="s0">from </span><span class="s1">shutil </span><span class="s0">import </span><span class="s1">get_terminal_size</span>
+
+<span class="s0">from </span><span class="s2">.</span><span class="s1">abstract </span><span class="s0">import </span><span class="s1">Callable</span><span class="s2">, </span><span class="s1">DTypeSpec</span><span class="s2">, </span><span class="s1">Dummy</span><span class="s2">, </span><span class="s1">Literal</span><span class="s2">, </span><span class="s1">Type</span><span class="s2">, </span><span class="s1">weakref</span>
+<span class="s0">from </span><span class="s2">.</span><span class="s1">common </span><span class="s0">import </span><span class="s1">Opaque</span>
+<span class="s0">from </span><span class="s2">.</span><span class="s1">misc </span><span class="s0">import </span><span class="s1">unliteral</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">errors</span><span class="s2">, </span><span class="s1">utils</span><span class="s2">, </span><span class="s1">types</span><span class="s2">, </span><span class="s1">config</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">typeconv </span><span class="s0">import </span><span class="s1">Conversion</span>
+
+<span class="s1">_logger </span><span class="s2">= </span><span class="s1">logging</span><span class="s2">.</span><span class="s1">getLogger</span><span class="s2">(</span><span class="s1">__name__</span><span class="s2">)</span>
+
+
+<span class="s3"># terminal color markup</span>
+<span class="s1">_termcolor </span><span class="s2">= </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">termcolor</span><span class="s2">()</span>
+
+<span class="s1">_FAILURE </span><span class="s2">= </span><span class="s1">namedtuple</span><span class="s2">(</span><span class="s4">'_FAILURE'</span><span class="s2">, </span><span class="s4">'template matched error literal'</span><span class="s2">)</span>
+
+<span class="s1">_termwidth </span><span class="s2">= </span><span class="s1">get_terminal_size</span><span class="s2">().</span><span class="s1">columns</span>
+
+
+<span class="s3"># pull out the lead line as unit tests often use this</span>
+<span class="s1">_header_lead </span><span class="s2">= </span><span class="s4">&quot;No implementation of function&quot;</span>
+<span class="s1">_header_template </span><span class="s2">= (</span><span class="s1">_header_lead </span><span class="s2">+ </span><span class="s4">&quot; {the_function} found for signature:</span><span class="s0">\n \n </span><span class="s4">&quot;</span>
+                    <span class="s4">&quot;&gt;&gt;&gt; {fname}({signature})</span><span class="s0">\n \n</span><span class="s4">There are {ncandidates} &quot;</span>
+                    <span class="s4">&quot;candidate implementations:&quot;</span><span class="s2">)</span>
+
+<span class="s1">_reason_template </span><span class="s2">= </span><span class="s4">&quot;&quot;&quot; 
+&quot; - Of which {nmatches} did not match due to:</span><span class="s0">\n</span>
+<span class="s4">&quot;&quot;&quot;</span>
+
+
+<span class="s0">def </span><span class="s1">_wrapper</span><span class="s2">(</span><span class="s1">tmp</span><span class="s2">, </span><span class="s1">indent</span><span class="s2">=</span><span class="s5">0</span><span class="s2">):</span>
+    <span class="s0">return </span><span class="s1">textwrap</span><span class="s2">.</span><span class="s1">indent</span><span class="s2">(</span><span class="s1">tmp</span><span class="s2">, </span><span class="s4">' ' </span><span class="s2">* </span><span class="s1">indent</span><span class="s2">, </span><span class="s0">lambda </span><span class="s1">line</span><span class="s2">: </span><span class="s0">True</span><span class="s2">)</span>
+
+
+<span class="s1">_overload_template </span><span class="s2">= (</span><span class="s4">&quot;- Of which {nduplicates} did not match due to:</span><span class="s0">\n</span><span class="s4">&quot;</span>
+                      <span class="s4">&quot;{kind} {inof} function '{function}': File: {file}: &quot;</span>
+                      <span class="s4">&quot;Line {line}.</span><span class="s0">\n  </span><span class="s4">With argument(s): '({args})':&quot;</span><span class="s2">)</span>
+
+
+<span class="s1">_err_reasons </span><span class="s2">= {</span><span class="s4">'specific_error'</span><span class="s2">: </span><span class="s4">&quot;Rejected as the implementation raised a &quot;</span>
+                                  <span class="s4">&quot;specific error:</span><span class="s0">\n</span><span class="s4">{}&quot;</span><span class="s2">}</span>
+
+
+<span class="s0">def </span><span class="s1">_bt_as_lines</span><span class="s2">(</span><span class="s1">bt</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    Converts a backtrace into a list of lines, squashes it a bit on the way. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">return </span><span class="s2">[</span><span class="s1">y </span><span class="s0">for </span><span class="s1">y </span><span class="s0">in </span><span class="s1">itertools</span><span class="s2">.</span><span class="s1">chain</span><span class="s2">(*[</span><span class="s1">x</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s4">'</span><span class="s0">\n</span><span class="s4">'</span><span class="s2">) </span><span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s1">bt</span><span class="s2">]) </span><span class="s0">if </span><span class="s1">y</span><span class="s2">]</span>
+
+
+<span class="s0">def </span><span class="s1">argsnkwargs_to_str</span><span class="s2">(</span><span class="s1">args</span><span class="s2">, </span><span class="s1">kwargs</span><span class="s2">):</span>
+    <span class="s1">buf </span><span class="s2">= [</span><span class="s1">str</span><span class="s2">(</span><span class="s1">a</span><span class="s2">) </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">args</span><span class="s2">)]</span>
+    <span class="s1">buf</span><span class="s2">.</span><span class="s1">extend</span><span class="s2">([</span><span class="s4">&quot;{}={}&quot;</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">k</span><span class="s2">, </span><span class="s1">v</span><span class="s2">) </span><span class="s0">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">items</span><span class="s2">()])</span>
+    <span class="s0">return </span><span class="s4">', '</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">buf</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">_ResolutionFailures</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot;Collect and format function resolution failures. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">function_type</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kwargs</span><span class="s2">, </span><span class="s1">depth</span><span class="s2">=</span><span class="s5">0</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_context </span><span class="s2">= </span><span class="s1">context</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_function_type </span><span class="s2">= </span><span class="s1">function_type</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_args </span><span class="s2">= </span><span class="s1">args</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_kwargs </span><span class="s2">= </span><span class="s1">kwargs</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_failures </span><span class="s2">= </span><span class="s1">defaultdict</span><span class="s2">(</span><span class="s1">list</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_depth </span><span class="s2">= </span><span class="s1">depth</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_max_depth </span><span class="s2">= </span><span class="s5">5</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_scale </span><span class="s2">= </span><span class="s5">2</span>
+
+    <span class="s0">def </span><span class="s1">__len__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_failures</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">add_error</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">calltemplate</span><span class="s2">, </span><span class="s1">matched</span><span class="s2">, </span><span class="s1">error</span><span class="s2">, </span><span class="s1">literal</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Args 
+        ---- 
+        calltemplate : CallTemplate 
+        error : Exception or str 
+            Error message 
+        &quot;&quot;&quot;</span>
+        <span class="s1">isexc </span><span class="s2">= </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">error</span><span class="s2">, </span><span class="s1">Exception</span><span class="s2">)</span>
+        <span class="s1">errclazz </span><span class="s2">= </span><span class="s4">'%s: ' </span><span class="s2">% </span><span class="s1">type</span><span class="s2">(</span><span class="s1">error</span><span class="s2">).</span><span class="s1">__name__ </span><span class="s0">if </span><span class="s1">isexc </span><span class="s0">else </span><span class="s4">''</span>
+
+        <span class="s1">key </span><span class="s2">= </span><span class="s4">&quot;{}{}&quot;</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">errclazz</span><span class="s2">, </span><span class="s1">str</span><span class="s2">(</span><span class="s1">error</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_failures</span><span class="s2">[</span><span class="s1">key</span><span class="s2">].</span><span class="s1">append</span><span class="s2">(</span><span class="s1">_FAILURE</span><span class="s2">(</span><span class="s1">calltemplate</span><span class="s2">, </span><span class="s1">matched</span><span class="s2">, </span><span class="s1">error</span><span class="s2">,</span>
+                                            <span class="s1">literal</span><span class="s2">))</span>
+
+    <span class="s0">def </span><span class="s1">format</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot;Return a formatted error message from all the gathered errors. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">indent </span><span class="s2">= </span><span class="s4">' ' </span><span class="s2">* </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_scale</span>
+        <span class="s1">argstr </span><span class="s2">= </span><span class="s1">argsnkwargs_to_str</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_args</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_kwargs</span><span class="s2">)</span>
+        <span class="s1">ncandidates </span><span class="s2">= </span><span class="s1">sum</span><span class="s2">([</span><span class="s1">len</span><span class="s2">(</span><span class="s1">x</span><span class="s2">) </span><span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_failures</span><span class="s2">.</span><span class="s1">values</span><span class="s2">()])</span>
+
+        <span class="s3"># sort out a display name for the function</span>
+        <span class="s1">tykey </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_function_type</span><span class="s2">.</span><span class="s1">typing_key</span>
+        <span class="s3"># most things have __name__</span>
+        <span class="s1">fname </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">tykey</span><span class="s2">, </span><span class="s4">'__name__'</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+        <span class="s1">is_external_fn_ptr </span><span class="s2">= </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_function_type</span><span class="s2">,</span>
+                                        <span class="s1">ExternalFunctionPointer</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">fname </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">is_external_fn_ptr</span><span class="s2">:</span>
+                <span class="s1">fname </span><span class="s2">= </span><span class="s4">&quot;ExternalFunctionPointer&quot;</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s1">fname </span><span class="s2">= </span><span class="s4">&quot;&lt;unknown function&gt;&quot;</span>
+
+        <span class="s1">msgbuf </span><span class="s2">= [</span><span class="s1">_header_template</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">the_function</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_function_type</span><span class="s2">,</span>
+                                          <span class="s1">fname</span><span class="s2">=</span><span class="s1">fname</span><span class="s2">,</span>
+                                          <span class="s1">signature</span><span class="s2">=</span><span class="s1">argstr</span><span class="s2">,</span>
+                                          <span class="s1">ncandidates</span><span class="s2">=</span><span class="s1">ncandidates</span><span class="s2">)]</span>
+        <span class="s1">nolitargs </span><span class="s2">= </span><span class="s1">tuple</span><span class="s2">([</span><span class="s1">unliteral</span><span class="s2">(</span><span class="s1">a</span><span class="s2">) </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_args</span><span class="s2">])</span>
+        <span class="s1">nolitkwargs </span><span class="s2">= {</span><span class="s1">k</span><span class="s2">: </span><span class="s1">unliteral</span><span class="s2">(</span><span class="s1">v</span><span class="s2">) </span><span class="s0">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_kwargs</span><span class="s2">.</span><span class="s1">items</span><span class="s2">()}</span>
+        <span class="s1">nolitargstr </span><span class="s2">= </span><span class="s1">argsnkwargs_to_str</span><span class="s2">(</span><span class="s1">nolitargs</span><span class="s2">, </span><span class="s1">nolitkwargs</span><span class="s2">)</span>
+
+        <span class="s3"># depth could potentially get massive, so limit it.</span>
+        <span class="s1">ldepth </span><span class="s2">= </span><span class="s1">min</span><span class="s2">(</span><span class="s1">max</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_depth</span><span class="s2">, </span><span class="s5">0</span><span class="s2">), </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_max_depth</span><span class="s2">)</span>
+
+        <span class="s0">def </span><span class="s1">template_info</span><span class="s2">(</span><span class="s1">tp</span><span class="s2">):</span>
+            <span class="s1">src_info </span><span class="s2">= </span><span class="s1">tp</span><span class="s2">.</span><span class="s1">get_template_info</span><span class="s2">()</span>
+            <span class="s1">unknown </span><span class="s2">= </span><span class="s4">&quot;unknown&quot;</span>
+            <span class="s1">source_name </span><span class="s2">= </span><span class="s1">src_info</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s4">'name'</span><span class="s2">, </span><span class="s1">unknown</span><span class="s2">)</span>
+            <span class="s1">source_file </span><span class="s2">= </span><span class="s1">src_info</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s4">'filename'</span><span class="s2">, </span><span class="s1">unknown</span><span class="s2">)</span>
+            <span class="s1">source_lines </span><span class="s2">= </span><span class="s1">src_info</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s4">'lines'</span><span class="s2">, </span><span class="s1">unknown</span><span class="s2">)</span>
+            <span class="s1">source_kind </span><span class="s2">= </span><span class="s1">src_info</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s4">'kind'</span><span class="s2">, </span><span class="s4">'Unknown template'</span><span class="s2">)</span>
+            <span class="s0">return </span><span class="s1">source_name</span><span class="s2">, </span><span class="s1">source_file</span><span class="s2">, </span><span class="s1">source_lines</span><span class="s2">, </span><span class="s1">source_kind</span>
+
+        <span class="s0">for </span><span class="s1">i</span><span class="s2">, (</span><span class="s1">k</span><span class="s2">, </span><span class="s1">err_list</span><span class="s2">) </span><span class="s0">in </span><span class="s1">enumerate</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_failures</span><span class="s2">.</span><span class="s1">items</span><span class="s2">()):</span>
+            <span class="s1">err </span><span class="s2">= </span><span class="s1">err_list</span><span class="s2">[</span><span class="s5">0</span><span class="s2">]</span>
+            <span class="s1">nduplicates </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">err_list</span><span class="s2">)</span>
+            <span class="s1">template</span><span class="s2">, </span><span class="s1">error </span><span class="s2">= </span><span class="s1">err</span><span class="s2">.</span><span class="s1">template</span><span class="s2">, </span><span class="s1">err</span><span class="s2">.</span><span class="s1">error</span>
+            <span class="s1">ifo </span><span class="s2">= </span><span class="s1">template_info</span><span class="s2">(</span><span class="s1">template</span><span class="s2">)</span>
+            <span class="s1">source_name</span><span class="s2">, </span><span class="s1">source_file</span><span class="s2">, </span><span class="s1">source_lines</span><span class="s2">, </span><span class="s1">source_kind </span><span class="s2">= </span><span class="s1">ifo</span>
+            <span class="s1">largstr </span><span class="s2">= </span><span class="s1">argstr </span><span class="s0">if </span><span class="s1">err</span><span class="s2">.</span><span class="s1">literal </span><span class="s0">else </span><span class="s1">nolitargstr</span>
+
+            <span class="s0">if </span><span class="s1">err</span><span class="s2">.</span><span class="s1">error </span><span class="s2">== </span><span class="s4">&quot;No match.&quot;</span><span class="s2">:</span>
+                <span class="s1">err_dict </span><span class="s2">= </span><span class="s1">defaultdict</span><span class="s2">(</span><span class="s1">set</span><span class="s2">)</span>
+                <span class="s0">for </span><span class="s1">errs </span><span class="s0">in </span><span class="s1">err_list</span><span class="s2">:</span>
+                    <span class="s1">err_dict</span><span class="s2">[</span><span class="s1">errs</span><span class="s2">.</span><span class="s1">template</span><span class="s2">].</span><span class="s1">add</span><span class="s2">(</span><span class="s1">errs</span><span class="s2">.</span><span class="s1">literal</span><span class="s2">)</span>
+                <span class="s3"># if there's just one template, and it's erroring on</span>
+                <span class="s3"># literal/nonliteral be specific</span>
+                <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">err_dict</span><span class="s2">) == </span><span class="s5">1</span><span class="s2">:</span>
+                    <span class="s1">template </span><span class="s2">= [</span><span class="s1">_ </span><span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">err_dict</span><span class="s2">.</span><span class="s1">keys</span><span class="s2">()][</span><span class="s5">0</span><span class="s2">]</span>
+                    <span class="s1">source_name</span><span class="s2">, </span><span class="s1">source_file</span><span class="s2">, </span><span class="s1">source_lines</span><span class="s2">, </span><span class="s1">source_kind </span><span class="s2">= </span><span class="s1">\</span>
+                        <span class="s1">template_info</span><span class="s2">(</span><span class="s1">template</span><span class="s2">)</span>
+                    <span class="s1">source_lines </span><span class="s2">= </span><span class="s1">source_lines</span><span class="s2">[</span><span class="s5">0</span><span class="s2">]</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s1">source_file </span><span class="s2">= </span><span class="s4">&quot;&lt;numerous&gt;&quot;</span>
+                    <span class="s1">source_lines </span><span class="s2">= </span><span class="s4">&quot;N/A&quot;</span>
+
+                <span class="s1">msgbuf</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">_termcolor</span><span class="s2">.</span><span class="s1">errmsg</span><span class="s2">(</span>
+                    <span class="s1">_wrapper</span><span class="s2">(</span><span class="s1">_overload_template</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">nduplicates</span><span class="s2">=</span><span class="s1">nduplicates</span><span class="s2">,</span>
+                                                       <span class="s1">kind</span><span class="s2">=</span><span class="s1">source_kind</span><span class="s2">.</span><span class="s1">title</span><span class="s2">(),</span>
+                                                       <span class="s1">function</span><span class="s2">=</span><span class="s1">fname</span><span class="s2">,</span>
+                                                       <span class="s1">inof</span><span class="s2">=</span><span class="s4">'of'</span><span class="s2">,</span>
+                                                       <span class="s1">file</span><span class="s2">=</span><span class="s1">source_file</span><span class="s2">,</span>
+                                                       <span class="s1">line</span><span class="s2">=</span><span class="s1">source_lines</span><span class="s2">,</span>
+                                                       <span class="s1">args</span><span class="s2">=</span><span class="s1">largstr</span><span class="s2">),</span>
+                             <span class="s1">ldepth </span><span class="s2">+ </span><span class="s5">1</span><span class="s2">)))</span>
+                <span class="s1">msgbuf</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">_termcolor</span><span class="s2">.</span><span class="s1">highlight</span><span class="s2">(</span><span class="s1">_wrapper</span><span class="s2">(</span><span class="s1">err</span><span class="s2">.</span><span class="s1">error</span><span class="s2">,</span>
+                                                            <span class="s1">ldepth </span><span class="s2">+ </span><span class="s5">2</span><span class="s2">)))</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s3"># There was at least one match in this failure class, but it</span>
+                <span class="s3"># failed for a specific reason try and report this.</span>
+                <span class="s1">msgbuf</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">_termcolor</span><span class="s2">.</span><span class="s1">errmsg</span><span class="s2">(</span>
+                    <span class="s1">_wrapper</span><span class="s2">(</span><span class="s1">_overload_template</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">nduplicates</span><span class="s2">=</span><span class="s1">nduplicates</span><span class="s2">,</span>
+                                                       <span class="s1">kind</span><span class="s2">=</span><span class="s1">source_kind</span><span class="s2">.</span><span class="s1">title</span><span class="s2">(),</span>
+                                                       <span class="s1">function</span><span class="s2">=</span><span class="s1">source_name</span><span class="s2">,</span>
+                                                       <span class="s1">inof</span><span class="s2">=</span><span class="s4">'in'</span><span class="s2">,</span>
+                                                       <span class="s1">file</span><span class="s2">=</span><span class="s1">source_file</span><span class="s2">,</span>
+                                                       <span class="s1">line</span><span class="s2">=</span><span class="s1">source_lines</span><span class="s2">[</span><span class="s5">0</span><span class="s2">],</span>
+                                                       <span class="s1">args</span><span class="s2">=</span><span class="s1">largstr</span><span class="s2">),</span>
+                             <span class="s1">ldepth </span><span class="s2">+ </span><span class="s5">1</span><span class="s2">)))</span>
+
+                <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">error</span><span class="s2">, </span><span class="s1">BaseException</span><span class="s2">):</span>
+                    <span class="s1">reason </span><span class="s2">= </span><span class="s1">indent </span><span class="s2">+ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">format_error</span><span class="s2">(</span><span class="s1">error</span><span class="s2">)</span>
+                    <span class="s1">errstr </span><span class="s2">= </span><span class="s1">_err_reasons</span><span class="s2">[</span><span class="s4">'specific_error'</span><span class="s2">].</span><span class="s1">format</span><span class="s2">(</span><span class="s1">reason</span><span class="s2">)</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s1">errstr </span><span class="s2">= </span><span class="s1">error</span>
+                <span class="s3"># if you are a developer, show the back traces</span>
+                <span class="s0">if </span><span class="s1">config</span><span class="s2">.</span><span class="s1">DEVELOPER_MODE</span><span class="s2">:</span>
+                    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">error</span><span class="s2">, </span><span class="s1">BaseException</span><span class="s2">):</span>
+                        <span class="s3"># if the error is an actual exception instance, trace it</span>
+                        <span class="s1">bt </span><span class="s2">= </span><span class="s1">traceback</span><span class="s2">.</span><span class="s1">format_exception</span><span class="s2">(</span><span class="s1">type</span><span class="s2">(</span><span class="s1">error</span><span class="s2">), </span><span class="s1">error</span><span class="s2">,</span>
+                                                        <span class="s1">error</span><span class="s2">.</span><span class="s1">__traceback__</span><span class="s2">)</span>
+                    <span class="s0">else</span><span class="s2">:</span>
+                        <span class="s1">bt </span><span class="s2">= [</span><span class="s4">&quot;&quot;</span><span class="s2">]</span>
+                    <span class="s1">bt_as_lines </span><span class="s2">= </span><span class="s1">_bt_as_lines</span><span class="s2">(</span><span class="s1">bt</span><span class="s2">)</span>
+                    <span class="s1">nd2indent </span><span class="s2">= </span><span class="s4">'</span><span class="s0">\n</span><span class="s4">{}'</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s5">2 </span><span class="s2">* </span><span class="s1">indent</span><span class="s2">)</span>
+                    <span class="s1">errstr </span><span class="s2">+= </span><span class="s1">_termcolor</span><span class="s2">.</span><span class="s1">reset</span><span class="s2">(</span><span class="s1">nd2indent </span><span class="s2">+</span>
+                                               <span class="s1">nd2indent</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">bt_as_lines</span><span class="s2">))</span>
+                <span class="s1">msgbuf</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">_termcolor</span><span class="s2">.</span><span class="s1">highlight</span><span class="s2">(</span><span class="s1">_wrapper</span><span class="s2">(</span><span class="s1">errstr</span><span class="s2">,</span>
+                                                            <span class="s1">ldepth </span><span class="s2">+ </span><span class="s5">2</span><span class="s2">)))</span>
+                <span class="s1">loc </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_loc</span><span class="s2">(</span><span class="s1">template</span><span class="s2">, </span><span class="s1">error</span><span class="s2">)</span>
+                <span class="s0">if </span><span class="s1">loc</span><span class="s2">:</span>
+                    <span class="s1">msgbuf</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s4">'{}raised from {}'</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">indent</span><span class="s2">, </span><span class="s1">loc</span><span class="s2">))</span>
+
+        <span class="s3"># the commented bit rewraps each block, may not be helpful?!</span>
+        <span class="s0">return </span><span class="s1">_wrapper</span><span class="s2">(</span><span class="s4">'</span><span class="s0">\n</span><span class="s4">'</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">msgbuf</span><span class="s2">) + </span><span class="s4">'</span><span class="s0">\n</span><span class="s4">'</span><span class="s2">) </span><span class="s3"># , self._scale * ldepth)</span>
+
+    <span class="s0">def </span><span class="s1">format_error</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">error</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot;Format error message or exception 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">error</span><span class="s2">, </span><span class="s1">Exception</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s4">'{}: {}'</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">type</span><span class="s2">(</span><span class="s1">error</span><span class="s2">).</span><span class="s1">__name__</span><span class="s2">, </span><span class="s1">error</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s4">'{}'</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">error</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">get_loc</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">classtemplate</span><span class="s2">, </span><span class="s1">error</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot;Get source location information from the error message. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">error</span><span class="s2">, </span><span class="s1">Exception</span><span class="s2">) </span><span class="s0">and </span><span class="s1">hasattr</span><span class="s2">(</span><span class="s1">error</span><span class="s2">, </span><span class="s4">'__traceback__'</span><span class="s2">):</span>
+            <span class="s3"># traceback is unavailable in py2</span>
+            <span class="s1">frame </span><span class="s2">= </span><span class="s1">traceback</span><span class="s2">.</span><span class="s1">extract_tb</span><span class="s2">(</span><span class="s1">error</span><span class="s2">.</span><span class="s1">__traceback__</span><span class="s2">)[-</span><span class="s5">1</span><span class="s2">]</span>
+            <span class="s0">return </span><span class="s4">&quot;{}:{}&quot;</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">frame</span><span class="s2">[</span><span class="s5">0</span><span class="s2">], </span><span class="s1">frame</span><span class="s2">[</span><span class="s5">1</span><span class="s2">])</span>
+
+    <span class="s0">def </span><span class="s1">raise_error</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">for </span><span class="s1">faillist </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_failures</span><span class="s2">.</span><span class="s1">values</span><span class="s2">():</span>
+            <span class="s0">for </span><span class="s1">fail </span><span class="s0">in </span><span class="s1">faillist</span><span class="s2">:</span>
+                <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">fail</span><span class="s2">.</span><span class="s1">error</span><span class="s2">, </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">ForceLiteralArg</span><span class="s2">):</span>
+                    <span class="s0">raise </span><span class="s1">fail</span><span class="s2">.</span><span class="s1">error</span>
+        <span class="s0">raise </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">TypingError</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">format</span><span class="s2">())</span>
+
+
+<span class="s0">def </span><span class="s1">_unlit_non_poison</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot;Apply unliteral(ty) and raise a TypingError if type is Poison. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">out </span><span class="s2">= </span><span class="s1">unliteral</span><span class="s2">(</span><span class="s1">ty</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">out</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Poison</span><span class="s2">):</span>
+        <span class="s1">m </span><span class="s2">= </span><span class="s4">f&quot;Poison type used in arguments; got </span><span class="s0">{</span><span class="s1">out</span><span class="s0">}</span><span class="s4">&quot;</span>
+        <span class="s0">raise </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">TypingError</span><span class="s2">(</span><span class="s1">m</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">out</span>
+
+
+<span class="s0">class </span><span class="s1">BaseFunction</span><span class="s2">(</span><span class="s1">Callable</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    Base type class for some function types. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">template</span><span class="s2">):</span>
+
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">template</span><span class="s2">, (</span><span class="s1">list</span><span class="s2">, </span><span class="s1">tuple</span><span class="s2">)):</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">templates </span><span class="s2">= </span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">template</span><span class="s2">)</span>
+            <span class="s1">keys </span><span class="s2">= </span><span class="s1">set</span><span class="s2">(</span><span class="s1">temp</span><span class="s2">.</span><span class="s1">key </span><span class="s0">for </span><span class="s1">temp </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">templates</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">keys</span><span class="s2">) != </span><span class="s5">1</span><span class="s2">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s4">&quot;incompatible templates: keys = %s&quot;</span>
+                                 <span class="s2">% (</span><span class="s1">keys</span><span class="s2">,))</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">typing_key</span><span class="s2">, = </span><span class="s1">keys</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">templates </span><span class="s2">= (</span><span class="s1">template</span><span class="s2">,)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">typing_key </span><span class="s2">= </span><span class="s1">template</span><span class="s2">.</span><span class="s1">key</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_impl_keys </span><span class="s2">= {}</span>
+        <span class="s1">name </span><span class="s2">= </span><span class="s4">&quot;%s(%s)&quot; </span><span class="s2">% (</span><span class="s1">self</span><span class="s2">.</span><span class="s1">__class__</span><span class="s2">.</span><span class="s1">__name__</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">typing_key</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_depth </span><span class="s2">= </span><span class="s5">0</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">BaseFunction</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">name</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">key</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">typing_key</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">templates</span>
+
+    <span class="s0">def </span><span class="s1">augment</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">other</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Augment this function type with the other function types' templates, 
+        so as to support more input types. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">type</span><span class="s2">(</span><span class="s1">other</span><span class="s2">) </span><span class="s0">is </span><span class="s1">type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">) </span><span class="s0">and </span><span class="s1">other</span><span class="s2">.</span><span class="s1">typing_key </span><span class="s2">== </span><span class="s1">self</span><span class="s2">.</span><span class="s1">typing_key</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">templates </span><span class="s2">+ </span><span class="s1">other</span><span class="s2">.</span><span class="s1">templates</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">get_impl_key</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Get the implementation key (used by the target context) for the 
+        given signature. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_impl_keys</span><span class="s2">[</span><span class="s1">sig</span><span class="s2">.</span><span class="s1">args</span><span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">get_call_type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+
+        <span class="s1">prefer_lit </span><span class="s2">= [</span><span class="s0">True</span><span class="s2">, </span><span class="s0">False</span><span class="s2">]    </span><span class="s3"># old behavior preferring literal</span>
+        <span class="s1">prefer_not </span><span class="s2">= [</span><span class="s0">False</span><span class="s2">, </span><span class="s0">True</span><span class="s2">]    </span><span class="s3"># new behavior preferring non-literal</span>
+        <span class="s1">failures </span><span class="s2">= </span><span class="s1">_ResolutionFailures</span><span class="s2">(</span><span class="s1">context</span><span class="s2">, </span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">,</span>
+                                       <span class="s1">depth</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_depth</span><span class="s2">)</span>
+
+        <span class="s3"># get the order in which to try templates</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">target_extension </span><span class="s0">import </span><span class="s1">get_local_target </span><span class="s3"># circular</span>
+        <span class="s1">target_hw </span><span class="s2">= </span><span class="s1">get_local_target</span><span class="s2">(</span><span class="s1">context</span><span class="s2">)</span>
+        <span class="s1">order </span><span class="s2">= </span><span class="s1">utils</span><span class="s2">.</span><span class="s1">order_by_target_specificity</span><span class="s2">(</span><span class="s1">target_hw</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">templates</span><span class="s2">,</span>
+                                                  <span class="s1">fnkey</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">key</span><span class="s2">[</span><span class="s5">0</span><span class="s2">])</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_depth </span><span class="s2">+= </span><span class="s5">1</span>
+
+        <span class="s0">for </span><span class="s1">temp_cls </span><span class="s0">in </span><span class="s1">order</span><span class="s2">:</span>
+            <span class="s1">temp </span><span class="s2">= </span><span class="s1">temp_cls</span><span class="s2">(</span><span class="s1">context</span><span class="s2">)</span>
+            <span class="s3"># The template can override the default and prefer literal args</span>
+            <span class="s1">choice </span><span class="s2">= </span><span class="s1">prefer_lit </span><span class="s0">if </span><span class="s1">temp</span><span class="s2">.</span><span class="s1">prefer_literal </span><span class="s0">else </span><span class="s1">prefer_not</span>
+            <span class="s0">for </span><span class="s1">uselit </span><span class="s0">in </span><span class="s1">choice</span><span class="s2">:</span>
+                <span class="s0">try</span><span class="s2">:</span>
+                    <span class="s0">if </span><span class="s1">uselit</span><span class="s2">:</span>
+                        <span class="s1">sig </span><span class="s2">= </span><span class="s1">temp</span><span class="s2">.</span><span class="s1">apply</span><span class="s2">(</span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">)</span>
+                    <span class="s0">else</span><span class="s2">:</span>
+                        <span class="s1">nolitargs </span><span class="s2">= </span><span class="s1">tuple</span><span class="s2">([</span><span class="s1">_unlit_non_poison</span><span class="s2">(</span><span class="s1">a</span><span class="s2">) </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">args</span><span class="s2">])</span>
+                        <span class="s1">nolitkws </span><span class="s2">= {</span><span class="s1">k</span><span class="s2">: </span><span class="s1">_unlit_non_poison</span><span class="s2">(</span><span class="s1">v</span><span class="s2">)</span>
+                                    <span class="s0">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">kws</span><span class="s2">.</span><span class="s1">items</span><span class="s2">()}</span>
+                        <span class="s1">sig </span><span class="s2">= </span><span class="s1">temp</span><span class="s2">.</span><span class="s1">apply</span><span class="s2">(</span><span class="s1">nolitargs</span><span class="s2">, </span><span class="s1">nolitkws</span><span class="s2">)</span>
+                <span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+                    <span class="s0">if </span><span class="s2">(</span><span class="s1">utils</span><span class="s2">.</span><span class="s1">use_new_style_errors</span><span class="s2">() </span><span class="s0">and not</span>
+                            <span class="s1">isinstance</span><span class="s2">(</span><span class="s1">e</span><span class="s2">, </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">NumbaError</span><span class="s2">)):</span>
+                        <span class="s0">raise </span><span class="s1">e</span>
+                    <span class="s0">else</span><span class="s2">:</span>
+                        <span class="s1">sig </span><span class="s2">= </span><span class="s0">None</span>
+                        <span class="s1">failures</span><span class="s2">.</span><span class="s1">add_error</span><span class="s2">(</span><span class="s1">temp</span><span class="s2">, </span><span class="s0">False</span><span class="s2">, </span><span class="s1">e</span><span class="s2">, </span><span class="s1">uselit</span><span class="s2">)</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s0">if </span><span class="s1">sig </span><span class="s0">is not None</span><span class="s2">:</span>
+                        <span class="s1">self</span><span class="s2">.</span><span class="s1">_impl_keys</span><span class="s2">[</span><span class="s1">sig</span><span class="s2">.</span><span class="s1">args</span><span class="s2">] = </span><span class="s1">temp</span><span class="s2">.</span><span class="s1">get_impl_key</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">)</span>
+                        <span class="s1">self</span><span class="s2">.</span><span class="s1">_depth </span><span class="s2">-= </span><span class="s5">1</span>
+                        <span class="s0">return </span><span class="s1">sig</span>
+                    <span class="s0">else</span><span class="s2">:</span>
+                        <span class="s1">registered_sigs </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">temp</span><span class="s2">, </span><span class="s4">'cases'</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+                        <span class="s0">if </span><span class="s1">registered_sigs </span><span class="s0">is not None</span><span class="s2">:</span>
+                            <span class="s1">msg </span><span class="s2">= </span><span class="s4">&quot;No match for registered cases:</span><span class="s0">\n</span><span class="s4">%s&quot;</span>
+                            <span class="s1">msg </span><span class="s2">= </span><span class="s1">msg </span><span class="s2">% </span><span class="s4">'</span><span class="s0">\n</span><span class="s4">'</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s4">&quot; * {}&quot;</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">x</span><span class="s2">) </span><span class="s0">for </span><span class="s1">x </span><span class="s0">in</span>
+                                                  <span class="s1">registered_sigs</span><span class="s2">)</span>
+                        <span class="s0">else</span><span class="s2">:</span>
+                            <span class="s1">msg </span><span class="s2">= </span><span class="s4">'No match.'</span>
+                        <span class="s1">failures</span><span class="s2">.</span><span class="s1">add_error</span><span class="s2">(</span><span class="s1">temp</span><span class="s2">, </span><span class="s0">True</span><span class="s2">, </span><span class="s1">msg</span><span class="s2">, </span><span class="s1">uselit</span><span class="s2">)</span>
+
+        <span class="s1">failures</span><span class="s2">.</span><span class="s1">raise_error</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">get_call_signatures</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">sigs </span><span class="s2">= []</span>
+        <span class="s1">is_param </span><span class="s2">= </span><span class="s0">False</span>
+        <span class="s0">for </span><span class="s1">temp </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">templates</span><span class="s2">:</span>
+            <span class="s1">sigs </span><span class="s2">+= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">temp</span><span class="s2">, </span><span class="s4">'cases'</span><span class="s2">, [])</span>
+            <span class="s1">is_param </span><span class="s2">= </span><span class="s1">is_param </span><span class="s0">or </span><span class="s1">hasattr</span><span class="s2">(</span><span class="s1">temp</span><span class="s2">, </span><span class="s4">'generic'</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">sigs</span><span class="s2">, </span><span class="s1">is_param</span>
+
+
+<span class="s0">class </span><span class="s1">Function</span><span class="s2">(</span><span class="s1">BaseFunction</span><span class="s2">, </span><span class="s1">Opaque</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    Type class for builtin functions implemented by Numba. 
+    &quot;&quot;&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">BoundFunction</span><span class="s2">(</span><span class="s1">Callable</span><span class="s2">, </span><span class="s1">Opaque</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    A function with an implicit first argument (denoted as *this* below). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">template</span><span class="s2">, </span><span class="s1">this</span><span class="s2">):</span>
+        <span class="s3"># Create a derived template with an attribute *this*</span>
+        <span class="s1">newcls </span><span class="s2">= </span><span class="s1">type</span><span class="s2">(</span><span class="s1">template</span><span class="s2">.</span><span class="s1">__name__ </span><span class="s2">+ </span><span class="s4">'.' </span><span class="s2">+ </span><span class="s1">str</span><span class="s2">(</span><span class="s1">this</span><span class="s2">), (</span><span class="s1">template</span><span class="s2">,),</span>
+                      <span class="s1">dict</span><span class="s2">(</span><span class="s1">this</span><span class="s2">=</span><span class="s1">this</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">template </span><span class="s2">= </span><span class="s1">newcls</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">typing_key </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">template</span><span class="s2">.</span><span class="s1">key</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">this </span><span class="s2">= </span><span class="s1">this</span>
+        <span class="s1">name </span><span class="s2">= </span><span class="s4">&quot;%s(%s for %s)&quot; </span><span class="s2">% (</span><span class="s1">self</span><span class="s2">.</span><span class="s1">__class__</span><span class="s2">.</span><span class="s1">__name__</span><span class="s2">,</span>
+                                  <span class="s1">self</span><span class="s2">.</span><span class="s1">typing_key</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">)</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">BoundFunction</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">name</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">unify</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">typingctx</span><span class="s2">, </span><span class="s1">other</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s2">(</span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">other</span><span class="s2">, </span><span class="s1">BoundFunction</span><span class="s2">) </span><span class="s0">and</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">typing_key </span><span class="s2">== </span><span class="s1">other</span><span class="s2">.</span><span class="s1">typing_key</span><span class="s2">):</span>
+            <span class="s1">this </span><span class="s2">= </span><span class="s1">typingctx</span><span class="s2">.</span><span class="s1">unify_pairs</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">, </span><span class="s1">other</span><span class="s2">.</span><span class="s1">this</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">this </span><span class="s0">is not None</span><span class="s2">:</span>
+                <span class="s3"># XXX is it right that both template instances are distinct?</span>
+                <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">this</span><span class="s2">=</span><span class="s1">this</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">copy</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">this</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">template</span><span class="s2">, </span><span class="s1">this</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">key</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># FIXME: With target-overload, the MethodTemplate can change depending</span>
+        <span class="s3">#        on the target.</span>
+        <span class="s1">unique_impl </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">template</span><span class="s2">, </span><span class="s4">&quot;_overload_func&quot;</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">typing_key</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">this</span><span class="s2">, </span><span class="s1">unique_impl</span>
+
+    <span class="s0">def </span><span class="s1">get_impl_key</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Get the implementation key (used by the target context) for the 
+        given signature. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">typing_key</span>
+
+    <span class="s0">def </span><span class="s1">get_call_type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s1">template </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">template</span><span class="s2">(</span><span class="s1">context</span><span class="s2">)</span>
+        <span class="s1">literal_e </span><span class="s2">= </span><span class="s0">None</span>
+        <span class="s1">nonliteral_e </span><span class="s2">= </span><span class="s0">None</span>
+        <span class="s1">out </span><span class="s2">= </span><span class="s0">None</span>
+
+        <span class="s1">choice </span><span class="s2">= [</span><span class="s0">True</span><span class="s2">, </span><span class="s0">False</span><span class="s2">] </span><span class="s0">if </span><span class="s1">template</span><span class="s2">.</span><span class="s1">prefer_literal </span><span class="s0">else </span><span class="s2">[</span><span class="s0">False</span><span class="s2">, </span><span class="s0">True</span><span class="s2">]</span>
+        <span class="s0">for </span><span class="s1">uselit </span><span class="s0">in </span><span class="s1">choice</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">uselit</span><span class="s2">:</span>
+                <span class="s3"># Try with Literal</span>
+                <span class="s0">try</span><span class="s2">:</span>
+                    <span class="s1">out </span><span class="s2">= </span><span class="s1">template</span><span class="s2">.</span><span class="s1">apply</span><span class="s2">(</span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">)</span>
+                <span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">exc</span><span class="s2">:</span>
+                    <span class="s0">if </span><span class="s2">(</span><span class="s1">utils</span><span class="s2">.</span><span class="s1">use_new_style_errors</span><span class="s2">() </span><span class="s0">and not</span>
+                            <span class="s1">isinstance</span><span class="s2">(</span><span class="s1">exc</span><span class="s2">, </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">NumbaError</span><span class="s2">)):</span>
+                        <span class="s0">raise </span><span class="s1">exc</span>
+                    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">exc</span><span class="s2">, </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">ForceLiteralArg</span><span class="s2">):</span>
+                        <span class="s0">raise </span><span class="s1">exc</span>
+                    <span class="s1">literal_e </span><span class="s2">= </span><span class="s1">exc</span>
+                    <span class="s1">out </span><span class="s2">= </span><span class="s0">None</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s0">break</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s3"># if the unliteral_args and unliteral_kws are the same as the</span>
+                <span class="s3"># literal ones, set up to not bother retrying</span>
+                <span class="s1">unliteral_args </span><span class="s2">= </span><span class="s1">tuple</span><span class="s2">([</span><span class="s1">_unlit_non_poison</span><span class="s2">(</span><span class="s1">a</span><span class="s2">) </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">args</span><span class="s2">])</span>
+                <span class="s1">unliteral_kws </span><span class="s2">= {</span><span class="s1">k</span><span class="s2">: </span><span class="s1">_unlit_non_poison</span><span class="s2">(</span><span class="s1">v</span><span class="s2">)</span>
+                                 <span class="s0">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">kws</span><span class="s2">.</span><span class="s1">items</span><span class="s2">()}</span>
+                <span class="s1">skip </span><span class="s2">= </span><span class="s1">unliteral_args </span><span class="s2">== </span><span class="s1">args </span><span class="s0">and </span><span class="s1">kws </span><span class="s2">== </span><span class="s1">unliteral_kws</span>
+
+                <span class="s3"># If the above template application failed and the non-literal</span>
+                <span class="s3"># args are different to the literal ones, try again with</span>
+                <span class="s3"># literals rewritten as non-literals</span>
+                <span class="s0">if not </span><span class="s1">skip </span><span class="s0">and </span><span class="s1">out </span><span class="s0">is None</span><span class="s2">:</span>
+                    <span class="s0">try</span><span class="s2">:</span>
+                        <span class="s1">out </span><span class="s2">= </span><span class="s1">template</span><span class="s2">.</span><span class="s1">apply</span><span class="s2">(</span><span class="s1">unliteral_args</span><span class="s2">, </span><span class="s1">unliteral_kws</span><span class="s2">)</span>
+                    <span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">exc</span><span class="s2">:</span>
+                        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">exc</span><span class="s2">, </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">ForceLiteralArg</span><span class="s2">):</span>
+                            <span class="s0">if </span><span class="s1">template</span><span class="s2">.</span><span class="s1">prefer_literal</span><span class="s2">:</span>
+                                <span class="s3"># For template that prefers literal types,</span>
+                                <span class="s3"># reaching here means that the literal types</span>
+                                <span class="s3"># have failed typing as well.</span>
+                                <span class="s0">raise </span><span class="s1">exc</span>
+                        <span class="s1">nonliteral_e </span><span class="s2">= </span><span class="s1">exc</span>
+                    <span class="s0">else</span><span class="s2">:</span>
+                        <span class="s0">break</span>
+
+        <span class="s0">if </span><span class="s1">out </span><span class="s0">is None and </span><span class="s2">(</span><span class="s1">nonliteral_e </span><span class="s0">is not None or </span><span class="s1">literal_e </span><span class="s0">is not None</span><span class="s2">):</span>
+            <span class="s1">header </span><span class="s2">= </span><span class="s4">&quot;- Resolution failure for {} arguments:</span><span class="s0">\n</span><span class="s4">{}</span><span class="s0">\n</span><span class="s4">&quot;</span>
+            <span class="s1">tmplt </span><span class="s2">= </span><span class="s1">_termcolor</span><span class="s2">.</span><span class="s1">highlight</span><span class="s2">(</span><span class="s1">header</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">config</span><span class="s2">.</span><span class="s1">DEVELOPER_MODE</span><span class="s2">:</span>
+                <span class="s1">indent </span><span class="s2">= </span><span class="s4">' ' </span><span class="s2">* </span><span class="s5">4</span>
+
+                <span class="s0">def </span><span class="s1">add_bt</span><span class="s2">(</span><span class="s1">error</span><span class="s2">):</span>
+                    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">error</span><span class="s2">, </span><span class="s1">BaseException</span><span class="s2">):</span>
+                        <span class="s3"># if the error is an actual exception instance, trace it</span>
+                        <span class="s1">bt </span><span class="s2">= </span><span class="s1">traceback</span><span class="s2">.</span><span class="s1">format_exception</span><span class="s2">(</span><span class="s1">type</span><span class="s2">(</span><span class="s1">error</span><span class="s2">), </span><span class="s1">error</span><span class="s2">,</span>
+                                                        <span class="s1">error</span><span class="s2">.</span><span class="s1">__traceback__</span><span class="s2">)</span>
+                    <span class="s0">else</span><span class="s2">:</span>
+                        <span class="s1">bt </span><span class="s2">= [</span><span class="s4">&quot;&quot;</span><span class="s2">]</span>
+                    <span class="s1">nd2indent </span><span class="s2">= </span><span class="s4">'</span><span class="s0">\n</span><span class="s4">{}'</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s5">2 </span><span class="s2">* </span><span class="s1">indent</span><span class="s2">)</span>
+                    <span class="s1">errstr </span><span class="s2">= </span><span class="s1">_termcolor</span><span class="s2">.</span><span class="s1">reset</span><span class="s2">(</span><span class="s1">nd2indent </span><span class="s2">+</span>
+                                              <span class="s1">nd2indent</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">_bt_as_lines</span><span class="s2">(</span><span class="s1">bt</span><span class="s2">)))</span>
+                    <span class="s0">return </span><span class="s1">_termcolor</span><span class="s2">.</span><span class="s1">reset</span><span class="s2">(</span><span class="s1">errstr</span><span class="s2">)</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s1">add_bt </span><span class="s2">= </span><span class="s0">lambda </span><span class="s1">X</span><span class="s2">: </span><span class="s4">''</span>
+
+            <span class="s0">def </span><span class="s1">nested_msg</span><span class="s2">(</span><span class="s1">literalness</span><span class="s2">, </span><span class="s1">e</span><span class="s2">):</span>
+                <span class="s1">estr </span><span class="s2">= </span><span class="s1">str</span><span class="s2">(</span><span class="s1">e</span><span class="s2">)</span>
+                <span class="s1">estr </span><span class="s2">= </span><span class="s1">estr </span><span class="s0">if </span><span class="s1">estr </span><span class="s0">else </span><span class="s2">(</span><span class="s1">str</span><span class="s2">(</span><span class="s1">repr</span><span class="s2">(</span><span class="s1">e</span><span class="s2">)) + </span><span class="s1">add_bt</span><span class="s2">(</span><span class="s1">e</span><span class="s2">))</span>
+                <span class="s1">new_e </span><span class="s2">= </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">TypingError</span><span class="s2">(</span><span class="s1">textwrap</span><span class="s2">.</span><span class="s1">dedent</span><span class="s2">(</span><span class="s1">estr</span><span class="s2">))</span>
+                <span class="s0">return </span><span class="s1">tmplt</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">literalness</span><span class="s2">, </span><span class="s1">str</span><span class="s2">(</span><span class="s1">new_e</span><span class="s2">))</span>
+
+            <span class="s0">raise </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">TypingError</span><span class="s2">(</span><span class="s1">nested_msg</span><span class="s2">(</span><span class="s4">'literal'</span><span class="s2">, </span><span class="s1">literal_e</span><span class="s2">) +</span>
+                                     <span class="s1">nested_msg</span><span class="s2">(</span><span class="s4">'non-literal'</span><span class="s2">, </span><span class="s1">nonliteral_e</span><span class="s2">))</span>
+        <span class="s0">return </span><span class="s1">out</span>
+
+    <span class="s0">def </span><span class="s1">get_call_signatures</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">sigs </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">template</span><span class="s2">, </span><span class="s4">'cases'</span><span class="s2">, [])</span>
+        <span class="s1">is_param </span><span class="s2">= </span><span class="s1">hasattr</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">template</span><span class="s2">, </span><span class="s4">'generic'</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">sigs</span><span class="s2">, </span><span class="s1">is_param</span>
+
+
+<span class="s0">class </span><span class="s1">MakeFunctionLiteral</span><span class="s2">(</span><span class="s1">Literal</span><span class="s2">, </span><span class="s1">Opaque</span><span class="s2">):</span>
+    <span class="s0">pass</span>
+
+
+<span class="s0">class </span><span class="s1">_PickleableWeakRef</span><span class="s2">(</span><span class="s1">weakref</span><span class="s2">.</span><span class="s1">ref</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    Allow a weakref to be pickled. 
+ 
+    Note that if the object referred to is not kept alive elsewhere in the 
+    pickle, the weakref will immediately expire after being constructed. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">def </span><span class="s1">__getnewargs__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">obj </span><span class="s2">= </span><span class="s1">self</span><span class="s2">()</span>
+        <span class="s0">if </span><span class="s1">obj </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ReferenceError</span><span class="s2">(</span><span class="s4">&quot;underlying object has vanished&quot;</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s2">(</span><span class="s1">obj</span><span class="s2">,)</span>
+
+
+<span class="s0">class </span><span class="s1">WeakType</span><span class="s2">(</span><span class="s1">Type</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    Base class for types parametered by a mortal object, to which only 
+    a weak reference is kept. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">_store_object</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">obj</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_wr </span><span class="s2">= </span><span class="s1">_PickleableWeakRef</span><span class="s2">(</span><span class="s1">obj</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">_get_object</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">obj </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_wr</span><span class="s2">()</span>
+        <span class="s0">if </span><span class="s1">obj </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ReferenceError</span><span class="s2">(</span><span class="s4">&quot;underlying object has vanished&quot;</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">obj</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">key</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_wr</span>
+
+    <span class="s0">def </span><span class="s1">__eq__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">other</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">) </span><span class="s0">is </span><span class="s1">type</span><span class="s2">(</span><span class="s1">other</span><span class="s2">):</span>
+            <span class="s1">obj </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_wr</span><span class="s2">()</span>
+            <span class="s0">return </span><span class="s1">obj </span><span class="s0">is not None and </span><span class="s1">obj </span><span class="s0">is </span><span class="s1">other</span><span class="s2">.</span><span class="s1">_wr</span><span class="s2">()</span>
+        <span class="s0">return </span><span class="s1">NotImplemented</span>
+
+    <span class="s0">def </span><span class="s1">__hash__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">Type</span><span class="s2">.</span><span class="s1">__hash__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">Dispatcher</span><span class="s2">(</span><span class="s1">WeakType</span><span class="s2">, </span><span class="s1">Callable</span><span class="s2">, </span><span class="s1">Dummy</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    Type class for @jit-compiled functions. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">dispatcher</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_store_object</span><span class="s2">(</span><span class="s1">dispatcher</span><span class="s2">)</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">Dispatcher</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">(</span><span class="s4">&quot;type(%s)&quot; </span><span class="s2">% </span><span class="s1">dispatcher</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">dump</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">tab</span><span class="s2">=</span><span class="s4">''</span><span class="s2">):</span>
+        <span class="s1">print</span><span class="s2">((</span><span class="s4">f'</span><span class="s0">{</span><span class="s1">tab</span><span class="s0">}</span><span class="s4">DUMP </span><span class="s0">{</span><span class="s1">type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">).</span><span class="s1">__name__</span><span class="s0">}</span><span class="s4">[code=</span><span class="s0">{</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_code</span><span class="s0">}</span><span class="s4">, '</span>
+               <span class="s4">f'name=</span><span class="s0">{</span><span class="s1">self</span><span class="s2">.</span><span class="s1">name</span><span class="s0">}</span><span class="s4">]'</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatcher</span><span class="s2">.</span><span class="s1">dump</span><span class="s2">(</span><span class="s1">tab</span><span class="s2">=</span><span class="s1">tab </span><span class="s2">+ </span><span class="s4">'  '</span><span class="s2">)</span>
+        <span class="s1">print</span><span class="s2">(</span><span class="s4">f'</span><span class="s0">{</span><span class="s1">tab</span><span class="s0">}</span><span class="s4">END DUMP'</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">get_call_type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Resolve a call to this dispatcher using the given argument types. 
+        A signature returned and it is ensured that a compiled specialization 
+        is available for it. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">template</span><span class="s2">, </span><span class="s1">pysig</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws </span><span class="s2">= </span><span class="s1">\</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatcher</span><span class="s2">.</span><span class="s1">get_call_template</span><span class="s2">(</span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">)</span>
+        <span class="s1">sig </span><span class="s2">= </span><span class="s1">template</span><span class="s2">(</span><span class="s1">context</span><span class="s2">).</span><span class="s1">apply</span><span class="s2">(</span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">sig</span><span class="s2">:</span>
+            <span class="s1">sig </span><span class="s2">= </span><span class="s1">sig</span><span class="s2">.</span><span class="s1">replace</span><span class="s2">(</span><span class="s1">pysig</span><span class="s2">=</span><span class="s1">pysig</span><span class="s2">)</span>
+            <span class="s0">return </span><span class="s1">sig</span>
+
+    <span class="s0">def </span><span class="s1">get_call_signatures</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">sigs </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">dispatcher</span><span class="s2">.</span><span class="s1">nopython_signatures</span>
+        <span class="s0">return </span><span class="s1">sigs</span><span class="s2">, </span><span class="s0">True</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">dispatcher</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        A strong reference to the underlying numba.dispatcher.Dispatcher 
+        instance. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_object</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">get_overload</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Get the compiled overload for the given signature. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">dispatcher</span><span class="s2">.</span><span class="s1">get_overload</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">.</span><span class="s1">args</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">get_impl_key</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Get the implementation key for the given signature. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_overload</span><span class="s2">(</span><span class="s1">sig</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">unify</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">other</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">utils</span><span class="s2">.</span><span class="s1">unified_function_type</span><span class="s2">((</span><span class="s1">self</span><span class="s2">, </span><span class="s1">other</span><span class="s2">), </span><span class="s1">require_precise</span><span class="s2">=</span><span class="s0">False</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">can_convert_to</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">typingctx</span><span class="s2">, </span><span class="s1">other</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">other</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">):</span>
+            <span class="s0">try</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatcher</span><span class="s2">.</span><span class="s1">get_compile_result</span><span class="s2">(</span><span class="s1">other</span><span class="s2">.</span><span class="s1">signature</span><span class="s2">)</span>
+            <span class="s0">except </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">NumbaError</span><span class="s2">:</span>
+                <span class="s0">return None</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s0">return </span><span class="s1">Conversion</span><span class="s2">.</span><span class="s1">safe</span>
+
+
+<span class="s0">class </span><span class="s1">ObjModeDispatcher</span><span class="s2">(</span><span class="s1">Dispatcher</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot;Dispatcher subclass that enters objectmode function. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">pass</span>
+
+
+<span class="s0">class </span><span class="s1">ExternalFunctionPointer</span><span class="s2">(</span><span class="s1">BaseFunction</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    A pointer to a native function (e.g. exported via ctypes or cffi). 
+    *get_pointer* is a Python function taking an object 
+    and returning the raw pointer value as an int. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">, </span><span class="s1">get_pointer</span><span class="s2">, </span><span class="s1">cconv</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">typing</span><span class="s2">.</span><span class="s1">templates </span><span class="s0">import </span><span class="s2">(</span><span class="s1">AbstractTemplate</span><span class="s2">,</span>
+                                                 <span class="s1">make_concrete_template</span><span class="s2">,</span>
+                                                 <span class="s1">signature</span><span class="s2">)</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">types </span><span class="s0">import </span><span class="s1">ffi_forced_object</span>
+        <span class="s0">if </span><span class="s1">sig</span><span class="s2">.</span><span class="s1">return_type </span><span class="s2">== </span><span class="s1">ffi_forced_object</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">TypeError</span><span class="s2">(</span><span class="s4">&quot;Cannot return a pyobject from a external function&quot;</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">sig </span><span class="s2">= </span><span class="s1">sig</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">requires_gil </span><span class="s2">= </span><span class="s1">any</span><span class="s2">(</span><span class="s1">a </span><span class="s2">== </span><span class="s1">ffi_forced_object </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sig</span><span class="s2">.</span><span class="s1">args</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">get_pointer </span><span class="s2">= </span><span class="s1">get_pointer</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">cconv </span><span class="s2">= </span><span class="s1">cconv</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">requires_gil</span><span class="s2">:</span>
+            <span class="s0">class </span><span class="s1">GilRequiringDefn</span><span class="s2">(</span><span class="s1">AbstractTemplate</span><span class="s2">):</span>
+                <span class="s1">key </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sig</span>
+
+                <span class="s0">def </span><span class="s1">generic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+                    <span class="s0">if </span><span class="s1">kws</span><span class="s2">:</span>
+                        <span class="s0">raise </span><span class="s1">TypeError</span><span class="s2">(</span><span class="s4">&quot;does not support keyword arguments&quot;</span><span class="s2">)</span>
+                    <span class="s3"># Make ffi_forced_object a bottom type to allow any type to</span>
+                    <span class="s3"># be casted to it. This is the only place that support</span>
+                    <span class="s3"># ffi_forced_object.</span>
+                    <span class="s1">coerced </span><span class="s2">= [</span><span class="s1">actual </span><span class="s0">if </span><span class="s1">formal </span><span class="s2">== </span><span class="s1">ffi_forced_object </span><span class="s0">else </span><span class="s1">formal</span>
+                               <span class="s0">for </span><span class="s1">actual</span><span class="s2">, </span><span class="s1">formal</span>
+                               <span class="s0">in </span><span class="s1">zip</span><span class="s2">(</span><span class="s1">args</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">key</span><span class="s2">.</span><span class="s1">args</span><span class="s2">)]</span>
+                    <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">key</span><span class="s2">.</span><span class="s1">return_type</span><span class="s2">, *</span><span class="s1">coerced</span><span class="s2">)</span>
+            <span class="s1">template </span><span class="s2">= </span><span class="s1">GilRequiringDefn</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">template </span><span class="s2">= </span><span class="s1">make_concrete_template</span><span class="s2">(</span><span class="s4">&quot;CFuncPtr&quot;</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">, [</span><span class="s1">sig</span><span class="s2">])</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">ExternalFunctionPointer</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">template</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">key</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sig</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">cconv</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_pointer</span>
+
+
+<span class="s0">class </span><span class="s1">ExternalFunction</span><span class="s2">(</span><span class="s1">Function</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    A named native function (resolvable by LLVM) accepting an explicit 
+    signature. For internal use only. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">symbol</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">):</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">typing</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">symbol </span><span class="s2">= </span><span class="s1">symbol</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">sig </span><span class="s2">= </span><span class="s1">sig</span>
+        <span class="s1">template </span><span class="s2">= </span><span class="s1">typing</span><span class="s2">.</span><span class="s1">make_concrete_template</span><span class="s2">(</span><span class="s1">symbol</span><span class="s2">, </span><span class="s1">symbol</span><span class="s2">, [</span><span class="s1">sig</span><span class="s2">])</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">ExternalFunction</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">template</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">key</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">symbol</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sig</span>
+
+
+<span class="s0">class </span><span class="s1">NamedTupleClass</span><span class="s2">(</span><span class="s1">Callable</span><span class="s2">, </span><span class="s1">Opaque</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    Type class for namedtuple classes. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">instance_class</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">instance_class </span><span class="s2">= </span><span class="s1">instance_class</span>
+        <span class="s1">name </span><span class="s2">= </span><span class="s4">&quot;class(%s)&quot; </span><span class="s2">% (</span><span class="s1">instance_class</span><span class="s2">)</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">NamedTupleClass</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">name</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">get_call_type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s3"># Overridden by the __call__ constructor resolution in</span>
+        <span class="s3"># typing.collections</span>
+        <span class="s0">return None</span>
+
+    <span class="s0">def </span><span class="s1">get_call_signatures</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s2">(), </span><span class="s0">True</span>
+
+    <span class="s0">def </span><span class="s1">get_impl_key</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">key</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">instance_class</span>
+
+
+<span class="s0">class </span><span class="s1">NumberClass</span><span class="s2">(</span><span class="s1">Callable</span><span class="s2">, </span><span class="s1">DTypeSpec</span><span class="s2">, </span><span class="s1">Opaque</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    Type class for number classes (e.g. &quot;np.float64&quot;). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">instance_type</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">instance_type </span><span class="s2">= </span><span class="s1">instance_type</span>
+        <span class="s1">name </span><span class="s2">= </span><span class="s4">&quot;class(%s)&quot; </span><span class="s2">% (</span><span class="s1">instance_type</span><span class="s2">,)</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">NumberClass</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">name</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">get_call_type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s3"># Overridden by the __call__ constructor resolution in typing.builtins</span>
+        <span class="s0">return None</span>
+
+    <span class="s0">def </span><span class="s1">get_call_signatures</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s2">(), </span><span class="s0">True</span>
+
+    <span class="s0">def </span><span class="s1">get_impl_key</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">sig</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">key</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">instance_type</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">dtype</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">instance_type</span>
+
+
+<span class="s1">_RecursiveCallOverloads </span><span class="s2">= </span><span class="s1">namedtuple</span><span class="s2">(</span><span class="s4">&quot;_RecursiveCallOverloads&quot;</span><span class="s2">, </span><span class="s4">&quot;qualname,uid&quot;</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">RecursiveCall</span><span class="s2">(</span><span class="s1">Opaque</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    Recursive call to a Dispatcher. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_overloads </span><span class="s2">= </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">dispatcher_type</span><span class="s2">):</span>
+        <span class="s0">assert </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">dispatcher_type</span><span class="s2">, </span><span class="s1">Dispatcher</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatcher_type </span><span class="s2">= </span><span class="s1">dispatcher_type</span>
+        <span class="s1">name </span><span class="s2">= </span><span class="s4">&quot;recursive(%s)&quot; </span><span class="s2">% (</span><span class="s1">dispatcher_type</span><span class="s2">,)</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">RecursiveCall</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">name</span><span class="s2">)</span>
+        <span class="s3"># Initializing for the first time</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_overloads </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_overloads </span><span class="s2">= {}</span>
+
+    <span class="s0">def </span><span class="s1">add_overloads</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">qualname</span><span class="s2">, </span><span class="s1">uid</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot;Add an overload of the function. 
+ 
+        Parameters 
+        ---------- 
+        args : 
+            argument types 
+        qualname : 
+            function qualifying name 
+        uid : 
+            unique id 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_overloads</span><span class="s2">[</span><span class="s1">args</span><span class="s2">] = </span><span class="s1">_RecursiveCallOverloads</span><span class="s2">(</span><span class="s1">qualname</span><span class="s2">, </span><span class="s1">uid</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">get_overloads</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot;Get the qualifying name and unique id for the overload given the 
+        argument types. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_overloads</span><span class="s2">[</span><span class="s1">args</span><span class="s2">]</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">key</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">dispatcher_type</span>
+</pre>
+</body>
+</html>

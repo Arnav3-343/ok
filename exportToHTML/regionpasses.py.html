@@ -1,0 +1,207 @@
+<html>
+<head>
+<title>regionpasses.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+regionpasses.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Define ``RegionVisitor`` and ``RegionTransformer`` classes to process SCFG 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">abc</span>
+<span class="s2">from </span><span class="s1">collections</span><span class="s3">.</span><span class="s1">abc </span><span class="s2">import </span><span class="s1">Mapping</span>
+<span class="s2">from </span><span class="s1">typing </span><span class="s2">import </span><span class="s1">TypeVar</span><span class="s3">, </span><span class="s1">Generic</span>
+
+<span class="s2">from </span><span class="s1">numba_rvsdg</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">datastructures</span><span class="s3">.</span><span class="s1">scfg </span><span class="s2">import </span><span class="s1">SCFG</span>
+<span class="s2">from </span><span class="s1">numba_rvsdg</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">datastructures</span><span class="s3">.</span><span class="s1">basic_block </span><span class="s2">import </span><span class="s3">(</span>
+    <span class="s1">BasicBlock</span><span class="s3">,</span>
+    <span class="s1">RegionBlock</span><span class="s3">,</span>
+<span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_compute_incoming_labels</span><span class="s3">(</span>
+    <span class="s1">graph</span><span class="s3">: </span><span class="s1">Mapping</span><span class="s3">[</span><span class="s1">str</span><span class="s3">, </span><span class="s1">BasicBlock</span><span class="s3">]</span>
+<span class="s3">) </span><span class="s1">-&gt; dict</span><span class="s3">[</span><span class="s1">str</span><span class="s3">, </span><span class="s1">set</span><span class="s3">[</span><span class="s1">str</span><span class="s3">]]:</span>
+    <span class="s0">&quot;&quot;&quot;Returns a backward mapping from destination blocks to their 
+    incoming blocks. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">jump_table</span><span class="s3">: </span><span class="s1">dict</span><span class="s3">[</span><span class="s1">str</span><span class="s3">, </span><span class="s1">set</span><span class="s3">[</span><span class="s1">str</span><span class="s3">]] = {}</span>
+    <span class="s1">blk</span><span class="s3">: </span><span class="s1">BasicBlock</span>
+    <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">graph</span><span class="s3">:</span>
+        <span class="s1">jump_table</span><span class="s3">[</span><span class="s1">k</span><span class="s3">] = </span><span class="s1">set</span><span class="s3">()</span>
+    <span class="s2">for </span><span class="s1">blk </span><span class="s2">in </span><span class="s1">graph</span><span class="s3">.</span><span class="s1">values</span><span class="s3">():</span>
+        <span class="s2">for </span><span class="s1">dst </span><span class="s2">in </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">jump_targets</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">dst </span><span class="s2">in </span><span class="s1">jump_table</span><span class="s3">:</span>
+                <span class="s1">jump_table</span><span class="s3">[</span><span class="s1">dst</span><span class="s3">].</span><span class="s1">add</span><span class="s3">(</span><span class="s1">blk</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">jump_table</span>
+
+
+<span class="s2">def </span><span class="s1">toposort_graph</span><span class="s3">(</span><span class="s1">graph</span><span class="s3">: </span><span class="s1">Mapping</span><span class="s3">[</span><span class="s1">str</span><span class="s3">, </span><span class="s1">BasicBlock</span><span class="s3">]) </span><span class="s1">-&gt; list</span><span class="s3">[</span><span class="s1">list</span><span class="s3">[</span><span class="s1">str</span><span class="s3">]]:</span>
+    <span class="s0">&quot;&quot;&quot;Topologically sort the graph returning a list. 
+ 
+    The first element of the list is the source and the last element is the 
+    sink, according to the direction of the dataflow. 
+    Each element of the list is a list of nodes at the same topological level. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">incoming_labels </span><span class="s3">= </span><span class="s1">_compute_incoming_labels</span><span class="s3">(</span><span class="s1">graph</span><span class="s3">)</span>
+    <span class="s1">visited</span><span class="s3">: </span><span class="s1">set</span><span class="s3">[</span><span class="s1">str</span><span class="s3">] = </span><span class="s1">set</span><span class="s3">()</span>
+    <span class="s1">toposorted</span><span class="s3">: </span><span class="s1">list</span><span class="s3">[</span><span class="s1">list</span><span class="s3">[</span><span class="s1">str</span><span class="s3">]] = []</span>
+    <span class="s4"># Toposort</span>
+    <span class="s2">while </span><span class="s1">incoming_labels</span><span class="s3">:</span>
+        <span class="s1">level </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">vs </span><span class="s2">in </span><span class="s1">incoming_labels</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+            <span class="s2">if not </span><span class="s3">(</span><span class="s1">vs </span><span class="s3">- </span><span class="s1">visited</span><span class="s3">):</span>
+                <span class="s4"># all incoming visited</span>
+                <span class="s1">level</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">k</span><span class="s3">)</span>
+        <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">level</span><span class="s3">:</span>
+            <span class="s2">del </span><span class="s1">incoming_labels</span><span class="s3">[</span><span class="s1">k</span><span class="s3">]</span>
+        <span class="s1">visited </span><span class="s3">|= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">level</span><span class="s3">)</span>
+        <span class="s1">toposorted</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">level</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">toposorted</span>
+
+
+<span class="s1">Tdata </span><span class="s3">= </span><span class="s1">TypeVar</span><span class="s3">(</span><span class="s5">&quot;Tdata&quot;</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">RegionVisitor</span><span class="s3">(</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">ABC</span><span class="s3">, </span><span class="s1">Generic</span><span class="s3">[</span><span class="s1">Tdata</span><span class="s3">]):</span>
+    <span class="s0">&quot;&quot;&quot;A non-mutating pass on a SCFG. 
+ 
+    When each block is visited, their parent must have be visited. 
+    The abstract ``visit_*`` methods will receive and will return any custom 
+    data of type Tdata. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">direction </span><span class="s3">= </span><span class="s5">&quot;forward&quot;</span>
+    <span class="s5">&quot;&quot;&quot;The direction in which the graph is processed. Default is set to 
+    &quot;forward&quot;. Set to &quot;backward&quot; for reverse dataflow direction. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">visit_block</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">block</span><span class="s3">: </span><span class="s1">BasicBlock</span><span class="s3">, </span><span class="s1">data</span><span class="s3">: </span><span class="s1">Tdata</span><span class="s3">) </span><span class="s1">-&gt; Tdata</span><span class="s3">:</span>
+        <span class="s0">&quot;&quot;&quot;This is called when a BasicBlock is visited.&quot;&quot;&quot;</span>
+        <span class="s2">pass</span>
+
+    <span class="s3">@</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">visit_loop</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">region</span><span class="s3">: </span><span class="s1">RegionBlock</span><span class="s3">, </span><span class="s1">data</span><span class="s3">: </span><span class="s1">Tdata</span><span class="s3">) </span><span class="s1">-&gt; Tdata</span><span class="s3">:</span>
+        <span class="s0">&quot;&quot;&quot;This is called when a loop region is visited. 
+ 
+        When overriding this method, remember to handle the merging path of 
+        ``data`` for the backedge back to the head of the loop. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">pass</span>
+
+    <span class="s3">@</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">visit_switch</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">region</span><span class="s3">: </span><span class="s1">RegionBlock</span><span class="s3">, </span><span class="s1">data</span><span class="s3">: </span><span class="s1">Tdata</span><span class="s3">) </span><span class="s1">-&gt; Tdata</span><span class="s3">:</span>
+        <span class="s0">&quot;&quot;&quot;This is called when a switch region is visited. 
+ 
+        When overriding this method, remember to handle the merging path of 
+        ``data`` for all the branches in the switch when joining into the tail. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">visit_linear</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">region</span><span class="s3">: </span><span class="s1">RegionBlock</span><span class="s3">, </span><span class="s1">data</span><span class="s3">: </span><span class="s1">Tdata</span><span class="s3">) </span><span class="s1">-&gt; Tdata</span><span class="s3">:</span>
+        <span class="s0">&quot;&quot;&quot;This is called when a linear region is visited.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">visit_graph</span><span class="s3">(</span><span class="s1">region</span><span class="s3">.</span><span class="s1">subregion</span><span class="s3">, </span><span class="s1">data</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">visit_graph</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">scfg</span><span class="s3">: </span><span class="s1">SCFG</span><span class="s3">, </span><span class="s1">data</span><span class="s3">: </span><span class="s1">Tdata</span><span class="s3">) </span><span class="s1">-&gt; Tdata</span><span class="s3">:</span>
+        <span class="s0">&quot;&quot;&quot;Process a SCFG in topological order.&quot;&quot;&quot;</span>
+        <span class="s1">toposorted </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_toposort_graph</span><span class="s3">(</span><span class="s1">scfg</span><span class="s3">)</span>
+        <span class="s1">label</span><span class="s3">: </span><span class="s1">str</span>
+        <span class="s2">for </span><span class="s1">lvl </span><span class="s2">in </span><span class="s1">toposorted</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">label </span><span class="s2">in </span><span class="s1">lvl</span><span class="s3">:</span>
+                <span class="s1">data </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">visit</span><span class="s3">(</span><span class="s1">scfg</span><span class="s3">[</span><span class="s1">label</span><span class="s3">], </span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">data</span>
+
+    <span class="s2">def </span><span class="s1">_toposort_graph</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">scfg</span><span class="s3">: </span><span class="s1">SCFG</span><span class="s3">):</span>
+        <span class="s1">toposorted </span><span class="s3">= </span><span class="s1">toposort_graph</span><span class="s3">(</span><span class="s1">scfg</span><span class="s3">.</span><span class="s1">graph</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">direction </span><span class="s3">== </span><span class="s5">&quot;forward&quot;</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">toposorted</span>
+        <span class="s2">elif </span><span class="s1">self</span><span class="s3">.</span><span class="s1">direction </span><span class="s3">== </span><span class="s5">&quot;backward&quot;</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">reversed</span><span class="s3">(</span><span class="s1">toposorted</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">assert False</span><span class="s3">, </span><span class="s5">f&quot;invalid direction </span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">direction</span><span class="s2">!r}</span><span class="s5">&quot;</span>
+
+    <span class="s2">def </span><span class="s1">visit</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">block</span><span class="s3">: </span><span class="s1">BasicBlock</span><span class="s3">, </span><span class="s1">data</span><span class="s3">: </span><span class="s1">Tdata</span><span class="s3">) </span><span class="s1">-&gt; Tdata</span><span class="s3">:</span>
+        <span class="s0">&quot;&quot;&quot;A generic visit method that will dispatch to the correct&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">block</span><span class="s3">, </span><span class="s1">RegionBlock</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">block</span><span class="s3">.</span><span class="s1">kind </span><span class="s3">== </span><span class="s5">&quot;loop&quot;</span><span class="s3">:</span>
+                <span class="s1">fn </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">visit_loop</span>
+            <span class="s2">elif </span><span class="s1">block</span><span class="s3">.</span><span class="s1">kind </span><span class="s3">== </span><span class="s5">&quot;switch&quot;</span><span class="s3">:</span>
+                <span class="s1">fn </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">visit_switch</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">NotImplementedError</span><span class="s3">(</span><span class="s5">&quot;unreachable&quot;</span><span class="s3">)</span>
+            <span class="s1">data </span><span class="s3">= </span><span class="s1">fn</span><span class="s3">(</span><span class="s1">block</span><span class="s3">, </span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">data </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">visit_block</span><span class="s3">(</span><span class="s1">block</span><span class="s3">, </span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">data</span>
+
+
+<span class="s2">class </span><span class="s1">RegionTransformer</span><span class="s3">(</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">ABC</span><span class="s3">, </span><span class="s1">Generic</span><span class="s3">[</span><span class="s1">Tdata</span><span class="s3">]):</span>
+    <span class="s0">&quot;&quot;&quot;A mutating pass over a SCFG. 
+ 
+    This class is similar to ``RegionVisitor`` but only a &quot;forward&quot; direction 
+    is supported. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">visit_block</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">, </span><span class="s1">parent</span><span class="s3">: </span><span class="s1">SCFG</span><span class="s3">, </span><span class="s1">block</span><span class="s3">: </span><span class="s1">BasicBlock</span><span class="s3">, </span><span class="s1">data</span><span class="s3">: </span><span class="s1">Tdata</span>
+    <span class="s3">) </span><span class="s1">-&gt; Tdata</span><span class="s3">:</span>
+        <span class="s2">pass</span>
+
+    <span class="s3">@</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">visit_loop</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">, </span><span class="s1">parent</span><span class="s3">: </span><span class="s1">SCFG</span><span class="s3">, </span><span class="s1">region</span><span class="s3">: </span><span class="s1">RegionBlock</span><span class="s3">, </span><span class="s1">data</span><span class="s3">: </span><span class="s1">Tdata</span>
+    <span class="s3">) </span><span class="s1">-&gt; Tdata</span><span class="s3">:</span>
+        <span class="s2">pass</span>
+
+    <span class="s3">@</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">visit_switch</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">, </span><span class="s1">parent</span><span class="s3">: </span><span class="s1">SCFG</span><span class="s3">, </span><span class="s1">region</span><span class="s3">: </span><span class="s1">RegionBlock</span><span class="s3">, </span><span class="s1">data</span><span class="s3">: </span><span class="s1">Tdata</span>
+    <span class="s3">) </span><span class="s1">-&gt; Tdata</span><span class="s3">:</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">visit_linear</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">, </span><span class="s1">parent</span><span class="s3">: </span><span class="s1">SCFG</span><span class="s3">, </span><span class="s1">region</span><span class="s3">: </span><span class="s1">RegionBlock</span><span class="s3">, </span><span class="s1">data</span><span class="s3">: </span><span class="s1">Tdata</span>
+    <span class="s3">) </span><span class="s1">-&gt; Tdata</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">visit_graph</span><span class="s3">(</span><span class="s1">region</span><span class="s3">.</span><span class="s1">subregion</span><span class="s3">, </span><span class="s1">data</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">visit_graph</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">scfg</span><span class="s3">: </span><span class="s1">SCFG</span><span class="s3">, </span><span class="s1">data</span><span class="s3">: </span><span class="s1">Tdata</span><span class="s3">) </span><span class="s1">-&gt; Tdata</span><span class="s3">:</span>
+        <span class="s1">toposorted </span><span class="s3">= </span><span class="s1">toposort_graph</span><span class="s3">(</span><span class="s1">scfg</span><span class="s3">.</span><span class="s1">graph</span><span class="s3">)</span>
+        <span class="s1">label</span><span class="s3">: </span><span class="s1">str</span>
+        <span class="s2">for </span><span class="s1">lvl </span><span class="s2">in </span><span class="s1">toposorted</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">label </span><span class="s2">in </span><span class="s1">lvl</span><span class="s3">:</span>
+                <span class="s1">data </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">visit</span><span class="s3">(</span><span class="s1">scfg</span><span class="s3">, </span><span class="s1">scfg</span><span class="s3">[</span><span class="s1">label</span><span class="s3">], </span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">data</span>
+
+    <span class="s2">def </span><span class="s1">visit</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">parent</span><span class="s3">: </span><span class="s1">SCFG</span><span class="s3">, </span><span class="s1">block</span><span class="s3">: </span><span class="s1">BasicBlock</span><span class="s3">, </span><span class="s1">data</span><span class="s3">: </span><span class="s1">Tdata</span><span class="s3">) </span><span class="s1">-&gt; Tdata</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">block</span><span class="s3">, </span><span class="s1">RegionBlock</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">block</span><span class="s3">.</span><span class="s1">kind </span><span class="s3">== </span><span class="s5">&quot;loop&quot;</span><span class="s3">:</span>
+                <span class="s1">fn </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">visit_loop</span>
+            <span class="s2">elif </span><span class="s1">block</span><span class="s3">.</span><span class="s1">kind </span><span class="s3">== </span><span class="s5">&quot;switch&quot;</span><span class="s3">:</span>
+                <span class="s1">fn </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">visit_switch</span>
+            <span class="s2">elif </span><span class="s1">block</span><span class="s3">.</span><span class="s1">kind </span><span class="s2">in </span><span class="s3">{</span><span class="s5">&quot;head&quot;</span><span class="s3">, </span><span class="s5">&quot;tail&quot;</span><span class="s3">, </span><span class="s5">&quot;branch&quot;</span><span class="s3">}:</span>
+                <span class="s1">fn </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">visit_linear</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">NotImplementedError</span><span class="s3">(</span>
+                    <span class="s5">&quot;unreachable&quot;</span><span class="s3">, </span><span class="s1">block</span><span class="s3">.</span><span class="s1">name</span><span class="s3">, </span><span class="s1">block</span><span class="s3">.</span><span class="s1">kind</span>
+                <span class="s3">)</span>
+            <span class="s1">data </span><span class="s3">= </span><span class="s1">fn</span><span class="s3">(</span><span class="s1">parent</span><span class="s3">, </span><span class="s1">block</span><span class="s3">, </span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">data </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">visit_block</span><span class="s3">(</span><span class="s1">parent</span><span class="s3">, </span><span class="s1">block</span><span class="s3">, </span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">data</span>
+</pre>
+</body>
+</html>

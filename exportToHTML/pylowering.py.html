@@ -1,0 +1,695 @@
+<html>
+<head>
+<title>pylowering.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+pylowering.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Lowering implementation for object mode. 
+&quot;&quot;&quot;</span>
+
+
+<span class="s2">import </span><span class="s1">builtins</span>
+<span class="s2">import </span><span class="s1">operator</span>
+<span class="s2">import </span><span class="s1">inspect</span>
+<span class="s2">from </span><span class="s1">functools </span><span class="s2">import </span><span class="s1">cached_property</span>
+
+<span class="s2">import </span><span class="s1">llvmlite</span><span class="s3">.</span><span class="s1">ir</span>
+
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">types</span><span class="s3">, </span><span class="s1">utils</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">, </span><span class="s1">generators</span><span class="s3">, </span><span class="s1">cgutils</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">errors </span><span class="s2">import </span><span class="s3">(</span><span class="s1">ForbiddenConstruct</span><span class="s3">, </span><span class="s1">LoweringError</span><span class="s3">,</span>
+                               <span class="s1">NumbaNotImplementedError</span><span class="s3">)</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">lowering </span><span class="s2">import </span><span class="s1">BaseLower</span>
+
+
+<span class="s4"># Issue #475: locals() is unsupported as calling it naively would give</span>
+<span class="s4"># out wrong results.</span>
+<span class="s1">_unsupported_builtins </span><span class="s3">= </span><span class="s1">set</span><span class="s3">([</span><span class="s1">locals</span><span class="s3">])</span>
+
+
+<span class="s2">class </span><span class="s1">_Undefined</span><span class="s3">:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A sentinel value for undefined variable created by Expr.undef. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s5">&quot;&lt;undefined&gt;&quot;</span>
+
+
+<span class="s1">_UNDEFINED </span><span class="s3">= </span><span class="s1">_Undefined</span><span class="s3">()</span>
+
+
+<span class="s4"># Map operators to methods on the PythonAPI class</span>
+<span class="s1">PYTHON_BINOPMAP </span><span class="s3">= {</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">add</span><span class="s3">: (</span><span class="s5">&quot;number_add&quot;</span><span class="s3">, </span><span class="s2">False</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">sub</span><span class="s3">: (</span><span class="s5">&quot;number_subtract&quot;</span><span class="s3">, </span><span class="s2">False</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">mul</span><span class="s3">: (</span><span class="s5">&quot;number_multiply&quot;</span><span class="s3">, </span><span class="s2">False</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">truediv</span><span class="s3">: (</span><span class="s5">&quot;number_truedivide&quot;</span><span class="s3">, </span><span class="s2">False</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">floordiv</span><span class="s3">: (</span><span class="s5">&quot;number_floordivide&quot;</span><span class="s3">, </span><span class="s2">False</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">mod</span><span class="s3">: (</span><span class="s5">&quot;number_remainder&quot;</span><span class="s3">, </span><span class="s2">False</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">pow</span><span class="s3">: (</span><span class="s5">&quot;number_power&quot;</span><span class="s3">, </span><span class="s2">False</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">lshift</span><span class="s3">: (</span><span class="s5">&quot;number_lshift&quot;</span><span class="s3">, </span><span class="s2">False</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">rshift</span><span class="s3">: (</span><span class="s5">&quot;number_rshift&quot;</span><span class="s3">, </span><span class="s2">False</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">and_</span><span class="s3">: (</span><span class="s5">&quot;number_and&quot;</span><span class="s3">, </span><span class="s2">False</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">or_</span><span class="s3">: (</span><span class="s5">&quot;number_or&quot;</span><span class="s3">, </span><span class="s2">False</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">xor</span><span class="s3">: (</span><span class="s5">&quot;number_xor&quot;</span><span class="s3">, </span><span class="s2">False</span><span class="s3">),</span>
+    <span class="s4"># inplace operators</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">iadd</span><span class="s3">: (</span><span class="s5">&quot;number_add&quot;</span><span class="s3">, </span><span class="s2">True</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">isub</span><span class="s3">: (</span><span class="s5">&quot;number_subtract&quot;</span><span class="s3">, </span><span class="s2">True</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">imul</span><span class="s3">: (</span><span class="s5">&quot;number_multiply&quot;</span><span class="s3">, </span><span class="s2">True</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">itruediv</span><span class="s3">: (</span><span class="s5">&quot;number_truedivide&quot;</span><span class="s3">, </span><span class="s2">True</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">ifloordiv</span><span class="s3">: (</span><span class="s5">&quot;number_floordivide&quot;</span><span class="s3">, </span><span class="s2">True</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">imod</span><span class="s3">: (</span><span class="s5">&quot;number_remainder&quot;</span><span class="s3">, </span><span class="s2">True</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">ipow</span><span class="s3">: (</span><span class="s5">&quot;number_power&quot;</span><span class="s3">, </span><span class="s2">True</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">ilshift</span><span class="s3">: (</span><span class="s5">&quot;number_lshift&quot;</span><span class="s3">, </span><span class="s2">True</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">irshift</span><span class="s3">: (</span><span class="s5">&quot;number_rshift&quot;</span><span class="s3">, </span><span class="s2">True</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">iand</span><span class="s3">: (</span><span class="s5">&quot;number_and&quot;</span><span class="s3">, </span><span class="s2">True</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">ior</span><span class="s3">: (</span><span class="s5">&quot;number_or&quot;</span><span class="s3">, </span><span class="s2">True</span><span class="s3">),</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">ixor</span><span class="s3">: (</span><span class="s5">&quot;number_xor&quot;</span><span class="s3">, </span><span class="s2">True</span><span class="s3">),</span>
+<span class="s3">}</span>
+
+<span class="s1">PYTHON_BINOPMAP</span><span class="s3">[</span><span class="s1">operator</span><span class="s3">.</span><span class="s1">matmul</span><span class="s3">] = (</span><span class="s5">&quot;number_matrix_multiply&quot;</span><span class="s3">, </span><span class="s2">False</span><span class="s3">)</span>
+<span class="s1">PYTHON_BINOPMAP</span><span class="s3">[</span><span class="s1">operator</span><span class="s3">.</span><span class="s1">imatmul</span><span class="s3">] = (</span><span class="s5">&quot;number_matrix_multiply&quot;</span><span class="s3">, </span><span class="s2">True</span><span class="s3">)</span>
+
+<span class="s1">PYTHON_COMPAREOPMAP </span><span class="s3">= {</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">eq</span><span class="s3">: </span><span class="s5">'=='</span><span class="s3">,</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">ne</span><span class="s3">: </span><span class="s5">'!='</span><span class="s3">,</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">lt</span><span class="s3">: </span><span class="s5">'&lt;'</span><span class="s3">,</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">le</span><span class="s3">: </span><span class="s5">'&lt;='</span><span class="s3">,</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">gt</span><span class="s3">: </span><span class="s5">'&gt;'</span><span class="s3">,</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">ge</span><span class="s3">: </span><span class="s5">'&gt;='</span><span class="s3">,</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">is_</span><span class="s3">: </span><span class="s5">'is'</span><span class="s3">,</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">is_not</span><span class="s3">: </span><span class="s5">'is not'</span><span class="s3">,</span>
+    <span class="s1">operator</span><span class="s3">.</span><span class="s1">contains</span><span class="s3">: </span><span class="s5">'in'</span>
+<span class="s3">}</span>
+
+<span class="s2">class </span><span class="s1">PyLower</span><span class="s3">(</span><span class="s1">BaseLower</span><span class="s3">):</span>
+
+    <span class="s1">GeneratorLower </span><span class="s3">= </span><span class="s1">generators</span><span class="s3">.</span><span class="s1">PyGeneratorLower</span>
+
+    <span class="s2">def </span><span class="s1">init</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s4"># Strings to be frozen into the Environment object</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_frozen_strings </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_live_vars </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">pre_lower</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">super</span><span class="s3">(</span><span class="s1">PyLower</span><span class="s3">, </span><span class="s1">self</span><span class="s3">).</span><span class="s1">pre_lower</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">init_pyapi</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">post_lower</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">pre_block</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">block</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">init_vars</span><span class="s3">(</span><span class="s1">block</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">lower_inst</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">inst</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Assign</span><span class="s3">):</span>
+            <span class="s1">value </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">lower_assign</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">storevar</span><span class="s3">(</span><span class="s1">value</span><span class="s3">, </span><span class="s1">inst</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">SetItem</span><span class="s3">):</span>
+            <span class="s1">target </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">index </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">index</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">value </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">ok </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">object_setitem</span><span class="s3">(</span><span class="s1">target</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">value</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_int_status</span><span class="s3">(</span><span class="s1">ok</span><span class="s3">)</span>
+
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">DelItem</span><span class="s3">):</span>
+            <span class="s1">target </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">index </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">index</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">ok </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">object_delitem</span><span class="s3">(</span><span class="s1">target</span><span class="s3">, </span><span class="s1">index</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_int_status</span><span class="s3">(</span><span class="s1">ok</span><span class="s3">)</span>
+
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">SetAttr</span><span class="s3">):</span>
+            <span class="s1">target </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">value </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">ok </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">object_setattr</span><span class="s3">(</span><span class="s1">target</span><span class="s3">,</span>
+                                           <span class="s1">self</span><span class="s3">.</span><span class="s1">_freeze_string</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">attr</span><span class="s3">),</span>
+                                           <span class="s1">value</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_int_status</span><span class="s3">(</span><span class="s1">ok</span><span class="s3">)</span>
+
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">DelAttr</span><span class="s3">):</span>
+            <span class="s1">target </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">ok </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">object_delattr</span><span class="s3">(</span><span class="s1">target</span><span class="s3">,</span>
+                                           <span class="s1">self</span><span class="s3">.</span><span class="s1">_freeze_string</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">attr</span><span class="s3">))</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_int_status</span><span class="s3">(</span><span class="s1">ok</span><span class="s3">)</span>
+
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">StoreMap</span><span class="s3">):</span>
+            <span class="s1">dct </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">dct</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">key </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">key</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">value </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">ok </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">dict_setitem</span><span class="s3">(</span><span class="s1">dct</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">value</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_int_status</span><span class="s3">(</span><span class="s1">ok</span><span class="s3">)</span>
+
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Return</span><span class="s3">):</span>
+            <span class="s1">retval </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">generator_info</span><span class="s3">:</span>
+                <span class="s4"># StopIteration</span>
+                <span class="s4"># We own a reference to the &quot;return value&quot;, but we</span>
+                <span class="s4"># don't return it.</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">decref</span><span class="s3">(</span><span class="s1">retval</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">genlower</span><span class="s3">.</span><span class="s1">return_from_generator</span><span class="s3">(</span><span class="s1">self</span><span class="s3">)</span>
+                <span class="s2">return</span>
+            <span class="s4"># No need to incref() as the reference is already owned.</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">call_conv</span><span class="s3">.</span><span class="s1">return_value</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">retval</span><span class="s3">)</span>
+
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Branch</span><span class="s3">):</span>
+            <span class="s1">cond </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">cond</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">cond</span><span class="s3">.</span><span class="s1">type </span><span class="s3">== </span><span class="s1">llvmlite</span><span class="s3">.</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">IntType</span><span class="s3">(</span><span class="s6">1</span><span class="s3">):</span>
+                <span class="s1">istrue </span><span class="s3">= </span><span class="s1">cond</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">istrue </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">object_istrue</span><span class="s3">(</span><span class="s1">cond</span><span class="s3">)</span>
+            <span class="s1">zero </span><span class="s3">= </span><span class="s1">llvmlite</span><span class="s3">.</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">istrue</span><span class="s3">.</span><span class="s1">type</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+            <span class="s1">pred </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">icmp_unsigned</span><span class="s3">(</span><span class="s5">'!='</span><span class="s3">, </span><span class="s1">istrue</span><span class="s3">, </span><span class="s1">zero</span><span class="s3">)</span>
+            <span class="s1">tr </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">blkmap</span><span class="s3">[</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">truebr</span><span class="s3">]</span>
+            <span class="s1">fl </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">blkmap</span><span class="s3">[</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">falsebr</span><span class="s3">]</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">cbranch</span><span class="s3">(</span><span class="s1">pred</span><span class="s3">, </span><span class="s1">tr</span><span class="s3">, </span><span class="s1">fl</span><span class="s3">)</span>
+
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Jump</span><span class="s3">):</span>
+            <span class="s1">target </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">blkmap</span><span class="s3">[</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">target</span><span class="s3">]</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">branch</span><span class="s3">(</span><span class="s1">target</span><span class="s3">)</span>
+
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Del</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">delvar</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">value</span><span class="s3">)</span>
+
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">PopBlock</span><span class="s3">):</span>
+            <span class="s2">pass </span><span class="s4"># this is just a marker</span>
+
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Raise</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">inst</span><span class="s3">.</span><span class="s1">exception </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">exc </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">exception</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+                <span class="s4"># A reference will be stolen by raise_object() and another</span>
+                <span class="s4"># by return_exception_raised().</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">incref</span><span class="s3">(</span><span class="s1">exc</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">exc </span><span class="s3">= </span><span class="s2">None</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">raise_object</span><span class="s3">(</span><span class="s1">exc</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">return_exception_raised</span><span class="s3">()</span>
+
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">msg </span><span class="s3">= </span><span class="s5">f&quot;</span><span class="s2">{</span><span class="s1">type</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">)</span><span class="s2">}</span><span class="s5">, </span><span class="s2">{</span><span class="s1">inst</span><span class="s2">}</span><span class="s5">&quot;</span>
+            <span class="s2">raise </span><span class="s1">NumbaNotImplementedError</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">cached_property</span>
+    <span class="s2">def </span><span class="s1">_omitted_typobj</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Return a `OmittedArg` type instance as a LLVM value suitable for 
+        testing at runtime. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">dispatcher </span><span class="s2">import </span><span class="s1">OmittedArg</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">unserialize</span><span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">serialize_object</span><span class="s3">(</span><span class="s1">OmittedArg</span><span class="s3">))</span>
+
+    <span class="s2">def </span><span class="s1">lower_assign</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">inst</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        The returned object must have a new reference 
+        &quot;&quot;&quot;</span>
+        <span class="s1">value </span><span class="s3">= </span><span class="s1">inst</span><span class="s3">.</span><span class="s1">value</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">value</span><span class="s3">, (</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Const</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">FreeVar</span><span class="s3">)):</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">lower_const</span><span class="s3">(</span><span class="s1">value</span><span class="s3">.</span><span class="s1">value</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">value</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Var</span><span class="s3">):</span>
+            <span class="s1">val </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">incref</span><span class="s3">(</span><span class="s1">val</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">val</span>
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">value</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Expr</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">lower_expr</span><span class="s3">(</span><span class="s1">value</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">value</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Global</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">lower_global</span><span class="s3">(</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">, </span><span class="s1">value</span><span class="s3">.</span><span class="s1">value</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">value</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Yield</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">lower_yield</span><span class="s3">(</span><span class="s1">value</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">value</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Arg</span><span class="s3">):</span>
+            <span class="s1">param </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">func_id</span><span class="s3">.</span><span class="s1">pysig</span><span class="s3">.</span><span class="s1">parameters</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+
+            <span class="s1">obj </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fnargs</span><span class="s3">[</span><span class="s1">value</span><span class="s3">.</span><span class="s1">index</span><span class="s3">]</span>
+            <span class="s1">slot </span><span class="s3">= </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">alloca_once_value</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">)</span>
+            <span class="s4"># Don't check for OmittedArg unless the argument has a default</span>
+            <span class="s2">if </span><span class="s1">param </span><span class="s2">is not None and </span><span class="s1">param</span><span class="s3">.</span><span class="s1">default </span><span class="s2">is </span><span class="s1">inspect</span><span class="s3">.</span><span class="s1">Parameter</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">incref</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">store</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">slot</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s4"># When an argument is omitted, the dispatcher hands it as</span>
+                <span class="s4"># _OmittedArg(&lt;default value&gt;)</span>
+                <span class="s1">typobj </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">get_type</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)</span>
+                <span class="s1">is_omitted </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">icmp_unsigned</span><span class="s3">(</span><span class="s5">'=='</span><span class="s3">, </span><span class="s1">typobj</span><span class="s3">,</span>
+                                                        <span class="s1">self</span><span class="s3">.</span><span class="s1">_omitted_typobj</span><span class="s3">)</span>
+                <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">if_else</span><span class="s3">(</span><span class="s1">is_omitted</span><span class="s3">, </span><span class="s1">likely</span><span class="s3">=</span><span class="s2">False</span><span class="s3">) </span><span class="s2">as </span><span class="s3">(</span><span class="s1">omitted</span><span class="s3">, </span><span class="s1">present</span><span class="s3">):</span>
+                    <span class="s2">with </span><span class="s1">present</span><span class="s3">:</span>
+                        <span class="s1">self</span><span class="s3">.</span><span class="s1">incref</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)</span>
+                        <span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">store</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">slot</span><span class="s3">)</span>
+                    <span class="s2">with </span><span class="s1">omitted</span><span class="s3">:</span>
+                        <span class="s4"># The argument is omitted =&gt; get the default value</span>
+                        <span class="s1">obj </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">object_getattr_string</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s5">'value'</span><span class="s3">)</span>
+                        <span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">store</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">slot</span><span class="s3">)</span>
+
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">slot</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">NotImplementedError</span><span class="s3">(</span><span class="s1">type</span><span class="s3">(</span><span class="s1">value</span><span class="s3">), </span><span class="s1">value</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">lower_yield</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">inst</span><span class="s3">):</span>
+        <span class="s1">yp </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">generator_info</span><span class="s3">.</span><span class="s1">yield_points</span><span class="s3">[</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">index</span><span class="s3">]</span>
+        <span class="s2">assert </span><span class="s1">yp</span><span class="s3">.</span><span class="s1">inst </span><span class="s2">is </span><span class="s1">inst</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">genlower</span><span class="s3">.</span><span class="s1">init_generator_state</span><span class="s3">(</span><span class="s1">self</span><span class="s3">)</span>
+
+        <span class="s4"># Save live vars in state</span>
+        <span class="s4"># We also need to save live vars that are del'ed afterwards.</span>
+        <span class="s1">y </span><span class="s3">= </span><span class="s1">generators</span><span class="s3">.</span><span class="s1">LowerYield</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">yp</span><span class="s3">, </span><span class="s1">yp</span><span class="s3">.</span><span class="s1">live_vars </span><span class="s3">| </span><span class="s1">yp</span><span class="s3">.</span><span class="s1">weak_live_vars</span><span class="s3">)</span>
+        <span class="s1">y</span><span class="s3">.</span><span class="s1">lower_yield_suspend</span><span class="s3">()</span>
+        <span class="s4"># Yield to caller</span>
+        <span class="s1">val </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s4"># Let caller own the reference</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">incref</span><span class="s3">(</span><span class="s1">val</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">call_conv</span><span class="s3">.</span><span class="s1">return_value</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">val</span><span class="s3">)</span>
+
+        <span class="s4"># Resumption point</span>
+        <span class="s1">y</span><span class="s3">.</span><span class="s1">lower_yield_resume</span><span class="s3">()</span>
+        <span class="s4"># None is returned by the yield expression</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">make_none</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">lower_binop</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">expr</span><span class="s3">, </span><span class="s1">op</span><span class="s3">, </span><span class="s1">inplace</span><span class="s3">=</span><span class="s2">False</span><span class="s3">):</span>
+        <span class="s1">lhs </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">lhs</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s1">rhs </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">rhs</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s2">assert not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">op</span><span class="s3">, </span><span class="s1">str</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">op </span><span class="s2">in </span><span class="s1">PYTHON_BINOPMAP</span><span class="s3">:</span>
+            <span class="s1">fname</span><span class="s3">, </span><span class="s1">inplace </span><span class="s3">= </span><span class="s1">PYTHON_BINOPMAP</span><span class="s3">[</span><span class="s1">op</span><span class="s3">]</span>
+            <span class="s1">fn </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">, </span><span class="s1">fname</span><span class="s3">)</span>
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">fn</span><span class="s3">(</span><span class="s1">lhs</span><span class="s3">, </span><span class="s1">rhs</span><span class="s3">, </span><span class="s1">inplace</span><span class="s3">=</span><span class="s1">inplace</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s4"># Assumed to be rich comparison</span>
+            <span class="s1">fn </span><span class="s3">= </span><span class="s1">PYTHON_COMPAREOPMAP</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">fn</span><span class="s3">, </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">fn</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">fn </span><span class="s3">== </span><span class="s5">'in'</span><span class="s3">:      </span><span class="s4"># 'in' and operator.contains have args reversed</span>
+                <span class="s1">lhs</span><span class="s3">, </span><span class="s1">rhs </span><span class="s3">= </span><span class="s1">rhs</span><span class="s3">, </span><span class="s1">lhs</span>
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">object_richcompare</span><span class="s3">(</span><span class="s1">lhs</span><span class="s3">, </span><span class="s1">rhs</span><span class="s3">, </span><span class="s1">fn</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_error</span><span class="s3">(</span><span class="s1">res</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">res</span>
+
+    <span class="s2">def </span><span class="s1">lower_expr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">expr</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'binop'</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">lower_binop</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">, </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">fn</span><span class="s3">, </span><span class="s1">inplace</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'inplace_binop'</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">lower_binop</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">, </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">fn</span><span class="s3">, </span><span class="s1">inplace</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'unary'</span><span class="s3">:</span>
+            <span class="s1">value </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">fn </span><span class="s3">== </span><span class="s1">operator</span><span class="s3">.</span><span class="s1">neg</span><span class="s3">:</span>
+                <span class="s1">res </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">number_negative</span><span class="s3">(</span><span class="s1">value</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">fn </span><span class="s3">== </span><span class="s1">operator</span><span class="s3">.</span><span class="s1">pos</span><span class="s3">:</span>
+                <span class="s1">res </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">number_positive</span><span class="s3">(</span><span class="s1">value</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">fn </span><span class="s3">== </span><span class="s1">operator</span><span class="s3">.</span><span class="s1">not_</span><span class="s3">:</span>
+                <span class="s1">res </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">object_not</span><span class="s3">(</span><span class="s1">value</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">check_int_status</span><span class="s3">(</span><span class="s1">res</span><span class="s3">)</span>
+                <span class="s1">res </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">bool_from_bool</span><span class="s3">(</span><span class="s1">res</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">fn </span><span class="s3">== </span><span class="s1">operator</span><span class="s3">.</span><span class="s1">invert</span><span class="s3">:</span>
+                <span class="s1">res </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">number_invert</span><span class="s3">(</span><span class="s1">value</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">NotImplementedError</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_error</span><span class="s3">(</span><span class="s1">res</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">res</span>
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'call'</span><span class="s3">:</span>
+            <span class="s1">argvals </span><span class="s3">= [</span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">a</span><span class="s3">.</span><span class="s1">name</span><span class="s3">) </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">args</span><span class="s3">]</span>
+            <span class="s1">fn </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">func</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">args </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">tuple_pack</span><span class="s3">(</span><span class="s1">argvals</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">vararg</span><span class="s3">:</span>
+                <span class="s4"># Expand *args</span>
+                <span class="s1">varargs </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">sequence_tuple</span><span class="s3">(</span>
+                                <span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">vararg</span><span class="s3">.</span><span class="s1">name</span><span class="s3">))</span>
+                <span class="s1">new_args </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">sequence_concat</span><span class="s3">(</span><span class="s1">args</span><span class="s3">, </span><span class="s1">varargs</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">decref</span><span class="s3">(</span><span class="s1">varargs</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">decref</span><span class="s3">(</span><span class="s1">args</span><span class="s3">)</span>
+                <span class="s1">args </span><span class="s3">= </span><span class="s1">new_args</span>
+            <span class="s2">if not </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">kws</span><span class="s3">:</span>
+                <span class="s4"># No named arguments</span>
+                <span class="s1">ret </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">call</span><span class="s3">(</span><span class="s1">fn</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s4"># Named arguments</span>
+                <span class="s1">keyvalues </span><span class="s3">= [(</span><span class="s1">k</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">v</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)) </span><span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">kws</span><span class="s3">]</span>
+                <span class="s1">kws </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">dict_pack</span><span class="s3">(</span><span class="s1">keyvalues</span><span class="s3">)</span>
+                <span class="s1">ret </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">call</span><span class="s3">(</span><span class="s1">fn</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">kws</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">decref</span><span class="s3">(</span><span class="s1">kws</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">decref</span><span class="s3">(</span><span class="s1">args</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_error</span><span class="s3">(</span><span class="s1">ret</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">ret</span>
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'getattr'</span><span class="s3">:</span>
+            <span class="s1">obj </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">object_getattr</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_freeze_string</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">attr</span><span class="s3">))</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_error</span><span class="s3">(</span><span class="s1">res</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">res</span>
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'build_tuple'</span><span class="s3">:</span>
+            <span class="s1">items </span><span class="s3">= [</span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">it</span><span class="s3">.</span><span class="s1">name</span><span class="s3">) </span><span class="s2">for </span><span class="s1">it </span><span class="s2">in </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">items</span><span class="s3">]</span>
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">tuple_pack</span><span class="s3">(</span><span class="s1">items</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_error</span><span class="s3">(</span><span class="s1">res</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">res</span>
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'build_list'</span><span class="s3">:</span>
+            <span class="s1">items </span><span class="s3">= [</span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">it</span><span class="s3">.</span><span class="s1">name</span><span class="s3">) </span><span class="s2">for </span><span class="s1">it </span><span class="s2">in </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">items</span><span class="s3">]</span>
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">list_pack</span><span class="s3">(</span><span class="s1">items</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_error</span><span class="s3">(</span><span class="s1">res</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">res</span>
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'build_map'</span><span class="s3">:</span>
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">dict_new</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">size</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_error</span><span class="s3">(</span><span class="s1">res</span><span class="s3">)</span>
+            <span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">items</span><span class="s3">:</span>
+                <span class="s1">key </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">k</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+                <span class="s1">value </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">v</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+                <span class="s1">ok </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">dict_setitem</span><span class="s3">(</span><span class="s1">res</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">value</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">check_int_status</span><span class="s3">(</span><span class="s1">ok</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">res</span>
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'build_set'</span><span class="s3">:</span>
+            <span class="s1">items </span><span class="s3">= [</span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">it</span><span class="s3">.</span><span class="s1">name</span><span class="s3">) </span><span class="s2">for </span><span class="s1">it </span><span class="s2">in </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">items</span><span class="s3">]</span>
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">set_new</span><span class="s3">()</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_error</span><span class="s3">(</span><span class="s1">res</span><span class="s3">)</span>
+            <span class="s2">for </span><span class="s1">it </span><span class="s2">in </span><span class="s1">items</span><span class="s3">:</span>
+                <span class="s1">ok </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">set_add</span><span class="s3">(</span><span class="s1">res</span><span class="s3">, </span><span class="s1">it</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">check_int_status</span><span class="s3">(</span><span class="s1">ok</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">res</span>
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'getiter'</span><span class="s3">:</span>
+            <span class="s1">obj </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">object_getiter</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_error</span><span class="s3">(</span><span class="s1">res</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">res</span>
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'iternext'</span><span class="s3">:</span>
+            <span class="s1">iterobj </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">item </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">iter_next</span><span class="s3">(</span><span class="s1">iterobj</span><span class="s3">)</span>
+            <span class="s1">is_valid </span><span class="s3">= </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">is_not_null</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">item</span><span class="s3">)</span>
+            <span class="s1">pair </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">tuple_new</span><span class="s3">(</span><span class="s6">2</span><span class="s3">)</span>
+            <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">if_else</span><span class="s3">(</span><span class="s1">is_valid</span><span class="s3">) </span><span class="s2">as </span><span class="s3">(</span><span class="s1">then</span><span class="s3">, </span><span class="s1">otherwise</span><span class="s3">):</span>
+                <span class="s2">with </span><span class="s1">then</span><span class="s3">:</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">tuple_setitem</span><span class="s3">(</span><span class="s1">pair</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s1">item</span><span class="s3">)</span>
+                <span class="s2">with </span><span class="s1">otherwise</span><span class="s3">:</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">check_occurred</span><span class="s3">()</span>
+                    <span class="s4"># Make the tuple valid by inserting None as dummy</span>
+                    <span class="s4"># iteration &quot;result&quot; (it will be ignored).</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">tuple_setitem</span><span class="s3">(</span><span class="s1">pair</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">make_none</span><span class="s3">())</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">tuple_setitem</span><span class="s3">(</span><span class="s1">pair</span><span class="s3">, </span><span class="s6">1</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">bool_from_bool</span><span class="s3">(</span><span class="s1">is_valid</span><span class="s3">))</span>
+            <span class="s2">return </span><span class="s1">pair</span>
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'pair_first'</span><span class="s3">:</span>
+            <span class="s1">pair </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">first </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">tuple_getitem</span><span class="s3">(</span><span class="s1">pair</span><span class="s3">, </span><span class="s6">0</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">incref</span><span class="s3">(</span><span class="s1">first</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">first</span>
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'pair_second'</span><span class="s3">:</span>
+            <span class="s1">pair </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">second </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">tuple_getitem</span><span class="s3">(</span><span class="s1">pair</span><span class="s3">, </span><span class="s6">1</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">incref</span><span class="s3">(</span><span class="s1">second</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">second</span>
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'exhaust_iter'</span><span class="s3">:</span>
+            <span class="s1">iterobj </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">tup </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">sequence_tuple</span><span class="s3">(</span><span class="s1">iterobj</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_error</span><span class="s3">(</span><span class="s1">tup</span><span class="s3">)</span>
+            <span class="s4"># Check tuple size is as expected</span>
+            <span class="s1">tup_size </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">tuple_size</span><span class="s3">(</span><span class="s1">tup</span><span class="s3">)</span>
+            <span class="s1">expected_size </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">get_constant</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">, </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">count</span><span class="s3">)</span>
+            <span class="s1">has_wrong_size </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">icmp_unsigned</span><span class="s3">(</span><span class="s5">'!='</span><span class="s3">,</span>
+                                               <span class="s1">tup_size</span><span class="s3">, </span><span class="s1">expected_size</span><span class="s3">)</span>
+            <span class="s2">with </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">if_unlikely</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">has_wrong_size</span><span class="s3">):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">return_exception</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">tup</span>
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'getitem'</span><span class="s3">:</span>
+            <span class="s1">value </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">index </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">index</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">object_getitem</span><span class="s3">(</span><span class="s1">value</span><span class="s3">, </span><span class="s1">index</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_error</span><span class="s3">(</span><span class="s1">res</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">res</span>
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'static_getitem'</span><span class="s3">:</span>
+            <span class="s1">value </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">index </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">get_constant</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">, </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">index</span><span class="s3">)</span>
+            <span class="s1">indexobj </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">long_from_ssize_t</span><span class="s3">(</span><span class="s1">index</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_error</span><span class="s3">(</span><span class="s1">indexobj</span><span class="s3">)</span>
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">object_getitem</span><span class="s3">(</span><span class="s1">value</span><span class="s3">, </span><span class="s1">indexobj</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">decref</span><span class="s3">(</span><span class="s1">indexobj</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_error</span><span class="s3">(</span><span class="s1">res</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">res</span>
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'getslice'</span><span class="s3">:</span>
+            <span class="s1">target </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">start </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">start</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">stop </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">stop</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+
+            <span class="s1">slicefn </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_builtin_obj</span><span class="s3">(</span><span class="s5">&quot;slice&quot;</span><span class="s3">)</span>
+            <span class="s1">sliceobj </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">call_function_objargs</span><span class="s3">(</span><span class="s1">slicefn</span><span class="s3">, (</span><span class="s1">start</span><span class="s3">, </span><span class="s1">stop</span><span class="s3">))</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">decref</span><span class="s3">(</span><span class="s1">slicefn</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_error</span><span class="s3">(</span><span class="s1">sliceobj</span><span class="s3">)</span>
+
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">object_getitem</span><span class="s3">(</span><span class="s1">target</span><span class="s3">, </span><span class="s1">sliceobj</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">check_error</span><span class="s3">(</span><span class="s1">res</span><span class="s3">)</span>
+
+            <span class="s2">return </span><span class="s1">res</span>
+
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'cast'</span><span class="s3">:</span>
+            <span class="s1">val </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">incref</span><span class="s3">(</span><span class="s1">val</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">val</span>
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'phi'</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">LoweringError</span><span class="s3">(</span><span class="s5">&quot;PHI not stripped&quot;</span><span class="s3">)</span>
+
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'null'</span><span class="s3">:</span>
+            <span class="s4"># Make null value</span>
+            <span class="s2">return </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">get_null_value</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">pyobj</span><span class="s3">)</span>
+
+        <span class="s2">elif </span><span class="s1">expr</span><span class="s3">.</span><span class="s1">op </span><span class="s3">== </span><span class="s5">'undef'</span><span class="s3">:</span>
+            <span class="s4"># Use a sentinel value for undefined variable</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">lower_const</span><span class="s3">(</span><span class="s1">_UNDEFINED</span><span class="s3">)</span>
+
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">NotImplementedError</span><span class="s3">(</span><span class="s1">expr</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">lower_const</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">const</span><span class="s3">):</span>
+        <span class="s4"># All constants are frozen inside the environment</span>
+        <span class="s1">index </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">env_manager</span><span class="s3">.</span><span class="s1">add_const</span><span class="s3">(</span><span class="s1">const</span><span class="s3">)</span>
+        <span class="s1">ret </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">env_manager</span><span class="s3">.</span><span class="s1">read_const</span><span class="s3">(</span><span class="s1">index</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">check_error</span><span class="s3">(</span><span class="s1">ret</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">incref</span><span class="s3">(</span><span class="s1">ret</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">ret</span>
+
+    <span class="s2">def </span><span class="s1">lower_global</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">value</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        1) Check global scope dictionary. 
+        2) Check __builtins__. 
+            2a) is it a dictionary (for non __main__ module) 
+            2b) is it a module (for __main__ module) 
+        &quot;&quot;&quot;</span>
+        <span class="s1">moddict </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_module_dict</span><span class="s3">()</span>
+        <span class="s1">obj </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">dict_getitem</span><span class="s3">(</span><span class="s1">moddict</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_freeze_string</span><span class="s3">(</span><span class="s1">name</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">incref</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)  </span><span class="s4"># obj is borrowed</span>
+
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">value </span><span class="s2">in </span><span class="s1">_unsupported_builtins</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">ForbiddenConstruct</span><span class="s3">(</span><span class="s5">&quot;builtins %s() is not supported&quot;</span>
+                                         <span class="s3">% </span><span class="s1">name</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">TypeError</span><span class="s3">:</span>
+            <span class="s4"># `value` is unhashable, ignore</span>
+            <span class="s2">pass</span>
+
+        <span class="s2">if </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">builtins</span><span class="s3">, </span><span class="s1">name</span><span class="s3">):</span>
+            <span class="s1">obj_is_null </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">is_null</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)</span>
+            <span class="s1">bbelse </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">basic_block</span>
+
+            <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">if_then</span><span class="s3">(</span><span class="s1">obj_is_null</span><span class="s3">):</span>
+                <span class="s1">mod </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">dict_getitem</span><span class="s3">(</span><span class="s1">moddict</span><span class="s3">,</span>
+                                          <span class="s1">self</span><span class="s3">.</span><span class="s1">_freeze_string</span><span class="s3">(</span><span class="s5">&quot;__builtins__&quot;</span><span class="s3">))</span>
+                <span class="s1">builtin </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builtin_lookup</span><span class="s3">(</span><span class="s1">mod</span><span class="s3">, </span><span class="s1">name</span><span class="s3">)</span>
+                <span class="s1">bbif </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">basic_block</span>
+
+            <span class="s1">retval </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">phi</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">pyobj</span><span class="s3">)</span>
+            <span class="s1">retval</span><span class="s3">.</span><span class="s1">add_incoming</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">bbelse</span><span class="s3">)</span>
+            <span class="s1">retval</span><span class="s3">.</span><span class="s1">add_incoming</span><span class="s3">(</span><span class="s1">builtin</span><span class="s3">, </span><span class="s1">bbif</span><span class="s3">)</span>
+
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">retval </span><span class="s3">= </span><span class="s1">obj</span>
+            <span class="s2">with </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">if_unlikely</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">is_null</span><span class="s3">(</span><span class="s1">retval</span><span class="s3">)):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">raise_missing_global_error</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">return_exception_raised</span><span class="s3">()</span>
+
+        <span class="s2">return </span><span class="s1">retval</span>
+
+    <span class="s4"># -------------------------------------------------------------------------</span>
+
+    <span class="s2">def </span><span class="s1">get_module_dict</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">env_body</span><span class="s3">.</span><span class="s1">globals</span>
+
+    <span class="s2">def </span><span class="s1">get_builtin_obj</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">):</span>
+        <span class="s4"># XXX The builtins dict could be bound into the environment</span>
+        <span class="s1">moddict </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_module_dict</span><span class="s3">()</span>
+        <span class="s1">mod </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">dict_getitem</span><span class="s3">(</span><span class="s1">moddict</span><span class="s3">,</span>
+                                      <span class="s1">self</span><span class="s3">.</span><span class="s1">_freeze_string</span><span class="s3">(</span><span class="s5">&quot;__builtins__&quot;</span><span class="s3">))</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builtin_lookup</span><span class="s3">(</span><span class="s1">mod</span><span class="s3">, </span><span class="s1">name</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">builtin_lookup</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">mod</span><span class="s3">, </span><span class="s1">name</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Args 
+        ---- 
+        mod: 
+            The __builtins__ dictionary or module, as looked up in 
+            a module's globals. 
+        name: str 
+            The object to lookup 
+        &quot;&quot;&quot;</span>
+        <span class="s1">fromdict </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">dict_getitem</span><span class="s3">(</span><span class="s1">mod</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_freeze_string</span><span class="s3">(</span><span class="s1">name</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">incref</span><span class="s3">(</span><span class="s1">fromdict</span><span class="s3">)       </span><span class="s4"># fromdict is borrowed</span>
+        <span class="s1">bbifdict </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">basic_block</span>
+
+        <span class="s2">with </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">if_unlikely</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">is_null</span><span class="s3">(</span><span class="s1">fromdict</span><span class="s3">)):</span>
+            <span class="s4"># This happen if we are using the __main__ module</span>
+            <span class="s1">frommod </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">object_getattr</span><span class="s3">(</span><span class="s1">mod</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_freeze_string</span><span class="s3">(</span><span class="s1">name</span><span class="s3">))</span>
+
+            <span class="s2">with </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">if_unlikely</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">is_null</span><span class="s3">(</span><span class="s1">frommod</span><span class="s3">)):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">raise_missing_global_error</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">return_exception_raised</span><span class="s3">()</span>
+
+            <span class="s1">bbifmod </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">basic_block</span>
+
+        <span class="s1">builtin </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">phi</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">pyobj</span><span class="s3">)</span>
+        <span class="s1">builtin</span><span class="s3">.</span><span class="s1">add_incoming</span><span class="s3">(</span><span class="s1">fromdict</span><span class="s3">, </span><span class="s1">bbifdict</span><span class="s3">)</span>
+        <span class="s1">builtin</span><span class="s3">.</span><span class="s1">add_incoming</span><span class="s3">(</span><span class="s1">frommod</span><span class="s3">, </span><span class="s1">bbifmod</span><span class="s3">)</span>
+
+        <span class="s2">return </span><span class="s1">builtin</span>
+
+    <span class="s2">def </span><span class="s1">check_occurred</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return if an exception occurred. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">err_occurred </span><span class="s3">= </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">is_not_null</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">,</span>
+                                           <span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">err_occurred</span><span class="s3">())</span>
+
+        <span class="s2">with </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">if_unlikely</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">err_occurred</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">return_exception_raised</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">check_error</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return if *obj* is NULL. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">with </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">if_unlikely</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">is_null</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">return_exception_raised</span><span class="s3">()</span>
+
+        <span class="s2">return </span><span class="s1">obj</span>
+
+    <span class="s2">def </span><span class="s1">check_int_status</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">num</span><span class="s3">, </span><span class="s1">ok_value</span><span class="s3">=</span><span class="s6">0</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Raise an exception if *num* is smaller than *ok_value*. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">ok </span><span class="s3">= </span><span class="s1">llvmlite</span><span class="s3">.</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">num</span><span class="s3">.</span><span class="s1">type</span><span class="s3">, </span><span class="s1">ok_value</span><span class="s3">)</span>
+        <span class="s1">pred </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">icmp_signed</span><span class="s3">(</span><span class="s5">'&lt;'</span><span class="s3">, </span><span class="s1">num</span><span class="s3">, </span><span class="s1">ok</span><span class="s3">)</span>
+        <span class="s2">with </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">if_unlikely</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">pred</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">return_exception_raised</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">is_null</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">is_null</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">return_exception_raised</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return with the currently raised exception. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">cleanup_vars</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">call_conv</span><span class="s3">.</span><span class="s1">return_exc</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">init_vars</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">block</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Initialize live variables for *block*. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_live_vars </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">get_block_entry_vars</span><span class="s3">(</span><span class="s1">block</span><span class="s3">))</span>
+
+    <span class="s2">def </span><span class="s1">_getvar</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">ltype</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">name </span><span class="s2">not in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">varmap</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">varmap</span><span class="s3">[</span><span class="s1">name</span><span class="s3">] = </span><span class="s1">self</span><span class="s3">.</span><span class="s1">alloca</span><span class="s3">(</span><span class="s1">name</span><span class="s3">, </span><span class="s1">ltype</span><span class="s3">=</span><span class="s1">ltype</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">varmap</span><span class="s3">[</span><span class="s1">name</span><span class="s3">]</span>
+
+    <span class="s2">def </span><span class="s1">loadvar</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Load the llvm value of the variable named *name*. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># If this raises then the live variables analysis is wrong</span>
+        <span class="s2">assert </span><span class="s1">name </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_live_vars</span><span class="s3">, </span><span class="s1">name</span>
+        <span class="s1">ptr </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">varmap</span><span class="s3">[</span><span class="s1">name</span><span class="s3">]</span>
+        <span class="s1">val </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">ptr</span><span class="s3">)</span>
+        <span class="s2">with </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">if_unlikely</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">is_null</span><span class="s3">(</span><span class="s1">val</span><span class="s3">)):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">raise_missing_name_error</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">return_exception_raised</span><span class="s3">()</span>
+        <span class="s2">return </span><span class="s1">val</span>
+
+    <span class="s2">def </span><span class="s1">delvar</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Delete the variable slot with the given name. This will decref 
+        the corresponding Python object. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># If this raises then the live variables analysis is wrong</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_live_vars</span><span class="s3">.</span><span class="s1">remove</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s1">ptr </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_getvar</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)  </span><span class="s4"># initializes `name` if not already</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">decref</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">ptr</span><span class="s3">))</span>
+        <span class="s4"># This is a safety guard against double decref's, but really</span>
+        <span class="s4"># the IR should be correct and have only one Del per variable</span>
+        <span class="s4"># and code path.</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">store</span><span class="s3">(</span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">get_null_value</span><span class="s3">(</span><span class="s1">ptr</span><span class="s3">.</span><span class="s1">type</span><span class="s3">.</span><span class="s1">pointee</span><span class="s3">), </span><span class="s1">ptr</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">storevar</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">clobber</span><span class="s3">=</span><span class="s2">False</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Stores a llvm value and allocate stack slot if necessary. 
+        The llvm value can be of arbitrary type. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">is_redefine </span><span class="s3">= </span><span class="s1">name </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_live_vars </span><span class="s2">and not </span><span class="s1">clobber</span>
+        <span class="s1">ptr </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_getvar</span><span class="s3">(</span><span class="s1">name</span><span class="s3">, </span><span class="s1">ltype</span><span class="s3">=</span><span class="s1">value</span><span class="s3">.</span><span class="s1">type</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">is_redefine</span><span class="s3">:</span>
+            <span class="s1">old </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">ptr</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_live_vars</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s1">value</span><span class="s3">.</span><span class="s1">type </span><span class="s3">== </span><span class="s1">ptr</span><span class="s3">.</span><span class="s1">type</span><span class="s3">.</span><span class="s1">pointee</span><span class="s3">, (</span><span class="s1">str</span><span class="s3">(</span><span class="s1">value</span><span class="s3">.</span><span class="s1">type</span><span class="s3">),</span>
+                                                <span class="s1">str</span><span class="s3">(</span><span class="s1">ptr</span><span class="s3">.</span><span class="s1">type</span><span class="s3">.</span><span class="s1">pointee</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">store</span><span class="s3">(</span><span class="s1">value</span><span class="s3">, </span><span class="s1">ptr</span><span class="s3">)</span>
+        <span class="s4"># Safe to call decref even on non python object</span>
+        <span class="s2">if </span><span class="s1">is_redefine</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">decref</span><span class="s3">(</span><span class="s1">old</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">cleanup_vars</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Cleanup live variables. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_live_vars</span><span class="s3">:</span>
+            <span class="s1">ptr </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_getvar</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">decref</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">ptr</span><span class="s3">))</span>
+
+    <span class="s2">def </span><span class="s1">alloca</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">ltype</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Allocate a stack slot and initialize it to NULL. 
+        The default is to allocate a pyobject pointer. 
+        Use ``ltype`` to override. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">ltype </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">ltype </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">get_value_type</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">pyobject</span><span class="s3">)</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">goto_block</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">entry_block</span><span class="s3">):</span>
+            <span class="s1">ptr </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">alloca</span><span class="s3">(</span><span class="s1">ltype</span><span class="s3">, </span><span class="s1">name</span><span class="s3">=</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">builder</span><span class="s3">.</span><span class="s1">store</span><span class="s3">(</span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">get_null_value</span><span class="s3">(</span><span class="s1">ltype</span><span class="s3">), </span><span class="s1">ptr</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">ptr</span>
+
+    <span class="s2">def </span><span class="s1">_alloca_var</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">fetype</span><span class="s3">):</span>
+        <span class="s4"># This is here for API compatibility with lowering.py::Lower.</span>
+        <span class="s4"># NOTE: fetype is unused</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">alloca</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">incref</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">value</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">incref</span><span class="s3">(</span><span class="s1">value</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">decref</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">value</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        This is allow to be called on non pyobject pointer, in which case 
+        no code is inserted. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">lpyobj </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">get_value_type</span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">pyobject</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">value</span><span class="s3">.</span><span class="s1">type </span><span class="s3">== </span><span class="s1">lpyobj</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">decref</span><span class="s3">(</span><span class="s1">value</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_freeze_string</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">string</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Freeze a Python string object into the code. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">lower_const</span><span class="s3">(</span><span class="s1">string</span><span class="s3">)</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,220 @@
+<html>
+<head>
+<title>cffi_usecases.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #5f826b; font-style: italic;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+cffi_usecases.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">sys</span>
+
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+
+<span class="s0">import </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">typing</span><span class="s2">.</span><span class="s1">cffi_utils </span><span class="s0">as </span><span class="s1">cffi_support</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">tests</span><span class="s2">.</span><span class="s1">support </span><span class="s0">import </span><span class="s1">import_dynamic</span><span class="s2">, </span><span class="s1">temp_directory</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">types </span><span class="s0">import </span><span class="s1">complex128</span>
+
+
+<span class="s0">def </span><span class="s1">load_inline_module</span><span class="s2">():</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Create an inline module, return the corresponding ffi and dll objects. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">from </span><span class="s1">cffi </span><span class="s0">import </span><span class="s1">FFI</span>
+
+    <span class="s4"># We can't rely on libc availability on Windows anymore, so we use our</span>
+    <span class="s4"># own compiled wrappers (see https://bugs.python.org/issue23606).</span>
+
+    <span class="s1">defs </span><span class="s2">= </span><span class="s5">&quot;&quot;&quot; 
+    double _numba_test_sin(double x); 
+    double _numba_test_cos(double x); 
+    double _numba_test_funcptr(double (*func)(double)); 
+    bool _numba_test_boolean(void); 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">ffi </span><span class="s2">= </span><span class="s1">FFI</span><span class="s2">()</span>
+    <span class="s1">ffi</span><span class="s2">.</span><span class="s1">cdef</span><span class="s2">(</span><span class="s1">defs</span><span class="s2">)</span>
+    <span class="s4"># Load the _helperlib namespace</span>
+    <span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">_helperlib</span>
+    <span class="s0">return </span><span class="s1">ffi</span><span class="s2">, </span><span class="s1">ffi</span><span class="s2">.</span><span class="s1">dlopen</span><span class="s2">(</span><span class="s1">_helperlib</span><span class="s2">.</span><span class="s1">__file__</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">load_ool_module</span><span class="s2">():</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Compile an out-of-line module, return the corresponding ffi and 
+    module objects. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">from </span><span class="s1">cffi </span><span class="s0">import </span><span class="s1">FFI</span>
+
+    <span class="s1">numba_complex </span><span class="s2">= </span><span class="s5">&quot;&quot;&quot; 
+    typedef struct _numba_complex { 
+        double real; 
+        double imag; 
+    } numba_complex; 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">bool_define </span><span class="s2">= </span><span class="s5">&quot;&quot;&quot; 
+    #ifdef _MSC_VER 
+        #define false 0 
+        #define true 1 
+        #define bool int 
+    #else 
+        #include &lt;stdbool.h&gt; 
+    #endif 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">defs </span><span class="s2">= </span><span class="s1">numba_complex </span><span class="s2">+ </span><span class="s5">&quot;&quot;&quot; 
+    bool boolean(void); 
+    double sin(double x); 
+    double cos(double x); 
+    int foo(int a, int b, int c); 
+    void vsSin(int n, float* x, float* y); 
+    void vdSin(int n, double* x, double* y); 
+    void vector_real(numba_complex *c, double *real, int n); 
+    void vector_imag(numba_complex *c, double *imag, int n); 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">source </span><span class="s2">= </span><span class="s1">numba_complex </span><span class="s2">+ </span><span class="s1">bool_define </span><span class="s2">+ </span><span class="s5">&quot;&quot;&quot; 
+    static bool boolean(void) 
+    { 
+        return true; 
+    } 
+ 
+    static int foo(int a, int b, int c) 
+    { 
+        return a + b * c; 
+    } 
+ 
+    void vsSin(int n, float* x, float* y) { 
+        int i; 
+        for (i=0; i&lt;n; i++) 
+            y[i] = sin(x[i]); 
+    } 
+ 
+    void vdSin(int n, double* x, double* y) { 
+        int i; 
+        for (i=0; i&lt;n; i++) 
+            y[i] = sin(x[i]); 
+    } 
+ 
+    static void vector_real(numba_complex *c, double *real, int n) { 
+        int i; 
+        for (i = 0; i &lt; n; i++) 
+            real[i] = c[i].real; 
+    } 
+ 
+    static void vector_imag(numba_complex *c, double *imag, int n) { 
+        int i; 
+        for (i = 0; i &lt; n; i++) 
+            imag[i] = c[i].imag; 
+    } 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">ffi </span><span class="s2">= </span><span class="s1">FFI</span><span class="s2">()</span>
+    <span class="s1">ffi</span><span class="s2">.</span><span class="s1">set_source</span><span class="s2">(</span><span class="s5">'cffi_usecases_ool'</span><span class="s2">, </span><span class="s1">source</span><span class="s2">)</span>
+    <span class="s1">ffi</span><span class="s2">.</span><span class="s1">cdef</span><span class="s2">(</span><span class="s1">defs</span><span class="s2">, </span><span class="s1">override</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+    <span class="s1">tmpdir </span><span class="s2">= </span><span class="s1">temp_directory</span><span class="s2">(</span><span class="s5">'test_cffi'</span><span class="s2">)</span>
+    <span class="s1">ffi</span><span class="s2">.</span><span class="s1">compile</span><span class="s2">(</span><span class="s1">tmpdir</span><span class="s2">=</span><span class="s1">tmpdir</span><span class="s2">)</span>
+    <span class="s1">sys</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">tmpdir</span><span class="s2">)</span>
+    <span class="s0">try</span><span class="s2">:</span>
+        <span class="s1">mod </span><span class="s2">= </span><span class="s1">import_dynamic</span><span class="s2">(</span><span class="s5">'cffi_usecases_ool'</span><span class="s2">)</span>
+        <span class="s1">cffi_support</span><span class="s2">.</span><span class="s1">register_module</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">)</span>
+        <span class="s1">cffi_support</span><span class="s2">.</span><span class="s1">register_type</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">.</span><span class="s1">ffi</span><span class="s2">.</span><span class="s1">typeof</span><span class="s2">(</span><span class="s5">'struct _numba_complex'</span><span class="s2">),</span>
+                                   <span class="s1">complex128</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">ffi</span><span class="s2">, </span><span class="s1">mod</span>
+    <span class="s0">finally</span><span class="s2">:</span>
+        <span class="s1">sys</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">remove</span><span class="s2">(</span><span class="s1">tmpdir</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">init</span><span class="s2">():</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Initialize module globals.  This can invoke external utilities, hence not 
+    being executed implicitly at module import. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">global </span><span class="s1">ffi</span><span class="s2">, </span><span class="s1">cffi_sin</span><span class="s2">, </span><span class="s1">cffi_cos</span><span class="s2">, </span><span class="s1">cffi_bool</span>
+
+    <span class="s0">if </span><span class="s1">ffi </span><span class="s0">is None</span><span class="s2">:</span>
+        <span class="s1">ffi</span><span class="s2">, </span><span class="s1">dll </span><span class="s2">= </span><span class="s1">load_inline_module</span><span class="s2">()</span>
+        <span class="s1">cffi_sin </span><span class="s2">= </span><span class="s1">dll</span><span class="s2">.</span><span class="s1">_numba_test_sin</span>
+        <span class="s1">cffi_cos </span><span class="s2">= </span><span class="s1">dll</span><span class="s2">.</span><span class="s1">_numba_test_cos</span>
+        <span class="s1">cffi_bool </span><span class="s2">= </span><span class="s1">dll</span><span class="s2">.</span><span class="s1">_numba_test_boolean</span>
+        <span class="s0">del </span><span class="s1">dll</span>
+
+<span class="s0">def </span><span class="s1">init_ool</span><span class="s2">():</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Same as init() for OOL mode. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">global </span><span class="s1">ffi_ool</span><span class="s2">, </span><span class="s1">cffi_sin_ool</span><span class="s2">, </span><span class="s1">cffi_cos_ool</span><span class="s2">, </span><span class="s1">cffi_foo</span><span class="s2">, </span><span class="s1">cffi_bool_ool</span>
+    <span class="s0">global </span><span class="s1">vsSin</span><span class="s2">, </span><span class="s1">vdSin</span><span class="s2">, </span><span class="s1">vector_real</span><span class="s2">, </span><span class="s1">vector_imag</span>
+
+    <span class="s0">if </span><span class="s1">ffi_ool </span><span class="s0">is None</span><span class="s2">:</span>
+        <span class="s1">ffi_ool</span><span class="s2">, </span><span class="s1">mod </span><span class="s2">= </span><span class="s1">load_ool_module</span><span class="s2">()</span>
+        <span class="s1">cffi_sin_ool </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">lib</span><span class="s2">.</span><span class="s1">sin</span>
+        <span class="s1">cffi_cos_ool </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">lib</span><span class="s2">.</span><span class="s1">cos</span>
+        <span class="s1">cffi_foo </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">lib</span><span class="s2">.</span><span class="s1">foo</span>
+        <span class="s1">cffi_bool_ool </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">lib</span><span class="s2">.</span><span class="s1">boolean</span>
+        <span class="s1">vsSin </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">lib</span><span class="s2">.</span><span class="s1">vsSin</span>
+        <span class="s1">vdSin </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">lib</span><span class="s2">.</span><span class="s1">vdSin</span>
+        <span class="s1">vector_real </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">lib</span><span class="s2">.</span><span class="s1">vector_real</span>
+        <span class="s1">vector_imag </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">lib</span><span class="s2">.</span><span class="s1">vector_imag</span>
+        <span class="s0">del </span><span class="s1">mod</span>
+
+<span class="s1">ffi </span><span class="s2">= </span><span class="s1">ffi_ool </span><span class="s2">= </span><span class="s0">None</span>
+
+
+<span class="s0">def </span><span class="s1">use_cffi_sin</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+    <span class="s0">return </span><span class="s1">cffi_sin</span><span class="s2">(</span><span class="s1">x</span><span class="s2">) * </span><span class="s6">2</span>
+
+<span class="s0">def </span><span class="s1">use_two_funcs</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+    <span class="s0">return </span><span class="s1">cffi_sin</span><span class="s2">(</span><span class="s1">x</span><span class="s2">) - </span><span class="s1">cffi_cos</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+
+<span class="s0">def </span><span class="s1">use_cffi_sin_ool</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+    <span class="s0">return </span><span class="s1">cffi_sin_ool</span><span class="s2">(</span><span class="s1">x</span><span class="s2">) * </span><span class="s6">2</span>
+
+<span class="s0">def </span><span class="s1">use_cffi_boolean_true</span><span class="s2">():</span>
+    <span class="s0">return </span><span class="s1">cffi_bool_ool</span><span class="s2">()</span>
+
+<span class="s0">def </span><span class="s1">use_two_funcs_ool</span><span class="s2">(</span><span class="s1">x</span><span class="s2">):</span>
+    <span class="s0">return </span><span class="s1">cffi_sin_ool</span><span class="s2">(</span><span class="s1">x</span><span class="s2">) - </span><span class="s1">cffi_cos_ool</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+
+<span class="s0">def </span><span class="s1">use_func_pointer</span><span class="s2">(</span><span class="s1">fa</span><span class="s2">, </span><span class="s1">fb</span><span class="s2">, </span><span class="s1">x</span><span class="s2">):</span>
+    <span class="s0">if </span><span class="s1">x </span><span class="s2">&gt; </span><span class="s6">0</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">fa</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">fb</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+
+<span class="s0">def </span><span class="s1">use_user_defined_symbols</span><span class="s2">():</span>
+    <span class="s0">return </span><span class="s1">cffi_foo</span><span class="s2">(</span><span class="s6">1</span><span class="s2">, </span><span class="s6">2</span><span class="s2">, </span><span class="s6">3</span><span class="s2">)</span>
+
+<span class="s4"># The from_buffer method is member of cffi.FFI, and also of CompiledFFI objects</span>
+<span class="s4"># (cffi_usecases_ool.ffi is a CompiledFFI object) so we use both in these</span>
+<span class="s4"># functions.</span>
+
+<span class="s0">def </span><span class="s1">vector_sin_float32</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">):</span>
+    <span class="s1">vsSin</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">x</span><span class="s2">), </span><span class="s1">ffi</span><span class="s2">.</span><span class="s1">from_buffer</span><span class="s2">(</span><span class="s1">x</span><span class="s2">), </span><span class="s1">ffi_ool</span><span class="s2">.</span><span class="s1">from_buffer</span><span class="s2">(</span><span class="s1">y</span><span class="s2">))</span>
+
+<span class="s0">def </span><span class="s1">vector_sin_float64</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">):</span>
+    <span class="s1">vdSin</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">x</span><span class="s2">), </span><span class="s1">ffi</span><span class="s2">.</span><span class="s1">from_buffer</span><span class="s2">(</span><span class="s1">x</span><span class="s2">), </span><span class="s1">ffi_ool</span><span class="s2">.</span><span class="s1">from_buffer</span><span class="s2">(</span><span class="s1">y</span><span class="s2">))</span>
+
+
+<span class="s4"># For testing pointer to structs from buffers</span>
+
+<span class="s0">def </span><span class="s1">vector_extract_real</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">):</span>
+    <span class="s1">vector_real</span><span class="s2">(</span><span class="s1">ffi</span><span class="s2">.</span><span class="s1">from_buffer</span><span class="s2">(</span><span class="s1">x</span><span class="s2">), </span><span class="s1">ffi</span><span class="s2">.</span><span class="s1">from_buffer</span><span class="s2">(</span><span class="s1">y</span><span class="s2">), </span><span class="s1">len</span><span class="s2">(</span><span class="s1">x</span><span class="s2">))</span>
+
+<span class="s0">def </span><span class="s1">vector_extract_imag</span><span class="s2">(</span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">):</span>
+    <span class="s1">vector_imag</span><span class="s2">(</span><span class="s1">ffi</span><span class="s2">.</span><span class="s1">from_buffer</span><span class="s2">(</span><span class="s1">x</span><span class="s2">), </span><span class="s1">ffi</span><span class="s2">.</span><span class="s1">from_buffer</span><span class="s2">(</span><span class="s1">y</span><span class="s2">), </span><span class="s1">len</span><span class="s2">(</span><span class="s1">x</span><span class="s2">))</span>
+</pre>
+</body>
+</html>

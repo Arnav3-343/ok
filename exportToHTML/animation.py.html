@@ -1,0 +1,854 @@
+<html>
+<head>
+<title>animation.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #cf8e6d;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+animation.py</font>
+</center></td></tr></table>
+<pre><span class="s0">''' 
+Animation 
+========= 
+ 
+:class:`Animation` and :class:`AnimationTransition` are used to animate 
+:class:`~kivy.uix.widget.Widget` properties. You must specify at least a 
+property name and target value. To use an Animation, follow these steps: 
+ 
+    * Setup an Animation object 
+    * Use the Animation object on a Widget 
+ 
+Simple animation 
+---------------- 
+ 
+To animate a Widget's x or y position, simply specify the target x/y values 
+where you want the widget positioned at the end of the animation:: 
+ 
+    anim = Animation(x=100, y=100) 
+    anim.start(widget) 
+ 
+The animation will last for 1 second unless :attr:`duration` is specified. 
+When anim.start() is called, the Widget will move smoothly from the current 
+x/y position to (100, 100). 
+ 
+Multiple properties and transitions 
+----------------------------------- 
+ 
+You can animate multiple properties and use built-in or custom transition 
+functions using :attr:`transition` (or the `t=` shortcut). For example, 
+to animate the position and size using the 'in_quad' transition:: 
+ 
+    anim = Animation(x=50, size=(80, 80), t='in_quad') 
+    anim.start(widget) 
+ 
+Note that the `t=` parameter can be the string name of a method in the 
+:class:`AnimationTransition` class or your own animation function. 
+ 
+Sequential animation 
+-------------------- 
+ 
+To join animations sequentially, use the '+' operator. The following example 
+will animate to x=50 over 1 second, then animate the size to (80, 80) over the 
+next two seconds:: 
+ 
+    anim = Animation(x=50) + Animation(size=(80, 80), duration=2.) 
+    anim.start(widget) 
+ 
+Parallel animation 
+------------------ 
+ 
+To join animations in parallel, use the '&amp;' operator. The following example 
+will animate the position to (80, 10) over 1 second, whilst in parallel 
+animating the size to (800, 800):: 
+ 
+    anim = Animation(pos=(80, 10)) 
+    anim &amp;= Animation(size=(800, 800), duration=2.) 
+    anim.start(widget) 
+ 
+Keep in mind that creating overlapping animations on the same property may have 
+unexpected results. If you want to apply multiple animations to the same 
+property, you should either schedule them sequentially (via the '+' operator or 
+using the *on_complete* callback) or cancel previous animations using the 
+:attr:`~Animation.cancel_all` method. 
+ 
+Repeating animation 
+------------------- 
+ 
+.. versionadded:: 1.8.0 
+ 
+.. note:: 
+    This is currently only implemented for 'Sequence' animations. 
+ 
+To set an animation to repeat, simply set the :attr:`Sequence.repeat` 
+property to `True`:: 
+ 
+    anim = Animation(...) + Animation(...) 
+    anim.repeat = True 
+    anim.start(widget) 
+ 
+For flow control of animations such as stopping and cancelling, use the methods 
+already in place in the animation module. 
+'''</span>
+
+<span class="s1">__all__ </span><span class="s2">= (</span><span class="s3">'Animation'</span><span class="s2">, </span><span class="s3">'AnimationTransition'</span><span class="s2">)</span>
+
+<span class="s4">from </span><span class="s1">math </span><span class="s4">import </span><span class="s1">sqrt</span><span class="s2">, </span><span class="s1">cos</span><span class="s2">, </span><span class="s1">sin</span><span class="s2">, </span><span class="s1">pi</span>
+<span class="s4">from </span><span class="s1">collections </span><span class="s4">import </span><span class="s1">ChainMap</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">event </span><span class="s4">import </span><span class="s1">EventDispatcher</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">clock </span><span class="s4">import </span><span class="s1">Clock</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">compat </span><span class="s4">import </span><span class="s1">string_types</span><span class="s2">, </span><span class="s1">iterkeys</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">weakproxy </span><span class="s4">import </span><span class="s1">WeakProxy</span>
+
+
+<span class="s4">class </span><span class="s1">Animation</span><span class="s2">(</span><span class="s1">EventDispatcher</span><span class="s2">):</span>
+    <span class="s0">'''Create an animation definition that can be used to animate a Widget. 
+ 
+    :Parameters: 
+        `duration` or `d`: float, defaults to 1. 
+            Duration of the animation, in seconds. 
+        `transition` or `t`: str or func 
+            Transition function for animate properties. It can be the name of a 
+            method from :class:`AnimationTransition`. 
+        `step` or `s`: float 
+            Step in milliseconds of the animation. Defaults to 0, which means 
+            the animation is updated for every frame. 
+ 
+            To update the animation less often, set the step value to a float. 
+            For example, if you want to animate at 30 FPS, use s=1/30. 
+ 
+    :Events: 
+        `on_start`: animation, widget 
+            Fired when the animation is started on a widget. 
+        `on_complete`: animation, widget 
+            Fired when the animation is completed or stopped on a widget. 
+        `on_progress`: animation, widget, progression 
+            Fired when the progression of the animation is changing. 
+ 
+    .. versionchanged:: 1.4.0 
+        Added s/step parameter. 
+ 
+    .. versionchanged:: 1.10.0 
+        The default value of the step parameter was changed from 1/60. to 0. 
+    '''</span>
+
+    <span class="s1">_update_ev </span><span class="s2">= </span><span class="s4">None</span>
+
+    <span class="s1">_instances </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+
+    <span class="s1">__events__ </span><span class="s2">= (</span><span class="s3">'on_start'</span><span class="s2">, </span><span class="s3">'on_progress'</span><span class="s2">, </span><span class="s3">'on_complete'</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, **</span><span class="s1">kw</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">()</span>
+        <span class="s5"># Initialize</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_clock_installed </span><span class="s2">= </span><span class="s4">False</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_duration </span><span class="s2">= </span><span class="s1">kw</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s3">'d'</span><span class="s2">, </span><span class="s1">kw</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s3">'duration'</span><span class="s2">, </span><span class="s6">1.</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_transition </span><span class="s2">= </span><span class="s1">kw</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s3">'t'</span><span class="s2">, </span><span class="s1">kw</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s3">'transition'</span><span class="s2">, </span><span class="s3">'linear'</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_step </span><span class="s2">= </span><span class="s1">kw</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s3">'s'</span><span class="s2">, </span><span class="s1">kw</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s3">'step'</span><span class="s2">, </span><span class="s6">0</span><span class="s2">))</span>
+        <span class="s4">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_transition</span><span class="s2">, </span><span class="s1">string_types</span><span class="s2">):</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_transition </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">AnimationTransition</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_transition</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_animated_properties </span><span class="s2">= </span><span class="s1">kw</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets </span><span class="s2">= {}</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s4">def </span><span class="s1">duration</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Return the duration of the animation. 
+        '''</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_duration</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s4">def </span><span class="s1">transition</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Return the transition of the animation. 
+        '''</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_transition</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s4">def </span><span class="s1">animated_properties</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Return the properties used to animate. 
+        '''</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_animated_properties</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">stop_all</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">, *</span><span class="s1">largs</span><span class="s2">):</span>
+        <span class="s0">'''Stop all animations that concern a specific widget / list of 
+        properties. 
+ 
+        Example:: 
+ 
+            anim = Animation(x=50) 
+            anim.start(widget) 
+ 
+            # and later 
+            Animation.stop_all(widget, 'x') 
+        '''</span>
+        <span class="s4">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">largs</span><span class="s2">):</span>
+            <span class="s4">for </span><span class="s1">animation </span><span class="s4">in </span><span class="s1">list</span><span class="s2">(</span><span class="s1">Animation</span><span class="s2">.</span><span class="s1">_instances</span><span class="s2">):</span>
+                <span class="s4">for </span><span class="s1">x </span><span class="s4">in </span><span class="s1">largs</span><span class="s2">:</span>
+                    <span class="s1">animation</span><span class="s2">.</span><span class="s1">stop_property</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">, </span><span class="s1">x</span><span class="s2">)</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s4">for </span><span class="s1">animation </span><span class="s4">in </span><span class="s1">set</span><span class="s2">(</span><span class="s1">Animation</span><span class="s2">.</span><span class="s1">_instances</span><span class="s2">):</span>
+                <span class="s1">animation</span><span class="s2">.</span><span class="s1">stop</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">cancel_all</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">, *</span><span class="s1">largs</span><span class="s2">):</span>
+        <span class="s0">'''Cancel all animations that concern a specific widget / list of 
+        properties. See :attr:`cancel`. 
+ 
+        Example:: 
+ 
+            anim = Animation(x=50) 
+            anim.start(widget) 
+ 
+            # and later 
+            Animation.cancel_all(widget, 'x') 
+ 
+        .. versionadded:: 1.4.0 
+ 
+        .. versionchanged:: 2.1.0 
+            If the parameter ``widget`` is None, all animated widgets will be 
+            the target and cancelled. If ``largs`` is also given, animation of 
+            these properties will be canceled for all animated widgets. 
+        '''</span>
+        <span class="s4">if </span><span class="s1">widget </span><span class="s4">is None</span><span class="s2">:</span>
+            <span class="s4">if </span><span class="s1">largs</span><span class="s2">:</span>
+                <span class="s4">for </span><span class="s1">animation </span><span class="s4">in </span><span class="s1">Animation</span><span class="s2">.</span><span class="s1">_instances</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">():</span>
+                    <span class="s4">for </span><span class="s1">info </span><span class="s4">in </span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">animation</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">.</span><span class="s1">values</span><span class="s2">()):</span>
+                        <span class="s1">widget </span><span class="s2">= </span><span class="s1">info</span><span class="s2">[</span><span class="s3">'widget'</span><span class="s2">]</span>
+                        <span class="s4">for </span><span class="s1">x </span><span class="s4">in </span><span class="s1">largs</span><span class="s2">:</span>
+                            <span class="s1">animation</span><span class="s2">.</span><span class="s1">cancel_property</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">, </span><span class="s1">x</span><span class="s2">)</span>
+            <span class="s4">else</span><span class="s2">:</span>
+                <span class="s4">for </span><span class="s1">animation </span><span class="s4">in </span><span class="s1">Animation</span><span class="s2">.</span><span class="s1">_instances</span><span class="s2">:</span>
+                    <span class="s1">animation</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">.</span><span class="s1">clear</span><span class="s2">()</span>
+                    <span class="s1">animation</span><span class="s2">.</span><span class="s1">_clock_uninstall</span><span class="s2">()</span>
+                <span class="s1">Animation</span><span class="s2">.</span><span class="s1">_instances</span><span class="s2">.</span><span class="s1">clear</span><span class="s2">()</span>
+            <span class="s4">return</span>
+        <span class="s4">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">largs</span><span class="s2">):</span>
+            <span class="s4">for </span><span class="s1">animation </span><span class="s4">in </span><span class="s1">list</span><span class="s2">(</span><span class="s1">Animation</span><span class="s2">.</span><span class="s1">_instances</span><span class="s2">):</span>
+                <span class="s4">for </span><span class="s1">x </span><span class="s4">in </span><span class="s1">largs</span><span class="s2">:</span>
+                    <span class="s1">animation</span><span class="s2">.</span><span class="s1">cancel_property</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">, </span><span class="s1">x</span><span class="s2">)</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s4">for </span><span class="s1">animation </span><span class="s4">in </span><span class="s1">set</span><span class="s2">(</span><span class="s1">Animation</span><span class="s2">.</span><span class="s1">_instances</span><span class="s2">):</span>
+                <span class="s1">animation</span><span class="s2">.</span><span class="s1">cancel</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">start</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">):</span>
+        <span class="s0">'''Start the animation on a widget. 
+        '''</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">stop</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_initialize</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_register</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_start'</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">stop</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">):</span>
+        <span class="s0">'''Stop the animation previously applied to a widget, triggering the 
+        `on_complete` event.'''</span>
+        <span class="s1">props </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">.</span><span class="s1">uid</span><span class="s2">, </span><span class="s4">None</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s1">props</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_complete'</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">cancel</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">cancel</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">):</span>
+        <span class="s0">'''Cancel the animation previously applied to a widget. Same 
+        effect as :attr:`stop`, except the `on_complete` event will 
+        *not* be triggered! 
+ 
+        .. versionadded:: 1.4.0 
+        '''</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">.</span><span class="s1">uid</span><span class="s2">, </span><span class="s4">None</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_clock_uninstall</span><span class="s2">()</span>
+        <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_unregister</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">stop_property</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">):</span>
+        <span class="s0">'''Even if an animation is running, remove a property. It will not be 
+        animated further. If it was the only/last property being animated, 
+        the animation will be stopped (see :attr:`stop`). 
+        '''</span>
+        <span class="s1">props </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">.</span><span class="s1">uid</span><span class="s2">, </span><span class="s4">None</span><span class="s2">)</span>
+        <span class="s4">if not </span><span class="s1">props</span><span class="s2">:</span>
+            <span class="s4">return</span>
+        <span class="s1">props</span><span class="s2">[</span><span class="s3">'properties'</span><span class="s2">].</span><span class="s1">pop</span><span class="s2">(</span><span class="s1">prop</span><span class="s2">, </span><span class="s4">None</span><span class="s2">)</span>
+
+        <span class="s5"># no more properties to animation ? kill the animation.</span>
+        <span class="s4">if not </span><span class="s1">props</span><span class="s2">[</span><span class="s3">'properties'</span><span class="s2">]:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">stop</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">cancel_property</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">):</span>
+        <span class="s0">'''Even if an animation is running, remove a property. It will not be 
+        animated further. If it was the only/last property being animated, 
+        the animation will be canceled (see :attr:`cancel`) 
+ 
+        .. versionadded:: 1.4.0 
+        '''</span>
+        <span class="s1">props </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">.</span><span class="s1">uid</span><span class="s2">, </span><span class="s4">None</span><span class="s2">)</span>
+        <span class="s4">if not </span><span class="s1">props</span><span class="s2">:</span>
+            <span class="s4">return</span>
+        <span class="s1">props</span><span class="s2">[</span><span class="s3">'properties'</span><span class="s2">].</span><span class="s1">pop</span><span class="s2">(</span><span class="s1">prop</span><span class="s2">, </span><span class="s4">None</span><span class="s2">)</span>
+
+        <span class="s5"># no more properties to animation ? kill the animation.</span>
+        <span class="s4">if not </span><span class="s1">props</span><span class="s2">[</span><span class="s3">'properties'</span><span class="s2">]:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">cancel</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">have_properties_to_animate</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">):</span>
+        <span class="s0">'''Return True if a widget still has properties to animate. 
+ 
+        .. versionadded:: 1.8.0 
+        '''</span>
+        <span class="s1">props </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">.</span><span class="s1">uid</span><span class="s2">, </span><span class="s4">None</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s1">props </span><span class="s4">and </span><span class="s1">props</span><span class="s2">[</span><span class="s3">'properties'</span><span class="s2">]:</span>
+            <span class="s4">return True</span>
+
+    <span class="s5">#</span>
+    <span class="s5"># Private</span>
+    <span class="s5">#</span>
+    <span class="s4">def </span><span class="s1">_register</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">Animation</span><span class="s2">.</span><span class="s1">_instances</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">_unregister</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">Animation</span><span class="s2">.</span><span class="s1">_instances</span><span class="s2">.</span><span class="s1">discard</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">_initialize</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">):</span>
+        <span class="s1">d </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">[</span><span class="s1">widget</span><span class="s2">.</span><span class="s1">uid</span><span class="s2">] = {</span>
+            <span class="s3">'widget'</span><span class="s2">: </span><span class="s1">widget</span><span class="s2">,</span>
+            <span class="s3">'properties'</span><span class="s2">: {},</span>
+            <span class="s3">'time'</span><span class="s2">: </span><span class="s4">None</span><span class="s2">}</span>
+
+        <span class="s5"># get current values</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">d</span><span class="s2">[</span><span class="s3">'properties'</span><span class="s2">]</span>
+        <span class="s4">for </span><span class="s1">key</span><span class="s2">, </span><span class="s1">value </span><span class="s4">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_animated_properties</span><span class="s2">.</span><span class="s1">items</span><span class="s2">():</span>
+            <span class="s1">original_value </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">, </span><span class="s1">key</span><span class="s2">)</span>
+            <span class="s4">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">original_value</span><span class="s2">, (</span><span class="s1">tuple</span><span class="s2">, </span><span class="s1">list</span><span class="s2">)):</span>
+                <span class="s1">original_value </span><span class="s2">= </span><span class="s1">original_value</span><span class="s2">[:]</span>
+            <span class="s4">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">original_value</span><span class="s2">, </span><span class="s1">dict</span><span class="s2">):</span>
+                <span class="s1">original_value </span><span class="s2">= </span><span class="s1">original_value</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">()</span>
+            <span class="s1">p</span><span class="s2">[</span><span class="s1">key</span><span class="s2">] = (</span><span class="s1">original_value</span><span class="s2">, </span><span class="s1">value</span><span class="s2">)</span>
+
+        <span class="s5"># install clock</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_clock_install</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">_clock_install</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_clock_installed</span><span class="s2">:</span>
+            <span class="s4">return</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_update_ev </span><span class="s2">= </span><span class="s1">Clock</span><span class="s2">.</span><span class="s1">schedule_interval</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_update</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_step</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_clock_installed </span><span class="s2">= </span><span class="s4">True</span>
+
+    <span class="s4">def </span><span class="s1">_clock_uninstall</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets </span><span class="s4">or not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_clock_installed</span><span class="s2">:</span>
+            <span class="s4">return</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_clock_installed </span><span class="s2">= </span><span class="s4">False</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_update_ev </span><span class="s4">is not None</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_update_ev</span><span class="s2">.</span><span class="s1">cancel</span><span class="s2">()</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_update_ev </span><span class="s2">= </span><span class="s4">None</span>
+
+    <span class="s4">def </span><span class="s1">_update</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">dt</span><span class="s2">):</span>
+        <span class="s1">widgets </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets</span>
+        <span class="s1">transition </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_transition</span>
+        <span class="s1">calculate </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_calculate</span>
+        <span class="s4">for </span><span class="s1">uid </span><span class="s4">in </span><span class="s1">list</span><span class="s2">(</span><span class="s1">widgets</span><span class="s2">.</span><span class="s1">keys</span><span class="s2">()):</span>
+            <span class="s1">anim </span><span class="s2">= </span><span class="s1">widgets</span><span class="s2">[</span><span class="s1">uid</span><span class="s2">]</span>
+            <span class="s1">widget </span><span class="s2">= </span><span class="s1">anim</span><span class="s2">[</span><span class="s3">'widget'</span><span class="s2">]</span>
+
+            <span class="s4">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">, </span><span class="s1">WeakProxy</span><span class="s2">) </span><span class="s4">and not </span><span class="s1">len</span><span class="s2">(</span><span class="s1">dir</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)):</span>
+                <span class="s5"># empty proxy, widget is gone. ref: #2458</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s1">uid</span><span class="s2">, </span><span class="s4">None</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_clock_uninstall</span><span class="s2">()</span>
+                <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">:</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">_unregister</span><span class="s2">()</span>
+                <span class="s4">continue</span>
+
+            <span class="s4">if </span><span class="s1">anim</span><span class="s2">[</span><span class="s3">'time'</span><span class="s2">] </span><span class="s4">is None</span><span class="s2">:</span>
+                <span class="s1">anim</span><span class="s2">[</span><span class="s3">'time'</span><span class="s2">] = </span><span class="s6">0.</span>
+            <span class="s4">else</span><span class="s2">:</span>
+                <span class="s1">anim</span><span class="s2">[</span><span class="s3">'time'</span><span class="s2">] += </span><span class="s1">dt</span>
+
+            <span class="s5"># calculate progression</span>
+            <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_duration</span><span class="s2">:</span>
+                <span class="s1">progress </span><span class="s2">= </span><span class="s1">min</span><span class="s2">(</span><span class="s6">1.</span><span class="s2">, </span><span class="s1">anim</span><span class="s2">[</span><span class="s3">'time'</span><span class="s2">] / </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_duration</span><span class="s2">)</span>
+            <span class="s4">else</span><span class="s2">:</span>
+                <span class="s1">progress </span><span class="s2">= </span><span class="s6">1</span>
+            <span class="s1">t </span><span class="s2">= </span><span class="s1">transition</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">)</span>
+
+            <span class="s5"># apply progression on widget</span>
+            <span class="s4">for </span><span class="s1">key</span><span class="s2">, </span><span class="s1">values </span><span class="s4">in </span><span class="s1">anim</span><span class="s2">[</span><span class="s3">'properties'</span><span class="s2">].</span><span class="s1">items</span><span class="s2">():</span>
+                <span class="s1">a</span><span class="s2">, </span><span class="s1">b </span><span class="s2">= </span><span class="s1">values</span>
+                <span class="s1">value </span><span class="s2">= </span><span class="s1">calculate</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">t</span><span class="s2">)</span>
+                <span class="s1">setattr</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">, </span><span class="s1">key</span><span class="s2">, </span><span class="s1">value</span><span class="s2">)</span>
+
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_progress'</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">, </span><span class="s1">progress</span><span class="s2">)</span>
+
+            <span class="s5"># time to stop ?</span>
+            <span class="s4">if </span><span class="s1">progress </span><span class="s2">&gt;= </span><span class="s6">1.</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">stop</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">_calculate</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">t</span><span class="s2">):</span>
+        <span class="s1">_calculate </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_calculate</span>
+        <span class="s4">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">list</span><span class="s2">) </span><span class="s4">or </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">tuple</span><span class="s2">):</span>
+            <span class="s4">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">list</span><span class="s2">):</span>
+                <span class="s1">tp </span><span class="s2">= </span><span class="s1">list</span>
+            <span class="s4">else</span><span class="s2">:</span>
+                <span class="s1">tp </span><span class="s2">= </span><span class="s1">tuple</span>
+            <span class="s4">return </span><span class="s1">tp</span><span class="s2">([</span><span class="s1">_calculate</span><span class="s2">(</span><span class="s1">a</span><span class="s2">[</span><span class="s1">x</span><span class="s2">], </span><span class="s1">b</span><span class="s2">[</span><span class="s1">x</span><span class="s2">], </span><span class="s1">t</span><span class="s2">) </span><span class="s4">for </span><span class="s1">x </span><span class="s4">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">a</span><span class="s2">))])</span>
+        <span class="s4">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">dict</span><span class="s2">):</span>
+            <span class="s1">d </span><span class="s2">= {}</span>
+            <span class="s4">for </span><span class="s1">x </span><span class="s4">in </span><span class="s1">iterkeys</span><span class="s2">(</span><span class="s1">a</span><span class="s2">):</span>
+                <span class="s4">if </span><span class="s1">x </span><span class="s4">not in </span><span class="s1">b</span><span class="s2">:</span>
+                    <span class="s5"># User requested to animate only part of the dict.</span>
+                    <span class="s5"># Copy the rest</span>
+                    <span class="s1">d</span><span class="s2">[</span><span class="s1">x</span><span class="s2">] = </span><span class="s1">a</span><span class="s2">[</span><span class="s1">x</span><span class="s2">]</span>
+                <span class="s4">else</span><span class="s2">:</span>
+                    <span class="s1">d</span><span class="s2">[</span><span class="s1">x</span><span class="s2">] = </span><span class="s1">_calculate</span><span class="s2">(</span><span class="s1">a</span><span class="s2">[</span><span class="s1">x</span><span class="s2">], </span><span class="s1">b</span><span class="s2">[</span><span class="s1">x</span><span class="s2">], </span><span class="s1">t</span><span class="s2">)</span>
+            <span class="s4">return </span><span class="s1">d</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s2">(</span><span class="s1">a </span><span class="s2">* (</span><span class="s6">1. </span><span class="s2">- </span><span class="s1">t</span><span class="s2">)) + (</span><span class="s1">b </span><span class="s2">* </span><span class="s1">t</span><span class="s2">)</span>
+
+    <span class="s5">#</span>
+    <span class="s5"># Default handlers</span>
+    <span class="s5">#</span>
+    <span class="s4">def </span><span class="s1">on_start</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">):</span>
+        <span class="s4">pass</span>
+
+    <span class="s4">def </span><span class="s1">on_progress</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">, </span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s4">pass</span>
+
+    <span class="s4">def </span><span class="s1">on_complete</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">):</span>
+        <span class="s4">pass</span>
+
+    <span class="s4">def </span><span class="s1">__add__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">animation</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s1">Sequence</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">animation</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">__and__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">animation</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s1">Parallel</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">animation</span><span class="s2">)</span>
+
+
+<span class="s4">class </span><span class="s1">CompoundAnimation</span><span class="s2">(</span><span class="s1">Animation</span><span class="s2">):</span>
+
+    <span class="s4">def </span><span class="s1">stop_property</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim1</span><span class="s2">.</span><span class="s1">stop_property</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim2</span><span class="s2">.</span><span class="s1">stop_property</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s2">(</span><span class="s4">not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">anim1</span><span class="s2">.</span><span class="s1">have_properties_to_animate</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">) </span><span class="s4">and</span>
+                <span class="s4">not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">anim2</span><span class="s2">.</span><span class="s1">have_properties_to_animate</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)):</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">stop</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">cancel</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim1</span><span class="s2">.</span><span class="s1">cancel</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim2</span><span class="s2">.</span><span class="s1">cancel</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">cancel</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">cancel_property</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">):</span>
+        <span class="s0">'''Even if an animation is running, remove a property. It will not be 
+        animated further. If it was the only/last property being animated, 
+        the animation will be canceled (see :attr:`cancel`) 
+ 
+        This method overrides `:class:kivy.animation.Animation`'s 
+        version, to cancel it on all animations of the Sequence. 
+ 
+        .. versionadded:: 1.10.0 
+        '''</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim1</span><span class="s2">.</span><span class="s1">cancel_property</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim2</span><span class="s2">.</span><span class="s1">cancel_property</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">, </span><span class="s1">prop</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s2">(</span><span class="s4">not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">anim1</span><span class="s2">.</span><span class="s1">have_properties_to_animate</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">) </span><span class="s4">and</span>
+                <span class="s4">not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">anim2</span><span class="s2">.</span><span class="s1">have_properties_to_animate</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)):</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">cancel</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">have_properties_to_animate</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">anim1</span><span class="s2">.</span><span class="s1">have_properties_to_animate</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">) </span><span class="s4">or</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">anim2</span><span class="s2">.</span><span class="s1">have_properties_to_animate</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">))</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s4">def </span><span class="s1">animated_properties</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s1">ChainMap</span><span class="s2">({},</span>
+                        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim2</span><span class="s2">.</span><span class="s1">animated_properties</span><span class="s2">,</span>
+                        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim1</span><span class="s2">.</span><span class="s1">animated_properties</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s4">def </span><span class="s1">transition</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># This property is impossible to implement</span>
+        <span class="s4">raise </span><span class="s1">AttributeError</span><span class="s2">(</span>
+            <span class="s3">&quot;Can't lookup transition attribute of a CompoundAnimation&quot;</span><span class="s2">)</span>
+
+
+<span class="s4">class </span><span class="s1">Sequence</span><span class="s2">(</span><span class="s1">CompoundAnimation</span><span class="s2">):</span>
+
+    <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">anim1</span><span class="s2">, </span><span class="s1">anim2</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">()</span>
+
+        <span class="s5">#: Repeat the sequence. See 'Repeating animation' in the header</span>
+        <span class="s5">#: documentation.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">repeat </span><span class="s2">= </span><span class="s4">False</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim1 </span><span class="s2">= </span><span class="s1">anim1</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim2 </span><span class="s2">= </span><span class="s1">anim2</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim1</span><span class="s2">.</span><span class="s1">bind</span><span class="s2">(</span><span class="s1">on_complete</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">on_anim1_complete</span><span class="s2">,</span>
+                        <span class="s1">on_progress</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">on_anim1_progress</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim2</span><span class="s2">.</span><span class="s1">bind</span><span class="s2">(</span><span class="s1">on_complete</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">on_anim2_complete</span><span class="s2">,</span>
+                        <span class="s1">on_progress</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">on_anim2_progress</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s4">def </span><span class="s1">duration</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">anim1</span><span class="s2">.</span><span class="s1">duration </span><span class="s2">+ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">anim2</span><span class="s2">.</span><span class="s1">duration</span>
+
+    <span class="s4">def </span><span class="s1">stop</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">):</span>
+        <span class="s1">props </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">.</span><span class="s1">uid</span><span class="s2">, </span><span class="s4">None</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim1</span><span class="s2">.</span><span class="s1">stop</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim2</span><span class="s2">.</span><span class="s1">stop</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s1">props</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_complete'</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">)</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">cancel</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">start</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">stop</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">[</span><span class="s1">widget</span><span class="s2">.</span><span class="s1">uid</span><span class="s2">] = </span><span class="s4">True</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_register</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_start'</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim1</span><span class="s2">.</span><span class="s1">start</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">on_anim1_complete</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">instance</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">widget</span><span class="s2">.</span><span class="s1">uid </span><span class="s4">not in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">:</span>
+            <span class="s4">return</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim2</span><span class="s2">.</span><span class="s1">start</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">on_anim1_progress</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">instance</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">, </span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_progress'</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">, </span><span class="s1">progress </span><span class="s2">/ </span><span class="s6">2.</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">on_anim2_complete</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">instance</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">):</span>
+        <span class="s0">'''Repeating logic used with boolean variable &quot;repeat&quot;. 
+ 
+        .. versionadded:: 1.7.1 
+        '''</span>
+        <span class="s4">if </span><span class="s1">widget</span><span class="s2">.</span><span class="s1">uid </span><span class="s4">not in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">:</span>
+            <span class="s4">return</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">repeat</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">anim1</span><span class="s2">.</span><span class="s1">start</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_complete'</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">cancel</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">on_anim2_progress</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">instance</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">, </span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_progress'</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">, </span><span class="s6">.5 </span><span class="s2">+ </span><span class="s1">progress </span><span class="s2">/ </span><span class="s6">2.</span><span class="s2">)</span>
+
+
+<span class="s4">class </span><span class="s1">Parallel</span><span class="s2">(</span><span class="s1">CompoundAnimation</span><span class="s2">):</span>
+
+    <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">anim1</span><span class="s2">, </span><span class="s1">anim2</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim1 </span><span class="s2">= </span><span class="s1">anim1</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim2 </span><span class="s2">= </span><span class="s1">anim2</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim1</span><span class="s2">.</span><span class="s1">bind</span><span class="s2">(</span><span class="s1">on_complete</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">on_anim_complete</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim2</span><span class="s2">.</span><span class="s1">bind</span><span class="s2">(</span><span class="s1">on_complete</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">on_anim_complete</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s4">def </span><span class="s1">duration</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s1">max</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">anim1</span><span class="s2">.</span><span class="s1">duration</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">anim2</span><span class="s2">.</span><span class="s1">duration</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">stop</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim1</span><span class="s2">.</span><span class="s1">stop</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim2</span><span class="s2">.</span><span class="s1">stop</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">.</span><span class="s1">uid</span><span class="s2">, </span><span class="s4">None</span><span class="s2">):</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_complete'</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">)</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">cancel</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">start</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">stop</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim1</span><span class="s2">.</span><span class="s1">start</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">anim2</span><span class="s2">.</span><span class="s1">start</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">[</span><span class="s1">widget</span><span class="s2">.</span><span class="s1">uid</span><span class="s2">] = {</span><span class="s3">'complete'</span><span class="s2">: </span><span class="s6">0</span><span class="s2">}</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_register</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_start'</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">on_anim_complete</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">instance</span><span class="s2">, </span><span class="s1">widget</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">[</span><span class="s1">widget</span><span class="s2">.</span><span class="s1">uid</span><span class="s2">][</span><span class="s3">'complete'</span><span class="s2">] += </span><span class="s6">1</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_widgets</span><span class="s2">[</span><span class="s1">widget</span><span class="s2">.</span><span class="s1">uid</span><span class="s2">][</span><span class="s3">'complete'</span><span class="s2">] == </span><span class="s6">2</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">stop</span><span class="s2">(</span><span class="s1">widget</span><span class="s2">)</span>
+
+
+<span class="s4">class </span><span class="s1">AnimationTransition</span><span class="s2">:</span>
+    <span class="s0">'''Collection of animation functions to be used with the Animation object. 
+    Easing Functions ported to Kivy from the Clutter Project 
+    https://developer.gnome.org/clutter/stable/ClutterAlpha.html 
+ 
+    The `progress` parameter in each animation function is in the range 0-1. 
+    '''</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">linear</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_linear.png'''</span>
+        <span class="s4">return </span><span class="s1">progress</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_quad</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_quad.png 
+        '''</span>
+        <span class="s4">return </span><span class="s1">progress </span><span class="s2">* </span><span class="s1">progress</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">out_quad</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_out_quad.png 
+        '''</span>
+        <span class="s4">return </span><span class="s2">-</span><span class="s6">1.0 </span><span class="s2">* </span><span class="s1">progress </span><span class="s2">* (</span><span class="s1">progress </span><span class="s2">- </span><span class="s6">2.0</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_out_quad</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_out_quad.png 
+        '''</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">progress </span><span class="s2">* </span><span class="s6">2</span>
+        <span class="s4">if </span><span class="s1">p </span><span class="s2">&lt; </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s6">0.5 </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p</span>
+        <span class="s1">p </span><span class="s2">-= </span><span class="s6">1.0</span>
+        <span class="s4">return </span><span class="s2">-</span><span class="s6">0.5 </span><span class="s2">* (</span><span class="s1">p </span><span class="s2">* (</span><span class="s1">p </span><span class="s2">- </span><span class="s6">2.0</span><span class="s2">) - </span><span class="s6">1.0</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_cubic</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_cubic.png 
+        '''</span>
+        <span class="s4">return </span><span class="s1">progress </span><span class="s2">* </span><span class="s1">progress </span><span class="s2">* </span><span class="s1">progress</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">out_cubic</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_out_cubic.png 
+        '''</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">progress </span><span class="s2">- </span><span class="s6">1.0</span>
+        <span class="s4">return </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">+ </span><span class="s6">1.0</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_out_cubic</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_out_cubic.png 
+        '''</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">progress </span><span class="s2">* </span><span class="s6">2</span>
+        <span class="s4">if </span><span class="s1">p </span><span class="s2">&lt; </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s6">0.5 </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p</span>
+        <span class="s1">p </span><span class="s2">-= </span><span class="s6">2</span>
+        <span class="s4">return </span><span class="s6">0.5 </span><span class="s2">* (</span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">+ </span><span class="s6">2.0</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_quart</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_quart.png 
+        '''</span>
+        <span class="s4">return </span><span class="s1">progress </span><span class="s2">* </span><span class="s1">progress </span><span class="s2">* </span><span class="s1">progress </span><span class="s2">* </span><span class="s1">progress</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">out_quart</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_out_quart.png 
+        '''</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">progress </span><span class="s2">- </span><span class="s6">1.0</span>
+        <span class="s4">return </span><span class="s2">-</span><span class="s6">1.0 </span><span class="s2">* (</span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">- </span><span class="s6">1.0</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_out_quart</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_out_quart.png 
+        '''</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">progress </span><span class="s2">* </span><span class="s6">2</span>
+        <span class="s4">if </span><span class="s1">p </span><span class="s2">&lt; </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s6">0.5 </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p</span>
+        <span class="s1">p </span><span class="s2">-= </span><span class="s6">2</span>
+        <span class="s4">return </span><span class="s2">-</span><span class="s6">0.5 </span><span class="s2">* (</span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">- </span><span class="s6">2.0</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_quint</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_quint.png 
+        '''</span>
+        <span class="s4">return </span><span class="s1">progress </span><span class="s2">* </span><span class="s1">progress </span><span class="s2">* </span><span class="s1">progress </span><span class="s2">* </span><span class="s1">progress </span><span class="s2">* </span><span class="s1">progress</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">out_quint</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_out_quint.png 
+        '''</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">progress </span><span class="s2">- </span><span class="s6">1.0</span>
+        <span class="s4">return </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">+ </span><span class="s6">1.0</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_out_quint</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_out_quint.png 
+        '''</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">progress </span><span class="s2">* </span><span class="s6">2</span>
+        <span class="s4">if </span><span class="s1">p </span><span class="s2">&lt; </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s6">0.5 </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p</span>
+        <span class="s1">p </span><span class="s2">-= </span><span class="s6">2.0</span>
+        <span class="s4">return </span><span class="s6">0.5 </span><span class="s2">* (</span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">+ </span><span class="s6">2.0</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_sine</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_sine.png 
+        '''</span>
+        <span class="s4">return </span><span class="s2">-</span><span class="s6">1.0 </span><span class="s2">* </span><span class="s1">cos</span><span class="s2">(</span><span class="s1">progress </span><span class="s2">* (</span><span class="s1">pi </span><span class="s2">/ </span><span class="s6">2.0</span><span class="s2">)) + </span><span class="s6">1.0</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">out_sine</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_out_sine.png 
+        '''</span>
+        <span class="s4">return </span><span class="s1">sin</span><span class="s2">(</span><span class="s1">progress </span><span class="s2">* (</span><span class="s1">pi </span><span class="s2">/ </span><span class="s6">2.0</span><span class="s2">))</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_out_sine</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_out_sine.png 
+        '''</span>
+        <span class="s4">return </span><span class="s2">-</span><span class="s6">0.5 </span><span class="s2">* (</span><span class="s1">cos</span><span class="s2">(</span><span class="s1">pi </span><span class="s2">* </span><span class="s1">progress</span><span class="s2">) - </span><span class="s6">1.0</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_expo</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_expo.png 
+        '''</span>
+        <span class="s4">if </span><span class="s1">progress </span><span class="s2">== </span><span class="s6">0</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s6">0.0</span>
+        <span class="s4">return </span><span class="s1">pow</span><span class="s2">(</span><span class="s6">2</span><span class="s2">, </span><span class="s6">10 </span><span class="s2">* (</span><span class="s1">progress </span><span class="s2">- </span><span class="s6">1.0</span><span class="s2">))</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">out_expo</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_out_expo.png 
+        '''</span>
+        <span class="s4">if </span><span class="s1">progress </span><span class="s2">== </span><span class="s6">1.0</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s6">1.0</span>
+        <span class="s4">return </span><span class="s2">-</span><span class="s1">pow</span><span class="s2">(</span><span class="s6">2</span><span class="s2">, -</span><span class="s6">10 </span><span class="s2">* </span><span class="s1">progress</span><span class="s2">) + </span><span class="s6">1.0</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_out_expo</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_out_expo.png 
+        '''</span>
+        <span class="s4">if </span><span class="s1">progress </span><span class="s2">== </span><span class="s6">0</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s6">0.0</span>
+        <span class="s4">if </span><span class="s1">progress </span><span class="s2">== </span><span class="s6">1.</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s6">1.0</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">progress </span><span class="s2">* </span><span class="s6">2</span>
+        <span class="s4">if </span><span class="s1">p </span><span class="s2">&lt; </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s6">0.5 </span><span class="s2">* </span><span class="s1">pow</span><span class="s2">(</span><span class="s6">2</span><span class="s2">, </span><span class="s6">10 </span><span class="s2">* (</span><span class="s1">p </span><span class="s2">- </span><span class="s6">1.0</span><span class="s2">))</span>
+        <span class="s1">p </span><span class="s2">-= </span><span class="s6">1.0</span>
+        <span class="s4">return </span><span class="s6">0.5 </span><span class="s2">* (-</span><span class="s1">pow</span><span class="s2">(</span><span class="s6">2</span><span class="s2">, -</span><span class="s6">10 </span><span class="s2">* </span><span class="s1">p</span><span class="s2">) + </span><span class="s6">2.0</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_circ</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_circ.png 
+        '''</span>
+        <span class="s4">return </span><span class="s2">-</span><span class="s6">1.0 </span><span class="s2">* (</span><span class="s1">sqrt</span><span class="s2">(</span><span class="s6">1.0 </span><span class="s2">- </span><span class="s1">progress </span><span class="s2">* </span><span class="s1">progress</span><span class="s2">) - </span><span class="s6">1.0</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">out_circ</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_out_circ.png 
+        '''</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">progress </span><span class="s2">- </span><span class="s6">1.0</span>
+        <span class="s4">return </span><span class="s1">sqrt</span><span class="s2">(</span><span class="s6">1.0 </span><span class="s2">- </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_out_circ</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_out_circ.png 
+        '''</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">progress </span><span class="s2">* </span><span class="s6">2</span>
+        <span class="s4">if </span><span class="s1">p </span><span class="s2">&lt; </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s2">-</span><span class="s6">0.5 </span><span class="s2">* (</span><span class="s1">sqrt</span><span class="s2">(</span><span class="s6">1.0 </span><span class="s2">- </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p</span><span class="s2">) - </span><span class="s6">1.0</span><span class="s2">)</span>
+        <span class="s1">p </span><span class="s2">-= </span><span class="s6">2.0</span>
+        <span class="s4">return </span><span class="s6">0.5 </span><span class="s2">* (</span><span class="s1">sqrt</span><span class="s2">(</span><span class="s6">1.0 </span><span class="s2">- </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p</span><span class="s2">) + </span><span class="s6">1.0</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_elastic</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_elastic.png 
+        '''</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s6">.3</span>
+        <span class="s1">s </span><span class="s2">= </span><span class="s1">p </span><span class="s2">/ </span><span class="s6">4.0</span>
+        <span class="s1">q </span><span class="s2">= </span><span class="s1">progress</span>
+        <span class="s4">if </span><span class="s1">q </span><span class="s2">== </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s6">1.0</span>
+        <span class="s1">q </span><span class="s2">-= </span><span class="s6">1.0</span>
+        <span class="s4">return </span><span class="s2">-(</span><span class="s1">pow</span><span class="s2">(</span><span class="s6">2</span><span class="s2">, </span><span class="s6">10 </span><span class="s2">* </span><span class="s1">q</span><span class="s2">) * </span><span class="s1">sin</span><span class="s2">((</span><span class="s1">q </span><span class="s2">- </span><span class="s1">s</span><span class="s2">) * (</span><span class="s6">2 </span><span class="s2">* </span><span class="s1">pi</span><span class="s2">) / </span><span class="s1">p</span><span class="s2">))</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">out_elastic</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_out_elastic.png 
+        '''</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s6">.3</span>
+        <span class="s1">s </span><span class="s2">= </span><span class="s1">p </span><span class="s2">/ </span><span class="s6">4.0</span>
+        <span class="s1">q </span><span class="s2">= </span><span class="s1">progress</span>
+        <span class="s4">if </span><span class="s1">q </span><span class="s2">== </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s6">1.0</span>
+        <span class="s4">return </span><span class="s1">pow</span><span class="s2">(</span><span class="s6">2</span><span class="s2">, -</span><span class="s6">10 </span><span class="s2">* </span><span class="s1">q</span><span class="s2">) * </span><span class="s1">sin</span><span class="s2">((</span><span class="s1">q </span><span class="s2">- </span><span class="s1">s</span><span class="s2">) * (</span><span class="s6">2 </span><span class="s2">* </span><span class="s1">pi</span><span class="s2">) / </span><span class="s1">p</span><span class="s2">) + </span><span class="s6">1.0</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_out_elastic</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_out_elastic.png 
+        '''</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s6">.3 </span><span class="s2">* </span><span class="s6">1.5</span>
+        <span class="s1">s </span><span class="s2">= </span><span class="s1">p </span><span class="s2">/ </span><span class="s6">4.0</span>
+        <span class="s1">q </span><span class="s2">= </span><span class="s1">progress </span><span class="s2">* </span><span class="s6">2</span>
+        <span class="s4">if </span><span class="s1">q </span><span class="s2">== </span><span class="s6">2</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s6">1.0</span>
+        <span class="s4">if </span><span class="s1">q </span><span class="s2">&lt; </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s1">q </span><span class="s2">-= </span><span class="s6">1.0</span>
+            <span class="s4">return </span><span class="s2">-</span><span class="s6">.5 </span><span class="s2">* (</span><span class="s1">pow</span><span class="s2">(</span><span class="s6">2</span><span class="s2">, </span><span class="s6">10 </span><span class="s2">* </span><span class="s1">q</span><span class="s2">) * </span><span class="s1">sin</span><span class="s2">((</span><span class="s1">q </span><span class="s2">- </span><span class="s1">s</span><span class="s2">) * (</span><span class="s6">2.0 </span><span class="s2">* </span><span class="s1">pi</span><span class="s2">) / </span><span class="s1">p</span><span class="s2">))</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s1">q </span><span class="s2">-= </span><span class="s6">1.0</span>
+            <span class="s4">return </span><span class="s1">pow</span><span class="s2">(</span><span class="s6">2</span><span class="s2">, -</span><span class="s6">10 </span><span class="s2">* </span><span class="s1">q</span><span class="s2">) * </span><span class="s1">sin</span><span class="s2">((</span><span class="s1">q </span><span class="s2">- </span><span class="s1">s</span><span class="s2">) * (</span><span class="s6">2.0 </span><span class="s2">* </span><span class="s1">pi</span><span class="s2">) / </span><span class="s1">p</span><span class="s2">) * </span><span class="s6">.5 </span><span class="s2">+ </span><span class="s6">1.0</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_back</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_back.png 
+        '''</span>
+        <span class="s4">return </span><span class="s1">progress </span><span class="s2">* </span><span class="s1">progress </span><span class="s2">* ((</span><span class="s6">1.70158 </span><span class="s2">+ </span><span class="s6">1.0</span><span class="s2">) * </span><span class="s1">progress </span><span class="s2">- </span><span class="s6">1.70158</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">out_back</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_out_back.png 
+        '''</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">progress </span><span class="s2">- </span><span class="s6">1.0</span>
+        <span class="s4">return </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* ((</span><span class="s6">1.70158 </span><span class="s2">+ </span><span class="s6">1</span><span class="s2">) * </span><span class="s1">p </span><span class="s2">+ </span><span class="s6">1.70158</span><span class="s2">) + </span><span class="s6">1.0</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_out_back</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_out_back.png 
+        '''</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">progress </span><span class="s2">* </span><span class="s6">2.</span>
+        <span class="s1">s </span><span class="s2">= </span><span class="s6">1.70158 </span><span class="s2">* </span><span class="s6">1.525</span>
+        <span class="s4">if </span><span class="s1">p </span><span class="s2">&lt; </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s6">0.5 </span><span class="s2">* (</span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* ((</span><span class="s1">s </span><span class="s2">+ </span><span class="s6">1.0</span><span class="s2">) * </span><span class="s1">p </span><span class="s2">- </span><span class="s1">s</span><span class="s2">))</span>
+        <span class="s1">p </span><span class="s2">-= </span><span class="s6">2.0</span>
+        <span class="s4">return </span><span class="s6">0.5 </span><span class="s2">* (</span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* ((</span><span class="s1">s </span><span class="s2">+ </span><span class="s6">1.0</span><span class="s2">) * </span><span class="s1">p </span><span class="s2">+ </span><span class="s1">s</span><span class="s2">) + </span><span class="s6">2.0</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">_out_bounce_internal</span><span class="s2">(</span><span class="s1">t</span><span class="s2">, </span><span class="s1">d</span><span class="s2">):</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">t </span><span class="s2">/ </span><span class="s1">d</span>
+        <span class="s4">if </span><span class="s1">p </span><span class="s2">&lt; (</span><span class="s6">1.0 </span><span class="s2">/ </span><span class="s6">2.75</span><span class="s2">):</span>
+            <span class="s4">return </span><span class="s6">7.5625 </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p</span>
+        <span class="s4">elif </span><span class="s1">p </span><span class="s2">&lt; (</span><span class="s6">2.0 </span><span class="s2">/ </span><span class="s6">2.75</span><span class="s2">):</span>
+            <span class="s1">p </span><span class="s2">-= (</span><span class="s6">1.5 </span><span class="s2">/ </span><span class="s6">2.75</span><span class="s2">)</span>
+            <span class="s4">return </span><span class="s6">7.5625 </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">+ </span><span class="s6">.75</span>
+        <span class="s4">elif </span><span class="s1">p </span><span class="s2">&lt; (</span><span class="s6">2.5 </span><span class="s2">/ </span><span class="s6">2.75</span><span class="s2">):</span>
+            <span class="s1">p </span><span class="s2">-= (</span><span class="s6">2.25 </span><span class="s2">/ </span><span class="s6">2.75</span><span class="s2">)</span>
+            <span class="s4">return </span><span class="s6">7.5625 </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">+ </span><span class="s6">.9375</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s1">p </span><span class="s2">-= (</span><span class="s6">2.625 </span><span class="s2">/ </span><span class="s6">2.75</span><span class="s2">)</span>
+            <span class="s4">return </span><span class="s6">7.5625 </span><span class="s2">* </span><span class="s1">p </span><span class="s2">* </span><span class="s1">p </span><span class="s2">+ </span><span class="s6">.984375</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">_in_bounce_internal</span><span class="s2">(</span><span class="s1">t</span><span class="s2">, </span><span class="s1">d</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s6">1.0 </span><span class="s2">- </span><span class="s1">AnimationTransition</span><span class="s2">.</span><span class="s1">_out_bounce_internal</span><span class="s2">(</span><span class="s1">d </span><span class="s2">- </span><span class="s1">t</span><span class="s2">, </span><span class="s1">d</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_bounce</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_bounce.png 
+        '''</span>
+        <span class="s4">return </span><span class="s1">AnimationTransition</span><span class="s2">.</span><span class="s1">_in_bounce_internal</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">, </span><span class="s6">1.</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">out_bounce</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_out_bounce.png 
+        '''</span>
+        <span class="s4">return </span><span class="s1">AnimationTransition</span><span class="s2">.</span><span class="s1">_out_bounce_internal</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">, </span><span class="s6">1.</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">in_out_bounce</span><span class="s2">(</span><span class="s1">progress</span><span class="s2">):</span>
+        <span class="s0">'''.. image:: images/anim_in_out_bounce.png 
+        '''</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">progress </span><span class="s2">* </span><span class="s6">2.</span>
+        <span class="s4">if </span><span class="s1">p </span><span class="s2">&lt; </span><span class="s6">1.</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s1">AnimationTransition</span><span class="s2">.</span><span class="s1">_in_bounce_internal</span><span class="s2">(</span><span class="s1">p</span><span class="s2">, </span><span class="s6">1.</span><span class="s2">) * </span><span class="s6">.5</span>
+        <span class="s4">return </span><span class="s1">AnimationTransition</span><span class="s2">.</span><span class="s1">_out_bounce_internal</span><span class="s2">(</span><span class="s1">p </span><span class="s2">- </span><span class="s6">1.</span><span class="s2">, </span><span class="s6">1.</span><span class="s2">) * </span><span class="s6">.5 </span><span class="s2">+ </span><span class="s6">.5</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,432 @@
+<html>
+<head>
+<title>llvm_pass_timings.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #5f826b; font-style: italic;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+.s6 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+llvm_pass_timings.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">re</span>
+<span class="s0">import </span><span class="s1">operator</span>
+<span class="s0">import </span><span class="s1">heapq</span>
+<span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">namedtuple</span>
+<span class="s0">from </span><span class="s1">collections</span><span class="s2">.</span><span class="s1">abc </span><span class="s0">import </span><span class="s1">Sequence</span>
+<span class="s0">from </span><span class="s1">contextlib </span><span class="s0">import </span><span class="s1">contextmanager</span>
+<span class="s0">from </span><span class="s1">functools </span><span class="s0">import </span><span class="s1">cached_property</span>
+
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">config</span>
+
+<span class="s0">import </span><span class="s1">llvmlite</span><span class="s2">.</span><span class="s1">binding </span><span class="s0">as </span><span class="s1">llvm</span>
+
+
+<span class="s0">class </span><span class="s1">RecordLLVMPassTimings</span><span class="s2">:</span>
+    <span class="s3">&quot;&quot;&quot;A helper context manager to track LLVM pass timings. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">__slots__ </span><span class="s2">= [</span><span class="s4">&quot;_data&quot;</span><span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">__enter__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Enables the pass timing in LLVM. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">llvm</span><span class="s2">.</span><span class="s1">set_time_passes</span><span class="s2">(</span><span class="s0">True</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">self</span>
+
+    <span class="s0">def </span><span class="s1">__exit__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">exc_val</span><span class="s2">, </span><span class="s1">exc_type</span><span class="s2">, </span><span class="s1">exc_tb</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Reset timings and save report internally. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_data </span><span class="s2">= </span><span class="s1">llvm</span><span class="s2">.</span><span class="s1">report_and_reset_timings</span><span class="s2">()</span>
+        <span class="s1">llvm</span><span class="s2">.</span><span class="s1">set_time_passes</span><span class="s2">(</span><span class="s0">False</span><span class="s2">)</span>
+        <span class="s0">return</span>
+
+    <span class="s0">def </span><span class="s1">get</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Retrieve timing data for processing. 
+ 
+        Returns 
+        ------- 
+        timings: ProcessedPassTimings 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">ProcessedPassTimings</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_data</span><span class="s2">)</span>
+
+
+<span class="s1">PassTimingRecord </span><span class="s2">= </span><span class="s1">namedtuple</span><span class="s2">(</span>
+    <span class="s4">&quot;PassTimingRecord&quot;</span><span class="s2">,</span>
+    <span class="s2">[</span>
+        <span class="s4">&quot;user_time&quot;</span><span class="s2">,</span>
+        <span class="s4">&quot;user_percent&quot;</span><span class="s2">,</span>
+        <span class="s4">&quot;system_time&quot;</span><span class="s2">,</span>
+        <span class="s4">&quot;system_percent&quot;</span><span class="s2">,</span>
+        <span class="s4">&quot;user_system_time&quot;</span><span class="s2">,</span>
+        <span class="s4">&quot;user_system_percent&quot;</span><span class="s2">,</span>
+        <span class="s4">&quot;wall_time&quot;</span><span class="s2">,</span>
+        <span class="s4">&quot;wall_percent&quot;</span><span class="s2">,</span>
+        <span class="s4">&quot;pass_name&quot;</span><span class="s2">,</span>
+        <span class="s4">&quot;instruction&quot;</span><span class="s2">,</span>
+    <span class="s2">],</span>
+<span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">_adjust_timings</span><span class="s2">(</span><span class="s1">records</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Adjust timing records because of truncated information. 
+ 
+    Details: The percent information can be used to improve the timing 
+    information. 
+ 
+    Returns 
+    ------- 
+    res: List[PassTimingRecord] 
+    &quot;&quot;&quot;</span>
+    <span class="s1">total_rec </span><span class="s2">= </span><span class="s1">records</span><span class="s2">[-</span><span class="s5">1</span><span class="s2">]</span>
+    <span class="s0">assert </span><span class="s1">total_rec</span><span class="s2">.</span><span class="s1">pass_name </span><span class="s2">== </span><span class="s4">&quot;Total&quot;  </span><span class="s6"># guard for implementation error</span>
+
+    <span class="s0">def </span><span class="s1">make_adjuster</span><span class="s2">(</span><span class="s1">attr</span><span class="s2">):</span>
+        <span class="s1">time_attr </span><span class="s2">= </span><span class="s4">f&quot;</span><span class="s0">{</span><span class="s1">attr</span><span class="s0">}</span><span class="s4">_time&quot;</span>
+        <span class="s1">percent_attr </span><span class="s2">= </span><span class="s4">f&quot;</span><span class="s0">{</span><span class="s1">attr</span><span class="s0">}</span><span class="s4">_percent&quot;</span>
+        <span class="s1">time_getter </span><span class="s2">= </span><span class="s1">operator</span><span class="s2">.</span><span class="s1">attrgetter</span><span class="s2">(</span><span class="s1">time_attr</span><span class="s2">)</span>
+
+        <span class="s0">def </span><span class="s1">adjust</span><span class="s2">(</span><span class="s1">d</span><span class="s2">):</span>
+            <span class="s3">&quot;&quot;&quot;Compute percent x total_time = adjusted&quot;&quot;&quot;</span>
+            <span class="s1">total </span><span class="s2">= </span><span class="s1">time_getter</span><span class="s2">(</span><span class="s1">total_rec</span><span class="s2">)</span>
+            <span class="s1">adjusted </span><span class="s2">= </span><span class="s1">total </span><span class="s2">* </span><span class="s1">d</span><span class="s2">[</span><span class="s1">percent_attr</span><span class="s2">] * </span><span class="s5">0.01</span>
+            <span class="s1">d</span><span class="s2">[</span><span class="s1">time_attr</span><span class="s2">] = </span><span class="s1">adjusted</span>
+            <span class="s0">return </span><span class="s1">d</span>
+
+        <span class="s0">return </span><span class="s1">adjust</span>
+
+    <span class="s6"># Make adjustment functions for each field</span>
+    <span class="s1">adj_fns </span><span class="s2">= [</span>
+        <span class="s1">make_adjuster</span><span class="s2">(</span><span class="s1">x</span><span class="s2">) </span><span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s2">[</span><span class="s4">&quot;user&quot;</span><span class="s2">, </span><span class="s4">&quot;system&quot;</span><span class="s2">, </span><span class="s4">&quot;user_system&quot;</span><span class="s2">, </span><span class="s4">&quot;wall&quot;</span><span class="s2">]</span>
+    <span class="s2">]</span>
+
+    <span class="s6"># Extract dictionaries from the namedtuples</span>
+    <span class="s1">dicts </span><span class="s2">= </span><span class="s1">map</span><span class="s2">(</span><span class="s0">lambda </span><span class="s1">x</span><span class="s2">: </span><span class="s1">x</span><span class="s2">.</span><span class="s1">_asdict</span><span class="s2">(), </span><span class="s1">records</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">chained</span><span class="s2">(</span><span class="s1">d</span><span class="s2">):</span>
+        <span class="s6"># Chain the adjustment functions</span>
+        <span class="s0">for </span><span class="s1">fn </span><span class="s0">in </span><span class="s1">adj_fns</span><span class="s2">:</span>
+            <span class="s1">d </span><span class="s2">= </span><span class="s1">fn</span><span class="s2">(</span><span class="s1">d</span><span class="s2">)</span>
+        <span class="s6"># Reconstruct the namedtuple</span>
+        <span class="s0">return </span><span class="s1">PassTimingRecord</span><span class="s2">(**</span><span class="s1">d</span><span class="s2">)</span>
+
+    <span class="s0">return </span><span class="s1">list</span><span class="s2">(</span><span class="s1">map</span><span class="s2">(</span><span class="s1">chained</span><span class="s2">, </span><span class="s1">dicts</span><span class="s2">))</span>
+
+
+<span class="s0">class </span><span class="s1">ProcessedPassTimings</span><span class="s2">:</span>
+    <span class="s3">&quot;&quot;&quot;A class for processing raw timing report from LLVM. 
+ 
+    The processing is done lazily so we don't waste time processing unused 
+    timing information. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">raw_data</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_raw_data </span><span class="s2">= </span><span class="s1">raw_data</span>
+
+    <span class="s0">def </span><span class="s1">__bool__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">bool</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_raw_data</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">get_raw_data</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Returns the raw string data. 
+ 
+        Returns 
+        ------- 
+        res: str 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_raw_data</span>
+
+    <span class="s0">def </span><span class="s1">get_total_time</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Compute the total time spend in all passes. 
+ 
+        Returns 
+        ------- 
+        res: float 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">list_records</span><span class="s2">()[-</span><span class="s5">1</span><span class="s2">].</span><span class="s1">wall_time</span>
+
+    <span class="s0">def </span><span class="s1">list_records</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Get the processed data for the timing report. 
+ 
+        Returns 
+        ------- 
+        res: List[PassTimingRecord] 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_processed</span>
+
+    <span class="s0">def </span><span class="s1">list_top</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">n</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Returns the top(n) most time-consuming (by wall-time) passes. 
+ 
+        Parameters 
+        ---------- 
+        n: int 
+            This limits the maximum number of items to show. 
+            This function will show the ``n`` most time-consuming passes. 
+ 
+        Returns 
+        ------- 
+        res: List[PassTimingRecord] 
+            Returns the top(n) most time-consuming passes in descending order. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">records </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">list_records</span><span class="s2">()</span>
+        <span class="s1">key </span><span class="s2">= </span><span class="s1">operator</span><span class="s2">.</span><span class="s1">attrgetter</span><span class="s2">(</span><span class="s4">&quot;wall_time&quot;</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">heapq</span><span class="s2">.</span><span class="s1">nlargest</span><span class="s2">(</span><span class="s1">n</span><span class="s2">, </span><span class="s1">records</span><span class="s2">[:-</span><span class="s5">1</span><span class="s2">], </span><span class="s1">key</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">summary</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">topn</span><span class="s2">=</span><span class="s5">5</span><span class="s2">, </span><span class="s1">indent</span><span class="s2">=</span><span class="s5">0</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Return a string summarizing the timing information. 
+ 
+        Parameters 
+        ---------- 
+        topn: int; optional 
+            This limits the maximum number of items to show. 
+            This function will show the ``topn`` most time-consuming passes. 
+        indent: int; optional 
+            Set the indentation level. Defaults to 0 for no indentation. 
+ 
+        Returns 
+        ------- 
+        res: str 
+        &quot;&quot;&quot;</span>
+        <span class="s1">buf </span><span class="s2">= []</span>
+        <span class="s1">prefix </span><span class="s2">= </span><span class="s4">&quot; &quot; </span><span class="s2">* </span><span class="s1">indent</span>
+
+        <span class="s0">def </span><span class="s1">ap</span><span class="s2">(</span><span class="s1">arg</span><span class="s2">):</span>
+            <span class="s1">buf</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s4">f&quot;</span><span class="s0">{</span><span class="s1">prefix</span><span class="s0">}{</span><span class="s1">arg</span><span class="s0">}</span><span class="s4">&quot;</span><span class="s2">)</span>
+
+        <span class="s1">ap</span><span class="s2">(</span><span class="s4">f&quot;Total </span><span class="s0">{</span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_total_time</span><span class="s2">()</span><span class="s0">:</span><span class="s4">.4f</span><span class="s0">}</span><span class="s4">s&quot;</span><span class="s2">)</span>
+        <span class="s1">ap</span><span class="s2">(</span><span class="s4">&quot;Top timings:&quot;</span><span class="s2">)</span>
+        <span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">list_top</span><span class="s2">(</span><span class="s1">topn</span><span class="s2">):</span>
+            <span class="s1">ap</span><span class="s2">(</span><span class="s4">f&quot;  </span><span class="s0">{</span><span class="s1">p</span><span class="s2">.</span><span class="s1">wall_time</span><span class="s0">:</span><span class="s4">.4f</span><span class="s0">}</span><span class="s4">s (</span><span class="s0">{</span><span class="s1">p</span><span class="s2">.</span><span class="s1">wall_percent</span><span class="s0">:</span><span class="s4">5</span><span class="s0">}</span><span class="s4">%) </span><span class="s0">{</span><span class="s1">p</span><span class="s2">.</span><span class="s1">pass_name</span><span class="s0">}</span><span class="s4">&quot;</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s4">&quot;</span><span class="s0">\n</span><span class="s4">&quot;</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">buf</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">cached_property</span>
+    <span class="s0">def </span><span class="s1">_processed</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;A cached property for lazily processing the data and returning it. 
+ 
+        See ``_process()`` for details. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_process</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">_process</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Parses the raw string data from LLVM timing report and attempts 
+        to improve the data by recomputing the times 
+        (See `_adjust_timings()``). 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0">def </span><span class="s1">parse</span><span class="s2">(</span><span class="s1">raw_data</span><span class="s2">):</span>
+            <span class="s3">&quot;&quot;&quot;A generator that parses the raw_data line-by-line to extract 
+            timing information for each pass. 
+            &quot;&quot;&quot;</span>
+            <span class="s1">lines </span><span class="s2">= </span><span class="s1">raw_data</span><span class="s2">.</span><span class="s1">splitlines</span><span class="s2">()</span>
+            <span class="s1">colheader </span><span class="s2">= </span><span class="s4">r&quot;[a-zA-Z+ ]+&quot;</span>
+            <span class="s6"># Take at least one column header.</span>
+            <span class="s1">multicolheaders </span><span class="s2">= </span><span class="s4">fr&quot;(?:\s*-+</span><span class="s0">{</span><span class="s1">colheader</span><span class="s0">}</span><span class="s4">-+)+&quot;</span>
+
+            <span class="s1">line_iter </span><span class="s2">= </span><span class="s1">iter</span><span class="s2">(</span><span class="s1">lines</span><span class="s2">)</span>
+            <span class="s6"># find column headers</span>
+            <span class="s1">header_map </span><span class="s2">= {</span>
+                <span class="s4">&quot;User Time&quot;</span><span class="s2">: </span><span class="s4">&quot;user&quot;</span><span class="s2">,</span>
+                <span class="s4">&quot;System Time&quot;</span><span class="s2">: </span><span class="s4">&quot;system&quot;</span><span class="s2">,</span>
+                <span class="s4">&quot;User+System&quot;</span><span class="s2">: </span><span class="s4">&quot;user_system&quot;</span><span class="s2">,</span>
+                <span class="s4">&quot;Wall Time&quot;</span><span class="s2">: </span><span class="s4">&quot;wall&quot;</span><span class="s2">,</span>
+                <span class="s4">&quot;Instr&quot;</span><span class="s2">: </span><span class="s4">&quot;instruction&quot;</span><span class="s2">,</span>
+                <span class="s4">&quot;Name&quot;</span><span class="s2">: </span><span class="s4">&quot;pass_name&quot;</span><span class="s2">,</span>
+            <span class="s2">}</span>
+            <span class="s0">for </span><span class="s1">ln </span><span class="s0">in </span><span class="s1">line_iter</span><span class="s2">:</span>
+                <span class="s1">m </span><span class="s2">= </span><span class="s1">re</span><span class="s2">.</span><span class="s1">match</span><span class="s2">(</span><span class="s1">multicolheaders</span><span class="s2">, </span><span class="s1">ln</span><span class="s2">)</span>
+                <span class="s0">if </span><span class="s1">m</span><span class="s2">:</span>
+                    <span class="s6"># Get all the column headers</span>
+                    <span class="s1">raw_headers </span><span class="s2">= </span><span class="s1">re</span><span class="s2">.</span><span class="s1">findall</span><span class="s2">(</span><span class="s4">r&quot;[a-zA-Z][a-zA-Z+ ]+&quot;</span><span class="s2">, </span><span class="s1">ln</span><span class="s2">)</span>
+                    <span class="s1">headers </span><span class="s2">= [</span><span class="s1">header_map</span><span class="s2">[</span><span class="s1">k</span><span class="s2">.</span><span class="s1">strip</span><span class="s2">()] </span><span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">raw_headers</span><span class="s2">]</span>
+                    <span class="s0">break</span>
+
+            <span class="s0">assert </span><span class="s1">headers</span><span class="s2">[-</span><span class="s5">1</span><span class="s2">] == </span><span class="s4">'pass_name'</span>
+            <span class="s6"># compute the list of available attributes from the column headers</span>
+            <span class="s1">attrs </span><span class="s2">= []</span>
+            <span class="s1">n </span><span class="s2">= </span><span class="s4">r&quot;\s*((?:[0-9]+\.)?[0-9]+)&quot;</span>
+            <span class="s1">pat </span><span class="s2">= </span><span class="s4">&quot;&quot;</span>
+            <span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">headers</span><span class="s2">[:-</span><span class="s5">1</span><span class="s2">]:</span>
+                <span class="s0">if </span><span class="s1">k </span><span class="s2">== </span><span class="s4">&quot;instruction&quot;</span><span class="s2">:</span>
+                    <span class="s1">pat </span><span class="s2">+= </span><span class="s1">n</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s1">attrs</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s4">f&quot;</span><span class="s0">{</span><span class="s1">k</span><span class="s0">}</span><span class="s4">_time&quot;</span><span class="s2">)</span>
+                    <span class="s1">attrs</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s4">f&quot;</span><span class="s0">{</span><span class="s1">k</span><span class="s0">}</span><span class="s4">_percent&quot;</span><span class="s2">)</span>
+                    <span class="s1">pat </span><span class="s2">+= </span><span class="s4">rf&quot;\s+(?:</span><span class="s0">{</span><span class="s1">n</span><span class="s0">}</span><span class="s4">\s*\(</span><span class="s0">{</span><span class="s1">n</span><span class="s0">}</span><span class="s4">%\)|-+)&quot;</span>
+
+            <span class="s6"># put default value 0.0 to all missing attributes</span>
+            <span class="s1">missing </span><span class="s2">= {}</span>
+            <span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">PassTimingRecord</span><span class="s2">.</span><span class="s1">_fields</span><span class="s2">:</span>
+                <span class="s0">if </span><span class="s1">k </span><span class="s0">not in </span><span class="s1">attrs </span><span class="s0">and </span><span class="s1">k </span><span class="s2">!= </span><span class="s4">'pass_name'</span><span class="s2">:</span>
+                    <span class="s1">missing</span><span class="s2">[</span><span class="s1">k</span><span class="s2">] = </span><span class="s5">0.0</span>
+            <span class="s6"># parse timings</span>
+            <span class="s1">pat </span><span class="s2">+= </span><span class="s4">r&quot;\s*(.*)&quot;</span>
+            <span class="s0">for </span><span class="s1">ln </span><span class="s0">in </span><span class="s1">line_iter</span><span class="s2">:</span>
+                <span class="s1">m </span><span class="s2">= </span><span class="s1">re</span><span class="s2">.</span><span class="s1">match</span><span class="s2">(</span><span class="s1">pat</span><span class="s2">, </span><span class="s1">ln</span><span class="s2">)</span>
+                <span class="s0">if </span><span class="s1">m </span><span class="s0">is not None</span><span class="s2">:</span>
+                    <span class="s1">raw_data </span><span class="s2">= </span><span class="s1">list</span><span class="s2">(</span><span class="s1">m</span><span class="s2">.</span><span class="s1">groups</span><span class="s2">())</span>
+                    <span class="s1">data </span><span class="s2">= {</span><span class="s1">k</span><span class="s2">: </span><span class="s1">float</span><span class="s2">(</span><span class="s1">v</span><span class="s2">) </span><span class="s0">if </span><span class="s1">v </span><span class="s0">is not None else </span><span class="s5">0.0</span>
+                            <span class="s0">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">zip</span><span class="s2">(</span><span class="s1">attrs</span><span class="s2">, </span><span class="s1">raw_data</span><span class="s2">)}</span>
+                    <span class="s1">data</span><span class="s2">.</span><span class="s1">update</span><span class="s2">(</span><span class="s1">missing</span><span class="s2">)</span>
+                    <span class="s1">pass_name </span><span class="s2">= </span><span class="s1">raw_data</span><span class="s2">[-</span><span class="s5">1</span><span class="s2">]</span>
+                    <span class="s1">rec </span><span class="s2">= </span><span class="s1">PassTimingRecord</span><span class="s2">(</span>
+                        <span class="s1">pass_name</span><span class="s2">=</span><span class="s1">pass_name</span><span class="s2">, **</span><span class="s1">data</span><span class="s2">,</span>
+                    <span class="s2">)</span>
+                    <span class="s0">yield </span><span class="s1">rec</span>
+                    <span class="s0">if </span><span class="s1">rec</span><span class="s2">.</span><span class="s1">pass_name </span><span class="s2">== </span><span class="s4">&quot;Total&quot;</span><span class="s2">:</span>
+                        <span class="s6"># &quot;Total&quot; means the report has ended</span>
+                        <span class="s0">break</span>
+            <span class="s6"># Check that we have reach the end of the report</span>
+            <span class="s1">remaining </span><span class="s2">= </span><span class="s4">'</span><span class="s0">\n</span><span class="s4">'</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">line_iter</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">remaining</span><span class="s2">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span>
+                    <span class="s4">f&quot;unexpected text after parser finished:</span><span class="s0">\n{</span><span class="s1">remaining</span><span class="s0">}</span><span class="s4">&quot;</span>
+                <span class="s2">)</span>
+
+        <span class="s6"># Parse raw data</span>
+        <span class="s1">records </span><span class="s2">= </span><span class="s1">list</span><span class="s2">(</span><span class="s1">parse</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_raw_data</span><span class="s2">))</span>
+        <span class="s0">return </span><span class="s1">_adjust_timings</span><span class="s2">(</span><span class="s1">records</span><span class="s2">)</span>
+
+
+<span class="s1">NamedTimings </span><span class="s2">= </span><span class="s1">namedtuple</span><span class="s2">(</span><span class="s4">&quot;NamedTimings&quot;</span><span class="s2">, [</span><span class="s4">&quot;name&quot;</span><span class="s2">, </span><span class="s4">&quot;timings&quot;</span><span class="s2">])</span>
+
+
+<span class="s0">class </span><span class="s1">PassTimingsCollection</span><span class="s2">(</span><span class="s1">Sequence</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;A collection of pass timings. 
+ 
+    This class implements the ``Sequence`` protocol for accessing the 
+    individual timing records. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_name </span><span class="s2">= </span><span class="s1">name</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_records </span><span class="s2">= []</span>
+
+    <span class="s2">@</span><span class="s1">contextmanager</span>
+    <span class="s0">def </span><span class="s1">record</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Record new timings and append to this collection. 
+ 
+        Note: this is mainly for internal use inside the compiler pipeline. 
+ 
+        See also ``RecordLLVMPassTimings`` 
+ 
+        Parameters 
+        ---------- 
+        name: str 
+            Name for the records. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">config</span><span class="s2">.</span><span class="s1">LLVM_PASS_TIMINGS</span><span class="s2">:</span>
+            <span class="s6"># Recording of pass timings is enabled</span>
+            <span class="s0">with </span><span class="s1">RecordLLVMPassTimings</span><span class="s2">() </span><span class="s0">as </span><span class="s1">timings</span><span class="s2">:</span>
+                <span class="s0">yield</span>
+            <span class="s1">rec </span><span class="s2">= </span><span class="s1">timings</span><span class="s2">.</span><span class="s1">get</span><span class="s2">()</span>
+            <span class="s6"># Only keep non-empty records</span>
+            <span class="s0">if </span><span class="s1">rec</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_append</span><span class="s2">(</span><span class="s1">name</span><span class="s2">, </span><span class="s1">rec</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s6"># Do nothing. Recording of pass timings is disabled.</span>
+            <span class="s0">yield</span>
+
+    <span class="s0">def </span><span class="s1">_append</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">timings</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Append timing records 
+ 
+        Parameters 
+        ---------- 
+        name: str 
+            Name for the records. 
+        timings: ProcessedPassTimings 
+            the timing records. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_records</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">NamedTimings</span><span class="s2">(</span><span class="s1">name</span><span class="s2">, </span><span class="s1">timings</span><span class="s2">))</span>
+
+    <span class="s0">def </span><span class="s1">get_total_time</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Computes the sum of the total time across all contained timings. 
+ 
+        Returns 
+        ------- 
+        res: float or None 
+            Returns the total number of seconds or None if no timings were 
+            recorded 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_records</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">sum</span><span class="s2">(</span><span class="s1">r</span><span class="s2">.</span><span class="s1">timings</span><span class="s2">.</span><span class="s1">get_total_time</span><span class="s2">() </span><span class="s0">for </span><span class="s1">r </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_records</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s0">return None</span>
+
+    <span class="s0">def </span><span class="s1">list_longest_first</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Returns the timings in descending order of total time duration. 
+ 
+        Returns 
+        ------- 
+        res: List[ProcessedPassTimings] 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">sorted</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_records</span><span class="s2">,</span>
+                      <span class="s1">key</span><span class="s2">=</span><span class="s0">lambda </span><span class="s1">x</span><span class="s2">: </span><span class="s1">x</span><span class="s2">.</span><span class="s1">timings</span><span class="s2">.</span><span class="s1">get_total_time</span><span class="s2">(),</span>
+                      <span class="s1">reverse</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">is_empty</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_records</span>
+
+    <span class="s0">def </span><span class="s1">summary</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">topn</span><span class="s2">=</span><span class="s5">5</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Return a string representing the summary of the timings. 
+ 
+        Parameters 
+        ---------- 
+        topn: int; optional, default=5. 
+            This limits the maximum number of items to show. 
+            This function will show the ``topn`` most time-consuming passes. 
+ 
+        Returns 
+        ------- 
+        res: str 
+ 
+        See also ``ProcessedPassTimings.summary()`` 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">is_empty</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s4">&quot;No pass timings were recorded&quot;</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">buf </span><span class="s2">= []</span>
+            <span class="s1">ap </span><span class="s2">= </span><span class="s1">buf</span><span class="s2">.</span><span class="s1">append</span>
+            <span class="s1">ap</span><span class="s2">(</span><span class="s4">f&quot;Printing pass timings for </span><span class="s0">{</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_name</span><span class="s0">}</span><span class="s4">&quot;</span><span class="s2">)</span>
+            <span class="s1">overall_time </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_total_time</span><span class="s2">()</span>
+            <span class="s1">ap</span><span class="s2">(</span><span class="s4">f&quot;Total time: </span><span class="s0">{</span><span class="s1">overall_time</span><span class="s0">:</span><span class="s4">.4f</span><span class="s0">}</span><span class="s4">&quot;</span><span class="s2">)</span>
+            <span class="s0">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">r </span><span class="s0">in </span><span class="s1">enumerate</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_records</span><span class="s2">):</span>
+                <span class="s1">ap</span><span class="s2">(</span><span class="s4">f&quot;== #</span><span class="s0">{</span><span class="s1">i</span><span class="s0">} {</span><span class="s1">r</span><span class="s2">.</span><span class="s1">name</span><span class="s0">}</span><span class="s4">&quot;</span><span class="s2">)</span>
+                <span class="s1">percent </span><span class="s2">= </span><span class="s1">r</span><span class="s2">.</span><span class="s1">timings</span><span class="s2">.</span><span class="s1">get_total_time</span><span class="s2">() / </span><span class="s1">overall_time </span><span class="s2">* </span><span class="s5">100</span>
+                <span class="s1">ap</span><span class="s2">(</span><span class="s4">f&quot; Percent: </span><span class="s0">{</span><span class="s1">percent</span><span class="s0">:</span><span class="s4">.1f</span><span class="s0">}</span><span class="s4">%&quot;</span><span class="s2">)</span>
+                <span class="s1">ap</span><span class="s2">(</span><span class="s1">r</span><span class="s2">.</span><span class="s1">timings</span><span class="s2">.</span><span class="s1">summary</span><span class="s2">(</span><span class="s1">topn</span><span class="s2">=</span><span class="s1">topn</span><span class="s2">, </span><span class="s1">indent</span><span class="s2">=</span><span class="s5">1</span><span class="s2">))</span>
+            <span class="s0">return </span><span class="s4">&quot;</span><span class="s0">\n</span><span class="s4">&quot;</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">buf</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__getitem__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">i</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Get the i-th timing record. 
+ 
+        Returns 
+        ------- 
+        res: (name, timings) 
+            A named tuple with two fields: 
+ 
+            - name: str 
+            - timings: ProcessedPassTimings 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_records</span><span class="s2">[</span><span class="s1">i</span><span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">__len__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Length of this collection. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_records</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">summary</span><span class="s2">()</span>
+</pre>
+</body>
+</html>

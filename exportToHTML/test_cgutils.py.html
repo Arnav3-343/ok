@@ -1,0 +1,176 @@
+<html>
+<head>
+<title>test_cgutils.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #7a7e85;}
+.s5 { color: #2aacb8;}
+.s6 { color: #a5c261;}
+.s7 { color: #5f826b; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_cgutils.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">contextlib</span>
+<span class="s0">import </span><span class="s1">ctypes</span>
+<span class="s0">import </span><span class="s1">struct</span>
+<span class="s0">import </span><span class="s1">sys</span>
+
+<span class="s0">import </span><span class="s1">llvmlite</span><span class="s2">.</span><span class="s1">ir </span><span class="s0">as </span><span class="s1">ir</span>
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+
+<span class="s0">import </span><span class="s1">unittest</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">types</span><span class="s2">, </span><span class="s1">typing</span><span class="s2">, </span><span class="s1">cgutils</span><span class="s2">, </span><span class="s1">cpu</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">compiler_lock </span><span class="s0">import </span><span class="s1">global_compiler_lock</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">tests</span><span class="s2">.</span><span class="s1">support </span><span class="s0">import </span><span class="s1">TestCase</span><span class="s2">, </span><span class="s1">run_in_subprocess</span>
+
+
+<span class="s1">machine_int </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">.</span><span class="s1">bitwidth</span><span class="s2">)</span>
+
+<span class="s0">def </span><span class="s1">machine_const</span><span class="s2">(</span><span class="s1">n</span><span class="s2">):</span>
+    <span class="s0">return </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Constant</span><span class="s2">(</span><span class="s1">machine_int</span><span class="s2">, </span><span class="s1">n</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">StructureTestCase</span><span class="s2">(</span><span class="s1">TestCase</span><span class="s2">):</span>
+
+    <span class="s0">def </span><span class="s1">setUp</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">typing_context </span><span class="s2">= </span><span class="s1">typing</span><span class="s2">.</span><span class="s1">Context</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">context </span><span class="s2">= </span><span class="s1">cpu</span><span class="s2">.</span><span class="s1">CPUContext</span><span class="s2">(</span><span class="s1">typing_context</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">contextlib</span><span class="s2">.</span><span class="s1">contextmanager</span>
+    <span class="s0">def </span><span class="s1">compile_function</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">nargs</span><span class="s2">):</span>
+        <span class="s1">llvm_fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">machine_int</span><span class="s2">, [</span><span class="s1">machine_int</span><span class="s2">] * </span><span class="s1">nargs</span><span class="s2">)</span>
+        <span class="s1">ctypes_fnty </span><span class="s2">= </span><span class="s1">ctypes</span><span class="s2">.</span><span class="s1">CFUNCTYPE</span><span class="s2">(</span><span class="s1">ctypes</span><span class="s2">.</span><span class="s1">c_size_t</span><span class="s2">,</span>
+                                    <span class="s2">* (</span><span class="s1">ctypes</span><span class="s2">.</span><span class="s1">c_size_t</span><span class="s2">,) * </span><span class="s1">nargs</span><span class="s2">)</span>
+        <span class="s1">module </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">create_module</span><span class="s2">(</span><span class="s3">&quot;&quot;</span><span class="s2">)</span>
+
+        <span class="s1">function </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">module</span><span class="s2">, </span><span class="s1">llvm_fnty</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">id</span><span class="s2">())</span>
+        <span class="s0">assert </span><span class="s1">function</span><span class="s2">.</span><span class="s1">is_declaration</span>
+        <span class="s1">entry_block </span><span class="s2">= </span><span class="s1">function</span><span class="s2">.</span><span class="s1">append_basic_block</span><span class="s2">(</span><span class="s3">'entry'</span><span class="s2">)</span>
+        <span class="s1">builder </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IRBuilder</span><span class="s2">(</span><span class="s1">entry_block</span><span class="s2">)</span>
+
+        <span class="s1">first </span><span class="s2">= [</span><span class="s0">True</span><span class="s2">]</span>
+
+        <span class="s2">@</span><span class="s1">global_compiler_lock</span>
+        <span class="s0">def </span><span class="s1">call_func</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">):</span>
+            <span class="s1">codegen </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">codegen</span><span class="s2">()</span>
+            <span class="s1">library </span><span class="s2">= </span><span class="s1">codegen</span><span class="s2">.</span><span class="s1">create_library</span><span class="s2">(</span><span class="s3">&quot;test_module.%s&quot; </span><span class="s2">% </span><span class="s1">self</span><span class="s2">.</span><span class="s1">id</span><span class="s2">())</span>
+            <span class="s1">library</span><span class="s2">.</span><span class="s1">add_ir_module</span><span class="s2">(</span><span class="s1">module</span><span class="s2">)</span>
+            <span class="s1">cptr </span><span class="s2">= </span><span class="s1">library</span><span class="s2">.</span><span class="s1">get_pointer_to_function</span><span class="s2">(</span><span class="s1">function</span><span class="s2">.</span><span class="s1">name</span><span class="s2">)</span>
+            <span class="s1">cfunc </span><span class="s2">= </span><span class="s1">ctypes_fnty</span><span class="s2">(</span><span class="s1">cptr</span><span class="s2">)</span>
+            <span class="s0">return </span><span class="s1">cfunc</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">)</span>
+
+        <span class="s0">yield </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">function</span><span class="s2">.</span><span class="s1">args</span><span class="s2">, </span><span class="s1">call_func</span>
+
+
+    <span class="s0">def </span><span class="s1">get_bytearray_addr</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ba</span><span class="s2">):</span>
+        <span class="s0">assert </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">ba</span><span class="s2">, </span><span class="s1">bytearray</span><span class="s2">)</span>
+        <span class="s1">ba_as_string </span><span class="s2">= </span><span class="s1">ctypes</span><span class="s2">.</span><span class="s1">pythonapi</span><span class="s2">.</span><span class="s1">PyByteArray_AsString</span>
+        <span class="s1">ba_as_string</span><span class="s2">.</span><span class="s1">argtypes </span><span class="s2">= [</span><span class="s1">ctypes</span><span class="s2">.</span><span class="s1">py_object</span><span class="s2">]</span>
+        <span class="s1">ba_as_string</span><span class="s2">.</span><span class="s1">restype </span><span class="s2">= </span><span class="s1">ctypes</span><span class="s2">.</span><span class="s1">c_void_p</span>
+        <span class="s0">return </span><span class="s1">ba_as_string</span><span class="s2">(</span><span class="s1">ba</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_compile_function</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4"># Simple self-test for compile_function()</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">compile_function</span><span class="s2">(</span><span class="s5">2</span><span class="s2">) </span><span class="s0">as </span><span class="s2">(</span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">call</span><span class="s2">):</span>
+            <span class="s1">res </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">args</span><span class="s2">[</span><span class="s5">0</span><span class="s2">], </span><span class="s1">args</span><span class="s2">[</span><span class="s5">1</span><span class="s2">])</span>
+            <span class="s1">builder</span><span class="s2">.</span><span class="s1">ret</span><span class="s2">(</span><span class="s1">res</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">call</span><span class="s2">(</span><span class="s5">5</span><span class="s2">, -</span><span class="s5">2</span><span class="s2">), </span><span class="s5">3</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">call</span><span class="s2">(</span><span class="s5">4</span><span class="s2">, </span><span class="s5">2</span><span class="s2">), </span><span class="s5">6</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">contextlib</span><span class="s2">.</span><span class="s1">contextmanager</span>
+    <span class="s0">def </span><span class="s1">run_struct_access</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">struct_class</span><span class="s2">, </span><span class="s1">buf</span><span class="s2">, </span><span class="s1">offset</span><span class="s2">=</span><span class="s5">0</span><span class="s2">):</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">compile_function</span><span class="s2">(</span><span class="s5">1</span><span class="s2">) </span><span class="s0">as </span><span class="s2">(</span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">call</span><span class="s2">):</span>
+            <span class="s1">inst </span><span class="s2">= </span><span class="s1">struct_class</span><span class="s2">(</span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">)</span>
+            <span class="s1">sptr </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">args</span><span class="s2">[</span><span class="s5">0</span><span class="s2">], </span><span class="s1">machine_const</span><span class="s2">(</span><span class="s1">offset</span><span class="s2">))</span>
+            <span class="s1">sptr </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">inttoptr</span><span class="s2">(</span><span class="s1">sptr</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">_type</span><span class="s2">))</span>
+            <span class="s1">inst </span><span class="s2">= </span><span class="s1">struct_class</span><span class="s2">(</span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">ref</span><span class="s2">=</span><span class="s1">sptr</span><span class="s2">)</span>
+
+            <span class="s0">yield </span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">inst</span>
+
+            <span class="s1">builder</span><span class="s2">.</span><span class="s1">ret</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Constant</span><span class="s2">(</span><span class="s1">machine_int</span><span class="s2">, </span><span class="s5">0</span><span class="s2">))</span>
+        <span class="s1">call</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_bytearray_addr</span><span class="s2">(</span><span class="s1">buf</span><span class="s2">))</span>
+
+    <span class="s2">@</span><span class="s1">contextlib</span><span class="s2">.</span><span class="s1">contextmanager</span>
+    <span class="s0">def </span><span class="s1">run_simple_struct_test</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">struct_class</span><span class="s2">, </span><span class="s1">struct_fmt</span><span class="s2">, </span><span class="s1">struct_args</span><span class="s2">):</span>
+        <span class="s4"># By using a too large buffer and a non-zero offset, we also check</span>
+        <span class="s4"># that surrounding memory isn't touched.</span>
+        <span class="s1">buf </span><span class="s2">= </span><span class="s1">bytearray</span><span class="s2">(</span><span class="s6">b'!'</span><span class="s2">) * </span><span class="s5">40</span>
+        <span class="s1">expected </span><span class="s2">= </span><span class="s1">buf</span><span class="s2">[:]</span>
+        <span class="s1">offset </span><span class="s2">= </span><span class="s5">8</span>
+
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">run_struct_access</span><span class="s2">(</span><span class="s1">struct_class</span><span class="s2">, </span><span class="s1">buf</span><span class="s2">, </span><span class="s1">offset</span><span class="s2">) </span><span class="s1">\</span>
+            <span class="s0">as </span><span class="s2">(</span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">):</span>
+            <span class="s0">yield </span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">inst</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertNotEqual</span><span class="s2">(</span><span class="s1">buf</span><span class="s2">, </span><span class="s1">expected</span><span class="s2">)</span>
+        <span class="s1">struct</span><span class="s2">.</span><span class="s1">pack_into</span><span class="s2">(</span><span class="s1">struct_fmt</span><span class="s2">, </span><span class="s1">expected</span><span class="s2">, </span><span class="s1">offset</span><span class="s2">, *</span><span class="s1">struct_args</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">buf</span><span class="s2">, </span><span class="s1">expected</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_int_fields</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">class </span><span class="s1">S</span><span class="s2">(</span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">Structure</span><span class="s2">):</span>
+            <span class="s1">_fields </span><span class="s2">= [(</span><span class="s3">'a'</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">),</span>
+                       <span class="s2">(</span><span class="s3">'b'</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint16</span><span class="s2">)]</span>
+
+        <span class="s1">fmt </span><span class="s2">= </span><span class="s3">&quot;=iH&quot;</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">run_simple_struct_test</span><span class="s2">(</span><span class="s1">S</span><span class="s2">, </span><span class="s1">fmt</span><span class="s2">, (</span><span class="s5">0x12345678</span><span class="s2">, </span><span class="s5">0xABCD</span><span class="s2">)) </span><span class="s1">\</span>
+            <span class="s0">as </span><span class="s2">(</span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">):</span>
+            <span class="s1">inst</span><span class="s2">.</span><span class="s1">a </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Constant</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s5">32</span><span class="s2">), </span><span class="s5">0x12345678</span><span class="s2">)</span>
+            <span class="s1">inst</span><span class="s2">.</span><span class="s1">b </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Constant</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s5">16</span><span class="s2">), </span><span class="s5">0xABCD</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_float_fields</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">class </span><span class="s1">S</span><span class="s2">(</span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">Structure</span><span class="s2">):</span>
+            <span class="s1">_fields </span><span class="s2">= [(</span><span class="s3">'a'</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">),</span>
+                       <span class="s2">(</span><span class="s3">'b'</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">)]</span>
+
+        <span class="s1">fmt </span><span class="s2">= </span><span class="s3">&quot;=df&quot;</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">run_simple_struct_test</span><span class="s2">(</span><span class="s1">S</span><span class="s2">, </span><span class="s1">fmt</span><span class="s2">, (</span><span class="s5">1.23</span><span class="s2">, </span><span class="s5">4.56</span><span class="s2">)) </span><span class="s1">\</span>
+            <span class="s0">as </span><span class="s2">(</span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">):</span>
+            <span class="s1">inst</span><span class="s2">.</span><span class="s1">a </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Constant</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">(), </span><span class="s5">1.23</span><span class="s2">)</span>
+            <span class="s1">inst</span><span class="s2">.</span><span class="s1">b </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Constant</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">(), </span><span class="s5">4.56</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">TestCGContext</span><span class="s2">(</span><span class="s1">TestCase</span><span class="s2">):</span>
+    <span class="s7">&quot;&quot;&quot;Tests for code generation context functionality&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">test_printf</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4"># Tests the printf() method</span>
+
+        <span class="s1">value </span><span class="s2">= </span><span class="s5">123456</span>
+
+        <span class="s1">code </span><span class="s2">= </span><span class="s3">f&quot;&quot;&quot;if 1:</span>
+        <span class="s3">from numba import njit, types</span>
+        <span class="s3">from numba.extending import intrinsic</span>
+
+        <span class="s3">@intrinsic</span>
+        <span class="s3">def printf(tyctx, int_arg):</span>
+            <span class="s3">sig = types.void(int_arg)</span>
+            <span class="s3">def codegen(cgctx, builder, sig, llargs):</span>
+                <span class="s3">cgctx.printf(builder, </span><span class="s0">\&quot;</span><span class="s3">%d</span><span class="s0">\\</span><span class="s3">n</span><span class="s0">\&quot;</span><span class="s3">, *llargs)</span>
+            <span class="s3">return sig, codegen</span>
+
+        <span class="s3">@njit</span>
+        <span class="s3">def foo():</span>
+            <span class="s3">printf(</span><span class="s0">{</span><span class="s1">value</span><span class="s0">}</span><span class="s3">)</span>
+
+        <span class="s3">foo()</span>
+        <span class="s3">&quot;&quot;&quot;</span>
+
+        <span class="s1">out</span><span class="s2">, </span><span class="s1">_ </span><span class="s2">= </span><span class="s1">run_in_subprocess</span><span class="s2">(</span><span class="s1">code</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s1">str</span><span class="s2">(</span><span class="s1">value</span><span class="s2">), </span><span class="s1">out</span><span class="s2">.</span><span class="s1">decode</span><span class="s2">())</span>
+
+
+
+<span class="s0">if </span><span class="s1">__name__ </span><span class="s2">== </span><span class="s3">'__main__'</span><span class="s2">:</span>
+    <span class="s1">unittest</span><span class="s2">.</span><span class="s1">main</span><span class="s2">()</span>
+</pre>
+</body>
+</html>

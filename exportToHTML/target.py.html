@@ -1,0 +1,464 @@
+<html>
+<head>
+<title>target.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #7a7e85;}
+.s4 { color: #6aab73;}
+.s5 { color: #5f826b; font-style: italic;}
+.s6 { color: #2aacb8;}
+.s7 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+target.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">re</span>
+<span class="s0">from </span><span class="s1">functools </span><span class="s0">import </span><span class="s1">cached_property</span>
+<span class="s0">import </span><span class="s1">llvmlite</span><span class="s2">.</span><span class="s1">binding </span><span class="s0">as </span><span class="s1">ll</span>
+<span class="s0">from </span><span class="s1">llvmlite </span><span class="s0">import </span><span class="s1">ir</span>
+
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s2">(</span><span class="s1">cgutils</span><span class="s2">, </span><span class="s1">config</span><span class="s2">, </span><span class="s1">debuginfo</span><span class="s2">, </span><span class="s1">itanium_mangler</span><span class="s2">, </span><span class="s1">types</span><span class="s2">,</span>
+                        <span class="s1">typing</span><span class="s2">, </span><span class="s1">utils</span><span class="s2">)</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">dispatcher </span><span class="s0">import </span><span class="s1">Dispatcher</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">base </span><span class="s0">import </span><span class="s1">BaseContext</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">callconv </span><span class="s0">import </span><span class="s1">BaseCallConv</span><span class="s2">, </span><span class="s1">MinimalCallConv</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">typing </span><span class="s0">import </span><span class="s1">cmathdecl</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">datamodel</span>
+
+<span class="s0">from </span><span class="s2">.</span><span class="s1">cudadrv </span><span class="s0">import </span><span class="s1">nvvm</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda </span><span class="s0">import </span><span class="s1">codegen</span><span class="s2">, </span><span class="s1">nvvmutils</span><span class="s2">, </span><span class="s1">ufuncs</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">models </span><span class="s0">import </span><span class="s1">cuda_data_manager</span>
+
+<span class="s3"># -----------------------------------------------------------------------------</span>
+<span class="s3"># Typing</span>
+
+
+<span class="s0">class </span><span class="s1">CUDATypingContext</span><span class="s2">(</span><span class="s1">typing</span><span class="s2">.</span><span class="s1">BaseContext</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">load_additional_registries</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">from </span><span class="s2">. </span><span class="s0">import </span><span class="s1">cudadecl</span><span class="s2">, </span><span class="s1">cudamath</span><span class="s2">, </span><span class="s1">libdevicedecl</span><span class="s2">, </span><span class="s1">vector_types</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">typing </span><span class="s0">import </span><span class="s1">enumdecl</span><span class="s2">, </span><span class="s1">cffi_utils</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">cudadecl</span><span class="s2">.</span><span class="s1">registry</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">cffi_utils</span><span class="s2">.</span><span class="s1">registry</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">cudamath</span><span class="s2">.</span><span class="s1">registry</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">cmathdecl</span><span class="s2">.</span><span class="s1">registry</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">libdevicedecl</span><span class="s2">.</span><span class="s1">registry</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">enumdecl</span><span class="s2">.</span><span class="s1">registry</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">vector_types</span><span class="s2">.</span><span class="s1">typing_registry</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_value_type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s3"># treat other dispatcher object as another device function</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">dispatcher </span><span class="s0">import </span><span class="s1">CUDADispatcher</span>
+        <span class="s0">if </span><span class="s2">(</span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">Dispatcher</span><span class="s2">) </span><span class="s0">and not</span>
+                <span class="s1">isinstance</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">CUDADispatcher</span><span class="s2">)):</span>
+            <span class="s0">try</span><span class="s2">:</span>
+                <span class="s3"># use cached device function</span>
+                <span class="s1">val </span><span class="s2">= </span><span class="s1">val</span><span class="s2">.</span><span class="s1">__dispatcher</span>
+            <span class="s0">except </span><span class="s1">AttributeError</span><span class="s2">:</span>
+                <span class="s0">if not </span><span class="s1">val</span><span class="s2">.</span><span class="s1">_can_compile</span><span class="s2">:</span>
+                    <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s4">'using cpu function on device '</span>
+                                     <span class="s4">'but its compilation is disabled'</span><span class="s2">)</span>
+                <span class="s1">targetoptions </span><span class="s2">= </span><span class="s1">val</span><span class="s2">.</span><span class="s1">targetoptions</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">()</span>
+                <span class="s1">targetoptions</span><span class="s2">[</span><span class="s4">'device'</span><span class="s2">] = </span><span class="s0">True</span>
+                <span class="s1">targetoptions</span><span class="s2">[</span><span class="s4">'debug'</span><span class="s2">] = </span><span class="s1">targetoptions</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s4">'debug'</span><span class="s2">, </span><span class="s0">False</span><span class="s2">)</span>
+                <span class="s1">targetoptions</span><span class="s2">[</span><span class="s4">'opt'</span><span class="s2">] = </span><span class="s1">targetoptions</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s4">'opt'</span><span class="s2">, </span><span class="s0">True</span><span class="s2">)</span>
+                <span class="s1">disp </span><span class="s2">= </span><span class="s1">CUDADispatcher</span><span class="s2">(</span><span class="s1">val</span><span class="s2">.</span><span class="s1">py_func</span><span class="s2">, </span><span class="s1">targetoptions</span><span class="s2">)</span>
+                <span class="s3"># cache the device function for future use and to avoid</span>
+                <span class="s3"># duplicated copy of the same function.</span>
+                <span class="s1">val</span><span class="s2">.</span><span class="s1">__dispatcher </span><span class="s2">= </span><span class="s1">disp</span>
+                <span class="s1">val </span><span class="s2">= </span><span class="s1">disp</span>
+
+        <span class="s3"># continue with parent logic</span>
+        <span class="s0">return </span><span class="s1">super</span><span class="s2">(</span><span class="s1">CUDATypingContext</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">resolve_value_type</span><span class="s2">(</span><span class="s1">val</span><span class="s2">)</span>
+
+<span class="s3"># -----------------------------------------------------------------------------</span>
+<span class="s3"># Implementation</span>
+
+
+<span class="s1">VALID_CHARS </span><span class="s2">= </span><span class="s1">re</span><span class="s2">.</span><span class="s1">compile</span><span class="s2">(</span><span class="s4">r'[^a-z0-9]'</span><span class="s2">, </span><span class="s1">re</span><span class="s2">.</span><span class="s1">I</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">CUDATargetContext</span><span class="s2">(</span><span class="s1">BaseContext</span><span class="s2">):</span>
+    <span class="s1">implement_powi_as_math_call </span><span class="s2">= </span><span class="s0">True</span>
+    <span class="s1">strict_alignment </span><span class="s2">= </span><span class="s0">True</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">typingctx</span><span class="s2">, </span><span class="s1">target</span><span class="s2">=</span><span class="s4">'cuda'</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">typingctx</span><span class="s2">, </span><span class="s1">target</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">data_model_manager </span><span class="s2">= </span><span class="s1">cuda_data_manager</span><span class="s2">.</span><span class="s1">chain</span><span class="s2">(</span>
+            <span class="s1">datamodel</span><span class="s2">.</span><span class="s1">default_manager</span>
+        <span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">DIBuilder</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">debuginfo</span><span class="s2">.</span><span class="s1">DIBuilder</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">enable_boundscheck</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Unconditionally disabled</span>
+        <span class="s0">return False</span>
+
+    <span class="s3"># Overrides</span>
+    <span class="s0">def </span><span class="s1">create_module</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_internal_codegen</span><span class="s2">.</span><span class="s1">_create_empty_module</span><span class="s2">(</span><span class="s1">name</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">init</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_internal_codegen </span><span class="s2">= </span><span class="s1">codegen</span><span class="s2">.</span><span class="s1">JITCUDACodegen</span><span class="s2">(</span><span class="s4">&quot;numba.cuda.jit&quot;</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_target_data </span><span class="s2">= </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">load_additional_registries</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># side effect of import needed for numba.cpython.*, the builtins</span>
+        <span class="s3"># registry is updated at import time.</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cpython </span><span class="s0">import </span><span class="s1">numbers</span><span class="s2">, </span><span class="s1">tupleobj</span><span class="s2">, </span><span class="s1">slicing </span><span class="s3"># noqa: F401</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cpython </span><span class="s0">import </span><span class="s1">rangeobj</span><span class="s2">, </span><span class="s1">iterators</span><span class="s2">, </span><span class="s1">enumimpl </span><span class="s3"># noqa: F401</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cpython </span><span class="s0">import </span><span class="s1">unicode</span><span class="s2">, </span><span class="s1">charseq </span><span class="s3"># noqa: F401</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cpython </span><span class="s0">import </span><span class="s1">cmathimpl</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">misc </span><span class="s0">import </span><span class="s1">cffiimpl</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">np </span><span class="s0">import </span><span class="s1">arrayobj </span><span class="s3"># noqa: F401</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">np </span><span class="s0">import </span><span class="s1">npdatetime </span><span class="s3"># noqa: F401</span>
+        <span class="s0">from </span><span class="s2">. </span><span class="s0">import </span><span class="s2">(</span>
+            <span class="s1">cudaimpl</span><span class="s2">, </span><span class="s1">printimpl</span><span class="s2">, </span><span class="s1">libdeviceimpl</span><span class="s2">, </span><span class="s1">mathimpl</span><span class="s2">, </span><span class="s1">vector_types</span>
+        <span class="s2">)</span>
+        <span class="s3"># fix for #8940</span>
+        <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">np</span><span class="s2">.</span><span class="s1">unsafe </span><span class="s0">import </span><span class="s1">ndarray </span><span class="s3"># noqa F401</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">cudaimpl</span><span class="s2">.</span><span class="s1">registry</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">cffiimpl</span><span class="s2">.</span><span class="s1">registry</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">printimpl</span><span class="s2">.</span><span class="s1">registry</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">libdeviceimpl</span><span class="s2">.</span><span class="s1">registry</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">cmathimpl</span><span class="s2">.</span><span class="s1">registry</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">mathimpl</span><span class="s2">.</span><span class="s1">registry</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">install_registry</span><span class="s2">(</span><span class="s1">vector_types</span><span class="s2">.</span><span class="s1">impl_registry</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">codegen</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_internal_codegen</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">target_data</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_target_data </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_target_data </span><span class="s2">= </span><span class="s1">ll</span><span class="s2">.</span><span class="s1">create_target_data</span><span class="s2">(</span><span class="s1">nvvm</span><span class="s2">.</span><span class="s1">NVVM</span><span class="s2">().</span><span class="s1">data_layout</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_target_data</span>
+
+    <span class="s2">@</span><span class="s1">cached_property</span>
+    <span class="s0">def </span><span class="s1">nonconst_module_attrs</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Some CUDA intrinsics are at the module level, but cannot be treated as 
+        constants, because they are loaded from a special register in the PTX. 
+        These include threadIdx, blockDim, etc. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">cuda</span>
+        <span class="s1">nonconsts </span><span class="s2">= (</span><span class="s4">'threadIdx'</span><span class="s2">, </span><span class="s4">'blockDim'</span><span class="s2">, </span><span class="s4">'blockIdx'</span><span class="s2">, </span><span class="s4">'gridDim'</span><span class="s2">, </span><span class="s4">'laneid'</span><span class="s2">,</span>
+                     <span class="s4">'warpsize'</span><span class="s2">)</span>
+        <span class="s1">nonconsts_with_mod </span><span class="s2">= </span><span class="s1">tuple</span><span class="s2">([(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">Module</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">), </span><span class="s1">nc</span><span class="s2">)</span>
+                                    <span class="s0">for </span><span class="s1">nc </span><span class="s0">in </span><span class="s1">nonconsts</span><span class="s2">])</span>
+        <span class="s0">return </span><span class="s1">nonconsts_with_mod</span>
+
+    <span class="s2">@</span><span class="s1">cached_property</span>
+    <span class="s0">def </span><span class="s1">call_conv</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">CUDACallConv</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">mangler</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">argtypes</span><span class="s2">, *, </span><span class="s1">abi_tags</span><span class="s2">=(), </span><span class="s1">uid</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">itanium_mangler</span><span class="s2">.</span><span class="s1">mangle</span><span class="s2">(</span><span class="s1">name</span><span class="s2">, </span><span class="s1">argtypes</span><span class="s2">, </span><span class="s1">abi_tags</span><span class="s2">=</span><span class="s1">abi_tags</span><span class="s2">,</span>
+                                      <span class="s1">uid</span><span class="s2">=</span><span class="s1">uid</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">prepare_cuda_kernel</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">codelib</span><span class="s2">, </span><span class="s1">fndesc</span><span class="s2">, </span><span class="s1">debug</span><span class="s2">, </span><span class="s1">lineinfo</span><span class="s2">,</span>
+                            <span class="s1">nvvm_options</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">, </span><span class="s1">linenum</span><span class="s2">,</span>
+                            <span class="s1">max_registers</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Adapt a code library ``codelib`` with the numba compiled CUDA kernel 
+        with name ``fname`` and arguments ``argtypes`` for NVVM. 
+        A new library is created with a wrapper function that can be used as 
+        the kernel entry point for the given kernel. 
+ 
+        Returns the new code library and the wrapper function. 
+ 
+        Parameters: 
+ 
+        codelib:       The CodeLibrary containing the device function to wrap 
+                       in a kernel call. 
+        fndesc:        The FunctionDescriptor of the source function. 
+        debug:         Whether to compile with debug. 
+        lineinfo:      Whether to emit line info. 
+        nvvm_options:  Dict of NVVM options used when compiling the new library. 
+        filename:      The source filename that the function is contained in. 
+        linenum:       The source line that the function is on. 
+        max_registers: The max_registers argument for the code library. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">kernel_name </span><span class="s2">= </span><span class="s1">itanium_mangler</span><span class="s2">.</span><span class="s1">prepend_namespace</span><span class="s2">(</span>
+            <span class="s1">fndesc</span><span class="s2">.</span><span class="s1">llvm_func_name</span><span class="s2">, </span><span class="s1">ns</span><span class="s2">=</span><span class="s4">'cudapy'</span><span class="s2">,</span>
+        <span class="s2">)</span>
+        <span class="s1">library </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">codegen</span><span class="s2">().</span><span class="s1">create_library</span><span class="s2">(</span><span class="s4">f'</span><span class="s0">{</span><span class="s1">codelib</span><span class="s2">.</span><span class="s1">name</span><span class="s0">}</span><span class="s4">_kernel_'</span><span class="s2">,</span>
+                                                <span class="s1">entry_name</span><span class="s2">=</span><span class="s1">kernel_name</span><span class="s2">,</span>
+                                                <span class="s1">nvvm_options</span><span class="s2">=</span><span class="s1">nvvm_options</span><span class="s2">,</span>
+                                                <span class="s1">max_registers</span><span class="s2">=</span><span class="s1">max_registers</span><span class="s2">)</span>
+        <span class="s1">library</span><span class="s2">.</span><span class="s1">add_linking_library</span><span class="s2">(</span><span class="s1">codelib</span><span class="s2">)</span>
+        <span class="s1">wrapper </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">generate_kernel_wrapper</span><span class="s2">(</span><span class="s1">library</span><span class="s2">, </span><span class="s1">fndesc</span><span class="s2">, </span><span class="s1">kernel_name</span><span class="s2">,</span>
+                                               <span class="s1">debug</span><span class="s2">, </span><span class="s1">lineinfo</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">,</span>
+                                               <span class="s1">linenum</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">library</span><span class="s2">, </span><span class="s1">wrapper</span>
+
+    <span class="s0">def </span><span class="s1">generate_kernel_wrapper</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">library</span><span class="s2">, </span><span class="s1">fndesc</span><span class="s2">, </span><span class="s1">kernel_name</span><span class="s2">, </span><span class="s1">debug</span><span class="s2">,</span>
+                                <span class="s1">lineinfo</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">, </span><span class="s1">linenum</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Generate the kernel wrapper in the given ``library``. 
+        The function being wrapped is described by ``fndesc``. 
+        The wrapper function is returned. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">argtypes </span><span class="s2">= </span><span class="s1">fndesc</span><span class="s2">.</span><span class="s1">argtypes</span>
+        <span class="s1">arginfo </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_arg_packer</span><span class="s2">(</span><span class="s1">argtypes</span><span class="s2">)</span>
+        <span class="s1">argtys </span><span class="s2">= </span><span class="s1">list</span><span class="s2">(</span><span class="s1">arginfo</span><span class="s2">.</span><span class="s1">argument_types</span><span class="s2">)</span>
+        <span class="s1">wrapfnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">VoidType</span><span class="s2">(), </span><span class="s1">argtys</span><span class="s2">)</span>
+        <span class="s1">wrapper_module </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">create_module</span><span class="s2">(</span><span class="s4">&quot;cuda.kernel.wrapper&quot;</span><span class="s2">)</span>
+        <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s6">32</span><span class="s2">),</span>
+                               <span class="s2">[</span><span class="s1">self</span><span class="s2">.</span><span class="s1">call_conv</span><span class="s2">.</span><span class="s1">get_return_type</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">pyobject</span><span class="s2">)]</span>
+                               <span class="s2">+ </span><span class="s1">argtys</span><span class="s2">)</span>
+        <span class="s1">func </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">wrapper_module</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fndesc</span><span class="s2">.</span><span class="s1">llvm_func_name</span><span class="s2">)</span>
+
+        <span class="s1">prefixed </span><span class="s2">= </span><span class="s1">itanium_mangler</span><span class="s2">.</span><span class="s1">prepend_namespace</span><span class="s2">(</span><span class="s1">func</span><span class="s2">.</span><span class="s1">name</span><span class="s2">, </span><span class="s1">ns</span><span class="s2">=</span><span class="s4">'cudapy'</span><span class="s2">)</span>
+        <span class="s1">wrapfn </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">wrapper_module</span><span class="s2">, </span><span class="s1">wrapfnty</span><span class="s2">, </span><span class="s1">prefixed</span><span class="s2">)</span>
+        <span class="s1">builder </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IRBuilder</span><span class="s2">(</span><span class="s1">wrapfn</span><span class="s2">.</span><span class="s1">append_basic_block</span><span class="s2">(</span><span class="s4">''</span><span class="s2">))</span>
+
+        <span class="s0">if </span><span class="s1">debug </span><span class="s0">or </span><span class="s1">lineinfo</span><span class="s2">:</span>
+            <span class="s1">directives_only </span><span class="s2">= </span><span class="s1">lineinfo </span><span class="s0">and not </span><span class="s1">debug</span>
+            <span class="s1">debuginfo </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">DIBuilder</span><span class="s2">(</span><span class="s1">module</span><span class="s2">=</span><span class="s1">wrapper_module</span><span class="s2">,</span>
+                                       <span class="s1">filepath</span><span class="s2">=</span><span class="s1">filename</span><span class="s2">,</span>
+                                       <span class="s1">cgctx</span><span class="s2">=</span><span class="s1">self</span><span class="s2">,</span>
+                                       <span class="s1">directives_only</span><span class="s2">=</span><span class="s1">directives_only</span><span class="s2">)</span>
+            <span class="s1">debuginfo</span><span class="s2">.</span><span class="s1">mark_subprogram</span><span class="s2">(</span>
+                <span class="s1">wrapfn</span><span class="s2">, </span><span class="s1">kernel_name</span><span class="s2">, </span><span class="s1">fndesc</span><span class="s2">.</span><span class="s1">args</span><span class="s2">, </span><span class="s1">argtypes</span><span class="s2">, </span><span class="s1">linenum</span><span class="s2">,</span>
+            <span class="s2">)</span>
+            <span class="s1">debuginfo</span><span class="s2">.</span><span class="s1">mark_location</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">linenum</span><span class="s2">)</span>
+
+        <span class="s3"># Define error handling variable</span>
+        <span class="s0">def </span><span class="s1">define_error_gv</span><span class="s2">(</span><span class="s1">postfix</span><span class="s2">):</span>
+            <span class="s1">name </span><span class="s2">= </span><span class="s1">wrapfn</span><span class="s2">.</span><span class="s1">name </span><span class="s2">+ </span><span class="s1">postfix</span>
+            <span class="s1">gv </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">add_global_variable</span><span class="s2">(</span><span class="s1">wrapper_module</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s6">32</span><span class="s2">),</span>
+                                             <span class="s1">name</span><span class="s2">)</span>
+            <span class="s1">gv</span><span class="s2">.</span><span class="s1">initializer </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Constant</span><span class="s2">(</span><span class="s1">gv</span><span class="s2">.</span><span class="s1">type</span><span class="s2">.</span><span class="s1">pointee</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+            <span class="s0">return </span><span class="s1">gv</span>
+
+        <span class="s1">gv_exc </span><span class="s2">= </span><span class="s1">define_error_gv</span><span class="s2">(</span><span class="s4">&quot;__errcode__&quot;</span><span class="s2">)</span>
+        <span class="s1">gv_tid </span><span class="s2">= []</span>
+        <span class="s1">gv_ctaid </span><span class="s2">= []</span>
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s4">'xyz'</span><span class="s2">:</span>
+            <span class="s1">gv_tid</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">define_error_gv</span><span class="s2">(</span><span class="s4">&quot;__tid%s__&quot; </span><span class="s2">% </span><span class="s1">i</span><span class="s2">))</span>
+            <span class="s1">gv_ctaid</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">define_error_gv</span><span class="s2">(</span><span class="s4">&quot;__ctaid%s__&quot; </span><span class="s2">% </span><span class="s1">i</span><span class="s2">))</span>
+
+        <span class="s1">callargs </span><span class="s2">= </span><span class="s1">arginfo</span><span class="s2">.</span><span class="s1">from_arguments</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">wrapfn</span><span class="s2">.</span><span class="s1">args</span><span class="s2">)</span>
+        <span class="s1">status</span><span class="s2">, </span><span class="s1">_ </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">call_conv</span><span class="s2">.</span><span class="s1">call_function</span><span class="s2">(</span>
+            <span class="s1">builder</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">void</span><span class="s2">, </span><span class="s1">argtypes</span><span class="s2">, </span><span class="s1">callargs</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">debug</span><span class="s2">:</span>
+            <span class="s3"># Check error status</span>
+            <span class="s0">with </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">if_likely</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">status</span><span class="s2">.</span><span class="s1">is_ok</span><span class="s2">):</span>
+                <span class="s1">builder</span><span class="s2">.</span><span class="s1">ret_void</span><span class="s2">()</span>
+
+            <span class="s0">with </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">if_then</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">not_</span><span class="s2">(</span><span class="s1">status</span><span class="s2">.</span><span class="s1">is_python_exc</span><span class="s2">)):</span>
+                <span class="s3"># User exception raised</span>
+                <span class="s1">old </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Constant</span><span class="s2">(</span><span class="s1">gv_exc</span><span class="s2">.</span><span class="s1">type</span><span class="s2">.</span><span class="s1">pointee</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+
+                <span class="s3"># Use atomic cmpxchg to prevent rewriting the error status</span>
+                <span class="s3"># Only the first error is recorded</span>
+
+                <span class="s1">xchg </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">cmpxchg</span><span class="s2">(</span><span class="s1">gv_exc</span><span class="s2">, </span><span class="s1">old</span><span class="s2">, </span><span class="s1">status</span><span class="s2">.</span><span class="s1">code</span><span class="s2">,</span>
+                                       <span class="s4">'monotonic'</span><span class="s2">, </span><span class="s4">'monotonic'</span><span class="s2">)</span>
+                <span class="s1">changed </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">extract_value</span><span class="s2">(</span><span class="s1">xchg</span><span class="s2">, </span><span class="s6">1</span><span class="s2">)</span>
+
+                <span class="s3"># If the xchange is successful, save the thread ID.</span>
+                <span class="s1">sreg </span><span class="s2">= </span><span class="s1">nvvmutils</span><span class="s2">.</span><span class="s1">SRegBuilder</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">)</span>
+                <span class="s0">with </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">if_then</span><span class="s2">(</span><span class="s1">changed</span><span class="s2">):</span>
+                    <span class="s0">for </span><span class="s1">dim</span><span class="s2">, </span><span class="s1">ptr</span><span class="s2">, </span><span class="s0">in </span><span class="s1">zip</span><span class="s2">(</span><span class="s4">&quot;xyz&quot;</span><span class="s2">, </span><span class="s1">gv_tid</span><span class="s2">):</span>
+                        <span class="s1">val </span><span class="s2">= </span><span class="s1">sreg</span><span class="s2">.</span><span class="s1">tid</span><span class="s2">(</span><span class="s1">dim</span><span class="s2">)</span>
+                        <span class="s1">builder</span><span class="s2">.</span><span class="s1">store</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">ptr</span><span class="s2">)</span>
+
+                    <span class="s0">for </span><span class="s1">dim</span><span class="s2">, </span><span class="s1">ptr</span><span class="s2">, </span><span class="s0">in </span><span class="s1">zip</span><span class="s2">(</span><span class="s4">&quot;xyz&quot;</span><span class="s2">, </span><span class="s1">gv_ctaid</span><span class="s2">):</span>
+                        <span class="s1">val </span><span class="s2">= </span><span class="s1">sreg</span><span class="s2">.</span><span class="s1">ctaid</span><span class="s2">(</span><span class="s1">dim</span><span class="s2">)</span>
+                        <span class="s1">builder</span><span class="s2">.</span><span class="s1">store</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">ptr</span><span class="s2">)</span>
+
+        <span class="s1">builder</span><span class="s2">.</span><span class="s1">ret_void</span><span class="s2">()</span>
+
+        <span class="s1">nvvm</span><span class="s2">.</span><span class="s1">set_cuda_kernel</span><span class="s2">(</span><span class="s1">wrapfn</span><span class="s2">)</span>
+        <span class="s1">library</span><span class="s2">.</span><span class="s1">add_ir_module</span><span class="s2">(</span><span class="s1">wrapper_module</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">debug </span><span class="s0">or </span><span class="s1">lineinfo</span><span class="s2">:</span>
+            <span class="s1">debuginfo</span><span class="s2">.</span><span class="s1">finalize</span><span class="s2">()</span>
+        <span class="s1">library</span><span class="s2">.</span><span class="s1">finalize</span><span class="s2">()</span>
+
+        <span class="s0">if </span><span class="s1">config</span><span class="s2">.</span><span class="s1">DUMP_LLVM</span><span class="s2">:</span>
+            <span class="s1">utils</span><span class="s2">.</span><span class="s1">dump_llvm</span><span class="s2">(</span><span class="s1">fndesc</span><span class="s2">, </span><span class="s1">wrapper_module</span><span class="s2">)</span>
+
+        <span class="s0">return </span><span class="s1">library</span><span class="s2">.</span><span class="s1">get_function</span><span class="s2">(</span><span class="s1">wrapfn</span><span class="s2">.</span><span class="s1">name</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">make_constant_array</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">aryty</span><span class="s2">, </span><span class="s1">arr</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Unlike the parent version.  This returns a a pointer in the constant 
+        addrspace. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">lmod </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">module</span>
+
+        <span class="s1">constvals </span><span class="s2">= [</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">get_constant</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">byte</span><span class="s2">, </span><span class="s1">i</span><span class="s2">)</span>
+            <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">iter</span><span class="s2">(</span><span class="s1">arr</span><span class="s2">.</span><span class="s1">tobytes</span><span class="s2">(</span><span class="s1">order</span><span class="s2">=</span><span class="s4">'A'</span><span class="s2">))</span>
+        <span class="s2">]</span>
+        <span class="s1">constaryty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">ArrayType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s6">8</span><span class="s2">), </span><span class="s1">len</span><span class="s2">(</span><span class="s1">constvals</span><span class="s2">))</span>
+        <span class="s1">constary </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Constant</span><span class="s2">(</span><span class="s1">constaryty</span><span class="s2">, </span><span class="s1">constvals</span><span class="s2">)</span>
+
+        <span class="s1">addrspace </span><span class="s2">= </span><span class="s1">nvvm</span><span class="s2">.</span><span class="s1">ADDRSPACE_CONSTANT</span>
+        <span class="s1">gv </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">add_global_variable</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">constary</span><span class="s2">.</span><span class="s1">type</span><span class="s2">, </span><span class="s4">&quot;_cudapy_cmem&quot;</span><span class="s2">,</span>
+                                         <span class="s1">addrspace</span><span class="s2">=</span><span class="s1">addrspace</span><span class="s2">)</span>
+        <span class="s1">gv</span><span class="s2">.</span><span class="s1">linkage </span><span class="s2">= </span><span class="s4">'internal'</span>
+        <span class="s1">gv</span><span class="s2">.</span><span class="s1">global_constant </span><span class="s2">= </span><span class="s0">True</span>
+        <span class="s1">gv</span><span class="s2">.</span><span class="s1">initializer </span><span class="s2">= </span><span class="s1">constary</span>
+
+        <span class="s3"># Preserve the underlying alignment</span>
+        <span class="s1">lldtype </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_data_type</span><span class="s2">(</span><span class="s1">aryty</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+        <span class="s1">align </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_abi_sizeof</span><span class="s2">(</span><span class="s1">lldtype</span><span class="s2">)</span>
+        <span class="s1">gv</span><span class="s2">.</span><span class="s1">align </span><span class="s2">= </span><span class="s6">2 </span><span class="s2">** (</span><span class="s1">align </span><span class="s2">- </span><span class="s6">1</span><span class="s2">).</span><span class="s1">bit_length</span><span class="s2">()</span>
+
+        <span class="s3"># Convert to generic address-space</span>
+        <span class="s1">ptrty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s6">8</span><span class="s2">))</span>
+        <span class="s1">genptr </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">addrspacecast</span><span class="s2">(</span><span class="s1">gv</span><span class="s2">, </span><span class="s1">ptrty</span><span class="s2">, </span><span class="s4">'generic'</span><span class="s2">)</span>
+
+        <span class="s3"># Create array object</span>
+        <span class="s1">ary </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">make_array</span><span class="s2">(</span><span class="s1">aryty</span><span class="s2">)(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">)</span>
+        <span class="s1">kshape </span><span class="s2">= [</span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_constant</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">, </span><span class="s1">s</span><span class="s2">) </span><span class="s0">for </span><span class="s1">s </span><span class="s0">in </span><span class="s1">arr</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">]</span>
+        <span class="s1">kstrides </span><span class="s2">= [</span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_constant</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">, </span><span class="s1">s</span><span class="s2">) </span><span class="s0">for </span><span class="s1">s </span><span class="s0">in </span><span class="s1">arr</span><span class="s2">.</span><span class="s1">strides</span><span class="s2">]</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">populate_array</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">, </span><span class="s1">data</span><span class="s2">=</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">bitcast</span><span class="s2">(</span><span class="s1">genptr</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">data</span><span class="s2">.</span><span class="s1">type</span><span class="s2">),</span>
+                            <span class="s1">shape</span><span class="s2">=</span><span class="s1">kshape</span><span class="s2">,</span>
+                            <span class="s1">strides</span><span class="s2">=</span><span class="s1">kstrides</span><span class="s2">,</span>
+                            <span class="s1">itemsize</span><span class="s2">=</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">itemsize</span><span class="s2">, </span><span class="s1">parent</span><span class="s2">=</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">parent</span><span class="s2">,</span>
+                            <span class="s1">meminfo</span><span class="s2">=</span><span class="s0">None</span><span class="s2">)</span>
+
+        <span class="s0">return </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">_getvalue</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">insert_const_string</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">, </span><span class="s1">string</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Unlike the parent version.  This returns a a pointer in the constant 
+        addrspace. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">text </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">make_bytearray</span><span class="s2">(</span><span class="s1">string</span><span class="s2">.</span><span class="s1">encode</span><span class="s2">(</span><span class="s4">&quot;utf-8&quot;</span><span class="s2">) + </span><span class="s7">b&quot;</span><span class="s0">\x00</span><span class="s7">&quot;</span><span class="s2">)</span>
+        <span class="s1">name </span><span class="s2">= </span><span class="s4">'$'</span><span class="s2">.</span><span class="s1">join</span><span class="s2">([</span><span class="s4">&quot;__conststring__&quot;</span><span class="s2">,</span>
+                         <span class="s1">itanium_mangler</span><span class="s2">.</span><span class="s1">mangle_identifier</span><span class="s2">(</span><span class="s1">string</span><span class="s2">)])</span>
+        <span class="s3"># Try to reuse existing global</span>
+        <span class="s1">gv </span><span class="s2">= </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">globals</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">name</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">gv </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s3"># Not defined yet</span>
+            <span class="s1">gv </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">add_global_variable</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">, </span><span class="s1">text</span><span class="s2">.</span><span class="s1">type</span><span class="s2">, </span><span class="s1">name</span><span class="s2">,</span>
+                                             <span class="s1">addrspace</span><span class="s2">=</span><span class="s1">nvvm</span><span class="s2">.</span><span class="s1">ADDRSPACE_CONSTANT</span><span class="s2">)</span>
+            <span class="s1">gv</span><span class="s2">.</span><span class="s1">linkage </span><span class="s2">= </span><span class="s4">'internal'</span>
+            <span class="s1">gv</span><span class="s2">.</span><span class="s1">global_constant </span><span class="s2">= </span><span class="s0">True</span>
+            <span class="s1">gv</span><span class="s2">.</span><span class="s1">initializer </span><span class="s2">= </span><span class="s1">text</span>
+
+        <span class="s3"># Cast to a i8* pointer</span>
+        <span class="s1">charty </span><span class="s2">= </span><span class="s1">gv</span><span class="s2">.</span><span class="s1">type</span><span class="s2">.</span><span class="s1">pointee</span><span class="s2">.</span><span class="s1">element</span>
+        <span class="s0">return </span><span class="s1">gv</span><span class="s2">.</span><span class="s1">bitcast</span><span class="s2">(</span><span class="s1">charty</span><span class="s2">.</span><span class="s1">as_pointer</span><span class="s2">(</span><span class="s1">nvvm</span><span class="s2">.</span><span class="s1">ADDRSPACE_CONSTANT</span><span class="s2">))</span>
+
+    <span class="s0">def </span><span class="s1">insert_string_const_addrspace</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">string</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Insert a constant string in the constant addresspace and return a 
+        generic i8 pointer to the data. 
+ 
+        This function attempts to deduplicate. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">lmod </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">module</span>
+        <span class="s1">gv </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">insert_const_string</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">string</span><span class="s2">)</span>
+        <span class="s1">charptrty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s6">8</span><span class="s2">))</span>
+        <span class="s0">return </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">addrspacecast</span><span class="s2">(</span><span class="s1">gv</span><span class="s2">, </span><span class="s1">charptrty</span><span class="s2">, </span><span class="s4">'generic'</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">optimize_function</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot;Run O1 function passes 
+        &quot;&quot;&quot;</span>
+        <span class="s0">pass</span>
+        <span class="s3">## XXX skipped for now</span>
+        <span class="s3"># fpm = lp.FunctionPassManager.new(func.module)</span>
+        <span class="s3">#</span>
+        <span class="s3"># lp.PassManagerBuilder.new().populate(fpm)</span>
+        <span class="s3">#</span>
+        <span class="s3"># fpm.initialize()</span>
+        <span class="s3"># fpm.run(func)</span>
+        <span class="s3"># fpm.finalize()</span>
+
+    <span class="s0">def </span><span class="s1">get_ufunc_info</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ufunc_key</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">ufuncs</span><span class="s2">.</span><span class="s1">get_ufunc_info</span><span class="s2">(</span><span class="s1">ufunc_key</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">CUDACallConv</span><span class="s2">(</span><span class="s1">MinimalCallConv</span><span class="s2">):</span>
+    <span class="s0">pass</span>
+
+
+<span class="s0">class </span><span class="s1">CUDACABICallConv</span><span class="s2">(</span><span class="s1">BaseCallConv</span><span class="s2">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Calling convention aimed at matching the CUDA C/C++ ABI. The implemented 
+    function signature is: 
+ 
+        &lt;Python return type&gt; (&lt;Python arguments&gt;) 
+ 
+    Exceptions are unsupported in this convention. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">_make_call_helper</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">):</span>
+        <span class="s3"># Call helpers are used to help report exceptions back to Python, so</span>
+        <span class="s3"># none is required here.</span>
+        <span class="s0">return None</span>
+
+    <span class="s0">def </span><span class="s1">return_value</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">retval</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">ret</span><span class="s2">(</span><span class="s1">retval</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">return_user_exc</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">exc</span><span class="s2">, </span><span class="s1">exc_args</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">loc</span><span class="s2">=</span><span class="s0">None</span><span class="s2">,</span>
+                        <span class="s1">func_name</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s1">msg </span><span class="s2">= </span><span class="s4">&quot;Python exceptions are unsupported in the CUDA C/C++ ABI&quot;</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">return_status_propagate</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">status</span><span class="s2">):</span>
+        <span class="s1">msg </span><span class="s2">= </span><span class="s4">&quot;Return status is unsupported in the CUDA C/C++ ABI&quot;</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">get_function_type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">restype</span><span class="s2">, </span><span class="s1">argtypes</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Get the LLVM IR Function type for *restype* and *argtypes*. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">arginfo </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_arg_packer</span><span class="s2">(</span><span class="s1">argtypes</span><span class="s2">)</span>
+        <span class="s1">argtypes </span><span class="s2">= </span><span class="s1">list</span><span class="s2">(</span><span class="s1">arginfo</span><span class="s2">.</span><span class="s1">argument_types</span><span class="s2">)</span>
+        <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_return_type</span><span class="s2">(</span><span class="s1">restype</span><span class="s2">), </span><span class="s1">argtypes</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">fnty</span>
+
+    <span class="s0">def </span><span class="s1">decorate_function</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">fn</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">fe_argtypes</span><span class="s2">, </span><span class="s1">noalias</span><span class="s2">=</span><span class="s0">False</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Set names and attributes of function arguments. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">assert not </span><span class="s1">noalias</span>
+        <span class="s1">arginfo </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_arg_packer</span><span class="s2">(</span><span class="s1">fe_argtypes</span><span class="s2">)</span>
+        <span class="s1">arginfo</span><span class="s2">.</span><span class="s1">assign_names</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_arguments</span><span class="s2">(</span><span class="s1">fn</span><span class="s2">),</span>
+                             <span class="s2">[</span><span class="s4">'arg.' </span><span class="s2">+ </span><span class="s1">a </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">args</span><span class="s2">])</span>
+
+    <span class="s0">def </span><span class="s1">get_arguments</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Get the Python-level arguments of LLVM *func*. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">func</span><span class="s2">.</span><span class="s1">args</span>
+
+    <span class="s0">def </span><span class="s1">call_function</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">callee</span><span class="s2">, </span><span class="s1">resty</span><span class="s2">, </span><span class="s1">argtys</span><span class="s2">, </span><span class="s1">args</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Call the Numba-compiled *callee*. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">arginfo </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_arg_packer</span><span class="s2">(</span><span class="s1">argtys</span><span class="s2">)</span>
+        <span class="s1">realargs </span><span class="s2">= </span><span class="s1">arginfo</span><span class="s2">.</span><span class="s1">as_arguments</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">args</span><span class="s2">)</span>
+        <span class="s1">code </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">call</span><span class="s2">(</span><span class="s1">callee</span><span class="s2">, </span><span class="s1">realargs</span><span class="s2">)</span>
+        <span class="s3"># No status required as we don't support exceptions or a distinct None</span>
+        <span class="s3"># value in a C ABI.</span>
+        <span class="s1">status </span><span class="s2">= </span><span class="s0">None</span>
+        <span class="s1">out </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_returned_value</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">resty</span><span class="s2">, </span><span class="s1">code</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">status</span><span class="s2">, </span><span class="s1">out</span>
+
+    <span class="s0">def </span><span class="s1">get_return_type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ty</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">data_model_manager</span><span class="s2">[</span><span class="s1">ty</span><span class="s2">].</span><span class="s1">get_return_type</span><span class="s2">()</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,966 @@
+<html>
+<head>
+<title>timsort.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+timsort.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Timsort implementation.  Mostly adapted from CPython's listobject.c. 
+ 
+For more information, see listsort.txt in CPython's source tree. 
+&quot;&quot;&quot;</span>
+
+
+<span class="s2">import </span><span class="s1">collections</span>
+
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">types</span>
+
+
+<span class="s1">TimsortImplementation </span><span class="s3">= </span><span class="s1">collections</span><span class="s3">.</span><span class="s1">namedtuple</span><span class="s3">(</span>
+    <span class="s4">'TimsortImplementation'</span><span class="s3">,</span>
+    <span class="s3">(</span><span class="s5"># The compile function itself</span>
+     <span class="s4">'compile'</span><span class="s3">,</span>
+     <span class="s5"># All subroutines exercised by test_sort</span>
+     <span class="s4">'count_run'</span><span class="s3">, </span><span class="s4">'binarysort'</span><span class="s3">, </span><span class="s4">'gallop_left'</span><span class="s3">, </span><span class="s4">'gallop_right'</span><span class="s3">,</span>
+     <span class="s4">'merge_init'</span><span class="s3">, </span><span class="s4">'merge_append'</span><span class="s3">, </span><span class="s4">'merge_pop'</span><span class="s3">,</span>
+     <span class="s4">'merge_compute_minrun'</span><span class="s3">, </span><span class="s4">'merge_lo'</span><span class="s3">, </span><span class="s4">'merge_hi'</span><span class="s3">, </span><span class="s4">'merge_at'</span><span class="s3">,</span>
+     <span class="s4">'merge_force_collapse'</span><span class="s3">, </span><span class="s4">'merge_collapse'</span><span class="s3">,</span>
+     <span class="s5"># The top-level functions</span>
+     <span class="s4">'run_timsort'</span><span class="s3">, </span><span class="s4">'run_timsort_with_values'</span>
+     <span class="s3">))</span>
+
+
+<span class="s5"># The maximum number of entries in a MergeState's pending-runs stack.</span>
+<span class="s5"># This is enough to sort arrays of size up to about</span>
+<span class="s5">#    32 * phi ** MAX_MERGE_PENDING</span>
+<span class="s5"># where phi ~= 1.618.  85 is ridiculously large enough, good for an array</span>
+<span class="s5"># with 2**64 elements.</span>
+<span class="s5"># NOTE this implementation doesn't depend on it (the stack is dynamically</span>
+<span class="s5"># allocated), but it's still good to check as an invariant.</span>
+<span class="s1">MAX_MERGE_PENDING  </span><span class="s3">= </span><span class="s6">85</span>
+
+<span class="s5"># When we get into galloping mode, we stay there until both runs win less</span>
+<span class="s5"># often than MIN_GALLOP consecutive times.  See listsort.txt for more info.</span>
+<span class="s1">MIN_GALLOP </span><span class="s3">= </span><span class="s6">7</span>
+
+<span class="s5"># Start size for temp arrays.</span>
+<span class="s1">MERGESTATE_TEMP_SIZE </span><span class="s3">= </span><span class="s6">256</span>
+
+<span class="s5"># A mergestate is a named tuple with the following members:</span>
+<span class="s5">#  - *min_gallop* is an integer controlling when we get into galloping mode</span>
+<span class="s5">#  - *keys* is a temp list for merging keys</span>
+<span class="s5">#  - *values* is a temp list for merging values, if needed</span>
+<span class="s5">#  - *pending* is a stack of pending runs to be merged</span>
+<span class="s5">#  - *n* is the current stack length of *pending*</span>
+
+<span class="s1">MergeState </span><span class="s3">= </span><span class="s1">collections</span><span class="s3">.</span><span class="s1">namedtuple</span><span class="s3">(</span>
+    <span class="s4">'MergeState'</span><span class="s3">, (</span><span class="s4">'min_gallop'</span><span class="s3">, </span><span class="s4">'keys'</span><span class="s3">, </span><span class="s4">'values'</span><span class="s3">, </span><span class="s4">'pending'</span><span class="s3">, </span><span class="s4">'n'</span><span class="s3">))</span>
+
+
+<span class="s1">MergeRun </span><span class="s3">= </span><span class="s1">collections</span><span class="s3">.</span><span class="s1">namedtuple</span><span class="s3">(</span><span class="s4">'MergeRun'</span><span class="s3">, (</span><span class="s4">'start'</span><span class="s3">, </span><span class="s4">'size'</span><span class="s3">))</span>
+
+
+<span class="s2">def </span><span class="s1">make_timsort_impl</span><span class="s3">(</span><span class="s1">wrap</span><span class="s3">, </span><span class="s1">make_temp_area</span><span class="s3">):</span>
+
+    <span class="s1">make_temp_area </span><span class="s3">= </span><span class="s1">wrap</span><span class="s3">(</span><span class="s1">make_temp_area</span><span class="s3">)</span>
+    <span class="s1">intp </span><span class="s3">= </span><span class="s1">types</span><span class="s3">.</span><span class="s1">intp</span>
+    <span class="s1">zero </span><span class="s3">= </span><span class="s1">intp</span><span class="s3">(</span><span class="s6">0</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">has_values</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">values </span><span class="s2">is not </span><span class="s1">keys</span>
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">merge_init</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Initialize a MergeState for a non-keyed sort. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">temp_size </span><span class="s3">= </span><span class="s1">min</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">) // </span><span class="s6">2 </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">, </span><span class="s1">MERGESTATE_TEMP_SIZE</span><span class="s3">)</span>
+        <span class="s1">temp_keys </span><span class="s3">= </span><span class="s1">make_temp_area</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">temp_size</span><span class="s3">)</span>
+        <span class="s1">temp_values </span><span class="s3">= </span><span class="s1">temp_keys</span>
+        <span class="s1">pending </span><span class="s3">= [</span><span class="s1">MergeRun</span><span class="s3">(</span><span class="s1">zero</span><span class="s3">, </span><span class="s1">zero</span><span class="s3">)] * </span><span class="s1">MAX_MERGE_PENDING</span>
+        <span class="s2">return </span><span class="s1">MergeState</span><span class="s3">(</span><span class="s1">intp</span><span class="s3">(</span><span class="s1">MIN_GALLOP</span><span class="s3">), </span><span class="s1">temp_keys</span><span class="s3">, </span><span class="s1">temp_values</span><span class="s3">, </span><span class="s1">pending</span><span class="s3">, </span><span class="s1">zero</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">merge_init_with_values</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Initialize a MergeState for a keyed sort. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">temp_size </span><span class="s3">= </span><span class="s1">min</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">) // </span><span class="s6">2 </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">, </span><span class="s1">MERGESTATE_TEMP_SIZE</span><span class="s3">)</span>
+        <span class="s1">temp_keys </span><span class="s3">= </span><span class="s1">make_temp_area</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">temp_size</span><span class="s3">)</span>
+        <span class="s1">temp_values </span><span class="s3">= </span><span class="s1">make_temp_area</span><span class="s3">(</span><span class="s1">values</span><span class="s3">, </span><span class="s1">temp_size</span><span class="s3">)</span>
+        <span class="s1">pending </span><span class="s3">= [</span><span class="s1">MergeRun</span><span class="s3">(</span><span class="s1">zero</span><span class="s3">, </span><span class="s1">zero</span><span class="s3">)] * </span><span class="s1">MAX_MERGE_PENDING</span>
+        <span class="s2">return </span><span class="s1">MergeState</span><span class="s3">(</span><span class="s1">intp</span><span class="s3">(</span><span class="s1">MIN_GALLOP</span><span class="s3">), </span><span class="s1">temp_keys</span><span class="s3">, </span><span class="s1">temp_values</span><span class="s3">, </span><span class="s1">pending</span><span class="s3">, </span><span class="s1">zero</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">merge_append</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">run</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Append a run on the merge stack. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">n </span><span class="s3">= </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">n</span>
+        <span class="s2">assert </span><span class="s1">n </span><span class="s3">&lt; </span><span class="s1">MAX_MERGE_PENDING</span>
+        <span class="s1">ms</span><span class="s3">.</span><span class="s1">pending</span><span class="s3">[</span><span class="s1">n</span><span class="s3">] = </span><span class="s1">run</span>
+        <span class="s2">return </span><span class="s1">MergeState</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">.</span><span class="s1">min_gallop</span><span class="s3">, </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">values</span><span class="s3">, </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">pending</span><span class="s3">, </span><span class="s1">n </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">merge_pop</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Pop the top run from the merge stack. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">MergeState</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">.</span><span class="s1">min_gallop</span><span class="s3">, </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">values</span><span class="s3">, </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">pending</span><span class="s3">, </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">n </span><span class="s3">- </span><span class="s6">1</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">merge_getmem</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">need</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Ensure enough temp memory for 'need' items is available. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">alloced </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">need </span><span class="s3">&lt;= </span><span class="s1">alloced</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">ms</span>
+        <span class="s5"># Over-allocate</span>
+        <span class="s2">while </span><span class="s1">alloced </span><span class="s3">&lt; </span><span class="s1">need</span><span class="s3">:</span>
+            <span class="s1">alloced </span><span class="s3">= </span><span class="s1">alloced </span><span class="s3">&lt;&lt; </span><span class="s6">1</span>
+        <span class="s5"># Don't realloc!  That can cost cycles to copy the old data, but</span>
+        <span class="s5"># we don't care what's in the block.</span>
+        <span class="s1">temp_keys </span><span class="s3">= </span><span class="s1">make_temp_area</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">alloced</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">has_values</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">values</span><span class="s3">):</span>
+            <span class="s1">temp_values </span><span class="s3">= </span><span class="s1">make_temp_area</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">.</span><span class="s1">values</span><span class="s3">, </span><span class="s1">alloced</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">temp_values </span><span class="s3">= </span><span class="s1">temp_keys</span>
+        <span class="s2">return </span><span class="s1">MergeState</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">.</span><span class="s1">min_gallop</span><span class="s3">, </span><span class="s1">temp_keys</span><span class="s3">, </span><span class="s1">temp_values</span><span class="s3">, </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">pending</span><span class="s3">, </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">n</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">merge_adjust_gallop</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">new_gallop</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Modify the MergeState's min_gallop. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">MergeState</span><span class="s3">(</span><span class="s1">intp</span><span class="s3">(</span><span class="s1">new_gallop</span><span class="s3">), </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">values</span><span class="s3">, </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">pending</span><span class="s3">, </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">n</span><span class="s3">)</span>
+
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">LT</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Trivial comparison function between two keys.  This is factored out to 
+        make it clear where comparisons occur. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">a </span><span class="s3">&lt; </span><span class="s1">b</span>
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">binarysort</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">lo</span><span class="s3">, </span><span class="s1">hi</span><span class="s3">, </span><span class="s1">start</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        binarysort is the best method for sorting small arrays: it does 
+        few compares, but can do data movement quadratic in the number of 
+        elements. 
+        [lo, hi) is a contiguous slice of a list, and is sorted via 
+        binary insertion.  This sort is stable. 
+        On entry, must have lo &lt;= start &lt;= hi, and that [lo, start) is already 
+        sorted (pass start == lo if you don't know!). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">assert </span><span class="s1">lo </span><span class="s3">&lt;= </span><span class="s1">start </span><span class="s2">and </span><span class="s1">start </span><span class="s3">&lt;= </span><span class="s1">hi</span>
+        <span class="s1">_has_values </span><span class="s3">= </span><span class="s1">has_values</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">lo </span><span class="s3">== </span><span class="s1">start</span><span class="s3">:</span>
+            <span class="s1">start </span><span class="s3">+= </span><span class="s6">1</span>
+        <span class="s2">while </span><span class="s1">start </span><span class="s3">&lt; </span><span class="s1">hi</span><span class="s3">:</span>
+            <span class="s1">pivot </span><span class="s3">= </span><span class="s1">keys</span><span class="s3">[</span><span class="s1">start</span><span class="s3">]</span>
+            <span class="s5"># Bisect to find where to insert `pivot`</span>
+            <span class="s5"># NOTE: bisection only wins over linear search if the comparison</span>
+            <span class="s5"># function is much more expensive than simply moving data.</span>
+            <span class="s1">l </span><span class="s3">= </span><span class="s1">lo</span>
+            <span class="s1">r </span><span class="s3">= </span><span class="s1">start</span>
+            <span class="s5"># Invariants:</span>
+            <span class="s5"># pivot &gt;= all in [lo, l).</span>
+            <span class="s5"># pivot  &lt; all in [r, start).</span>
+            <span class="s5"># The second is vacuously true at the start.</span>
+            <span class="s2">while </span><span class="s1">l </span><span class="s3">&lt; </span><span class="s1">r</span><span class="s3">:</span>
+                <span class="s1">p </span><span class="s3">= </span><span class="s1">l </span><span class="s3">+ ((</span><span class="s1">r </span><span class="s3">- </span><span class="s1">l</span><span class="s3">) &gt;&gt; </span><span class="s6">1</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">LT</span><span class="s3">(</span><span class="s1">pivot</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">[</span><span class="s1">p</span><span class="s3">]):</span>
+                    <span class="s1">r </span><span class="s3">= </span><span class="s1">p</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">l </span><span class="s3">= </span><span class="s1">p</span><span class="s3">+</span><span class="s6">1</span>
+
+            <span class="s5"># The invariants still hold, so pivot &gt;= all in [lo, l) and</span>
+            <span class="s5"># pivot &lt; all in [l, start), so pivot belongs at l.  Note</span>
+            <span class="s5"># that if there are elements equal to pivot, l points to the</span>
+            <span class="s5"># first slot after them -- that's why this sort is stable.</span>
+            <span class="s5"># Slide over to make room (aka memmove()).</span>
+            <span class="s2">for </span><span class="s1">p </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">start</span><span class="s3">, </span><span class="s1">l</span><span class="s3">, -</span><span class="s6">1</span><span class="s3">):</span>
+                <span class="s1">keys</span><span class="s3">[</span><span class="s1">p</span><span class="s3">] = </span><span class="s1">keys</span><span class="s3">[</span><span class="s1">p </span><span class="s3">- </span><span class="s6">1</span><span class="s3">]</span>
+            <span class="s1">keys</span><span class="s3">[</span><span class="s1">l</span><span class="s3">] = </span><span class="s1">pivot</span>
+            <span class="s2">if </span><span class="s1">_has_values</span><span class="s3">:</span>
+                <span class="s1">pivot_val </span><span class="s3">= </span><span class="s1">values</span><span class="s3">[</span><span class="s1">start</span><span class="s3">]</span>
+                <span class="s2">for </span><span class="s1">p </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">start</span><span class="s3">, </span><span class="s1">l</span><span class="s3">, -</span><span class="s6">1</span><span class="s3">):</span>
+                    <span class="s1">values</span><span class="s3">[</span><span class="s1">p</span><span class="s3">] = </span><span class="s1">values</span><span class="s3">[</span><span class="s1">p </span><span class="s3">- </span><span class="s6">1</span><span class="s3">]</span>
+                <span class="s1">values</span><span class="s3">[</span><span class="s1">l</span><span class="s3">] = </span><span class="s1">pivot_val</span>
+
+            <span class="s1">start </span><span class="s3">+= </span><span class="s6">1</span>
+
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">count_run</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">lo</span><span class="s3">, </span><span class="s1">hi</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the length of the run beginning at lo, in the slice [lo, hi). 
+        lo &lt; hi is required on entry.  &quot;A run&quot; is the longest ascending sequence, with 
+ 
+            lo[0] &lt;= lo[1] &lt;= lo[2] &lt;= ... 
+ 
+        or the longest descending sequence, with 
+ 
+            lo[0] &gt; lo[1] &gt; lo[2] &gt; ... 
+ 
+        A tuple (length, descending) is returned, where boolean *descending* 
+        is set to 0 in the former case, or to 1 in the latter. 
+        For its intended use in a stable mergesort, the strictness of the defn of 
+        &quot;descending&quot; is needed so that the caller can safely reverse a descending 
+        sequence without violating stability (strict &gt; ensures there are no equal 
+        elements to get out of order). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">assert </span><span class="s1">lo </span><span class="s3">&lt; </span><span class="s1">hi</span>
+        <span class="s2">if </span><span class="s1">lo </span><span class="s3">+ </span><span class="s6">1 </span><span class="s3">== </span><span class="s1">hi</span><span class="s3">:</span>
+            <span class="s5"># Trivial 1-long run</span>
+            <span class="s2">return </span><span class="s6">1</span><span class="s3">, </span><span class="s2">False</span>
+        <span class="s2">if </span><span class="s1">LT</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">[</span><span class="s1">lo </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">], </span><span class="s1">keys</span><span class="s3">[</span><span class="s1">lo</span><span class="s3">]):</span>
+            <span class="s5"># Descending run</span>
+            <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">lo </span><span class="s3">+ </span><span class="s6">2</span><span class="s3">, </span><span class="s1">hi</span><span class="s3">):</span>
+                <span class="s2">if not </span><span class="s1">LT</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">[</span><span class="s1">k</span><span class="s3">], </span><span class="s1">keys</span><span class="s3">[</span><span class="s1">k </span><span class="s3">- </span><span class="s6">1</span><span class="s3">]):</span>
+                    <span class="s2">return </span><span class="s1">k </span><span class="s3">- </span><span class="s1">lo</span><span class="s3">, </span><span class="s2">True</span>
+            <span class="s2">return </span><span class="s1">hi </span><span class="s3">- </span><span class="s1">lo</span><span class="s3">, </span><span class="s2">True</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s5"># Ascending run</span>
+            <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">lo </span><span class="s3">+ </span><span class="s6">2</span><span class="s3">, </span><span class="s1">hi</span><span class="s3">):</span>
+                <span class="s2">if </span><span class="s1">LT</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">[</span><span class="s1">k</span><span class="s3">], </span><span class="s1">keys</span><span class="s3">[</span><span class="s1">k </span><span class="s3">- </span><span class="s6">1</span><span class="s3">]):</span>
+                    <span class="s2">return </span><span class="s1">k </span><span class="s3">- </span><span class="s1">lo</span><span class="s3">, </span><span class="s2">False</span>
+            <span class="s2">return </span><span class="s1">hi </span><span class="s3">- </span><span class="s1">lo</span><span class="s3">, </span><span class="s2">False</span>
+
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">gallop_left</span><span class="s3">(</span><span class="s1">key</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">start</span><span class="s3">, </span><span class="s1">stop</span><span class="s3">, </span><span class="s1">hint</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Locate the proper position of key in a sorted vector; if the vector contains 
+        an element equal to key, return the position immediately to the left of 
+        the leftmost equal element.  [gallop_right() does the same except returns 
+        the position to the right of the rightmost equal element (if any).] 
+ 
+        &quot;a&quot; is a sorted vector with stop elements, starting at a[start]. 
+        stop must be &gt; start. 
+ 
+        &quot;hint&quot; is an index at which to begin the search, start &lt;= hint &lt; stop. 
+        The closer hint is to the final result, the faster this runs. 
+ 
+        The return value is the int k in start..stop such that 
+ 
+            a[k-1] &lt; key &lt;= a[k] 
+ 
+        pretending that a[start-1] is minus infinity and a[stop] is plus infinity. 
+        IOW, key belongs at index k; or, IOW, the first k elements of a should 
+        precede key, and the last stop-start-k should follow key. 
+ 
+        See listsort.txt for info on the method. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">assert </span><span class="s1">stop </span><span class="s3">&gt; </span><span class="s1">start</span>
+        <span class="s2">assert </span><span class="s1">hint </span><span class="s3">&gt;= </span><span class="s1">start </span><span class="s2">and </span><span class="s1">hint </span><span class="s3">&lt; </span><span class="s1">stop</span>
+        <span class="s1">n </span><span class="s3">= </span><span class="s1">stop </span><span class="s3">- </span><span class="s1">start</span>
+
+        <span class="s5"># First, gallop from the hint to find a &quot;good&quot; subinterval for bisecting</span>
+        <span class="s1">lastofs </span><span class="s3">= </span><span class="s6">0</span>
+        <span class="s1">ofs </span><span class="s3">= </span><span class="s6">1</span>
+        <span class="s2">if </span><span class="s1">LT</span><span class="s3">(</span><span class="s1">a</span><span class="s3">[</span><span class="s1">hint</span><span class="s3">], </span><span class="s1">key</span><span class="s3">):</span>
+            <span class="s5"># a[hint] &lt; key =&gt; gallop right, until</span>
+            <span class="s5">#                  a[hint + lastofs] &lt; key &lt;= a[hint + ofs]</span>
+            <span class="s1">maxofs </span><span class="s3">= </span><span class="s1">stop </span><span class="s3">- </span><span class="s1">hint</span>
+            <span class="s2">while </span><span class="s1">ofs </span><span class="s3">&lt; </span><span class="s1">maxofs</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">LT</span><span class="s3">(</span><span class="s1">a</span><span class="s3">[</span><span class="s1">hint </span><span class="s3">+ </span><span class="s1">ofs</span><span class="s3">], </span><span class="s1">key</span><span class="s3">):</span>
+                    <span class="s1">lastofs </span><span class="s3">= </span><span class="s1">ofs</span>
+                    <span class="s1">ofs </span><span class="s3">= (</span><span class="s1">ofs </span><span class="s3">&lt;&lt; </span><span class="s6">1</span><span class="s3">) + </span><span class="s6">1</span>
+                    <span class="s2">if </span><span class="s1">ofs </span><span class="s3">&lt;= </span><span class="s6">0</span><span class="s3">:</span>
+                        <span class="s5"># Int overflow</span>
+                        <span class="s1">ofs </span><span class="s3">= </span><span class="s1">maxofs</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s5"># key &lt;= a[hint + ofs]</span>
+                    <span class="s2">break</span>
+            <span class="s2">if </span><span class="s1">ofs </span><span class="s3">&gt; </span><span class="s1">maxofs</span><span class="s3">:</span>
+                <span class="s1">ofs </span><span class="s3">= </span><span class="s1">maxofs</span>
+            <span class="s5"># Translate back to offsets relative to a[0]</span>
+            <span class="s1">lastofs </span><span class="s3">+= </span><span class="s1">hint</span>
+            <span class="s1">ofs </span><span class="s3">+= </span><span class="s1">hint</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s5"># key &lt;= a[hint] =&gt; gallop left, until</span>
+            <span class="s5">#                   a[hint - ofs] &lt; key &lt;= a[hint - lastofs]</span>
+            <span class="s1">maxofs </span><span class="s3">= </span><span class="s1">hint </span><span class="s3">- </span><span class="s1">start </span><span class="s3">+ </span><span class="s6">1</span>
+            <span class="s2">while </span><span class="s1">ofs </span><span class="s3">&lt; </span><span class="s1">maxofs</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">LT</span><span class="s3">(</span><span class="s1">a</span><span class="s3">[</span><span class="s1">hint </span><span class="s3">- </span><span class="s1">ofs</span><span class="s3">], </span><span class="s1">key</span><span class="s3">):</span>
+                    <span class="s2">break</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s5"># key &lt;= a[hint - ofs]</span>
+                    <span class="s1">lastofs </span><span class="s3">= </span><span class="s1">ofs</span>
+                    <span class="s1">ofs </span><span class="s3">= (</span><span class="s1">ofs </span><span class="s3">&lt;&lt; </span><span class="s6">1</span><span class="s3">) + </span><span class="s6">1</span>
+                    <span class="s2">if </span><span class="s1">ofs </span><span class="s3">&lt;= </span><span class="s6">0</span><span class="s3">:</span>
+                        <span class="s5"># Int overflow</span>
+                        <span class="s1">ofs </span><span class="s3">= </span><span class="s1">maxofs</span>
+            <span class="s2">if </span><span class="s1">ofs </span><span class="s3">&gt; </span><span class="s1">maxofs</span><span class="s3">:</span>
+                <span class="s1">ofs </span><span class="s3">= </span><span class="s1">maxofs</span>
+            <span class="s5"># Translate back to positive offsets relative to a[0]</span>
+            <span class="s1">lastofs</span><span class="s3">, </span><span class="s1">ofs </span><span class="s3">= </span><span class="s1">hint </span><span class="s3">- </span><span class="s1">ofs</span><span class="s3">, </span><span class="s1">hint </span><span class="s3">- </span><span class="s1">lastofs</span>
+
+        <span class="s2">assert </span><span class="s1">start </span><span class="s3">- </span><span class="s6">1 </span><span class="s3">&lt;= </span><span class="s1">lastofs </span><span class="s2">and </span><span class="s1">lastofs </span><span class="s3">&lt; </span><span class="s1">ofs </span><span class="s2">and </span><span class="s1">ofs </span><span class="s3">&lt;= </span><span class="s1">stop</span>
+        <span class="s5"># Now a[lastofs] &lt; key &lt;= a[ofs], so key belongs somewhere to the</span>
+        <span class="s5"># right of lastofs but no farther right than ofs.  Do a binary</span>
+        <span class="s5"># search, with invariant a[lastofs-1] &lt; key &lt;= a[ofs].</span>
+        <span class="s1">lastofs </span><span class="s3">+= </span><span class="s6">1</span>
+        <span class="s2">while </span><span class="s1">lastofs </span><span class="s3">&lt; </span><span class="s1">ofs</span><span class="s3">:</span>
+            <span class="s1">m </span><span class="s3">= </span><span class="s1">lastofs </span><span class="s3">+ ((</span><span class="s1">ofs </span><span class="s3">- </span><span class="s1">lastofs</span><span class="s3">) &gt;&gt; </span><span class="s6">1</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">LT</span><span class="s3">(</span><span class="s1">a</span><span class="s3">[</span><span class="s1">m</span><span class="s3">], </span><span class="s1">key</span><span class="s3">):</span>
+                <span class="s5"># a[m] &lt; key</span>
+                <span class="s1">lastofs </span><span class="s3">= </span><span class="s1">m </span><span class="s3">+ </span><span class="s6">1</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s5"># key &lt;= a[m]</span>
+                <span class="s1">ofs </span><span class="s3">= </span><span class="s1">m</span>
+        <span class="s5"># Now lastofs == ofs, so a[ofs - 1] &lt; key &lt;= a[ofs]</span>
+        <span class="s2">return </span><span class="s1">ofs</span>
+
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">gallop_right</span><span class="s3">(</span><span class="s1">key</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">start</span><span class="s3">, </span><span class="s1">stop</span><span class="s3">, </span><span class="s1">hint</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Exactly like gallop_left(), except that if key already exists in a[start:stop], 
+        finds the position immediately to the right of the rightmost equal value. 
+ 
+        The return value is the int k in start..stop such that 
+ 
+            a[k-1] &lt;= key &lt; a[k] 
+ 
+        The code duplication is massive, but this is enough different given that 
+        we're sticking to &quot;&lt;&quot; comparisons that it's much harder to follow if 
+        written as one routine with yet another &quot;left or right?&quot; flag. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">assert </span><span class="s1">stop </span><span class="s3">&gt; </span><span class="s1">start</span>
+        <span class="s2">assert </span><span class="s1">hint </span><span class="s3">&gt;= </span><span class="s1">start </span><span class="s2">and </span><span class="s1">hint </span><span class="s3">&lt; </span><span class="s1">stop</span>
+        <span class="s1">n </span><span class="s3">= </span><span class="s1">stop </span><span class="s3">- </span><span class="s1">start</span>
+
+        <span class="s5"># First, gallop from the hint to find a &quot;good&quot; subinterval for bisecting</span>
+        <span class="s1">lastofs </span><span class="s3">= </span><span class="s6">0</span>
+        <span class="s1">ofs </span><span class="s3">= </span><span class="s6">1</span>
+        <span class="s2">if </span><span class="s1">LT</span><span class="s3">(</span><span class="s1">key</span><span class="s3">, </span><span class="s1">a</span><span class="s3">[</span><span class="s1">hint</span><span class="s3">]):</span>
+            <span class="s5"># key &lt; a[hint] =&gt; gallop left, until</span>
+            <span class="s5">#                  a[hint - ofs] &lt;= key &lt; a[hint - lastofs]</span>
+            <span class="s1">maxofs </span><span class="s3">= </span><span class="s1">hint </span><span class="s3">- </span><span class="s1">start </span><span class="s3">+ </span><span class="s6">1</span>
+            <span class="s2">while </span><span class="s1">ofs </span><span class="s3">&lt; </span><span class="s1">maxofs</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">LT</span><span class="s3">(</span><span class="s1">key</span><span class="s3">, </span><span class="s1">a</span><span class="s3">[</span><span class="s1">hint </span><span class="s3">- </span><span class="s1">ofs</span><span class="s3">]):</span>
+                    <span class="s1">lastofs </span><span class="s3">= </span><span class="s1">ofs</span>
+                    <span class="s1">ofs </span><span class="s3">= (</span><span class="s1">ofs </span><span class="s3">&lt;&lt; </span><span class="s6">1</span><span class="s3">) + </span><span class="s6">1</span>
+                    <span class="s2">if </span><span class="s1">ofs </span><span class="s3">&lt;= </span><span class="s6">0</span><span class="s3">:</span>
+                        <span class="s5"># Int overflow</span>
+                        <span class="s1">ofs </span><span class="s3">= </span><span class="s1">maxofs</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s5"># a[hint - ofs] &lt;= key</span>
+                    <span class="s2">break</span>
+            <span class="s2">if </span><span class="s1">ofs </span><span class="s3">&gt; </span><span class="s1">maxofs</span><span class="s3">:</span>
+                <span class="s1">ofs </span><span class="s3">= </span><span class="s1">maxofs</span>
+            <span class="s5"># Translate back to positive offsets relative to a[0]</span>
+            <span class="s1">lastofs</span><span class="s3">, </span><span class="s1">ofs </span><span class="s3">= </span><span class="s1">hint </span><span class="s3">- </span><span class="s1">ofs</span><span class="s3">, </span><span class="s1">hint </span><span class="s3">- </span><span class="s1">lastofs</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s5"># a[hint] &lt;= key -- gallop right, until</span>
+            <span class="s5"># a[hint + lastofs] &lt;= key &lt; a[hint + ofs]</span>
+            <span class="s1">maxofs </span><span class="s3">= </span><span class="s1">stop </span><span class="s3">- </span><span class="s1">hint</span>
+            <span class="s2">while </span><span class="s1">ofs </span><span class="s3">&lt; </span><span class="s1">maxofs</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">LT</span><span class="s3">(</span><span class="s1">key</span><span class="s3">, </span><span class="s1">a</span><span class="s3">[</span><span class="s1">hint </span><span class="s3">+ </span><span class="s1">ofs</span><span class="s3">]):</span>
+                    <span class="s2">break</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s5"># a[hint + ofs] &lt;= key</span>
+                    <span class="s1">lastofs </span><span class="s3">= </span><span class="s1">ofs</span>
+                    <span class="s1">ofs </span><span class="s3">= (</span><span class="s1">ofs </span><span class="s3">&lt;&lt; </span><span class="s6">1</span><span class="s3">) + </span><span class="s6">1</span>
+                    <span class="s2">if </span><span class="s1">ofs </span><span class="s3">&lt;= </span><span class="s6">0</span><span class="s3">:</span>
+                        <span class="s5"># Int overflow</span>
+                        <span class="s1">ofs </span><span class="s3">= </span><span class="s1">maxofs</span>
+            <span class="s2">if </span><span class="s1">ofs </span><span class="s3">&gt; </span><span class="s1">maxofs</span><span class="s3">:</span>
+                <span class="s1">ofs </span><span class="s3">= </span><span class="s1">maxofs</span>
+            <span class="s5"># Translate back to offsets relative to a[0]</span>
+            <span class="s1">lastofs </span><span class="s3">+= </span><span class="s1">hint</span>
+            <span class="s1">ofs </span><span class="s3">+= </span><span class="s1">hint</span>
+
+        <span class="s2">assert </span><span class="s1">start </span><span class="s3">- </span><span class="s6">1 </span><span class="s3">&lt;= </span><span class="s1">lastofs </span><span class="s2">and </span><span class="s1">lastofs </span><span class="s3">&lt; </span><span class="s1">ofs </span><span class="s2">and </span><span class="s1">ofs </span><span class="s3">&lt;= </span><span class="s1">stop</span>
+        <span class="s5"># Now a[lastofs] &lt;= key &lt; a[ofs], so key belongs somewhere to the</span>
+        <span class="s5"># right of lastofs but no farther right than ofs.  Do a binary</span>
+        <span class="s5"># search, with invariant a[lastofs-1] &lt;= key &lt; a[ofs].</span>
+        <span class="s1">lastofs </span><span class="s3">+= </span><span class="s6">1</span>
+        <span class="s2">while </span><span class="s1">lastofs </span><span class="s3">&lt; </span><span class="s1">ofs</span><span class="s3">:</span>
+            <span class="s1">m </span><span class="s3">= </span><span class="s1">lastofs </span><span class="s3">+ ((</span><span class="s1">ofs </span><span class="s3">- </span><span class="s1">lastofs</span><span class="s3">) &gt;&gt; </span><span class="s6">1</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">LT</span><span class="s3">(</span><span class="s1">key</span><span class="s3">, </span><span class="s1">a</span><span class="s3">[</span><span class="s1">m</span><span class="s3">]):</span>
+                <span class="s5"># key &lt; a[m]</span>
+                <span class="s1">ofs </span><span class="s3">= </span><span class="s1">m</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s5"># a[m] &lt;= key</span>
+                <span class="s1">lastofs </span><span class="s3">= </span><span class="s1">m </span><span class="s3">+ </span><span class="s6">1</span>
+        <span class="s5"># Now lastofs == ofs, so a[ofs - 1] &lt;= key &lt; a[ofs]</span>
+        <span class="s2">return </span><span class="s1">ofs</span>
+
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">merge_compute_minrun</span><span class="s3">(</span><span class="s1">n</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Compute a good value for the minimum run length; natural runs shorter 
+        than this are boosted artificially via binary insertion. 
+ 
+        If n &lt; 64, return n (it's too small to bother with fancy stuff). 
+        Else if n is an exact power of 2, return 32. 
+        Else return an int k, 32 &lt;= k &lt;= 64, such that n/k is close to, but 
+        strictly less than, an exact power of 2. 
+ 
+        See listsort.txt for more info. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">r </span><span class="s3">= </span><span class="s6">0</span>
+        <span class="s2">assert </span><span class="s1">n </span><span class="s3">&gt;= </span><span class="s6">0</span>
+        <span class="s2">while </span><span class="s1">n </span><span class="s3">&gt;= </span><span class="s6">64</span><span class="s3">:</span>
+            <span class="s1">r </span><span class="s3">|= </span><span class="s1">n </span><span class="s3">&amp; </span><span class="s6">1</span>
+            <span class="s1">n </span><span class="s3">&gt;&gt;= </span><span class="s6">1</span>
+        <span class="s2">return </span><span class="s1">n </span><span class="s3">+ </span><span class="s1">r</span>
+
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">sortslice_copy</span><span class="s3">(</span><span class="s1">dest_keys</span><span class="s3">, </span><span class="s1">dest_values</span><span class="s3">, </span><span class="s1">dest_start</span><span class="s3">,</span>
+                       <span class="s1">src_keys</span><span class="s3">, </span><span class="s1">src_values</span><span class="s3">, </span><span class="s1">src_start</span><span class="s3">,</span>
+                       <span class="s1">nitems</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Upwards memcpy(). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">assert </span><span class="s1">src_start </span><span class="s3">&gt;= </span><span class="s6">0</span>
+        <span class="s2">assert </span><span class="s1">dest_start </span><span class="s3">&gt;= </span><span class="s6">0</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">nitems</span><span class="s3">):</span>
+            <span class="s1">dest_keys</span><span class="s3">[</span><span class="s1">dest_start </span><span class="s3">+ </span><span class="s1">i</span><span class="s3">] = </span><span class="s1">src_keys</span><span class="s3">[</span><span class="s1">src_start </span><span class="s3">+ </span><span class="s1">i</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">has_values</span><span class="s3">(</span><span class="s1">src_keys</span><span class="s3">, </span><span class="s1">src_values</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">nitems</span><span class="s3">):</span>
+                <span class="s1">dest_values</span><span class="s3">[</span><span class="s1">dest_start </span><span class="s3">+ </span><span class="s1">i</span><span class="s3">] = </span><span class="s1">src_values</span><span class="s3">[</span><span class="s1">src_start </span><span class="s3">+ </span><span class="s1">i</span><span class="s3">]</span>
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">sortslice_copy_down</span><span class="s3">(</span><span class="s1">dest_keys</span><span class="s3">, </span><span class="s1">dest_values</span><span class="s3">, </span><span class="s1">dest_start</span><span class="s3">,</span>
+                            <span class="s1">src_keys</span><span class="s3">, </span><span class="s1">src_values</span><span class="s3">, </span><span class="s1">src_start</span><span class="s3">,</span>
+                            <span class="s1">nitems</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Downwards memcpy(). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">assert </span><span class="s1">src_start </span><span class="s3">&gt;= </span><span class="s6">0</span>
+        <span class="s2">assert </span><span class="s1">dest_start </span><span class="s3">&gt;= </span><span class="s6">0</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">nitems</span><span class="s3">):</span>
+            <span class="s1">dest_keys</span><span class="s3">[</span><span class="s1">dest_start </span><span class="s3">- </span><span class="s1">i</span><span class="s3">] = </span><span class="s1">src_keys</span><span class="s3">[</span><span class="s1">src_start </span><span class="s3">- </span><span class="s1">i</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">has_values</span><span class="s3">(</span><span class="s1">src_keys</span><span class="s3">, </span><span class="s1">src_values</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">nitems</span><span class="s3">):</span>
+                <span class="s1">dest_values</span><span class="s3">[</span><span class="s1">dest_start </span><span class="s3">- </span><span class="s1">i</span><span class="s3">] = </span><span class="s1">src_values</span><span class="s3">[</span><span class="s1">src_start </span><span class="s3">- </span><span class="s1">i</span><span class="s3">]</span>
+
+
+    <span class="s5"># Disable this for debug or perf comparison</span>
+    <span class="s1">DO_GALLOP </span><span class="s3">= </span><span class="s6">1</span>
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">merge_lo</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">ssa</span><span class="s3">, </span><span class="s1">na</span><span class="s3">, </span><span class="s1">ssb</span><span class="s3">, </span><span class="s1">nb</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Merge the na elements starting at ssa with the nb elements starting at 
+        ssb = ssa + na in a stable way, in-place.  na and nb must be &gt; 0, 
+        and should have na &lt;= nb. See listsort.txt for more info. 
+ 
+        An updated MergeState is returned (with possibly a different min_gallop 
+        or larger temp arrays). 
+ 
+        NOTE: compared to CPython's timsort, the requirement that 
+            &quot;Must also have that keys[ssa + na - 1] belongs at the end of the merge&quot; 
+ 
+        is removed. This makes the code a bit simpler and easier to reason about. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">assert </span><span class="s1">na </span><span class="s3">&gt; </span><span class="s6">0 </span><span class="s2">and </span><span class="s1">nb </span><span class="s3">&gt; </span><span class="s6">0 </span><span class="s2">and </span><span class="s1">na </span><span class="s3">&lt;= </span><span class="s1">nb</span>
+        <span class="s2">assert </span><span class="s1">ssb </span><span class="s3">== </span><span class="s1">ssa </span><span class="s3">+ </span><span class="s1">na</span>
+        <span class="s5"># First copy [ssa, ssa + na) into the temp space</span>
+        <span class="s1">ms </span><span class="s3">= </span><span class="s1">merge_getmem</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">na</span><span class="s3">)</span>
+        <span class="s1">sortslice_copy</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">values</span><span class="s3">, </span><span class="s6">0</span><span class="s3">,</span>
+                       <span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">ssa</span><span class="s3">,</span>
+                       <span class="s1">na</span><span class="s3">)</span>
+        <span class="s1">a_keys </span><span class="s3">= </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">keys</span>
+        <span class="s1">a_values </span><span class="s3">= </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">values</span>
+        <span class="s1">b_keys </span><span class="s3">= </span><span class="s1">keys</span>
+        <span class="s1">b_values </span><span class="s3">= </span><span class="s1">values</span>
+        <span class="s1">dest </span><span class="s3">= </span><span class="s1">ssa</span>
+        <span class="s1">ssa </span><span class="s3">= </span><span class="s6">0</span>
+
+        <span class="s1">_has_values </span><span class="s3">= </span><span class="s1">has_values</span><span class="s3">(</span><span class="s1">a_keys</span><span class="s3">, </span><span class="s1">a_values</span><span class="s3">)</span>
+        <span class="s1">min_gallop </span><span class="s3">= </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">min_gallop</span>
+
+        <span class="s5"># Now start merging into the space left from [ssa, ...)</span>
+
+        <span class="s2">while </span><span class="s1">nb </span><span class="s3">&gt; </span><span class="s6">0 </span><span class="s2">and </span><span class="s1">na </span><span class="s3">&gt; </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s5"># Do the straightforward thing until (if ever) one run</span>
+            <span class="s5"># appears to win consistently.</span>
+            <span class="s1">acount </span><span class="s3">= </span><span class="s6">0</span>
+            <span class="s1">bcount </span><span class="s3">= </span><span class="s6">0</span>
+
+            <span class="s2">while True</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">LT</span><span class="s3">(</span><span class="s1">b_keys</span><span class="s3">[</span><span class="s1">ssb</span><span class="s3">], </span><span class="s1">a_keys</span><span class="s3">[</span><span class="s1">ssa</span><span class="s3">]):</span>
+                    <span class="s1">keys</span><span class="s3">[</span><span class="s1">dest</span><span class="s3">] = </span><span class="s1">b_keys</span><span class="s3">[</span><span class="s1">ssb</span><span class="s3">]</span>
+                    <span class="s2">if </span><span class="s1">_has_values</span><span class="s3">:</span>
+                        <span class="s1">values</span><span class="s3">[</span><span class="s1">dest</span><span class="s3">] = </span><span class="s1">b_values</span><span class="s3">[</span><span class="s1">ssb</span><span class="s3">]</span>
+                    <span class="s1">dest </span><span class="s3">+= </span><span class="s6">1</span>
+                    <span class="s1">ssb </span><span class="s3">+= </span><span class="s6">1</span>
+                    <span class="s1">nb </span><span class="s3">-= </span><span class="s6">1</span>
+                    <span class="s2">if </span><span class="s1">nb </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+                        <span class="s2">break</span>
+                    <span class="s5"># It's a B run</span>
+                    <span class="s1">bcount </span><span class="s3">+= </span><span class="s6">1</span>
+                    <span class="s1">acount </span><span class="s3">= </span><span class="s6">0</span>
+                    <span class="s2">if </span><span class="s1">bcount </span><span class="s3">&gt;= </span><span class="s1">min_gallop</span><span class="s3">:</span>
+                        <span class="s2">break</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">keys</span><span class="s3">[</span><span class="s1">dest</span><span class="s3">] = </span><span class="s1">a_keys</span><span class="s3">[</span><span class="s1">ssa</span><span class="s3">]</span>
+                    <span class="s2">if </span><span class="s1">_has_values</span><span class="s3">:</span>
+                        <span class="s1">values</span><span class="s3">[</span><span class="s1">dest</span><span class="s3">] = </span><span class="s1">a_values</span><span class="s3">[</span><span class="s1">ssa</span><span class="s3">]</span>
+                    <span class="s1">dest </span><span class="s3">+= </span><span class="s6">1</span>
+                    <span class="s1">ssa </span><span class="s3">+= </span><span class="s6">1</span>
+                    <span class="s1">na </span><span class="s3">-= </span><span class="s6">1</span>
+                    <span class="s2">if </span><span class="s1">na </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+                        <span class="s2">break</span>
+                    <span class="s5"># It's a A run</span>
+                    <span class="s1">acount </span><span class="s3">+= </span><span class="s6">1</span>
+                    <span class="s1">bcount </span><span class="s3">= </span><span class="s6">0</span>
+                    <span class="s2">if </span><span class="s1">acount </span><span class="s3">&gt;= </span><span class="s1">min_gallop</span><span class="s3">:</span>
+                        <span class="s2">break</span>
+
+            <span class="s5"># One run is winning so consistently that galloping may</span>
+            <span class="s5"># be a huge win.  So try that, and continue galloping until</span>
+            <span class="s5"># (if ever) neither run appears to be winning consistently</span>
+            <span class="s5"># anymore.</span>
+            <span class="s2">if </span><span class="s1">DO_GALLOP </span><span class="s2">and </span><span class="s1">na </span><span class="s3">&gt; </span><span class="s6">0 </span><span class="s2">and </span><span class="s1">nb </span><span class="s3">&gt; </span><span class="s6">0</span><span class="s3">:</span>
+                <span class="s1">min_gallop </span><span class="s3">+= </span><span class="s6">1</span>
+
+                <span class="s2">while </span><span class="s1">acount </span><span class="s3">&gt;= </span><span class="s1">MIN_GALLOP </span><span class="s2">or </span><span class="s1">bcount </span><span class="s3">&gt;= </span><span class="s1">MIN_GALLOP</span><span class="s3">:</span>
+                    <span class="s5"># As long as we gallop without leaving this loop, make</span>
+                    <span class="s5"># the heuristic more likely</span>
+                    <span class="s1">min_gallop </span><span class="s3">-= </span><span class="s1">min_gallop </span><span class="s3">&gt; </span><span class="s6">1</span>
+
+                    <span class="s5"># Gallop in A to find where keys[ssb] should end up</span>
+                    <span class="s1">k </span><span class="s3">= </span><span class="s1">gallop_right</span><span class="s3">(</span><span class="s1">b_keys</span><span class="s3">[</span><span class="s1">ssb</span><span class="s3">], </span><span class="s1">a_keys</span><span class="s3">, </span><span class="s1">ssa</span><span class="s3">, </span><span class="s1">ssa </span><span class="s3">+ </span><span class="s1">na</span><span class="s3">, </span><span class="s1">ssa</span><span class="s3">)</span>
+                    <span class="s5"># k is an index, make it a size</span>
+                    <span class="s1">k </span><span class="s3">-= </span><span class="s1">ssa</span>
+                    <span class="s1">acount </span><span class="s3">= </span><span class="s1">k</span>
+                    <span class="s2">if </span><span class="s1">k </span><span class="s3">&gt; </span><span class="s6">0</span><span class="s3">:</span>
+                        <span class="s5"># Copy everything from A before k</span>
+                        <span class="s1">sortslice_copy</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">dest</span><span class="s3">,</span>
+                                       <span class="s1">a_keys</span><span class="s3">, </span><span class="s1">a_values</span><span class="s3">, </span><span class="s1">ssa</span><span class="s3">,</span>
+                                       <span class="s1">k</span><span class="s3">)</span>
+                        <span class="s1">dest </span><span class="s3">+= </span><span class="s1">k</span>
+                        <span class="s1">ssa </span><span class="s3">+= </span><span class="s1">k</span>
+                        <span class="s1">na </span><span class="s3">-= </span><span class="s1">k</span>
+                        <span class="s2">if </span><span class="s1">na </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+                            <span class="s5"># Finished merging</span>
+                            <span class="s2">break</span>
+                    <span class="s5"># Copy keys[ssb]</span>
+                    <span class="s1">keys</span><span class="s3">[</span><span class="s1">dest</span><span class="s3">] = </span><span class="s1">b_keys</span><span class="s3">[</span><span class="s1">ssb</span><span class="s3">]</span>
+                    <span class="s2">if </span><span class="s1">_has_values</span><span class="s3">:</span>
+                        <span class="s1">values</span><span class="s3">[</span><span class="s1">dest</span><span class="s3">] = </span><span class="s1">b_values</span><span class="s3">[</span><span class="s1">ssb</span><span class="s3">]</span>
+                    <span class="s1">dest </span><span class="s3">+= </span><span class="s6">1</span>
+                    <span class="s1">ssb </span><span class="s3">+= </span><span class="s6">1</span>
+                    <span class="s1">nb </span><span class="s3">-= </span><span class="s6">1</span>
+                    <span class="s2">if </span><span class="s1">nb </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+                        <span class="s5"># Finished merging</span>
+                        <span class="s2">break</span>
+
+                    <span class="s5"># Gallop in B to find where keys[ssa] should end up</span>
+                    <span class="s1">k </span><span class="s3">= </span><span class="s1">gallop_left</span><span class="s3">(</span><span class="s1">a_keys</span><span class="s3">[</span><span class="s1">ssa</span><span class="s3">], </span><span class="s1">b_keys</span><span class="s3">, </span><span class="s1">ssb</span><span class="s3">, </span><span class="s1">ssb </span><span class="s3">+ </span><span class="s1">nb</span><span class="s3">, </span><span class="s1">ssb</span><span class="s3">)</span>
+                    <span class="s5"># k is an index, make it a size</span>
+                    <span class="s1">k </span><span class="s3">-= </span><span class="s1">ssb</span>
+                    <span class="s1">bcount </span><span class="s3">= </span><span class="s1">k</span>
+                    <span class="s2">if </span><span class="s1">k </span><span class="s3">&gt; </span><span class="s6">0</span><span class="s3">:</span>
+                        <span class="s5"># Copy everything from B before k</span>
+                        <span class="s5"># NOTE: source and dest are the same buffer, but the</span>
+                        <span class="s5"># destination index is below the source index</span>
+                        <span class="s1">sortslice_copy</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">dest</span><span class="s3">,</span>
+                                       <span class="s1">b_keys</span><span class="s3">, </span><span class="s1">b_values</span><span class="s3">, </span><span class="s1">ssb</span><span class="s3">,</span>
+                                       <span class="s1">k</span><span class="s3">)</span>
+                        <span class="s1">dest </span><span class="s3">+= </span><span class="s1">k</span>
+                        <span class="s1">ssb </span><span class="s3">+= </span><span class="s1">k</span>
+                        <span class="s1">nb </span><span class="s3">-= </span><span class="s1">k</span>
+                        <span class="s2">if </span><span class="s1">nb </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+                            <span class="s5"># Finished merging</span>
+                            <span class="s2">break</span>
+                    <span class="s5"># Copy keys[ssa]</span>
+                    <span class="s1">keys</span><span class="s3">[</span><span class="s1">dest</span><span class="s3">] = </span><span class="s1">a_keys</span><span class="s3">[</span><span class="s1">ssa</span><span class="s3">]</span>
+                    <span class="s2">if </span><span class="s1">_has_values</span><span class="s3">:</span>
+                        <span class="s1">values</span><span class="s3">[</span><span class="s1">dest</span><span class="s3">] = </span><span class="s1">a_values</span><span class="s3">[</span><span class="s1">ssa</span><span class="s3">]</span>
+                    <span class="s1">dest </span><span class="s3">+= </span><span class="s6">1</span>
+                    <span class="s1">ssa </span><span class="s3">+= </span><span class="s6">1</span>
+                    <span class="s1">na </span><span class="s3">-= </span><span class="s6">1</span>
+                    <span class="s2">if </span><span class="s1">na </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+                        <span class="s5"># Finished merging</span>
+                        <span class="s2">break</span>
+
+                <span class="s5"># Penalize it for leaving galloping mode</span>
+                <span class="s1">min_gallop </span><span class="s3">+= </span><span class="s6">1</span>
+
+        <span class="s5"># Merge finished, now handle the remaining areas</span>
+        <span class="s2">if </span><span class="s1">nb </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s5"># Only A remaining to copy at the end of the destination area</span>
+            <span class="s1">sortslice_copy</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">dest</span><span class="s3">,</span>
+                           <span class="s1">a_keys</span><span class="s3">, </span><span class="s1">a_values</span><span class="s3">, </span><span class="s1">ssa</span><span class="s3">,</span>
+                           <span class="s1">na</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">na </span><span class="s3">== </span><span class="s6">0</span>
+            <span class="s2">assert </span><span class="s1">dest </span><span class="s3">== </span><span class="s1">ssb</span>
+            <span class="s5"># B's tail is already at the right place, do nothing</span>
+
+        <span class="s2">return </span><span class="s1">merge_adjust_gallop</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">min_gallop</span><span class="s3">)</span>
+
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">merge_hi</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">ssa</span><span class="s3">, </span><span class="s1">na</span><span class="s3">, </span><span class="s1">ssb</span><span class="s3">, </span><span class="s1">nb</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Merge the na elements starting at ssa with the nb elements starting at 
+        ssb = ssa + na in a stable way, in-place.  na and nb must be &gt; 0, 
+        and should have na &gt;= nb.  See listsort.txt for more info. 
+ 
+        An updated MergeState is returned (with possibly a different min_gallop 
+        or larger temp arrays). 
+ 
+        NOTE: compared to CPython's timsort, the requirement that 
+            &quot;Must also have that keys[ssa + na - 1] belongs at the end of the merge&quot; 
+ 
+        is removed. This makes the code a bit simpler and easier to reason about. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">assert </span><span class="s1">na </span><span class="s3">&gt; </span><span class="s6">0 </span><span class="s2">and </span><span class="s1">nb </span><span class="s3">&gt; </span><span class="s6">0 </span><span class="s2">and </span><span class="s1">na </span><span class="s3">&gt;= </span><span class="s1">nb</span>
+        <span class="s2">assert </span><span class="s1">ssb </span><span class="s3">== </span><span class="s1">ssa </span><span class="s3">+ </span><span class="s1">na</span>
+        <span class="s5"># First copy [ssb, ssb + nb) into the temp space</span>
+        <span class="s1">ms </span><span class="s3">= </span><span class="s1">merge_getmem</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">nb</span><span class="s3">)</span>
+        <span class="s1">sortslice_copy</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">values</span><span class="s3">, </span><span class="s6">0</span><span class="s3">,</span>
+                       <span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">ssb</span><span class="s3">,</span>
+                       <span class="s1">nb</span><span class="s3">)</span>
+        <span class="s1">a_keys </span><span class="s3">= </span><span class="s1">keys</span>
+        <span class="s1">a_values </span><span class="s3">= </span><span class="s1">values</span>
+        <span class="s1">b_keys </span><span class="s3">= </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">keys</span>
+        <span class="s1">b_values </span><span class="s3">= </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">values</span>
+
+        <span class="s5"># Now start merging *in descending order* into the space left</span>
+        <span class="s5"># from [..., ssb + nb).</span>
+        <span class="s1">dest </span><span class="s3">= </span><span class="s1">ssb </span><span class="s3">+ </span><span class="s1">nb </span><span class="s3">- </span><span class="s6">1</span>
+        <span class="s1">ssb </span><span class="s3">= </span><span class="s1">nb </span><span class="s3">- </span><span class="s6">1</span>
+        <span class="s1">ssa </span><span class="s3">= </span><span class="s1">ssa </span><span class="s3">+ </span><span class="s1">na </span><span class="s3">- </span><span class="s6">1</span>
+
+        <span class="s1">_has_values </span><span class="s3">= </span><span class="s1">has_values</span><span class="s3">(</span><span class="s1">b_keys</span><span class="s3">, </span><span class="s1">b_values</span><span class="s3">)</span>
+        <span class="s1">min_gallop </span><span class="s3">= </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">min_gallop</span>
+
+        <span class="s2">while </span><span class="s1">nb </span><span class="s3">&gt; </span><span class="s6">0 </span><span class="s2">and </span><span class="s1">na </span><span class="s3">&gt; </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s5"># Do the straightforward thing until (if ever) one run</span>
+            <span class="s5"># appears to win consistently.</span>
+            <span class="s1">acount </span><span class="s3">= </span><span class="s6">0</span>
+            <span class="s1">bcount </span><span class="s3">= </span><span class="s6">0</span>
+
+            <span class="s2">while True</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">LT</span><span class="s3">(</span><span class="s1">b_keys</span><span class="s3">[</span><span class="s1">ssb</span><span class="s3">], </span><span class="s1">a_keys</span><span class="s3">[</span><span class="s1">ssa</span><span class="s3">]):</span>
+                    <span class="s5"># We merge in descending order, so copy the larger value</span>
+                    <span class="s1">keys</span><span class="s3">[</span><span class="s1">dest</span><span class="s3">] = </span><span class="s1">a_keys</span><span class="s3">[</span><span class="s1">ssa</span><span class="s3">]</span>
+                    <span class="s2">if </span><span class="s1">_has_values</span><span class="s3">:</span>
+                        <span class="s1">values</span><span class="s3">[</span><span class="s1">dest</span><span class="s3">] = </span><span class="s1">a_values</span><span class="s3">[</span><span class="s1">ssa</span><span class="s3">]</span>
+                    <span class="s1">dest </span><span class="s3">-= </span><span class="s6">1</span>
+                    <span class="s1">ssa </span><span class="s3">-= </span><span class="s6">1</span>
+                    <span class="s1">na </span><span class="s3">-= </span><span class="s6">1</span>
+                    <span class="s2">if </span><span class="s1">na </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+                        <span class="s2">break</span>
+                    <span class="s5"># It's a A run</span>
+                    <span class="s1">acount </span><span class="s3">+= </span><span class="s6">1</span>
+                    <span class="s1">bcount </span><span class="s3">= </span><span class="s6">0</span>
+                    <span class="s2">if </span><span class="s1">acount </span><span class="s3">&gt;= </span><span class="s1">min_gallop</span><span class="s3">:</span>
+                        <span class="s2">break</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">keys</span><span class="s3">[</span><span class="s1">dest</span><span class="s3">] = </span><span class="s1">b_keys</span><span class="s3">[</span><span class="s1">ssb</span><span class="s3">]</span>
+                    <span class="s2">if </span><span class="s1">_has_values</span><span class="s3">:</span>
+                        <span class="s1">values</span><span class="s3">[</span><span class="s1">dest</span><span class="s3">] = </span><span class="s1">b_values</span><span class="s3">[</span><span class="s1">ssb</span><span class="s3">]</span>
+                    <span class="s1">dest </span><span class="s3">-= </span><span class="s6">1</span>
+                    <span class="s1">ssb </span><span class="s3">-= </span><span class="s6">1</span>
+                    <span class="s1">nb </span><span class="s3">-= </span><span class="s6">1</span>
+                    <span class="s2">if </span><span class="s1">nb </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+                        <span class="s2">break</span>
+                    <span class="s5"># It's a B run</span>
+                    <span class="s1">bcount </span><span class="s3">+= </span><span class="s6">1</span>
+                    <span class="s1">acount </span><span class="s3">= </span><span class="s6">0</span>
+                    <span class="s2">if </span><span class="s1">bcount </span><span class="s3">&gt;= </span><span class="s1">min_gallop</span><span class="s3">:</span>
+                        <span class="s2">break</span>
+
+            <span class="s5"># One run is winning so consistently that galloping may</span>
+            <span class="s5"># be a huge win.  So try that, and continue galloping until</span>
+            <span class="s5"># (if ever) neither run appears to be winning consistently</span>
+            <span class="s5"># anymore.</span>
+            <span class="s2">if </span><span class="s1">DO_GALLOP </span><span class="s2">and </span><span class="s1">na </span><span class="s3">&gt; </span><span class="s6">0 </span><span class="s2">and </span><span class="s1">nb </span><span class="s3">&gt; </span><span class="s6">0</span><span class="s3">:</span>
+                <span class="s1">min_gallop </span><span class="s3">+= </span><span class="s6">1</span>
+
+                <span class="s2">while </span><span class="s1">acount </span><span class="s3">&gt;= </span><span class="s1">MIN_GALLOP </span><span class="s2">or </span><span class="s1">bcount </span><span class="s3">&gt;= </span><span class="s1">MIN_GALLOP</span><span class="s3">:</span>
+                    <span class="s5"># As long as we gallop without leaving this loop, make</span>
+                    <span class="s5"># the heuristic more likely</span>
+                    <span class="s1">min_gallop </span><span class="s3">-= </span><span class="s1">min_gallop </span><span class="s3">&gt; </span><span class="s6">1</span>
+
+                    <span class="s5"># Gallop in A to find where keys[ssb] should end up</span>
+                    <span class="s1">k </span><span class="s3">= </span><span class="s1">gallop_right</span><span class="s3">(</span><span class="s1">b_keys</span><span class="s3">[</span><span class="s1">ssb</span><span class="s3">], </span><span class="s1">a_keys</span><span class="s3">, </span><span class="s1">ssa </span><span class="s3">- </span><span class="s1">na </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">, </span><span class="s1">ssa </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">, </span><span class="s1">ssa</span><span class="s3">)</span>
+                    <span class="s5"># k is an index, make it a size from the end</span>
+                    <span class="s1">k </span><span class="s3">= </span><span class="s1">ssa </span><span class="s3">+ </span><span class="s6">1 </span><span class="s3">- </span><span class="s1">k</span>
+                    <span class="s1">acount </span><span class="s3">= </span><span class="s1">k</span>
+                    <span class="s2">if </span><span class="s1">k </span><span class="s3">&gt; </span><span class="s6">0</span><span class="s3">:</span>
+                        <span class="s5"># Copy everything from A after k.</span>
+                        <span class="s5"># Destination and source are the same buffer, and destination</span>
+                        <span class="s5"># index is greater, so copy from the end to the start.</span>
+                        <span class="s1">sortslice_copy_down</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">dest</span><span class="s3">,</span>
+                                            <span class="s1">a_keys</span><span class="s3">, </span><span class="s1">a_values</span><span class="s3">, </span><span class="s1">ssa</span><span class="s3">,</span>
+                                            <span class="s1">k</span><span class="s3">)</span>
+                        <span class="s1">dest </span><span class="s3">-= </span><span class="s1">k</span>
+                        <span class="s1">ssa </span><span class="s3">-= </span><span class="s1">k</span>
+                        <span class="s1">na </span><span class="s3">-= </span><span class="s1">k</span>
+                        <span class="s2">if </span><span class="s1">na </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+                            <span class="s5"># Finished merging</span>
+                            <span class="s2">break</span>
+                    <span class="s5"># Copy keys[ssb]</span>
+                    <span class="s1">keys</span><span class="s3">[</span><span class="s1">dest</span><span class="s3">] = </span><span class="s1">b_keys</span><span class="s3">[</span><span class="s1">ssb</span><span class="s3">]</span>
+                    <span class="s2">if </span><span class="s1">_has_values</span><span class="s3">:</span>
+                        <span class="s1">values</span><span class="s3">[</span><span class="s1">dest</span><span class="s3">] = </span><span class="s1">b_values</span><span class="s3">[</span><span class="s1">ssb</span><span class="s3">]</span>
+                    <span class="s1">dest </span><span class="s3">-= </span><span class="s6">1</span>
+                    <span class="s1">ssb </span><span class="s3">-= </span><span class="s6">1</span>
+                    <span class="s1">nb </span><span class="s3">-= </span><span class="s6">1</span>
+                    <span class="s2">if </span><span class="s1">nb </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+                        <span class="s5"># Finished merging</span>
+                        <span class="s2">break</span>
+
+                    <span class="s5"># Gallop in B to find where keys[ssa] should end up</span>
+                    <span class="s1">k </span><span class="s3">= </span><span class="s1">gallop_left</span><span class="s3">(</span><span class="s1">a_keys</span><span class="s3">[</span><span class="s1">ssa</span><span class="s3">], </span><span class="s1">b_keys</span><span class="s3">, </span><span class="s1">ssb </span><span class="s3">- </span><span class="s1">nb </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">, </span><span class="s1">ssb </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">, </span><span class="s1">ssb</span><span class="s3">)</span>
+                    <span class="s5"># k is an index, make it a size from the end</span>
+                    <span class="s1">k </span><span class="s3">= </span><span class="s1">ssb </span><span class="s3">+ </span><span class="s6">1 </span><span class="s3">- </span><span class="s1">k</span>
+                    <span class="s1">bcount </span><span class="s3">= </span><span class="s1">k</span>
+                    <span class="s2">if </span><span class="s1">k </span><span class="s3">&gt; </span><span class="s6">0</span><span class="s3">:</span>
+                        <span class="s5"># Copy everything from B before k</span>
+                        <span class="s1">sortslice_copy_down</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">dest</span><span class="s3">,</span>
+                                            <span class="s1">b_keys</span><span class="s3">, </span><span class="s1">b_values</span><span class="s3">, </span><span class="s1">ssb</span><span class="s3">,</span>
+                                            <span class="s1">k</span><span class="s3">)</span>
+                        <span class="s1">dest </span><span class="s3">-= </span><span class="s1">k</span>
+                        <span class="s1">ssb </span><span class="s3">-= </span><span class="s1">k</span>
+                        <span class="s1">nb </span><span class="s3">-= </span><span class="s1">k</span>
+                        <span class="s2">if </span><span class="s1">nb </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+                            <span class="s5"># Finished merging</span>
+                            <span class="s2">break</span>
+                    <span class="s5"># Copy keys[ssa]</span>
+                    <span class="s1">keys</span><span class="s3">[</span><span class="s1">dest</span><span class="s3">] = </span><span class="s1">a_keys</span><span class="s3">[</span><span class="s1">ssa</span><span class="s3">]</span>
+                    <span class="s2">if </span><span class="s1">_has_values</span><span class="s3">:</span>
+                        <span class="s1">values</span><span class="s3">[</span><span class="s1">dest</span><span class="s3">] = </span><span class="s1">a_values</span><span class="s3">[</span><span class="s1">ssa</span><span class="s3">]</span>
+                    <span class="s1">dest </span><span class="s3">-= </span><span class="s6">1</span>
+                    <span class="s1">ssa </span><span class="s3">-= </span><span class="s6">1</span>
+                    <span class="s1">na </span><span class="s3">-= </span><span class="s6">1</span>
+                    <span class="s2">if </span><span class="s1">na </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+                        <span class="s5"># Finished merging</span>
+                        <span class="s2">break</span>
+
+                <span class="s5"># Penalize it for leaving galloping mode</span>
+                <span class="s1">min_gallop </span><span class="s3">+= </span><span class="s6">1</span>
+
+        <span class="s5"># Merge finished, now handle the remaining areas</span>
+        <span class="s2">if </span><span class="s1">na </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s5"># Only B remaining to copy at the front of the destination area</span>
+            <span class="s1">sortslice_copy</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">dest </span><span class="s3">- </span><span class="s1">nb </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">,</span>
+                           <span class="s1">b_keys</span><span class="s3">, </span><span class="s1">b_values</span><span class="s3">, </span><span class="s1">ssb </span><span class="s3">- </span><span class="s1">nb </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">,</span>
+                           <span class="s1">nb</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">nb </span><span class="s3">== </span><span class="s6">0</span>
+            <span class="s2">assert </span><span class="s1">dest </span><span class="s3">== </span><span class="s1">ssa</span>
+            <span class="s5"># A's front is already at the right place, do nothing</span>
+
+        <span class="s2">return </span><span class="s1">merge_adjust_gallop</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">min_gallop</span><span class="s3">)</span>
+
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">merge_at</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">i</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Merge the two runs at stack indices i and i+1. 
+ 
+        An updated MergeState is returned. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">n </span><span class="s3">= </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">n</span>
+        <span class="s2">assert </span><span class="s1">n </span><span class="s3">&gt;= </span><span class="s6">2</span>
+        <span class="s2">assert </span><span class="s1">i </span><span class="s3">&gt;= </span><span class="s6">0</span>
+        <span class="s2">assert </span><span class="s1">i </span><span class="s3">== </span><span class="s1">n </span><span class="s3">- </span><span class="s6">2 </span><span class="s2">or </span><span class="s1">i </span><span class="s3">== </span><span class="s1">n </span><span class="s3">- </span><span class="s6">3</span>
+
+        <span class="s1">ssa</span><span class="s3">, </span><span class="s1">na </span><span class="s3">= </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">pending</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+        <span class="s1">ssb</span><span class="s3">, </span><span class="s1">nb </span><span class="s3">= </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">pending</span><span class="s3">[</span><span class="s1">i </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">]</span>
+        <span class="s2">assert </span><span class="s1">na </span><span class="s3">&gt; </span><span class="s6">0 </span><span class="s2">and </span><span class="s1">nb </span><span class="s3">&gt; </span><span class="s6">0</span>
+        <span class="s2">assert </span><span class="s1">ssa </span><span class="s3">+ </span><span class="s1">na </span><span class="s3">== </span><span class="s1">ssb</span>
+
+        <span class="s5"># Record the length of the combined runs; if i is the 3rd-last</span>
+        <span class="s5"># run now, also slide over the last run (which isn't involved</span>
+        <span class="s5"># in this merge).  The current run i+1 goes away in any case.</span>
+        <span class="s1">ms</span><span class="s3">.</span><span class="s1">pending</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s1">MergeRun</span><span class="s3">(</span><span class="s1">ssa</span><span class="s3">, </span><span class="s1">na </span><span class="s3">+ </span><span class="s1">nb</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">i </span><span class="s3">== </span><span class="s1">n </span><span class="s3">- </span><span class="s6">3</span><span class="s3">:</span>
+            <span class="s1">ms</span><span class="s3">.</span><span class="s1">pending</span><span class="s3">[</span><span class="s1">i </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">] = </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">pending</span><span class="s3">[</span><span class="s1">i </span><span class="s3">+ </span><span class="s6">2</span><span class="s3">]</span>
+        <span class="s1">ms </span><span class="s3">= </span><span class="s1">merge_pop</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">)</span>
+
+        <span class="s5"># Where does b start in a?  Elements in a before that can be</span>
+        <span class="s5"># ignored (already in place).</span>
+        <span class="s1">k </span><span class="s3">= </span><span class="s1">gallop_right</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">[</span><span class="s1">ssb</span><span class="s3">], </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">ssa</span><span class="s3">, </span><span class="s1">ssa </span><span class="s3">+ </span><span class="s1">na</span><span class="s3">, </span><span class="s1">ssa</span><span class="s3">)</span>
+        <span class="s5"># [k, ssa + na) remains to be merged</span>
+        <span class="s1">na </span><span class="s3">-= </span><span class="s1">k </span><span class="s3">- </span><span class="s1">ssa</span>
+        <span class="s1">ssa </span><span class="s3">= </span><span class="s1">k</span>
+        <span class="s2">if </span><span class="s1">na </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">ms</span>
+
+        <span class="s5"># Where does a end in b?  Elements in b after that can be</span>
+        <span class="s5"># ignored (already in place).</span>
+        <span class="s1">k </span><span class="s3">= </span><span class="s1">gallop_left</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">[</span><span class="s1">ssa </span><span class="s3">+ </span><span class="s1">na </span><span class="s3">- </span><span class="s6">1</span><span class="s3">], </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">ssb</span><span class="s3">, </span><span class="s1">ssb </span><span class="s3">+ </span><span class="s1">nb</span><span class="s3">, </span><span class="s1">ssb </span><span class="s3">+ </span><span class="s1">nb </span><span class="s3">- </span><span class="s6">1</span><span class="s3">)</span>
+        <span class="s5"># [ssb, k) remains to be merged</span>
+        <span class="s1">nb </span><span class="s3">= </span><span class="s1">k </span><span class="s3">- </span><span class="s1">ssb</span>
+
+        <span class="s5"># Merge what remains of the runs, using a temp array with</span>
+        <span class="s5"># min(na, nb) elements.</span>
+        <span class="s2">if </span><span class="s1">na </span><span class="s3">&lt;= </span><span class="s1">nb</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">merge_lo</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">ssa</span><span class="s3">, </span><span class="s1">na</span><span class="s3">, </span><span class="s1">ssb</span><span class="s3">, </span><span class="s1">nb</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">merge_hi</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">ssa</span><span class="s3">, </span><span class="s1">na</span><span class="s3">, </span><span class="s1">ssb</span><span class="s3">, </span><span class="s1">nb</span><span class="s3">)</span>
+
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">merge_collapse</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Examine the stack of runs waiting to be merged, merging adjacent runs 
+        until the stack invariants are re-established: 
+ 
+        1. len[-3] &gt; len[-2] + len[-1] 
+        2. len[-2] &gt; len[-1] 
+ 
+        An updated MergeState is returned. 
+ 
+        See listsort.txt for more info. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">while </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">n </span><span class="s3">&gt; </span><span class="s6">1</span><span class="s3">:</span>
+            <span class="s1">pending </span><span class="s3">= </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">pending</span>
+            <span class="s1">n </span><span class="s3">= </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">n </span><span class="s3">- </span><span class="s6">2</span>
+            <span class="s2">if </span><span class="s3">((</span><span class="s1">n </span><span class="s3">&gt; </span><span class="s6">0 </span><span class="s2">and </span><span class="s1">pending</span><span class="s3">[</span><span class="s1">n</span><span class="s3">-</span><span class="s6">1</span><span class="s3">].</span><span class="s1">size </span><span class="s3">&lt;= </span><span class="s1">pending</span><span class="s3">[</span><span class="s1">n</span><span class="s3">].</span><span class="s1">size </span><span class="s3">+ </span><span class="s1">pending</span><span class="s3">[</span><span class="s1">n</span><span class="s3">+</span><span class="s6">1</span><span class="s3">].</span><span class="s1">size</span><span class="s3">) </span><span class="s2">or</span>
+                <span class="s3">(</span><span class="s1">n </span><span class="s3">&gt; </span><span class="s6">1 </span><span class="s2">and </span><span class="s1">pending</span><span class="s3">[</span><span class="s1">n</span><span class="s3">-</span><span class="s6">2</span><span class="s3">].</span><span class="s1">size </span><span class="s3">&lt;= </span><span class="s1">pending</span><span class="s3">[</span><span class="s1">n</span><span class="s3">-</span><span class="s6">1</span><span class="s3">].</span><span class="s1">size </span><span class="s3">+ </span><span class="s1">pending</span><span class="s3">[</span><span class="s1">n</span><span class="s3">].</span><span class="s1">size</span><span class="s3">)):</span>
+                <span class="s2">if </span><span class="s1">pending</span><span class="s3">[</span><span class="s1">n </span><span class="s3">- </span><span class="s6">1</span><span class="s3">].</span><span class="s1">size </span><span class="s3">&lt; </span><span class="s1">pending</span><span class="s3">[</span><span class="s1">n </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">].</span><span class="s1">size</span><span class="s3">:</span>
+                    <span class="s5"># Merge smaller one first</span>
+                    <span class="s1">n </span><span class="s3">-= </span><span class="s6">1</span>
+                <span class="s1">ms </span><span class="s3">= </span><span class="s1">merge_at</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">n</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">pending</span><span class="s3">[</span><span class="s1">n</span><span class="s3">].</span><span class="s1">size </span><span class="s3">&lt; </span><span class="s1">pending</span><span class="s3">[</span><span class="s1">n </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">].</span><span class="s1">size</span><span class="s3">:</span>
+                <span class="s1">ms </span><span class="s3">= </span><span class="s1">merge_at</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">n</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">break</span>
+        <span class="s2">return </span><span class="s1">ms</span>
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">merge_force_collapse</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Regardless of invariants, merge all runs on the stack until only one 
+        remains.  This is used at the end of the mergesort. 
+ 
+        An updated MergeState is returned. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">while </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">n </span><span class="s3">&gt; </span><span class="s6">1</span><span class="s3">:</span>
+            <span class="s1">pending </span><span class="s3">= </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">pending</span>
+            <span class="s1">n </span><span class="s3">= </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">n </span><span class="s3">- </span><span class="s6">2</span>
+            <span class="s2">if </span><span class="s1">n </span><span class="s3">&gt; </span><span class="s6">0</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">pending</span><span class="s3">[</span><span class="s1">n </span><span class="s3">- </span><span class="s6">1</span><span class="s3">].</span><span class="s1">size </span><span class="s3">&lt; </span><span class="s1">pending</span><span class="s3">[</span><span class="s1">n </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">].</span><span class="s1">size</span><span class="s3">:</span>
+                    <span class="s5"># Merge the smaller one first</span>
+                    <span class="s1">n </span><span class="s3">-= </span><span class="s6">1</span>
+            <span class="s1">ms </span><span class="s3">= </span><span class="s1">merge_at</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">n</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">ms</span>
+
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">reverse_slice</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">start</span><span class="s3">, </span><span class="s1">stop</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Reverse a slice, in-place. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">i </span><span class="s3">= </span><span class="s1">start</span>
+        <span class="s1">j </span><span class="s3">= </span><span class="s1">stop </span><span class="s3">- </span><span class="s6">1</span>
+        <span class="s2">while </span><span class="s1">i </span><span class="s3">&lt; </span><span class="s1">j</span><span class="s3">:</span>
+            <span class="s1">keys</span><span class="s3">[</span><span class="s1">i</span><span class="s3">], </span><span class="s1">keys</span><span class="s3">[</span><span class="s1">j</span><span class="s3">] = </span><span class="s1">keys</span><span class="s3">[</span><span class="s1">j</span><span class="s3">], </span><span class="s1">keys</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+            <span class="s1">i </span><span class="s3">+= </span><span class="s6">1</span>
+            <span class="s1">j </span><span class="s3">-= </span><span class="s6">1</span>
+        <span class="s2">if </span><span class="s1">has_values</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">):</span>
+            <span class="s1">i </span><span class="s3">= </span><span class="s1">start</span>
+            <span class="s1">j </span><span class="s3">= </span><span class="s1">stop </span><span class="s3">- </span><span class="s6">1</span>
+            <span class="s2">while </span><span class="s1">i </span><span class="s3">&lt; </span><span class="s1">j</span><span class="s3">:</span>
+                <span class="s1">values</span><span class="s3">[</span><span class="s1">i</span><span class="s3">], </span><span class="s1">values</span><span class="s3">[</span><span class="s1">j</span><span class="s3">] = </span><span class="s1">values</span><span class="s3">[</span><span class="s1">j</span><span class="s3">], </span><span class="s1">values</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+                <span class="s1">i </span><span class="s3">+= </span><span class="s6">1</span>
+                <span class="s1">j </span><span class="s3">-= </span><span class="s6">1</span>
+
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">run_timsort_with_mergestate</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Run timsort with the mergestate. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">nremaining </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">nremaining </span><span class="s3">&lt; </span><span class="s6">2</span><span class="s3">:</span>
+            <span class="s2">return</span>
+
+        <span class="s5"># March over the array once, left to right, finding natural runs,</span>
+        <span class="s5"># and extending short natural runs to minrun elements.</span>
+        <span class="s1">minrun </span><span class="s3">= </span><span class="s1">merge_compute_minrun</span><span class="s3">(</span><span class="s1">nremaining</span><span class="s3">)</span>
+
+        <span class="s1">lo </span><span class="s3">= </span><span class="s1">zero</span>
+        <span class="s2">while </span><span class="s1">nremaining </span><span class="s3">&gt; </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s1">n</span><span class="s3">, </span><span class="s1">desc </span><span class="s3">= </span><span class="s1">count_run</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">lo</span><span class="s3">, </span><span class="s1">lo </span><span class="s3">+ </span><span class="s1">nremaining</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">desc</span><span class="s3">:</span>
+                <span class="s5"># Descending run =&gt; reverse</span>
+                <span class="s1">reverse_slice</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">lo</span><span class="s3">, </span><span class="s1">lo </span><span class="s3">+ </span><span class="s1">n</span><span class="s3">)</span>
+            <span class="s5"># If short, extend to min(minrun, nremaining)</span>
+            <span class="s2">if </span><span class="s1">n </span><span class="s3">&lt; </span><span class="s1">minrun</span><span class="s3">:</span>
+                <span class="s1">force </span><span class="s3">= </span><span class="s1">min</span><span class="s3">(</span><span class="s1">minrun</span><span class="s3">, </span><span class="s1">nremaining</span><span class="s3">)</span>
+                <span class="s1">binarysort</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">, </span><span class="s1">lo</span><span class="s3">, </span><span class="s1">lo </span><span class="s3">+ </span><span class="s1">force</span><span class="s3">, </span><span class="s1">lo </span><span class="s3">+ </span><span class="s1">n</span><span class="s3">)</span>
+                <span class="s1">n </span><span class="s3">= </span><span class="s1">force</span>
+            <span class="s5"># Push run onto stack, and maybe merge.</span>
+            <span class="s1">ms </span><span class="s3">= </span><span class="s1">merge_append</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">MergeRun</span><span class="s3">(</span><span class="s1">lo</span><span class="s3">, </span><span class="s1">n</span><span class="s3">))</span>
+            <span class="s1">ms </span><span class="s3">= </span><span class="s1">merge_collapse</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">)</span>
+            <span class="s5"># Advance to find next run.</span>
+            <span class="s1">lo </span><span class="s3">+= </span><span class="s1">n</span>
+            <span class="s1">nremaining </span><span class="s3">-= </span><span class="s1">n</span>
+
+        <span class="s5"># All initial runs have been discovered, now finish merging.</span>
+        <span class="s1">ms </span><span class="s3">= </span><span class="s1">merge_force_collapse</span><span class="s3">(</span><span class="s1">ms</span><span class="s3">, </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">n </span><span class="s3">== </span><span class="s6">1</span>
+        <span class="s2">assert </span><span class="s1">ms</span><span class="s3">.</span><span class="s1">pending</span><span class="s3">[</span><span class="s6">0</span><span class="s3">] == (</span><span class="s6">0</span><span class="s3">, </span><span class="s1">len</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">))</span>
+
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">run_timsort</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Run timsort over the given keys. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">values </span><span class="s3">= </span><span class="s1">keys</span>
+        <span class="s1">run_timsort_with_mergestate</span><span class="s3">(</span><span class="s1">merge_init</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">), </span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">)</span>
+
+
+    <span class="s3">@</span><span class="s1">wrap</span>
+    <span class="s2">def </span><span class="s1">run_timsort_with_values</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Run timsort over the given keys and values. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">run_timsort_with_mergestate</span><span class="s3">(</span><span class="s1">merge_init_with_values</span><span class="s3">(</span><span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">),</span>
+                                    <span class="s1">keys</span><span class="s3">, </span><span class="s1">values</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">TimsortImplementation</span><span class="s3">(</span>
+        <span class="s1">wrap</span><span class="s3">,</span>
+        <span class="s1">count_run</span><span class="s3">, </span><span class="s1">binarysort</span><span class="s3">, </span><span class="s1">gallop_left</span><span class="s3">, </span><span class="s1">gallop_right</span><span class="s3">,</span>
+        <span class="s1">merge_init</span><span class="s3">, </span><span class="s1">merge_append</span><span class="s3">, </span><span class="s1">merge_pop</span><span class="s3">,</span>
+        <span class="s1">merge_compute_minrun</span><span class="s3">, </span><span class="s1">merge_lo</span><span class="s3">, </span><span class="s1">merge_hi</span><span class="s3">, </span><span class="s1">merge_at</span><span class="s3">,</span>
+        <span class="s1">merge_force_collapse</span><span class="s3">, </span><span class="s1">merge_collapse</span><span class="s3">,</span>
+        <span class="s1">run_timsort</span><span class="s3">, </span><span class="s1">run_timsort_with_values</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">make_py_timsort</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">make_timsort_impl</span><span class="s3">((</span><span class="s2">lambda </span><span class="s1">f</span><span class="s3">: </span><span class="s1">f</span><span class="s3">), *</span><span class="s1">args</span><span class="s3">)</span>
+
+<span class="s2">def </span><span class="s1">make_jit_timsort</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">):</span>
+    <span class="s2">from </span><span class="s1">numba </span><span class="s2">import </span><span class="s1">jit</span>
+    <span class="s2">return </span><span class="s1">make_timsort_impl</span><span class="s3">((</span><span class="s2">lambda </span><span class="s1">f</span><span class="s3">: </span><span class="s1">jit</span><span class="s3">(</span><span class="s1">nopython</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)(</span><span class="s1">f</span><span class="s3">)),</span>
+                              <span class="s3">*</span><span class="s1">args</span><span class="s3">)</span>
+</pre>
+</body>
+</html>

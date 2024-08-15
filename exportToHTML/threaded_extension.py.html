@@ -1,0 +1,212 @@
+<html>
+<head>
+<title>threaded_extension.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #2aacb8;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+threaded_extension.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;An ISAPI extension base class implemented using a thread-pool.&quot;&quot;&quot;</span>
+<span class="s2"># $Id$</span>
+
+<span class="s3">import </span><span class="s1">sys</span>
+<span class="s3">import </span><span class="s1">threading</span>
+<span class="s3">import </span><span class="s1">time</span>
+<span class="s3">import </span><span class="s1">traceback</span>
+
+<span class="s3">from </span><span class="s1">pywintypes </span><span class="s3">import </span><span class="s1">OVERLAPPED</span>
+<span class="s3">from </span><span class="s1">win32event </span><span class="s3">import </span><span class="s1">INFINITE</span>
+<span class="s3">from </span><span class="s1">win32file </span><span class="s3">import </span><span class="s4">(</span>
+    <span class="s1">CloseHandle</span><span class="s4">,</span>
+    <span class="s1">CreateIoCompletionPort</span><span class="s4">,</span>
+    <span class="s1">GetQueuedCompletionStatus</span><span class="s4">,</span>
+    <span class="s1">PostQueuedCompletionStatus</span><span class="s4">,</span>
+<span class="s4">)</span>
+<span class="s3">from </span><span class="s1">win32security </span><span class="s3">import </span><span class="s1">SetThreadToken</span>
+
+<span class="s3">import </span><span class="s1">isapi</span><span class="s4">.</span><span class="s1">simple</span>
+<span class="s3">from </span><span class="s1">isapi </span><span class="s3">import </span><span class="s1">ExtensionError</span><span class="s4">, </span><span class="s1">isapicon</span>
+
+<span class="s1">ISAPI_REQUEST </span><span class="s4">= </span><span class="s5">1</span>
+<span class="s1">ISAPI_SHUTDOWN </span><span class="s4">= </span><span class="s5">2</span>
+
+
+<span class="s3">class </span><span class="s1">WorkerThread</span><span class="s4">(</span><span class="s1">threading</span><span class="s4">.</span><span class="s1">Thread</span><span class="s4">):</span>
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">extension</span><span class="s4">, </span><span class="s1">io_req_port</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">running </span><span class="s4">= </span><span class="s3">False</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">io_req_port </span><span class="s4">= </span><span class="s1">io_req_port</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">extension </span><span class="s4">= </span><span class="s1">extension</span>
+        <span class="s1">threading</span><span class="s4">.</span><span class="s1">Thread</span><span class="s4">.</span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+        <span class="s2"># We wait 15 seconds for a thread to terminate, but if it fails to,</span>
+        <span class="s2"># we don't want the process to hang at exit waiting for it...</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">setDaemon</span><span class="s4">(</span><span class="s3">True</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">run</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">running </span><span class="s4">= </span><span class="s3">True</span>
+        <span class="s3">while </span><span class="s1">self</span><span class="s4">.</span><span class="s1">running</span><span class="s4">:</span>
+            <span class="s1">errCode</span><span class="s4">, </span><span class="s1">bytes</span><span class="s4">, </span><span class="s1">key</span><span class="s4">, </span><span class="s1">overlapped </span><span class="s4">= </span><span class="s1">GetQueuedCompletionStatus</span><span class="s4">(</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">io_req_port</span><span class="s4">, </span><span class="s1">INFINITE</span>
+            <span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">key </span><span class="s4">== </span><span class="s1">ISAPI_SHUTDOWN </span><span class="s3">and </span><span class="s1">overlapped </span><span class="s3">is None</span><span class="s4">:</span>
+                <span class="s3">break</span>
+
+            <span class="s2"># Let the parent extension handle the command.</span>
+            <span class="s1">dispatcher </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">extension</span><span class="s4">.</span><span class="s1">dispatch_map</span><span class="s4">.</span><span class="s1">get</span><span class="s4">(</span><span class="s1">key</span><span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">dispatcher </span><span class="s3">is None</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">RuntimeError</span><span class="s4">(</span><span class="s6">&quot;Bad request '%s'&quot; </span><span class="s4">% (</span><span class="s1">key</span><span class="s4">,))</span>
+
+            <span class="s1">dispatcher</span><span class="s4">(</span><span class="s1">errCode</span><span class="s4">, </span><span class="s1">bytes</span><span class="s4">, </span><span class="s1">key</span><span class="s4">, </span><span class="s1">overlapped</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">call_handler</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">cblock</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">extension</span><span class="s4">.</span><span class="s1">Dispatch</span><span class="s4">(</span><span class="s1">cblock</span><span class="s4">)</span>
+
+
+<span class="s2"># A generic thread-pool based extension, using IO Completion Ports.</span>
+<span class="s2"># Sub-classes can override one method to implement a simple extension, or</span>
+<span class="s2"># may leverage the CompletionPort to queue their own requests, and implement a</span>
+<span class="s2"># fully asynch extension.</span>
+<span class="s3">class </span><span class="s1">ThreadPoolExtension</span><span class="s4">(</span><span class="s1">isapi</span><span class="s4">.</span><span class="s1">simple</span><span class="s4">.</span><span class="s1">SimpleExtension</span><span class="s4">):</span>
+    <span class="s0">&quot;Base class for an ISAPI extension based around a thread-pool&quot;</span>
+    <span class="s1">max_workers </span><span class="s4">= </span><span class="s5">20</span>
+    <span class="s1">worker_shutdown_wait </span><span class="s4">= </span><span class="s5">15000  </span><span class="s2"># 15 seconds for workers to quit...</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">workers </span><span class="s4">= []</span>
+        <span class="s2"># extensible dispatch map, for sub-classes that need to post their</span>
+        <span class="s2"># own requests to the completion port.</span>
+        <span class="s2"># Each of these functions is called with the result of</span>
+        <span class="s2"># GetQueuedCompletionStatus for our port.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">dispatch_map </span><span class="s4">= {</span>
+            <span class="s1">ISAPI_REQUEST</span><span class="s4">: </span><span class="s1">self</span><span class="s4">.</span><span class="s1">DispatchConnection</span><span class="s4">,</span>
+        <span class="s4">}</span>
+
+    <span class="s3">def </span><span class="s1">GetExtensionVersion</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">vi</span><span class="s4">):</span>
+        <span class="s1">isapi</span><span class="s4">.</span><span class="s1">simple</span><span class="s4">.</span><span class="s1">SimpleExtension</span><span class="s4">.</span><span class="s1">GetExtensionVersion</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">vi</span><span class="s4">)</span>
+        <span class="s2"># As per Q192800, the CompletionPort should be created with the number</span>
+        <span class="s2"># of processors, even if the number of worker threads is much larger.</span>
+        <span class="s2"># Passing 0 means the system picks the number.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">io_req_port </span><span class="s4">= </span><span class="s1">CreateIoCompletionPort</span><span class="s4">(-</span><span class="s5">1</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s5">0</span><span class="s4">, </span><span class="s5">0</span><span class="s4">)</span>
+        <span class="s2"># start up the workers</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">workers </span><span class="s4">= []</span>
+        <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">max_workers</span><span class="s4">):</span>
+            <span class="s1">worker </span><span class="s4">= </span><span class="s1">WorkerThread</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">io_req_port</span><span class="s4">)</span>
+            <span class="s1">worker</span><span class="s4">.</span><span class="s1">start</span><span class="s4">()</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">workers</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">worker</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">HttpExtensionProc</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">control_block</span><span class="s4">):</span>
+        <span class="s1">overlapped </span><span class="s4">= </span><span class="s1">OVERLAPPED</span><span class="s4">()</span>
+        <span class="s1">overlapped</span><span class="s4">.</span><span class="s1">object </span><span class="s4">= </span><span class="s1">control_block</span>
+        <span class="s1">PostQueuedCompletionStatus</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">io_req_port</span><span class="s4">, </span><span class="s5">0</span><span class="s4">, </span><span class="s1">ISAPI_REQUEST</span><span class="s4">, </span><span class="s1">overlapped</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">isapicon</span><span class="s4">.</span><span class="s1">HSE_STATUS_PENDING</span>
+
+    <span class="s3">def </span><span class="s1">TerminateExtension</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">status</span><span class="s4">):</span>
+        <span class="s3">for </span><span class="s1">worker </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">workers</span><span class="s4">:</span>
+            <span class="s1">worker</span><span class="s4">.</span><span class="s1">running </span><span class="s4">= </span><span class="s3">False</span>
+        <span class="s3">for </span><span class="s1">worker </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">workers</span><span class="s4">:</span>
+            <span class="s1">PostQueuedCompletionStatus</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">io_req_port</span><span class="s4">, </span><span class="s5">0</span><span class="s4">, </span><span class="s1">ISAPI_SHUTDOWN</span><span class="s4">, </span><span class="s3">None</span><span class="s4">)</span>
+        <span class="s2"># wait for them to terminate - pity we aren't using 'native' threads</span>
+        <span class="s2"># as then we could do a smart wait - but now we need to poll....</span>
+        <span class="s1">end_time </span><span class="s4">= </span><span class="s1">time</span><span class="s4">.</span><span class="s1">time</span><span class="s4">() + </span><span class="s1">self</span><span class="s4">.</span><span class="s1">worker_shutdown_wait </span><span class="s4">/ </span><span class="s5">1000</span>
+        <span class="s1">alive </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">workers</span>
+        <span class="s3">while </span><span class="s1">alive</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">time</span><span class="s4">.</span><span class="s1">time</span><span class="s4">() &gt; </span><span class="s1">end_time</span><span class="s4">:</span>
+                <span class="s2"># xxx - might be nice to log something here.</span>
+                <span class="s3">break</span>
+            <span class="s1">time</span><span class="s4">.</span><span class="s1">sleep</span><span class="s4">(</span><span class="s5">0.2</span><span class="s4">)</span>
+            <span class="s1">alive </span><span class="s4">= [</span><span class="s1">w </span><span class="s3">for </span><span class="s1">w </span><span class="s3">in </span><span class="s1">alive </span><span class="s3">if </span><span class="s1">w</span><span class="s4">.</span><span class="s1">is_alive</span><span class="s4">()]</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">dispatch_map </span><span class="s4">= {}  </span><span class="s2"># break circles</span>
+        <span class="s1">CloseHandle</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">io_req_port</span><span class="s4">)</span>
+
+    <span class="s2"># This is the one operation the base class supports - a simple</span>
+    <span class="s2"># Connection request.  We setup the thread-token, and dispatch to the</span>
+    <span class="s2"># sub-class's 'Dispatch' method.</span>
+    <span class="s3">def </span><span class="s1">DispatchConnection</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">errCode</span><span class="s4">, </span><span class="s1">bytes</span><span class="s4">, </span><span class="s1">key</span><span class="s4">, </span><span class="s1">overlapped</span><span class="s4">):</span>
+        <span class="s1">control_block </span><span class="s4">= </span><span class="s1">overlapped</span><span class="s4">.</span><span class="s1">object</span>
+        <span class="s2"># setup the correct user for this request</span>
+        <span class="s1">hRequestToken </span><span class="s4">= </span><span class="s1">control_block</span><span class="s4">.</span><span class="s1">GetImpersonationToken</span><span class="s4">()</span>
+        <span class="s1">SetThreadToken</span><span class="s4">(</span><span class="s3">None</span><span class="s4">, </span><span class="s1">hRequestToken</span><span class="s4">)</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s3">try</span><span class="s4">:</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">Dispatch</span><span class="s4">(</span><span class="s1">control_block</span><span class="s4">)</span>
+            <span class="s3">except</span><span class="s4">:</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">HandleDispatchError</span><span class="s4">(</span><span class="s1">control_block</span><span class="s4">)</span>
+        <span class="s3">finally</span><span class="s4">:</span>
+            <span class="s2"># reset the security context</span>
+            <span class="s1">SetThreadToken</span><span class="s4">(</span><span class="s3">None</span><span class="s4">, </span><span class="s3">None</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">Dispatch</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">ecb</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Overridden by the sub-class to handle connection requests. 
+ 
+        This class creates a thread-pool using a Windows completion port, 
+        and dispatches requests via this port.  Sub-classes can generally 
+        implement each connection request using blocking reads and writes, and 
+        the thread-pool will still provide decent response to the end user. 
+ 
+        The sub-class can set a max_workers attribute (default is 20).  Note 
+        that this generally does *not* mean 20 threads will all be concurrently 
+        running, via the magic of Windows completion ports. 
+ 
+        There is no default implementation - sub-classes must implement this. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">raise </span><span class="s1">NotImplementedError</span><span class="s4">(</span><span class="s6">&quot;sub-classes should override Dispatch&quot;</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">HandleDispatchError</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">ecb</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Handles errors in the Dispatch method. 
+ 
+        When a Dispatch method call fails, this method is called to handle 
+        the exception.  The default implementation formats the traceback 
+        in the browser. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">ecb</span><span class="s4">.</span><span class="s1">HttpStatusCode </span><span class="s4">= </span><span class="s1">isapicon</span><span class="s4">.</span><span class="s1">HSE_STATUS_ERROR</span>
+        <span class="s2"># control_block.LogData = &quot;we failed!&quot;</span>
+        <span class="s1">exc_typ</span><span class="s4">, </span><span class="s1">exc_val</span><span class="s4">, </span><span class="s1">exc_tb </span><span class="s4">= </span><span class="s1">sys</span><span class="s4">.</span><span class="s1">exc_info</span><span class="s4">()</span>
+        <span class="s1">limit </span><span class="s4">= </span><span class="s3">None</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s3">try</span><span class="s4">:</span>
+                <span class="s3">import </span><span class="s1">cgi</span>
+
+                <span class="s1">ecb</span><span class="s4">.</span><span class="s1">SendResponseHeaders</span><span class="s4">(</span>
+                    <span class="s6">&quot;200 OK&quot;</span><span class="s4">, </span><span class="s6">&quot;Content-type: text/html</span><span class="s3">\r\n\r\n</span><span class="s6">&quot;</span><span class="s4">, </span><span class="s3">False</span>
+                <span class="s4">)</span>
+                <span class="s1">print</span><span class="s4">(</span><span class="s1">file</span><span class="s4">=</span><span class="s1">ecb</span><span class="s4">)</span>
+                <span class="s1">print</span><span class="s4">(</span><span class="s6">&quot;&lt;H3&gt;Traceback (most recent call last):&lt;/H3&gt;&quot;</span><span class="s4">, </span><span class="s1">file</span><span class="s4">=</span><span class="s1">ecb</span><span class="s4">)</span>
+                <span class="s1">list </span><span class="s4">= </span><span class="s1">traceback</span><span class="s4">.</span><span class="s1">format_tb</span><span class="s4">(</span>
+                    <span class="s1">exc_tb</span><span class="s4">, </span><span class="s1">limit</span>
+                <span class="s4">) + </span><span class="s1">traceback</span><span class="s4">.</span><span class="s1">format_exception_only</span><span class="s4">(</span><span class="s1">exc_typ</span><span class="s4">, </span><span class="s1">exc_val</span><span class="s4">)</span>
+                <span class="s1">print</span><span class="s4">(</span>
+                    <span class="s6">&quot;&lt;PRE&gt;%s&lt;B&gt;%s&lt;/B&gt;&lt;/PRE&gt;&quot;</span>
+                    <span class="s4">% (</span>
+                        <span class="s1">cgi</span><span class="s4">.</span><span class="s1">escape</span><span class="s4">(</span><span class="s6">&quot;&quot;</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">list</span><span class="s4">[:-</span><span class="s5">1</span><span class="s4">])),</span>
+                        <span class="s1">cgi</span><span class="s4">.</span><span class="s1">escape</span><span class="s4">(</span><span class="s1">list</span><span class="s4">[-</span><span class="s5">1</span><span class="s4">]),</span>
+                    <span class="s4">),</span>
+                    <span class="s1">file</span><span class="s4">=</span><span class="s1">ecb</span><span class="s4">,</span>
+                <span class="s4">)</span>
+            <span class="s3">except </span><span class="s1">ExtensionError</span><span class="s4">:</span>
+                <span class="s2"># The client disconnected without reading the error body -</span>
+                <span class="s2"># its probably not a real browser at the other end, ignore it.</span>
+                <span class="s3">pass</span>
+            <span class="s3">except</span><span class="s4">:</span>
+                <span class="s1">print</span><span class="s4">(</span><span class="s6">&quot;FAILED to render the error message!&quot;</span><span class="s4">)</span>
+                <span class="s1">traceback</span><span class="s4">.</span><span class="s1">print_exc</span><span class="s4">()</span>
+                <span class="s1">print</span><span class="s4">(</span><span class="s6">&quot;ORIGINAL extension error:&quot;</span><span class="s4">)</span>
+                <span class="s1">traceback</span><span class="s4">.</span><span class="s1">print_exception</span><span class="s4">(</span><span class="s1">exc_typ</span><span class="s4">, </span><span class="s1">exc_val</span><span class="s4">, </span><span class="s1">exc_tb</span><span class="s4">)</span>
+        <span class="s3">finally</span><span class="s4">:</span>
+            <span class="s2"># holding tracebacks in a local of a frame that may itself be</span>
+            <span class="s2"># part of a traceback used to be evil and cause leaks!</span>
+            <span class="s1">exc_tb </span><span class="s4">= </span><span class="s3">None</span>
+            <span class="s1">ecb</span><span class="s4">.</span><span class="s1">DoneWithSession</span><span class="s4">()</span>
+</pre>
+</body>
+</html>

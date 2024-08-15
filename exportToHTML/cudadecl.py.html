@@ -1,0 +1,829 @@
+<html>
+<head>
+<title>cudadecl.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #7a7e85;}
+.s4 { color: #6aab73;}
+.s5 { color: #5f826b; font-style: italic;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+cudadecl.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">operator</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">types</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">typing</span><span class="s2">.</span><span class="s1">npydecl </span><span class="s0">import </span><span class="s2">(</span><span class="s1">parse_dtype</span><span class="s2">, </span><span class="s1">parse_shape</span><span class="s2">,</span>
+                                       <span class="s1">register_number_classes</span><span class="s2">,</span>
+                                       <span class="s1">register_numpy_ufunc</span><span class="s2">,</span>
+                                       <span class="s1">trigonometric_functions</span><span class="s2">,</span>
+                                       <span class="s1">comparison_functions</span><span class="s2">,</span>
+                                       <span class="s1">math_operations</span><span class="s2">,</span>
+                                       <span class="s1">bit_twiddling_functions</span><span class="s2">)</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">typing</span><span class="s2">.</span><span class="s1">templates </span><span class="s0">import </span><span class="s2">(</span><span class="s1">AttributeTemplate</span><span class="s2">, </span><span class="s1">ConcreteTemplate</span><span class="s2">,</span>
+                                         <span class="s1">AbstractTemplate</span><span class="s2">, </span><span class="s1">CallableTemplate</span><span class="s2">,</span>
+                                         <span class="s1">signature</span><span class="s2">, </span><span class="s1">Registry</span><span class="s2">)</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">types </span><span class="s0">import </span><span class="s1">dim3</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">typeconv </span><span class="s0">import </span><span class="s1">Conversion</span>
+<span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">cuda</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">compiler </span><span class="s0">import </span><span class="s1">declare_device_function_template</span>
+
+<span class="s1">registry </span><span class="s2">= </span><span class="s1">Registry</span><span class="s2">()</span>
+<span class="s1">register </span><span class="s2">= </span><span class="s1">registry</span><span class="s2">.</span><span class="s1">register</span>
+<span class="s1">register_attr </span><span class="s2">= </span><span class="s1">registry</span><span class="s2">.</span><span class="s1">register_attr</span>
+<span class="s1">register_global </span><span class="s2">= </span><span class="s1">registry</span><span class="s2">.</span><span class="s1">register_global</span>
+
+<span class="s1">register_number_classes</span><span class="s2">(</span><span class="s1">register_global</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">Cuda_array_decl</span><span class="s2">(</span><span class="s1">CallableTemplate</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">generic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">def </span><span class="s1">typer</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">):</span>
+
+            <span class="s3"># Only integer literals and tuples of integer literals are valid</span>
+            <span class="s3"># shapes</span>
+            <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Integer</span><span class="s2">):</span>
+                <span class="s0">if not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">IntegerLiteral</span><span class="s2">):</span>
+                    <span class="s0">return None</span>
+            <span class="s0">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">, (</span><span class="s1">types</span><span class="s2">.</span><span class="s1">Tuple</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">UniTuple</span><span class="s2">)):</span>
+                <span class="s0">if </span><span class="s1">any</span><span class="s2">([</span><span class="s0">not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">s</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">IntegerLiteral</span><span class="s2">)</span>
+                        <span class="s0">for </span><span class="s1">s </span><span class="s0">in </span><span class="s1">shape</span><span class="s2">]):</span>
+                    <span class="s0">return None</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s0">return None</span>
+
+            <span class="s1">ndim </span><span class="s2">= </span><span class="s1">parse_shape</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">)</span>
+            <span class="s1">nb_dtype </span><span class="s2">= </span><span class="s1">parse_dtype</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">nb_dtype </span><span class="s0">is not None and </span><span class="s1">ndim </span><span class="s0">is not None</span><span class="s2">:</span>
+                <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">nb_dtype</span><span class="s2">, </span><span class="s1">ndim</span><span class="s2">=</span><span class="s1">ndim</span><span class="s2">, </span><span class="s1">layout</span><span class="s2">=</span><span class="s4">'C'</span><span class="s2">)</span>
+
+        <span class="s0">return </span><span class="s1">typer</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_shared_array</span><span class="s2">(</span><span class="s1">Cuda_array_decl</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">shared</span><span class="s2">.</span><span class="s1">array</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_local_array</span><span class="s2">(</span><span class="s1">Cuda_array_decl</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">local</span><span class="s2">.</span><span class="s1">array</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_const_array_like</span><span class="s2">(</span><span class="s1">CallableTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">const</span><span class="s2">.</span><span class="s1">array_like</span>
+
+    <span class="s0">def </span><span class="s1">generic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">def </span><span class="s1">typer</span><span class="s2">(</span><span class="s1">ndarray</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">ndarray</span>
+        <span class="s0">return </span><span class="s1">typer</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_threadfence_device</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">threadfence</span>
+    <span class="s1">cases </span><span class="s2">= [</span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">none</span><span class="s2">)]</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_threadfence_block</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">threadfence_block</span>
+    <span class="s1">cases </span><span class="s2">= [</span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">none</span><span class="s2">)]</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_threadfence_system</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">threadfence_system</span>
+    <span class="s1">cases </span><span class="s2">= [</span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">none</span><span class="s2">)]</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_syncwarp</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">syncwarp</span>
+    <span class="s1">cases </span><span class="s2">= [</span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">none</span><span class="s2">), </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">none</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">)]</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_shfl_sync_intrinsic</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">shfl_sync_intrinsic</span>
+    <span class="s1">cases </span><span class="s2">= [</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">Tuple</span><span class="s2">((</span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">b1</span><span class="s2">)),</span>
+                  <span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">Tuple</span><span class="s2">((</span><span class="s1">types</span><span class="s2">.</span><span class="s1">i8</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">b1</span><span class="s2">)),</span>
+                  <span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i8</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">Tuple</span><span class="s2">((</span><span class="s1">types</span><span class="s2">.</span><span class="s1">f4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">b1</span><span class="s2">)),</span>
+                  <span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">f4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">Tuple</span><span class="s2">((</span><span class="s1">types</span><span class="s2">.</span><span class="s1">f8</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">b1</span><span class="s2">)),</span>
+                  <span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">f8</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">),</span>
+    <span class="s2">]</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_vote_sync_intrinsic</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">vote_sync_intrinsic</span>
+    <span class="s1">cases </span><span class="s2">= [</span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">Tuple</span><span class="s2">((</span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">b1</span><span class="s2">)),</span>
+                       <span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">b1</span><span class="s2">)]</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_match_any_sync</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">match_any_sync</span>
+    <span class="s1">cases </span><span class="s2">= [</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i8</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">f4</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">f8</span><span class="s2">),</span>
+    <span class="s2">]</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_match_all_sync</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">match_all_sync</span>
+    <span class="s1">cases </span><span class="s2">= [</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">Tuple</span><span class="s2">((</span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">b1</span><span class="s2">)), </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">Tuple</span><span class="s2">((</span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">b1</span><span class="s2">)), </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i8</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">Tuple</span><span class="s2">((</span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">b1</span><span class="s2">)), </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">f4</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">Tuple</span><span class="s2">((</span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">b1</span><span class="s2">)), </span><span class="s1">types</span><span class="s2">.</span><span class="s1">i4</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">f8</span><span class="s2">),</span>
+    <span class="s2">]</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_activemask</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">activemask</span>
+    <span class="s1">cases </span><span class="s2">= [</span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">)]</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_lanemask_lt</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">lanemask_lt</span>
+    <span class="s1">cases </span><span class="s2">= [</span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">)]</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_popc</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Supported types from `llvm.popc` 
+    [here](http://docs.nvidia.com/cuda/nvvm-ir-spec/index.html#bit-manipulations-intrinics) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">popc</span>
+    <span class="s1">cases </span><span class="s2">= [</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">int8</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">int8</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">int16</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">int16</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint8</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint8</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint16</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint16</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint64</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint64</span><span class="s2">),</span>
+    <span class="s2">]</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_fma</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Supported types from `llvm.fma` 
+    [here](https://docs.nvidia.com/cuda/nvvm-ir-spec/index.html#standard-c-library-intrinics) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">fma</span>
+    <span class="s1">cases </span><span class="s2">= [</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">),</span>
+    <span class="s2">]</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_hfma</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">fp16</span><span class="s2">.</span><span class="s1">hfma</span>
+    <span class="s1">cases </span><span class="s2">= [</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">)</span>
+    <span class="s2">]</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_cbrt</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">cbrt</span>
+    <span class="s1">cases </span><span class="s2">= [</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">),</span>
+    <span class="s2">]</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_brev</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">brev</span>
+    <span class="s1">cases </span><span class="s2">= [</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint64</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint64</span><span class="s2">),</span>
+    <span class="s2">]</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_clz</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Supported types from `llvm.ctlz` 
+    [here](http://docs.nvidia.com/cuda/nvvm-ir-spec/index.html#bit-manipulations-intrinics) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">clz</span>
+    <span class="s1">cases </span><span class="s2">= [</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">int8</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">int8</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">int16</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">int16</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint8</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint8</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint16</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint16</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint64</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint64</span><span class="s2">),</span>
+    <span class="s2">]</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_ffs</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Supported types from `llvm.cttz` 
+    [here](http://docs.nvidia.com/cuda/nvvm-ir-spec/index.html#bit-manipulations-intrinics) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">ffs</span>
+    <span class="s1">cases </span><span class="s2">= [</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">int8</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">int16</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint8</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint16</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">),</span>
+        <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint64</span><span class="s2">),</span>
+    <span class="s2">]</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_selp</span><span class="s2">(</span><span class="s1">AbstractTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">selp</span>
+
+    <span class="s0">def </span><span class="s1">generic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s0">assert not </span><span class="s1">kws</span>
+        <span class="s1">test</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">b </span><span class="s2">= </span><span class="s1">args</span>
+
+        <span class="s3"># per docs</span>
+        <span class="s3"># http://docs.nvidia.com/cuda/parallel-thread-execution/index.html#comparison-and-selection-instructions-selp</span>
+        <span class="s1">supported_types </span><span class="s2">= (</span><span class="s1">types</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">,</span>
+                           <span class="s1">types</span><span class="s2">.</span><span class="s1">int16</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint16</span><span class="s2">,</span>
+                           <span class="s1">types</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">,</span>
+                           <span class="s1">types</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint64</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">a </span><span class="s2">!= </span><span class="s1">b </span><span class="s0">or </span><span class="s1">a </span><span class="s0">not in </span><span class="s1">supported_types</span><span class="s2">:</span>
+            <span class="s0">return</span>
+
+        <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">test</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">a</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">_genfp16_unary</span><span class="s2">(</span><span class="s1">l_key</span><span class="s2">):</span>
+    <span class="s2">@</span><span class="s1">register</span>
+    <span class="s0">class </span><span class="s1">Cuda_fp16_unary</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+        <span class="s1">key </span><span class="s2">= </span><span class="s1">l_key</span>
+        <span class="s1">cases </span><span class="s2">= [</span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">)]</span>
+
+    <span class="s0">return </span><span class="s1">Cuda_fp16_unary</span>
+
+
+<span class="s0">def </span><span class="s1">_genfp16_unary_operator</span><span class="s2">(</span><span class="s1">l_key</span><span class="s2">):</span>
+    <span class="s2">@</span><span class="s1">register_global</span><span class="s2">(</span><span class="s1">l_key</span><span class="s2">)</span>
+    <span class="s0">class </span><span class="s1">Cuda_fp16_unary</span><span class="s2">(</span><span class="s1">AbstractTemplate</span><span class="s2">):</span>
+        <span class="s1">key </span><span class="s2">= </span><span class="s1">l_key</span>
+
+        <span class="s0">def </span><span class="s1">generic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+            <span class="s0">assert not </span><span class="s1">kws</span>
+            <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">args</span><span class="s2">) == </span><span class="s6">1 </span><span class="s0">and </span><span class="s1">args</span><span class="s2">[</span><span class="s6">0</span><span class="s2">] == </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">:</span>
+                <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">)</span>
+
+    <span class="s0">return </span><span class="s1">Cuda_fp16_unary</span>
+
+
+<span class="s0">def </span><span class="s1">_genfp16_binary</span><span class="s2">(</span><span class="s1">l_key</span><span class="s2">):</span>
+    <span class="s2">@</span><span class="s1">register</span>
+    <span class="s0">class </span><span class="s1">Cuda_fp16_binary</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+        <span class="s1">key </span><span class="s2">= </span><span class="s1">l_key</span>
+        <span class="s1">cases </span><span class="s2">= [</span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">)]</span>
+
+    <span class="s0">return </span><span class="s1">Cuda_fp16_binary</span>
+
+
+<span class="s2">@</span><span class="s1">register_global</span><span class="s2">(</span><span class="s1">float</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">Float</span><span class="s2">(</span><span class="s1">AbstractTemplate</span><span class="s2">):</span>
+
+    <span class="s0">def </span><span class="s1">generic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s0">assert not </span><span class="s1">kws</span>
+
+        <span class="s2">[</span><span class="s1">arg</span><span class="s2">] = </span><span class="s1">args</span>
+
+        <span class="s0">if </span><span class="s1">arg </span><span class="s2">== </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">arg</span><span class="s2">, </span><span class="s1">arg</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">_genfp16_binary_comparison</span><span class="s2">(</span><span class="s1">l_key</span><span class="s2">):</span>
+    <span class="s2">@</span><span class="s1">register</span>
+    <span class="s0">class </span><span class="s1">Cuda_fp16_cmp</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+        <span class="s1">key </span><span class="s2">= </span><span class="s1">l_key</span>
+
+        <span class="s1">cases </span><span class="s2">= [</span>
+            <span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">b1</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">)</span>
+        <span class="s2">]</span>
+    <span class="s0">return </span><span class="s1">Cuda_fp16_cmp</span>
+
+<span class="s3"># If multiple ConcreteTemplates provide typing for a single function, then</span>
+<span class="s3"># function resolution will pick the first compatible typing it finds even if it</span>
+<span class="s3"># involves inserting a cast that would be considered undesirable (in this</span>
+<span class="s3"># specific case, float16s could be cast to float32s for comparisons).</span>
+<span class="s3">#</span>
+<span class="s3"># To work around this, we instead use an AbstractTemplate that implements</span>
+<span class="s3"># exactly the casting logic that we desire. The AbstractTemplate gets</span>
+<span class="s3"># considered in preference to ConcreteTemplates during typing.</span>
+<span class="s3">#</span>
+<span class="s3"># This is tracked as Issue #7863 (https://github.com/numba/numba/issues/7863) -</span>
+<span class="s3"># once this is resolved it should be possible to replace this AbstractTemplate</span>
+<span class="s3"># with a ConcreteTemplate to simplify the logic.</span>
+
+
+<span class="s0">def </span><span class="s1">_fp16_binary_operator</span><span class="s2">(</span><span class="s1">l_key</span><span class="s2">, </span><span class="s1">retty</span><span class="s2">):</span>
+    <span class="s2">@</span><span class="s1">register_global</span><span class="s2">(</span><span class="s1">l_key</span><span class="s2">)</span>
+    <span class="s0">class </span><span class="s1">Cuda_fp16_operator</span><span class="s2">(</span><span class="s1">AbstractTemplate</span><span class="s2">):</span>
+        <span class="s1">key </span><span class="s2">= </span><span class="s1">l_key</span>
+
+        <span class="s0">def </span><span class="s1">generic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+            <span class="s0">assert not </span><span class="s1">kws</span>
+
+            <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">args</span><span class="s2">) == </span><span class="s6">2 </span><span class="s0">and </span><span class="s1">\</span>
+                    <span class="s2">(</span><span class="s1">args</span><span class="s2">[</span><span class="s6">0</span><span class="s2">] == </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16 </span><span class="s0">or </span><span class="s1">args</span><span class="s2">[</span><span class="s6">1</span><span class="s2">] == </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">):</span>
+                <span class="s0">if </span><span class="s2">(</span><span class="s1">args</span><span class="s2">[</span><span class="s6">0</span><span class="s2">] == </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">):</span>
+                    <span class="s1">convertible </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">can_convert</span><span class="s2">(</span><span class="s1">args</span><span class="s2">[</span><span class="s6">1</span><span class="s2">], </span><span class="s1">args</span><span class="s2">[</span><span class="s6">0</span><span class="s2">])</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s1">convertible </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">can_convert</span><span class="s2">(</span><span class="s1">args</span><span class="s2">[</span><span class="s6">0</span><span class="s2">], </span><span class="s1">args</span><span class="s2">[</span><span class="s6">1</span><span class="s2">])</span>
+
+                <span class="s3"># We allow three cases here:</span>
+                <span class="s3">#</span>
+                <span class="s3"># 1. fp16 to fp16 - Conversion.exact</span>
+                <span class="s3"># 2. fp16 to other types fp16 can be promoted to</span>
+                <span class="s3">#  - Conversion.promote</span>
+                <span class="s3"># 3. fp16 to int8 (safe conversion) -</span>
+                <span class="s3">#  - Conversion.safe</span>
+
+                <span class="s0">if </span><span class="s2">(</span><span class="s1">convertible </span><span class="s2">== </span><span class="s1">Conversion</span><span class="s2">.</span><span class="s1">exact</span><span class="s2">) </span><span class="s0">or </span><span class="s1">\</span>
+                   <span class="s2">(</span><span class="s1">convertible </span><span class="s2">== </span><span class="s1">Conversion</span><span class="s2">.</span><span class="s1">promote</span><span class="s2">) </span><span class="s0">or </span><span class="s1">\</span>
+                   <span class="s2">(</span><span class="s1">convertible </span><span class="s2">== </span><span class="s1">Conversion</span><span class="s2">.</span><span class="s1">safe</span><span class="s2">):</span>
+                    <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">retty</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">)</span>
+
+    <span class="s0">return </span><span class="s1">Cuda_fp16_operator</span>
+
+
+<span class="s0">def </span><span class="s1">_genfp16_comparison_operator</span><span class="s2">(</span><span class="s1">op</span><span class="s2">):</span>
+    <span class="s0">return </span><span class="s1">_fp16_binary_operator</span><span class="s2">(</span><span class="s1">op</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">b1</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">_genfp16_binary_operator</span><span class="s2">(</span><span class="s1">op</span><span class="s2">):</span>
+    <span class="s0">return </span><span class="s1">_fp16_binary_operator</span><span class="s2">(</span><span class="s1">op</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">)</span>
+
+
+<span class="s1">Cuda_hadd </span><span class="s2">= </span><span class="s1">_genfp16_binary</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">fp16</span><span class="s2">.</span><span class="s1">hadd</span><span class="s2">)</span>
+<span class="s1">Cuda_add </span><span class="s2">= </span><span class="s1">_genfp16_binary_operator</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">add</span><span class="s2">)</span>
+<span class="s1">Cuda_iadd </span><span class="s2">= </span><span class="s1">_genfp16_binary_operator</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">iadd</span><span class="s2">)</span>
+<span class="s1">Cuda_hsub </span><span class="s2">= </span><span class="s1">_genfp16_binary</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">fp16</span><span class="s2">.</span><span class="s1">hsub</span><span class="s2">)</span>
+<span class="s1">Cuda_sub </span><span class="s2">= </span><span class="s1">_genfp16_binary_operator</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">sub</span><span class="s2">)</span>
+<span class="s1">Cuda_isub </span><span class="s2">= </span><span class="s1">_genfp16_binary_operator</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">isub</span><span class="s2">)</span>
+<span class="s1">Cuda_hmul </span><span class="s2">= </span><span class="s1">_genfp16_binary</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">fp16</span><span class="s2">.</span><span class="s1">hmul</span><span class="s2">)</span>
+<span class="s1">Cuda_mul </span><span class="s2">= </span><span class="s1">_genfp16_binary_operator</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">mul</span><span class="s2">)</span>
+<span class="s1">Cuda_imul </span><span class="s2">= </span><span class="s1">_genfp16_binary_operator</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">imul</span><span class="s2">)</span>
+<span class="s1">Cuda_hmax </span><span class="s2">= </span><span class="s1">_genfp16_binary</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">fp16</span><span class="s2">.</span><span class="s1">hmax</span><span class="s2">)</span>
+<span class="s1">Cuda_hmin </span><span class="s2">= </span><span class="s1">_genfp16_binary</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">fp16</span><span class="s2">.</span><span class="s1">hmin</span><span class="s2">)</span>
+<span class="s1">Cuda_hneg </span><span class="s2">= </span><span class="s1">_genfp16_unary</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">fp16</span><span class="s2">.</span><span class="s1">hneg</span><span class="s2">)</span>
+<span class="s1">Cuda_neg </span><span class="s2">= </span><span class="s1">_genfp16_unary_operator</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">neg</span><span class="s2">)</span>
+<span class="s1">Cuda_habs </span><span class="s2">= </span><span class="s1">_genfp16_unary</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">fp16</span><span class="s2">.</span><span class="s1">habs</span><span class="s2">)</span>
+<span class="s1">Cuda_abs </span><span class="s2">= </span><span class="s1">_genfp16_unary_operator</span><span class="s2">(</span><span class="s1">abs</span><span class="s2">)</span>
+<span class="s1">Cuda_heq </span><span class="s2">= </span><span class="s1">_genfp16_binary_comparison</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">fp16</span><span class="s2">.</span><span class="s1">heq</span><span class="s2">)</span>
+<span class="s1">_genfp16_comparison_operator</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">eq</span><span class="s2">)</span>
+<span class="s1">Cuda_hne </span><span class="s2">= </span><span class="s1">_genfp16_binary_comparison</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">fp16</span><span class="s2">.</span><span class="s1">hne</span><span class="s2">)</span>
+<span class="s1">_genfp16_comparison_operator</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">ne</span><span class="s2">)</span>
+<span class="s1">Cuda_hge </span><span class="s2">= </span><span class="s1">_genfp16_binary_comparison</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">fp16</span><span class="s2">.</span><span class="s1">hge</span><span class="s2">)</span>
+<span class="s1">_genfp16_comparison_operator</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">ge</span><span class="s2">)</span>
+<span class="s1">Cuda_hgt </span><span class="s2">= </span><span class="s1">_genfp16_binary_comparison</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">fp16</span><span class="s2">.</span><span class="s1">hgt</span><span class="s2">)</span>
+<span class="s1">_genfp16_comparison_operator</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">gt</span><span class="s2">)</span>
+<span class="s1">Cuda_hle </span><span class="s2">= </span><span class="s1">_genfp16_binary_comparison</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">fp16</span><span class="s2">.</span><span class="s1">hle</span><span class="s2">)</span>
+<span class="s1">_genfp16_comparison_operator</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">le</span><span class="s2">)</span>
+<span class="s1">Cuda_hlt </span><span class="s2">= </span><span class="s1">_genfp16_binary_comparison</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">fp16</span><span class="s2">.</span><span class="s1">hlt</span><span class="s2">)</span>
+<span class="s1">_genfp16_comparison_operator</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">lt</span><span class="s2">)</span>
+<span class="s1">_genfp16_binary_operator</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">truediv</span><span class="s2">)</span>
+<span class="s1">_genfp16_binary_operator</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">itruediv</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">_resolve_wrapped_unary</span><span class="s2">(</span><span class="s1">fname</span><span class="s2">):</span>
+    <span class="s1">decl </span><span class="s2">= </span><span class="s1">declare_device_function_template</span><span class="s2">(</span><span class="s4">f'__numba_wrapper_</span><span class="s0">{</span><span class="s1">fname</span><span class="s0">}</span><span class="s4">'</span><span class="s2">,</span>
+                                            <span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">,</span>
+                                            <span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">,))</span>
+    <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">decl</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">_resolve_wrapped_binary</span><span class="s2">(</span><span class="s1">fname</span><span class="s2">):</span>
+    <span class="s1">decl </span><span class="s2">= </span><span class="s1">declare_device_function_template</span><span class="s2">(</span><span class="s4">f'__numba_wrapper_</span><span class="s0">{</span><span class="s1">fname</span><span class="s0">}</span><span class="s4">'</span><span class="s2">,</span>
+                                            <span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">,</span>
+                                            <span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float16</span><span class="s2">,))</span>
+    <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">decl</span><span class="s2">)</span>
+
+
+<span class="s1">hsin_device </span><span class="s2">= </span><span class="s1">_resolve_wrapped_unary</span><span class="s2">(</span><span class="s4">'hsin'</span><span class="s2">)</span>
+<span class="s1">hcos_device </span><span class="s2">= </span><span class="s1">_resolve_wrapped_unary</span><span class="s2">(</span><span class="s4">'hcos'</span><span class="s2">)</span>
+<span class="s1">hlog_device </span><span class="s2">= </span><span class="s1">_resolve_wrapped_unary</span><span class="s2">(</span><span class="s4">'hlog'</span><span class="s2">)</span>
+<span class="s1">hlog10_device </span><span class="s2">= </span><span class="s1">_resolve_wrapped_unary</span><span class="s2">(</span><span class="s4">'hlog10'</span><span class="s2">)</span>
+<span class="s1">hlog2_device </span><span class="s2">= </span><span class="s1">_resolve_wrapped_unary</span><span class="s2">(</span><span class="s4">'hlog2'</span><span class="s2">)</span>
+<span class="s1">hexp_device </span><span class="s2">= </span><span class="s1">_resolve_wrapped_unary</span><span class="s2">(</span><span class="s4">'hexp'</span><span class="s2">)</span>
+<span class="s1">hexp10_device </span><span class="s2">= </span><span class="s1">_resolve_wrapped_unary</span><span class="s2">(</span><span class="s4">'hexp10'</span><span class="s2">)</span>
+<span class="s1">hexp2_device </span><span class="s2">= </span><span class="s1">_resolve_wrapped_unary</span><span class="s2">(</span><span class="s4">'hexp2'</span><span class="s2">)</span>
+<span class="s1">hsqrt_device </span><span class="s2">= </span><span class="s1">_resolve_wrapped_unary</span><span class="s2">(</span><span class="s4">'hsqrt'</span><span class="s2">)</span>
+<span class="s1">hrsqrt_device </span><span class="s2">= </span><span class="s1">_resolve_wrapped_unary</span><span class="s2">(</span><span class="s4">'hrsqrt'</span><span class="s2">)</span>
+<span class="s1">hfloor_device </span><span class="s2">= </span><span class="s1">_resolve_wrapped_unary</span><span class="s2">(</span><span class="s4">'hfloor'</span><span class="s2">)</span>
+<span class="s1">hceil_device </span><span class="s2">= </span><span class="s1">_resolve_wrapped_unary</span><span class="s2">(</span><span class="s4">'hceil'</span><span class="s2">)</span>
+<span class="s1">hrcp_device </span><span class="s2">= </span><span class="s1">_resolve_wrapped_unary</span><span class="s2">(</span><span class="s4">'hrcp'</span><span class="s2">)</span>
+<span class="s1">hrint_device </span><span class="s2">= </span><span class="s1">_resolve_wrapped_unary</span><span class="s2">(</span><span class="s4">'hrint'</span><span class="s2">)</span>
+<span class="s1">htrunc_device </span><span class="s2">= </span><span class="s1">_resolve_wrapped_unary</span><span class="s2">(</span><span class="s4">'htrunc'</span><span class="s2">)</span>
+<span class="s1">hdiv_device </span><span class="s2">= </span><span class="s1">_resolve_wrapped_binary</span><span class="s2">(</span><span class="s4">'hdiv'</span><span class="s2">)</span>
+
+
+<span class="s3"># generate atomic operations</span>
+<span class="s0">def </span><span class="s1">_gen</span><span class="s2">(</span><span class="s1">l_key</span><span class="s2">, </span><span class="s1">supported_types</span><span class="s2">):</span>
+    <span class="s2">@</span><span class="s1">register</span>
+    <span class="s0">class </span><span class="s1">Cuda_atomic</span><span class="s2">(</span><span class="s1">AbstractTemplate</span><span class="s2">):</span>
+        <span class="s1">key </span><span class="s2">= </span><span class="s1">l_key</span>
+
+        <span class="s0">def </span><span class="s1">generic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+            <span class="s0">assert not </span><span class="s1">kws</span>
+            <span class="s1">ary</span><span class="s2">, </span><span class="s1">idx</span><span class="s2">, </span><span class="s1">val </span><span class="s2">= </span><span class="s1">args</span>
+
+            <span class="s0">if </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype </span><span class="s0">not in </span><span class="s1">supported_types</span><span class="s2">:</span>
+                <span class="s0">return</span>
+
+            <span class="s0">if </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">== </span><span class="s6">1</span><span class="s2">:</span>
+                <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+            <span class="s0">elif </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">&gt; </span><span class="s6">1</span><span class="s2">:</span>
+                <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">idx</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">Cuda_atomic</span>
+
+
+<span class="s1">all_numba_types </span><span class="s2">= (</span><span class="s1">types</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">,</span>
+                   <span class="s1">types</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">,</span>
+                   <span class="s1">types</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint64</span><span class="s2">)</span>
+
+<span class="s1">integer_numba_types </span><span class="s2">= (</span><span class="s1">types</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">,</span>
+                       <span class="s1">types</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint64</span><span class="s2">)</span>
+
+<span class="s1">unsigned_int_numba_types </span><span class="s2">= (</span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint64</span><span class="s2">)</span>
+
+<span class="s1">Cuda_atomic_add </span><span class="s2">= </span><span class="s1">_gen</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">atomic</span><span class="s2">.</span><span class="s1">add</span><span class="s2">, </span><span class="s1">all_numba_types</span><span class="s2">)</span>
+<span class="s1">Cuda_atomic_sub </span><span class="s2">= </span><span class="s1">_gen</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">atomic</span><span class="s2">.</span><span class="s1">sub</span><span class="s2">, </span><span class="s1">all_numba_types</span><span class="s2">)</span>
+<span class="s1">Cuda_atomic_max </span><span class="s2">= </span><span class="s1">_gen</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">atomic</span><span class="s2">.</span><span class="s1">max</span><span class="s2">, </span><span class="s1">all_numba_types</span><span class="s2">)</span>
+<span class="s1">Cuda_atomic_min </span><span class="s2">= </span><span class="s1">_gen</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">atomic</span><span class="s2">.</span><span class="s1">min</span><span class="s2">, </span><span class="s1">all_numba_types</span><span class="s2">)</span>
+<span class="s1">Cuda_atomic_nanmax </span><span class="s2">= </span><span class="s1">_gen</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">atomic</span><span class="s2">.</span><span class="s1">nanmax</span><span class="s2">, </span><span class="s1">all_numba_types</span><span class="s2">)</span>
+<span class="s1">Cuda_atomic_nanmin </span><span class="s2">= </span><span class="s1">_gen</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">atomic</span><span class="s2">.</span><span class="s1">nanmin</span><span class="s2">, </span><span class="s1">all_numba_types</span><span class="s2">)</span>
+<span class="s1">Cuda_atomic_and </span><span class="s2">= </span><span class="s1">_gen</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">atomic</span><span class="s2">.</span><span class="s1">and_</span><span class="s2">, </span><span class="s1">integer_numba_types</span><span class="s2">)</span>
+<span class="s1">Cuda_atomic_or </span><span class="s2">= </span><span class="s1">_gen</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">atomic</span><span class="s2">.</span><span class="s1">or_</span><span class="s2">, </span><span class="s1">integer_numba_types</span><span class="s2">)</span>
+<span class="s1">Cuda_atomic_xor </span><span class="s2">= </span><span class="s1">_gen</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">atomic</span><span class="s2">.</span><span class="s1">xor</span><span class="s2">, </span><span class="s1">integer_numba_types</span><span class="s2">)</span>
+<span class="s1">Cuda_atomic_inc </span><span class="s2">= </span><span class="s1">_gen</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">atomic</span><span class="s2">.</span><span class="s1">inc</span><span class="s2">, </span><span class="s1">unsigned_int_numba_types</span><span class="s2">)</span>
+<span class="s1">Cuda_atomic_dec </span><span class="s2">= </span><span class="s1">_gen</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">atomic</span><span class="s2">.</span><span class="s1">dec</span><span class="s2">, </span><span class="s1">unsigned_int_numba_types</span><span class="s2">)</span>
+<span class="s1">Cuda_atomic_exch </span><span class="s2">= </span><span class="s1">_gen</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">atomic</span><span class="s2">.</span><span class="s1">exch</span><span class="s2">, </span><span class="s1">integer_numba_types</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_atomic_compare_and_swap</span><span class="s2">(</span><span class="s1">AbstractTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">atomic</span><span class="s2">.</span><span class="s1">compare_and_swap</span>
+
+    <span class="s0">def </span><span class="s1">generic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s0">assert not </span><span class="s1">kws</span>
+        <span class="s1">ary</span><span class="s2">, </span><span class="s1">old</span><span class="s2">, </span><span class="s1">val </span><span class="s2">= </span><span class="s1">args</span>
+        <span class="s1">dty </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span>
+
+        <span class="s0">if </span><span class="s1">dty </span><span class="s0">in </span><span class="s1">integer_numba_types </span><span class="s0">and </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">== </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">dty</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">dty</span><span class="s2">, </span><span class="s1">dty</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_atomic_cas</span><span class="s2">(</span><span class="s1">AbstractTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">atomic</span><span class="s2">.</span><span class="s1">cas</span>
+
+    <span class="s0">def </span><span class="s1">generic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s0">assert not </span><span class="s1">kws</span>
+        <span class="s1">ary</span><span class="s2">, </span><span class="s1">idx</span><span class="s2">, </span><span class="s1">old</span><span class="s2">, </span><span class="s1">val </span><span class="s2">= </span><span class="s1">args</span>
+        <span class="s1">dty </span><span class="s2">= </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">dtype</span>
+
+        <span class="s0">if </span><span class="s1">dty </span><span class="s0">not in </span><span class="s1">integer_numba_types</span><span class="s2">:</span>
+            <span class="s0">return</span>
+
+        <span class="s0">if </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">== </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">dty</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">, </span><span class="s1">dty</span><span class="s2">, </span><span class="s1">dty</span><span class="s2">)</span>
+        <span class="s0">elif </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">&gt; </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">dty</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">, </span><span class="s1">idx</span><span class="s2">, </span><span class="s1">dty</span><span class="s2">, </span><span class="s1">dty</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">register</span>
+<span class="s0">class </span><span class="s1">Cuda_nanosleep</span><span class="s2">(</span><span class="s1">ConcreteTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">nanosleep</span>
+
+    <span class="s1">cases </span><span class="s2">= [</span><span class="s1">signature</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">void</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">uint32</span><span class="s2">)]</span>
+
+
+<span class="s2">@</span><span class="s1">register_attr</span>
+<span class="s0">class </span><span class="s1">Dim3_attrs</span><span class="s2">(</span><span class="s1">AttributeTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">dim3</span>
+
+    <span class="s0">def </span><span class="s1">resolve_x</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">int32</span>
+
+    <span class="s0">def </span><span class="s1">resolve_y</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">int32</span>
+
+    <span class="s0">def </span><span class="s1">resolve_z</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">int32</span>
+
+
+<span class="s2">@</span><span class="s1">register_attr</span>
+<span class="s0">class </span><span class="s1">CudaSharedModuleTemplate</span><span class="s2">(</span><span class="s1">AttributeTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Module</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">shared</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_array</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_shared_array</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">register_attr</span>
+<span class="s0">class </span><span class="s1">CudaConstModuleTemplate</span><span class="s2">(</span><span class="s1">AttributeTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Module</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">const</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_array_like</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_const_array_like</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">register_attr</span>
+<span class="s0">class </span><span class="s1">CudaLocalModuleTemplate</span><span class="s2">(</span><span class="s1">AttributeTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Module</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">local</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_array</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_local_array</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">register_attr</span>
+<span class="s0">class </span><span class="s1">CudaAtomicTemplate</span><span class="s2">(</span><span class="s1">AttributeTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Module</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">atomic</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_add</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_atomic_add</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_sub</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_atomic_sub</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_and_</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_atomic_and</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_or_</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_atomic_or</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_xor</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_atomic_xor</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_inc</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_atomic_inc</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_dec</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_atomic_dec</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_exch</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_atomic_exch</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_max</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_atomic_max</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_min</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_atomic_min</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_nanmin</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_atomic_nanmin</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_nanmax</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_atomic_nanmax</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_compare_and_swap</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_atomic_compare_and_swap</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_cas</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_atomic_cas</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">register_attr</span>
+<span class="s0">class </span><span class="s1">CudaFp16Template</span><span class="s2">(</span><span class="s1">AttributeTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Module</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">fp16</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hadd</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_hadd</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hsub</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_hsub</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hmul</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_hmul</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hdiv</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">hdiv_device</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hneg</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_hneg</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_habs</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_habs</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hfma</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_hfma</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hsin</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">hsin_device</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hcos</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">hcos_device</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hlog</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">hlog_device</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hlog10</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">hlog10_device</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hlog2</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">hlog2_device</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hexp</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">hexp_device</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hexp10</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">hexp10_device</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hexp2</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">hexp2_device</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hfloor</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">hfloor_device</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hceil</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">hceil_device</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hsqrt</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">hsqrt_device</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hrsqrt</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">hrsqrt_device</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hrcp</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">hrcp_device</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hrint</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">hrint_device</span>
+
+    <span class="s0">def </span><span class="s1">resolve_htrunc</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">htrunc_device</span>
+
+    <span class="s0">def </span><span class="s1">resolve_heq</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_heq</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hne</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_hne</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hge</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_hge</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hgt</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_hgt</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hle</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_hle</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hlt</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_hlt</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hmax</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_hmax</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_hmin</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_hmin</span><span class="s2">)</span>
+
+
+<span class="s2">@</span><span class="s1">register_attr</span>
+<span class="s0">class </span><span class="s1">CudaModuleTemplate</span><span class="s2">(</span><span class="s1">AttributeTemplate</span><span class="s2">):</span>
+    <span class="s1">key </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Module</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_cg</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Module</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">cg</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_threadIdx</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">dim3</span>
+
+    <span class="s0">def </span><span class="s1">resolve_blockIdx</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">dim3</span>
+
+    <span class="s0">def </span><span class="s1">resolve_blockDim</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">dim3</span>
+
+    <span class="s0">def </span><span class="s1">resolve_gridDim</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">dim3</span>
+
+    <span class="s0">def </span><span class="s1">resolve_laneid</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">int32</span>
+
+    <span class="s0">def </span><span class="s1">resolve_shared</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Module</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">shared</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_popc</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_popc</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_brev</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_brev</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_clz</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_clz</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_ffs</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_ffs</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_fma</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_fma</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_cbrt</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_cbrt</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_threadfence</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_threadfence_device</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_threadfence_block</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_threadfence_block</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_threadfence_system</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_threadfence_system</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_syncwarp</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_syncwarp</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_shfl_sync_intrinsic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_shfl_sync_intrinsic</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_vote_sync_intrinsic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_vote_sync_intrinsic</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_match_any_sync</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_match_any_sync</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_match_all_sync</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_match_all_sync</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_activemask</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_activemask</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_lanemask_lt</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_lanemask_lt</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_selp</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_selp</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_nanosleep</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">Cuda_nanosleep</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_atomic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Module</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">atomic</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_fp16</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Module</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">fp16</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_const</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Module</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">const</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">resolve_local</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Module</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">local</span><span class="s2">)</span>
+
+
+<span class="s1">register_global</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Module</span><span class="s2">(</span><span class="s1">cuda</span><span class="s2">))</span>
+
+
+<span class="s3"># NumPy</span>
+
+<span class="s0">for </span><span class="s1">func </span><span class="s0">in </span><span class="s1">trigonometric_functions</span><span class="s2">:</span>
+    <span class="s1">register_numpy_ufunc</span><span class="s2">(</span><span class="s1">func</span><span class="s2">, </span><span class="s1">register_global</span><span class="s2">)</span>
+
+<span class="s0">for </span><span class="s1">func </span><span class="s0">in </span><span class="s1">comparison_functions</span><span class="s2">:</span>
+    <span class="s1">register_numpy_ufunc</span><span class="s2">(</span><span class="s1">func</span><span class="s2">, </span><span class="s1">register_global</span><span class="s2">)</span>
+
+<span class="s0">for </span><span class="s1">func </span><span class="s0">in </span><span class="s1">bit_twiddling_functions</span><span class="s2">:</span>
+    <span class="s1">register_numpy_ufunc</span><span class="s2">(</span><span class="s1">func</span><span class="s2">, </span><span class="s1">register_global</span><span class="s2">)</span>
+
+<span class="s0">for </span><span class="s1">func </span><span class="s0">in </span><span class="s1">math_operations</span><span class="s2">:</span>
+    <span class="s0">if </span><span class="s1">func </span><span class="s0">in </span><span class="s2">(</span><span class="s4">'log'</span><span class="s2">, </span><span class="s4">'log2'</span><span class="s2">, </span><span class="s4">'log10'</span><span class="s2">):</span>
+        <span class="s1">register_numpy_ufunc</span><span class="s2">(</span><span class="s1">func</span><span class="s2">, </span><span class="s1">register_global</span><span class="s2">)</span>
+</pre>
+</body>
+</html>

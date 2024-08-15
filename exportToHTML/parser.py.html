@@ -1,0 +1,552 @@
+<html>
+<head>
+<title>parser.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+parser.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+This module started out as largely a copy paste from the stdlib's 
+optparse module with the features removed that we do not need from 
+optparse because we implement them in Click on a higher level (for 
+instance type handling, help formatting and a lot more). 
+ 
+The plan is to remove more and more from here over time. 
+ 
+The reason this is a different module and not optparse from the stdlib 
+is that there are differences in 2.x and 3.x about the error messages 
+generated and optparse in the stdlib uses gettext for no good reason 
+and might cause us issues. 
+ 
+Click uses parts of optparse written by Gregory P. Ward and maintained 
+by the Python Software Foundation. This is limited to code in parser.py. 
+ 
+Copyright 2001-2006 Gregory P. Ward. All rights reserved. 
+Copyright 2002-2006 Python Software Foundation. All rights reserved. 
+&quot;&quot;&quot;</span>
+<span class="s2"># This code uses parts of optparse written by Gregory P. Ward and</span>
+<span class="s2"># maintained by the Python Software Foundation.</span>
+<span class="s2"># Copyright 2001-2006 Gregory P. Ward</span>
+<span class="s2"># Copyright 2002-2006 Python Software Foundation</span>
+<span class="s3">import </span><span class="s1">typing </span><span class="s3">as </span><span class="s1">t</span>
+<span class="s3">from </span><span class="s1">collections </span><span class="s3">import </span><span class="s1">deque</span>
+<span class="s3">from </span><span class="s1">gettext </span><span class="s3">import </span><span class="s1">gettext </span><span class="s3">as </span><span class="s1">_</span>
+<span class="s3">from </span><span class="s1">gettext </span><span class="s3">import </span><span class="s1">ngettext</span>
+
+<span class="s3">from </span><span class="s4">.</span><span class="s1">exceptions </span><span class="s3">import </span><span class="s1">BadArgumentUsage</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">exceptions </span><span class="s3">import </span><span class="s1">BadOptionUsage</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">exceptions </span><span class="s3">import </span><span class="s1">NoSuchOption</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">exceptions </span><span class="s3">import </span><span class="s1">UsageError</span>
+
+<span class="s3">if </span><span class="s1">t</span><span class="s4">.</span><span class="s1">TYPE_CHECKING</span><span class="s4">:</span>
+    <span class="s3">import </span><span class="s1">typing_extensions </span><span class="s3">as </span><span class="s1">te</span>
+    <span class="s3">from </span><span class="s4">.</span><span class="s1">core </span><span class="s3">import </span><span class="s1">Argument </span><span class="s3">as </span><span class="s1">CoreArgument</span>
+    <span class="s3">from </span><span class="s4">.</span><span class="s1">core </span><span class="s3">import </span><span class="s1">Context</span>
+    <span class="s3">from </span><span class="s4">.</span><span class="s1">core </span><span class="s3">import </span><span class="s1">Option </span><span class="s3">as </span><span class="s1">CoreOption</span>
+    <span class="s3">from </span><span class="s4">.</span><span class="s1">core </span><span class="s3">import </span><span class="s1">Parameter </span><span class="s3">as </span><span class="s1">CoreParameter</span>
+
+<span class="s1">V </span><span class="s4">= </span><span class="s1">t</span><span class="s4">.</span><span class="s1">TypeVar</span><span class="s4">(</span><span class="s5">&quot;V&quot;</span><span class="s4">)</span>
+
+<span class="s2"># Sentinel value that indicates an option was passed as a flag without a</span>
+<span class="s2"># value but is not a flag option. Option.consume_value uses this to</span>
+<span class="s2"># prompt or use the flag_value.</span>
+<span class="s1">_flag_needs_value </span><span class="s4">= </span><span class="s1">object</span><span class="s4">()</span>
+
+
+<span class="s3">def </span><span class="s1">_unpack_args</span><span class="s4">(</span>
+    <span class="s1">args</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Sequence</span><span class="s4">[</span><span class="s1">str</span><span class="s4">], </span><span class="s1">nargs_spec</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Sequence</span><span class="s4">[</span><span class="s1">int</span><span class="s4">]</span>
+<span class="s4">) </span><span class="s1">-&gt; t</span><span class="s4">.</span><span class="s1">Tuple</span><span class="s4">[</span><span class="s1">t</span><span class="s4">.</span><span class="s1">Sequence</span><span class="s4">[</span><span class="s1">t</span><span class="s4">.</span><span class="s1">Union</span><span class="s4">[</span><span class="s1">str</span><span class="s4">, </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Sequence</span><span class="s4">[</span><span class="s1">t</span><span class="s4">.</span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">str</span><span class="s4">]], </span><span class="s3">None</span><span class="s4">]], </span><span class="s1">t</span><span class="s4">.</span><span class="s1">List</span><span class="s4">[</span><span class="s1">str</span><span class="s4">]]:</span>
+    <span class="s0">&quot;&quot;&quot;Given an iterable of arguments and an iterable of nargs specifications, 
+    it returns a tuple with all the unpacked arguments at the first index 
+    and all remaining arguments as the second. 
+ 
+    The nargs specification is the number of arguments that should be consumed 
+    or `-1` to indicate that this position should eat up all the remainders. 
+ 
+    Missing items are filled with `None`. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">args </span><span class="s4">= </span><span class="s1">deque</span><span class="s4">(</span><span class="s1">args</span><span class="s4">)</span>
+    <span class="s1">nargs_spec </span><span class="s4">= </span><span class="s1">deque</span><span class="s4">(</span><span class="s1">nargs_spec</span><span class="s4">)</span>
+    <span class="s1">rv</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">List</span><span class="s4">[</span><span class="s1">t</span><span class="s4">.</span><span class="s1">Union</span><span class="s4">[</span><span class="s1">str</span><span class="s4">, </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Tuple</span><span class="s4">[</span><span class="s1">t</span><span class="s4">.</span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">str</span><span class="s4">], ...], </span><span class="s3">None</span><span class="s4">]] = []</span>
+    <span class="s1">spos</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">int</span><span class="s4">] = </span><span class="s3">None</span>
+
+    <span class="s3">def </span><span class="s1">_fetch</span><span class="s4">(</span><span class="s1">c</span><span class="s4">: </span><span class="s5">&quot;te.Deque[V]&quot;</span><span class="s4">) </span><span class="s1">-&gt; t</span><span class="s4">.</span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">V</span><span class="s4">]:</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">spos </span><span class="s3">is None</span><span class="s4">:</span>
+                <span class="s3">return </span><span class="s1">c</span><span class="s4">.</span><span class="s1">popleft</span><span class="s4">()</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s3">return </span><span class="s1">c</span><span class="s4">.</span><span class="s1">pop</span><span class="s4">()</span>
+        <span class="s3">except </span><span class="s1">IndexError</span><span class="s4">:</span>
+            <span class="s3">return None</span>
+
+    <span class="s3">while </span><span class="s1">nargs_spec</span><span class="s4">:</span>
+        <span class="s1">nargs </span><span class="s4">= </span><span class="s1">_fetch</span><span class="s4">(</span><span class="s1">nargs_spec</span><span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s1">nargs </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s3">continue</span>
+
+        <span class="s3">if </span><span class="s1">nargs </span><span class="s4">== </span><span class="s6">1</span><span class="s4">:</span>
+            <span class="s1">rv</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">_fetch</span><span class="s4">(</span><span class="s1">args</span><span class="s4">))</span>
+        <span class="s3">elif </span><span class="s1">nargs </span><span class="s4">&gt; </span><span class="s6">1</span><span class="s4">:</span>
+            <span class="s1">x </span><span class="s4">= [</span><span class="s1">_fetch</span><span class="s4">(</span><span class="s1">args</span><span class="s4">) </span><span class="s3">for </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">nargs</span><span class="s4">)]</span>
+
+            <span class="s2"># If we're reversed, we're pulling in the arguments in reverse,</span>
+            <span class="s2"># so we need to turn them around.</span>
+            <span class="s3">if </span><span class="s1">spos </span><span class="s3">is not None</span><span class="s4">:</span>
+                <span class="s1">x</span><span class="s4">.</span><span class="s1">reverse</span><span class="s4">()</span>
+
+            <span class="s1">rv</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">tuple</span><span class="s4">(</span><span class="s1">x</span><span class="s4">))</span>
+        <span class="s3">elif </span><span class="s1">nargs </span><span class="s4">&lt; </span><span class="s6">0</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">spos </span><span class="s3">is not None</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">TypeError</span><span class="s4">(</span><span class="s5">&quot;Cannot have two nargs &lt; 0&quot;</span><span class="s4">)</span>
+
+            <span class="s1">spos </span><span class="s4">= </span><span class="s1">len</span><span class="s4">(</span><span class="s1">rv</span><span class="s4">)</span>
+            <span class="s1">rv</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s3">None</span><span class="s4">)</span>
+
+    <span class="s2"># spos is the position of the wildcard (star).  If it's not `None`,</span>
+    <span class="s2"># we fill it with the remainder.</span>
+    <span class="s3">if </span><span class="s1">spos </span><span class="s3">is not None</span><span class="s4">:</span>
+        <span class="s1">rv</span><span class="s4">[</span><span class="s1">spos</span><span class="s4">] = </span><span class="s1">tuple</span><span class="s4">(</span><span class="s1">args</span><span class="s4">)</span>
+        <span class="s1">args </span><span class="s4">= []</span>
+        <span class="s1">rv</span><span class="s4">[</span><span class="s1">spos </span><span class="s4">+ </span><span class="s6">1 </span><span class="s4">:] = </span><span class="s1">reversed</span><span class="s4">(</span><span class="s1">rv</span><span class="s4">[</span><span class="s1">spos </span><span class="s4">+ </span><span class="s6">1 </span><span class="s4">:])</span>
+
+    <span class="s3">return </span><span class="s1">tuple</span><span class="s4">(</span><span class="s1">rv</span><span class="s4">), </span><span class="s1">list</span><span class="s4">(</span><span class="s1">args</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">split_opt</span><span class="s4">(</span><span class="s1">opt</span><span class="s4">: </span><span class="s1">str</span><span class="s4">) </span><span class="s1">-&gt; t</span><span class="s4">.</span><span class="s1">Tuple</span><span class="s4">[</span><span class="s1">str</span><span class="s4">, </span><span class="s1">str</span><span class="s4">]:</span>
+    <span class="s1">first </span><span class="s4">= </span><span class="s1">opt</span><span class="s4">[:</span><span class="s6">1</span><span class="s4">]</span>
+    <span class="s3">if </span><span class="s1">first</span><span class="s4">.</span><span class="s1">isalnum</span><span class="s4">():</span>
+        <span class="s3">return </span><span class="s5">&quot;&quot;</span><span class="s4">, </span><span class="s1">opt</span>
+    <span class="s3">if </span><span class="s1">opt</span><span class="s4">[</span><span class="s6">1</span><span class="s4">:</span><span class="s6">2</span><span class="s4">] == </span><span class="s1">first</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">opt</span><span class="s4">[:</span><span class="s6">2</span><span class="s4">], </span><span class="s1">opt</span><span class="s4">[</span><span class="s6">2</span><span class="s4">:]</span>
+    <span class="s3">return </span><span class="s1">first</span><span class="s4">, </span><span class="s1">opt</span><span class="s4">[</span><span class="s6">1</span><span class="s4">:]</span>
+
+
+<span class="s3">def </span><span class="s1">normalize_opt</span><span class="s4">(</span><span class="s1">opt</span><span class="s4">: </span><span class="s1">str</span><span class="s4">, </span><span class="s1">ctx</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Optional</span><span class="s4">[</span><span class="s5">&quot;Context&quot;</span><span class="s4">]) </span><span class="s1">-&gt; str</span><span class="s4">:</span>
+    <span class="s3">if </span><span class="s1">ctx </span><span class="s3">is None or </span><span class="s1">ctx</span><span class="s4">.</span><span class="s1">token_normalize_func </span><span class="s3">is None</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">opt</span>
+    <span class="s1">prefix</span><span class="s4">, </span><span class="s1">opt </span><span class="s4">= </span><span class="s1">split_opt</span><span class="s4">(</span><span class="s1">opt</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s5">f&quot;</span><span class="s3">{</span><span class="s1">prefix</span><span class="s3">}{</span><span class="s1">ctx</span><span class="s4">.</span><span class="s1">token_normalize_func</span><span class="s4">(</span><span class="s1">opt</span><span class="s4">)</span><span class="s3">}</span><span class="s5">&quot;</span>
+
+
+<span class="s3">def </span><span class="s1">split_arg_string</span><span class="s4">(</span><span class="s1">string</span><span class="s4">: </span><span class="s1">str</span><span class="s4">) </span><span class="s1">-&gt; t</span><span class="s4">.</span><span class="s1">List</span><span class="s4">[</span><span class="s1">str</span><span class="s4">]:</span>
+    <span class="s0">&quot;&quot;&quot;Split an argument string as with :func:`shlex.split`, but don't 
+    fail if the string is incomplete. Ignores a missing closing quote or 
+    incomplete escape sequence and uses the partial token as-is. 
+ 
+    .. code-block:: python 
+ 
+        split_arg_string(&quot;example 'my file&quot;) 
+        [&quot;example&quot;, &quot;my file&quot;] 
+ 
+        split_arg_string(&quot;example my\\&quot;) 
+        [&quot;example&quot;, &quot;my&quot;] 
+ 
+    :param string: String to split. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">import </span><span class="s1">shlex</span>
+
+    <span class="s1">lex </span><span class="s4">= </span><span class="s1">shlex</span><span class="s4">.</span><span class="s1">shlex</span><span class="s4">(</span><span class="s1">string</span><span class="s4">, </span><span class="s1">posix</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)</span>
+    <span class="s1">lex</span><span class="s4">.</span><span class="s1">whitespace_split </span><span class="s4">= </span><span class="s3">True</span>
+    <span class="s1">lex</span><span class="s4">.</span><span class="s1">commenters </span><span class="s4">= </span><span class="s5">&quot;&quot;</span>
+    <span class="s1">out </span><span class="s4">= []</span>
+
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s3">for </span><span class="s1">token </span><span class="s3">in </span><span class="s1">lex</span><span class="s4">:</span>
+            <span class="s1">out</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">token</span><span class="s4">)</span>
+    <span class="s3">except </span><span class="s1">ValueError</span><span class="s4">:</span>
+        <span class="s2"># Raised when end-of-string is reached in an invalid state. Use</span>
+        <span class="s2"># the partial token as-is. The quote or escape character is in</span>
+        <span class="s2"># lex.state, not lex.token.</span>
+        <span class="s1">out</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">lex</span><span class="s4">.</span><span class="s1">token</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">out</span>
+
+
+<span class="s3">class </span><span class="s1">Option</span><span class="s4">:</span>
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s1">obj</span><span class="s4">: </span><span class="s5">&quot;CoreOption&quot;</span><span class="s4">,</span>
+        <span class="s1">opts</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Sequence</span><span class="s4">[</span><span class="s1">str</span><span class="s4">],</span>
+        <span class="s1">dest</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">str</span><span class="s4">],</span>
+        <span class="s1">action</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">str</span><span class="s4">] = </span><span class="s3">None</span><span class="s4">,</span>
+        <span class="s1">nargs</span><span class="s4">: </span><span class="s1">int </span><span class="s4">= </span><span class="s6">1</span><span class="s4">,</span>
+        <span class="s1">const</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">t</span><span class="s4">.</span><span class="s1">Any</span><span class="s4">] = </span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_short_opts </span><span class="s4">= []</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_long_opts </span><span class="s4">= []</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">prefixes</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Set</span><span class="s4">[</span><span class="s1">str</span><span class="s4">] = </span><span class="s1">set</span><span class="s4">()</span>
+
+        <span class="s3">for </span><span class="s1">opt </span><span class="s3">in </span><span class="s1">opts</span><span class="s4">:</span>
+            <span class="s1">prefix</span><span class="s4">, </span><span class="s1">value </span><span class="s4">= </span><span class="s1">split_opt</span><span class="s4">(</span><span class="s1">opt</span><span class="s4">)</span>
+            <span class="s3">if not </span><span class="s1">prefix</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">f&quot;Invalid start character for option (</span><span class="s3">{</span><span class="s1">opt</span><span class="s3">}</span><span class="s5">)&quot;</span><span class="s4">)</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">prefixes</span><span class="s4">.</span><span class="s1">add</span><span class="s4">(</span><span class="s1">prefix</span><span class="s4">[</span><span class="s6">0</span><span class="s4">])</span>
+            <span class="s3">if </span><span class="s1">len</span><span class="s4">(</span><span class="s1">prefix</span><span class="s4">) == </span><span class="s6">1 </span><span class="s3">and </span><span class="s1">len</span><span class="s4">(</span><span class="s1">value</span><span class="s4">) == </span><span class="s6">1</span><span class="s4">:</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">_short_opts</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">opt</span><span class="s4">)</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">_long_opts</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">opt</span><span class="s4">)</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">prefixes</span><span class="s4">.</span><span class="s1">add</span><span class="s4">(</span><span class="s1">prefix</span><span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s1">action </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s1">action </span><span class="s4">= </span><span class="s5">&quot;store&quot;</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">dest </span><span class="s4">= </span><span class="s1">dest</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">action </span><span class="s4">= </span><span class="s1">action</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">nargs </span><span class="s4">= </span><span class="s1">nargs</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">const </span><span class="s4">= </span><span class="s1">const</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">obj </span><span class="s4">= </span><span class="s1">obj</span>
+
+    <span class="s4">@</span><span class="s1">property</span>
+    <span class="s3">def </span><span class="s1">takes_value</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; bool</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">action </span><span class="s3">in </span><span class="s4">(</span><span class="s5">&quot;store&quot;</span><span class="s4">, </span><span class="s5">&quot;append&quot;</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">process</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">value</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Any</span><span class="s4">, </span><span class="s1">state</span><span class="s4">: </span><span class="s5">&quot;ParsingState&quot;</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">action </span><span class="s4">== </span><span class="s5">&quot;store&quot;</span><span class="s4">:</span>
+            <span class="s1">state</span><span class="s4">.</span><span class="s1">opts</span><span class="s4">[</span><span class="s1">self</span><span class="s4">.</span><span class="s1">dest</span><span class="s4">] = </span><span class="s1">value  </span><span class="s2"># type: ignore</span>
+        <span class="s3">elif </span><span class="s1">self</span><span class="s4">.</span><span class="s1">action </span><span class="s4">== </span><span class="s5">&quot;store_const&quot;</span><span class="s4">:</span>
+            <span class="s1">state</span><span class="s4">.</span><span class="s1">opts</span><span class="s4">[</span><span class="s1">self</span><span class="s4">.</span><span class="s1">dest</span><span class="s4">] = </span><span class="s1">self</span><span class="s4">.</span><span class="s1">const  </span><span class="s2"># type: ignore</span>
+        <span class="s3">elif </span><span class="s1">self</span><span class="s4">.</span><span class="s1">action </span><span class="s4">== </span><span class="s5">&quot;append&quot;</span><span class="s4">:</span>
+            <span class="s1">state</span><span class="s4">.</span><span class="s1">opts</span><span class="s4">.</span><span class="s1">setdefault</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">dest</span><span class="s4">, []).</span><span class="s1">append</span><span class="s4">(</span><span class="s1">value</span><span class="s4">)  </span><span class="s2"># type: ignore</span>
+        <span class="s3">elif </span><span class="s1">self</span><span class="s4">.</span><span class="s1">action </span><span class="s4">== </span><span class="s5">&quot;append_const&quot;</span><span class="s4">:</span>
+            <span class="s1">state</span><span class="s4">.</span><span class="s1">opts</span><span class="s4">.</span><span class="s1">setdefault</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">dest</span><span class="s4">, []).</span><span class="s1">append</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">const</span><span class="s4">)  </span><span class="s2"># type: ignore</span>
+        <span class="s3">elif </span><span class="s1">self</span><span class="s4">.</span><span class="s1">action </span><span class="s4">== </span><span class="s5">&quot;count&quot;</span><span class="s4">:</span>
+            <span class="s1">state</span><span class="s4">.</span><span class="s1">opts</span><span class="s4">[</span><span class="s1">self</span><span class="s4">.</span><span class="s1">dest</span><span class="s4">] = </span><span class="s1">state</span><span class="s4">.</span><span class="s1">opts</span><span class="s4">.</span><span class="s1">get</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">dest</span><span class="s4">, </span><span class="s6">0</span><span class="s4">) + </span><span class="s6">1  </span><span class="s2"># type: ignore</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">f&quot;unknown action '</span><span class="s3">{</span><span class="s1">self</span><span class="s4">.</span><span class="s1">action</span><span class="s3">}</span><span class="s5">'&quot;</span><span class="s4">)</span>
+        <span class="s1">state</span><span class="s4">.</span><span class="s1">order</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">obj</span><span class="s4">)</span>
+
+
+<span class="s3">class </span><span class="s1">Argument</span><span class="s4">:</span>
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">obj</span><span class="s4">: </span><span class="s5">&quot;CoreArgument&quot;</span><span class="s4">, </span><span class="s1">dest</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">str</span><span class="s4">], </span><span class="s1">nargs</span><span class="s4">: </span><span class="s1">int </span><span class="s4">= </span><span class="s6">1</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">dest </span><span class="s4">= </span><span class="s1">dest</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">nargs </span><span class="s4">= </span><span class="s1">nargs</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">obj </span><span class="s4">= </span><span class="s1">obj</span>
+
+    <span class="s3">def </span><span class="s1">process</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s1">value</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Union</span><span class="s4">[</span><span class="s1">t</span><span class="s4">.</span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">str</span><span class="s4">], </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Sequence</span><span class="s4">[</span><span class="s1">t</span><span class="s4">.</span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">str</span><span class="s4">]]],</span>
+        <span class="s1">state</span><span class="s4">: </span><span class="s5">&quot;ParsingState&quot;</span><span class="s4">,</span>
+    <span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">nargs </span><span class="s4">&gt; </span><span class="s6">1</span><span class="s4">:</span>
+            <span class="s3">assert </span><span class="s1">value </span><span class="s3">is not None</span>
+            <span class="s1">holes </span><span class="s4">= </span><span class="s1">sum</span><span class="s4">(</span><span class="s6">1 </span><span class="s3">for </span><span class="s1">x </span><span class="s3">in </span><span class="s1">value </span><span class="s3">if </span><span class="s1">x </span><span class="s3">is None</span><span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">holes </span><span class="s4">== </span><span class="s1">len</span><span class="s4">(</span><span class="s1">value</span><span class="s4">):</span>
+                <span class="s1">value </span><span class="s4">= </span><span class="s3">None</span>
+            <span class="s3">elif </span><span class="s1">holes </span><span class="s4">!= </span><span class="s6">0</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">BadArgumentUsage</span><span class="s4">(</span>
+                    <span class="s1">_</span><span class="s4">(</span><span class="s5">&quot;Argument {name!r} takes {nargs} values.&quot;</span><span class="s4">).</span><span class="s1">format</span><span class="s4">(</span>
+                        <span class="s1">name</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">dest</span><span class="s4">, </span><span class="s1">nargs</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">nargs</span>
+                    <span class="s4">)</span>
+                <span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">nargs </span><span class="s4">== -</span><span class="s6">1 </span><span class="s3">and </span><span class="s1">self</span><span class="s4">.</span><span class="s1">obj</span><span class="s4">.</span><span class="s1">envvar </span><span class="s3">is not None and </span><span class="s1">value </span><span class="s4">== ():</span>
+            <span class="s2"># Replace empty tuple with None so that a value from the</span>
+            <span class="s2"># environment may be tried.</span>
+            <span class="s1">value </span><span class="s4">= </span><span class="s3">None</span>
+
+        <span class="s1">state</span><span class="s4">.</span><span class="s1">opts</span><span class="s4">[</span><span class="s1">self</span><span class="s4">.</span><span class="s1">dest</span><span class="s4">] = </span><span class="s1">value  </span><span class="s2"># type: ignore</span>
+        <span class="s1">state</span><span class="s4">.</span><span class="s1">order</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">obj</span><span class="s4">)</span>
+
+
+<span class="s3">class </span><span class="s1">ParsingState</span><span class="s4">:</span>
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">rargs</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">List</span><span class="s4">[</span><span class="s1">str</span><span class="s4">]) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">opts</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Dict</span><span class="s4">[</span><span class="s1">str</span><span class="s4">, </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Any</span><span class="s4">] = {}</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">largs</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">List</span><span class="s4">[</span><span class="s1">str</span><span class="s4">] = []</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">rargs </span><span class="s4">= </span><span class="s1">rargs</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">order</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">List</span><span class="s4">[</span><span class="s5">&quot;CoreParameter&quot;</span><span class="s4">] = []</span>
+
+
+<span class="s3">class </span><span class="s1">OptionParser</span><span class="s4">:</span>
+    <span class="s0">&quot;&quot;&quot;The option parser is an internal class that is ultimately used to 
+    parse options and arguments.  It's modelled after optparse and brings 
+    a similar but vastly simplified API.  It should generally not be used 
+    directly as the high level Click classes wrap it for you. 
+ 
+    It's not nearly as extensible as optparse or argparse as it does not 
+    implement features that are implemented on a higher level (such as 
+    types or defaults). 
+ 
+    :param ctx: optionally the :class:`~click.Context` where this parser 
+                should go with. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">ctx</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Optional</span><span class="s4">[</span><span class="s5">&quot;Context&quot;</span><span class="s4">] = </span><span class="s3">None</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s2">#: The :class:`~click.Context` for this parser.  This might be</span>
+        <span class="s2">#: `None` for some advanced use cases.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">ctx </span><span class="s4">= </span><span class="s1">ctx</span>
+        <span class="s2">#: This controls how the parser deals with interspersed arguments.</span>
+        <span class="s2">#: If this is set to `False`, the parser will stop on the first</span>
+        <span class="s2">#: non-option.  Click uses this to implement nested subcommands</span>
+        <span class="s2">#: safely.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">allow_interspersed_args</span><span class="s4">: </span><span class="s1">bool </span><span class="s4">= </span><span class="s3">True</span>
+        <span class="s2">#: This tells the parser how to deal with unknown options.  By</span>
+        <span class="s2">#: default it will error out (which is sensible), but there is a</span>
+        <span class="s2">#: second mode where it will ignore it and continue processing</span>
+        <span class="s2">#: after shifting all the unknown options into the resulting args.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">ignore_unknown_options</span><span class="s4">: </span><span class="s1">bool </span><span class="s4">= </span><span class="s3">False</span>
+
+        <span class="s3">if </span><span class="s1">ctx </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">allow_interspersed_args </span><span class="s4">= </span><span class="s1">ctx</span><span class="s4">.</span><span class="s1">allow_interspersed_args</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">ignore_unknown_options </span><span class="s4">= </span><span class="s1">ctx</span><span class="s4">.</span><span class="s1">ignore_unknown_options</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_short_opt</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Dict</span><span class="s4">[</span><span class="s1">str</span><span class="s4">, </span><span class="s1">Option</span><span class="s4">] = {}</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_long_opt</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Dict</span><span class="s4">[</span><span class="s1">str</span><span class="s4">, </span><span class="s1">Option</span><span class="s4">] = {}</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_opt_prefixes </span><span class="s4">= {</span><span class="s5">&quot;-&quot;</span><span class="s4">, </span><span class="s5">&quot;--&quot;</span><span class="s4">}</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_args</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">List</span><span class="s4">[</span><span class="s1">Argument</span><span class="s4">] = []</span>
+
+    <span class="s3">def </span><span class="s1">add_option</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s1">obj</span><span class="s4">: </span><span class="s5">&quot;CoreOption&quot;</span><span class="s4">,</span>
+        <span class="s1">opts</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Sequence</span><span class="s4">[</span><span class="s1">str</span><span class="s4">],</span>
+        <span class="s1">dest</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">str</span><span class="s4">],</span>
+        <span class="s1">action</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">str</span><span class="s4">] = </span><span class="s3">None</span><span class="s4">,</span>
+        <span class="s1">nargs</span><span class="s4">: </span><span class="s1">int </span><span class="s4">= </span><span class="s6">1</span><span class="s4">,</span>
+        <span class="s1">const</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">t</span><span class="s4">.</span><span class="s1">Any</span><span class="s4">] = </span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s0">&quot;&quot;&quot;Adds a new option named `dest` to the parser.  The destination 
+        is not inferred (unlike with optparse) and needs to be explicitly 
+        provided.  Action can be any of ``store``, ``store_const``, 
+        ``append``, ``append_const`` or ``count``. 
+ 
+        The `obj` can be used to identify the option in the order list 
+        that is returned from the parser. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">opts </span><span class="s4">= [</span><span class="s1">normalize_opt</span><span class="s4">(</span><span class="s1">opt</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">ctx</span><span class="s4">) </span><span class="s3">for </span><span class="s1">opt </span><span class="s3">in </span><span class="s1">opts</span><span class="s4">]</span>
+        <span class="s1">option </span><span class="s4">= </span><span class="s1">Option</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">, </span><span class="s1">opts</span><span class="s4">, </span><span class="s1">dest</span><span class="s4">, </span><span class="s1">action</span><span class="s4">=</span><span class="s1">action</span><span class="s4">, </span><span class="s1">nargs</span><span class="s4">=</span><span class="s1">nargs</span><span class="s4">, </span><span class="s1">const</span><span class="s4">=</span><span class="s1">const</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_opt_prefixes</span><span class="s4">.</span><span class="s1">update</span><span class="s4">(</span><span class="s1">option</span><span class="s4">.</span><span class="s1">prefixes</span><span class="s4">)</span>
+        <span class="s3">for </span><span class="s1">opt </span><span class="s3">in </span><span class="s1">option</span><span class="s4">.</span><span class="s1">_short_opts</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_short_opt</span><span class="s4">[</span><span class="s1">opt</span><span class="s4">] = </span><span class="s1">option</span>
+        <span class="s3">for </span><span class="s1">opt </span><span class="s3">in </span><span class="s1">option</span><span class="s4">.</span><span class="s1">_long_opts</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_long_opt</span><span class="s4">[</span><span class="s1">opt</span><span class="s4">] = </span><span class="s1">option</span>
+
+    <span class="s3">def </span><span class="s1">add_argument</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">, </span><span class="s1">obj</span><span class="s4">: </span><span class="s5">&quot;CoreArgument&quot;</span><span class="s4">, </span><span class="s1">dest</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">str</span><span class="s4">], </span><span class="s1">nargs</span><span class="s4">: </span><span class="s1">int </span><span class="s4">= </span><span class="s6">1</span>
+    <span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s0">&quot;&quot;&quot;Adds a positional argument named `dest` to the parser. 
+ 
+        The `obj` can be used to identify the option in the order list 
+        that is returned from the parser. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_args</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">Argument</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">, </span><span class="s1">dest</span><span class="s4">=</span><span class="s1">dest</span><span class="s4">, </span><span class="s1">nargs</span><span class="s4">=</span><span class="s1">nargs</span><span class="s4">))</span>
+
+    <span class="s3">def </span><span class="s1">parse_args</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">, </span><span class="s1">args</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">List</span><span class="s4">[</span><span class="s1">str</span><span class="s4">]</span>
+    <span class="s4">) </span><span class="s1">-&gt; t</span><span class="s4">.</span><span class="s1">Tuple</span><span class="s4">[</span><span class="s1">t</span><span class="s4">.</span><span class="s1">Dict</span><span class="s4">[</span><span class="s1">str</span><span class="s4">, </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Any</span><span class="s4">], </span><span class="s1">t</span><span class="s4">.</span><span class="s1">List</span><span class="s4">[</span><span class="s1">str</span><span class="s4">], </span><span class="s1">t</span><span class="s4">.</span><span class="s1">List</span><span class="s4">[</span><span class="s5">&quot;CoreParameter&quot;</span><span class="s4">]]:</span>
+        <span class="s0">&quot;&quot;&quot;Parses positional arguments and returns ``(values, args, order)`` 
+        for the parsed options and arguments as well as the leftover 
+        arguments if there are any.  The order is a list of objects as they 
+        appear on the command line.  If arguments appear multiple times they 
+        will be memorized multiple times as well. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">state </span><span class="s4">= </span><span class="s1">ParsingState</span><span class="s4">(</span><span class="s1">args</span><span class="s4">)</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_process_args_for_options</span><span class="s4">(</span><span class="s1">state</span><span class="s4">)</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_process_args_for_args</span><span class="s4">(</span><span class="s1">state</span><span class="s4">)</span>
+        <span class="s3">except </span><span class="s1">UsageError</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">ctx </span><span class="s3">is None or not </span><span class="s1">self</span><span class="s4">.</span><span class="s1">ctx</span><span class="s4">.</span><span class="s1">resilient_parsing</span><span class="s4">:</span>
+                <span class="s3">raise</span>
+        <span class="s3">return </span><span class="s1">state</span><span class="s4">.</span><span class="s1">opts</span><span class="s4">, </span><span class="s1">state</span><span class="s4">.</span><span class="s1">largs</span><span class="s4">, </span><span class="s1">state</span><span class="s4">.</span><span class="s1">order</span>
+
+    <span class="s3">def </span><span class="s1">_process_args_for_args</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">state</span><span class="s4">: </span><span class="s1">ParsingState</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s1">pargs</span><span class="s4">, </span><span class="s1">args </span><span class="s4">= </span><span class="s1">_unpack_args</span><span class="s4">(</span>
+            <span class="s1">state</span><span class="s4">.</span><span class="s1">largs </span><span class="s4">+ </span><span class="s1">state</span><span class="s4">.</span><span class="s1">rargs</span><span class="s4">, [</span><span class="s1">x</span><span class="s4">.</span><span class="s1">nargs </span><span class="s3">for </span><span class="s1">x </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_args</span><span class="s4">]</span>
+        <span class="s4">)</span>
+
+        <span class="s3">for </span><span class="s1">idx</span><span class="s4">, </span><span class="s1">arg </span><span class="s3">in </span><span class="s1">enumerate</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_args</span><span class="s4">):</span>
+            <span class="s1">arg</span><span class="s4">.</span><span class="s1">process</span><span class="s4">(</span><span class="s1">pargs</span><span class="s4">[</span><span class="s1">idx</span><span class="s4">], </span><span class="s1">state</span><span class="s4">)</span>
+
+        <span class="s1">state</span><span class="s4">.</span><span class="s1">largs </span><span class="s4">= </span><span class="s1">args</span>
+        <span class="s1">state</span><span class="s4">.</span><span class="s1">rargs </span><span class="s4">= []</span>
+
+    <span class="s3">def </span><span class="s1">_process_args_for_options</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">state</span><span class="s4">: </span><span class="s1">ParsingState</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s3">while </span><span class="s1">state</span><span class="s4">.</span><span class="s1">rargs</span><span class="s4">:</span>
+            <span class="s1">arg </span><span class="s4">= </span><span class="s1">state</span><span class="s4">.</span><span class="s1">rargs</span><span class="s4">.</span><span class="s1">pop</span><span class="s4">(</span><span class="s6">0</span><span class="s4">)</span>
+            <span class="s1">arglen </span><span class="s4">= </span><span class="s1">len</span><span class="s4">(</span><span class="s1">arg</span><span class="s4">)</span>
+            <span class="s2"># Double dashes always handled explicitly regardless of what</span>
+            <span class="s2"># prefixes are valid.</span>
+            <span class="s3">if </span><span class="s1">arg </span><span class="s4">== </span><span class="s5">&quot;--&quot;</span><span class="s4">:</span>
+                <span class="s3">return</span>
+            <span class="s3">elif </span><span class="s1">arg</span><span class="s4">[:</span><span class="s6">1</span><span class="s4">] </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_opt_prefixes </span><span class="s3">and </span><span class="s1">arglen </span><span class="s4">&gt; </span><span class="s6">1</span><span class="s4">:</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">_process_opts</span><span class="s4">(</span><span class="s1">arg</span><span class="s4">, </span><span class="s1">state</span><span class="s4">)</span>
+            <span class="s3">elif </span><span class="s1">self</span><span class="s4">.</span><span class="s1">allow_interspersed_args</span><span class="s4">:</span>
+                <span class="s1">state</span><span class="s4">.</span><span class="s1">largs</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">arg</span><span class="s4">)</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">state</span><span class="s4">.</span><span class="s1">rargs</span><span class="s4">.</span><span class="s1">insert</span><span class="s4">(</span><span class="s6">0</span><span class="s4">, </span><span class="s1">arg</span><span class="s4">)</span>
+                <span class="s3">return</span>
+
+        <span class="s2"># Say this is the original argument list:</span>
+        <span class="s2"># [arg0, arg1, ..., arg(i-1), arg(i), arg(i+1), ..., arg(N-1)]</span>
+        <span class="s2">#                            ^</span>
+        <span class="s2"># (we are about to process arg(i)).</span>
+        <span class="s2">#</span>
+        <span class="s2"># Then rargs is [arg(i), ..., arg(N-1)] and largs is a *subset* of</span>
+        <span class="s2"># [arg0, ..., arg(i-1)] (any options and their arguments will have</span>
+        <span class="s2"># been removed from largs).</span>
+        <span class="s2">#</span>
+        <span class="s2"># The while loop will usually consume 1 or more arguments per pass.</span>
+        <span class="s2"># If it consumes 1 (eg. arg is an option that takes no arguments),</span>
+        <span class="s2"># then after _process_arg() is done the situation is:</span>
+        <span class="s2">#</span>
+        <span class="s2">#   largs = subset of [arg0, ..., arg(i)]</span>
+        <span class="s2">#   rargs = [arg(i+1), ..., arg(N-1)]</span>
+        <span class="s2">#</span>
+        <span class="s2"># If allow_interspersed_args is false, largs will always be</span>
+        <span class="s2"># *empty* -- still a subset of [arg0, ..., arg(i-1)], but</span>
+        <span class="s2"># not a very interesting subset!</span>
+
+    <span class="s3">def </span><span class="s1">_match_long_opt</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">, </span><span class="s1">opt</span><span class="s4">: </span><span class="s1">str</span><span class="s4">, </span><span class="s1">explicit_value</span><span class="s4">: </span><span class="s1">t</span><span class="s4">.</span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">str</span><span class="s4">], </span><span class="s1">state</span><span class="s4">: </span><span class="s1">ParsingState</span>
+    <span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s3">if </span><span class="s1">opt </span><span class="s3">not in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_long_opt</span><span class="s4">:</span>
+            <span class="s3">from </span><span class="s1">difflib </span><span class="s3">import </span><span class="s1">get_close_matches</span>
+
+            <span class="s1">possibilities </span><span class="s4">= </span><span class="s1">get_close_matches</span><span class="s4">(</span><span class="s1">opt</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_long_opt</span><span class="s4">)</span>
+            <span class="s3">raise </span><span class="s1">NoSuchOption</span><span class="s4">(</span><span class="s1">opt</span><span class="s4">, </span><span class="s1">possibilities</span><span class="s4">=</span><span class="s1">possibilities</span><span class="s4">, </span><span class="s1">ctx</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">ctx</span><span class="s4">)</span>
+
+        <span class="s1">option </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_long_opt</span><span class="s4">[</span><span class="s1">opt</span><span class="s4">]</span>
+        <span class="s3">if </span><span class="s1">option</span><span class="s4">.</span><span class="s1">takes_value</span><span class="s4">:</span>
+            <span class="s2"># At this point it's safe to modify rargs by injecting the</span>
+            <span class="s2"># explicit value, because no exception is raised in this</span>
+            <span class="s2"># branch.  This means that the inserted value will be fully</span>
+            <span class="s2"># consumed.</span>
+            <span class="s3">if </span><span class="s1">explicit_value </span><span class="s3">is not None</span><span class="s4">:</span>
+                <span class="s1">state</span><span class="s4">.</span><span class="s1">rargs</span><span class="s4">.</span><span class="s1">insert</span><span class="s4">(</span><span class="s6">0</span><span class="s4">, </span><span class="s1">explicit_value</span><span class="s4">)</span>
+
+            <span class="s1">value </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_get_value_from_state</span><span class="s4">(</span><span class="s1">opt</span><span class="s4">, </span><span class="s1">option</span><span class="s4">, </span><span class="s1">state</span><span class="s4">)</span>
+
+        <span class="s3">elif </span><span class="s1">explicit_value </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">BadOptionUsage</span><span class="s4">(</span>
+                <span class="s1">opt</span><span class="s4">, </span><span class="s1">_</span><span class="s4">(</span><span class="s5">&quot;Option {name!r} does not take a value.&quot;</span><span class="s4">).</span><span class="s1">format</span><span class="s4">(</span><span class="s1">name</span><span class="s4">=</span><span class="s1">opt</span><span class="s4">)</span>
+            <span class="s4">)</span>
+
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">value </span><span class="s4">= </span><span class="s3">None</span>
+
+        <span class="s1">option</span><span class="s4">.</span><span class="s1">process</span><span class="s4">(</span><span class="s1">value</span><span class="s4">, </span><span class="s1">state</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_match_short_opt</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">arg</span><span class="s4">: </span><span class="s1">str</span><span class="s4">, </span><span class="s1">state</span><span class="s4">: </span><span class="s1">ParsingState</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s1">stop </span><span class="s4">= </span><span class="s3">False</span>
+        <span class="s1">i </span><span class="s4">= </span><span class="s6">1</span>
+        <span class="s1">prefix </span><span class="s4">= </span><span class="s1">arg</span><span class="s4">[</span><span class="s6">0</span><span class="s4">]</span>
+        <span class="s1">unknown_options </span><span class="s4">= []</span>
+
+        <span class="s3">for </span><span class="s1">ch </span><span class="s3">in </span><span class="s1">arg</span><span class="s4">[</span><span class="s6">1</span><span class="s4">:]:</span>
+            <span class="s1">opt </span><span class="s4">= </span><span class="s1">normalize_opt</span><span class="s4">(</span><span class="s5">f&quot;</span><span class="s3">{</span><span class="s1">prefix</span><span class="s3">}{</span><span class="s1">ch</span><span class="s3">}</span><span class="s5">&quot;</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">ctx</span><span class="s4">)</span>
+            <span class="s1">option </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_short_opt</span><span class="s4">.</span><span class="s1">get</span><span class="s4">(</span><span class="s1">opt</span><span class="s4">)</span>
+            <span class="s1">i </span><span class="s4">+= </span><span class="s6">1</span>
+
+            <span class="s3">if not </span><span class="s1">option</span><span class="s4">:</span>
+                <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">ignore_unknown_options</span><span class="s4">:</span>
+                    <span class="s1">unknown_options</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">ch</span><span class="s4">)</span>
+                    <span class="s3">continue</span>
+                <span class="s3">raise </span><span class="s1">NoSuchOption</span><span class="s4">(</span><span class="s1">opt</span><span class="s4">, </span><span class="s1">ctx</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">ctx</span><span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">option</span><span class="s4">.</span><span class="s1">takes_value</span><span class="s4">:</span>
+                <span class="s2"># Any characters left in arg?  Pretend they're the</span>
+                <span class="s2"># next arg, and stop consuming characters of arg.</span>
+                <span class="s3">if </span><span class="s1">i </span><span class="s4">&lt; </span><span class="s1">len</span><span class="s4">(</span><span class="s1">arg</span><span class="s4">):</span>
+                    <span class="s1">state</span><span class="s4">.</span><span class="s1">rargs</span><span class="s4">.</span><span class="s1">insert</span><span class="s4">(</span><span class="s6">0</span><span class="s4">, </span><span class="s1">arg</span><span class="s4">[</span><span class="s1">i</span><span class="s4">:])</span>
+                    <span class="s1">stop </span><span class="s4">= </span><span class="s3">True</span>
+
+                <span class="s1">value </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_get_value_from_state</span><span class="s4">(</span><span class="s1">opt</span><span class="s4">, </span><span class="s1">option</span><span class="s4">, </span><span class="s1">state</span><span class="s4">)</span>
+
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">value </span><span class="s4">= </span><span class="s3">None</span>
+
+            <span class="s1">option</span><span class="s4">.</span><span class="s1">process</span><span class="s4">(</span><span class="s1">value</span><span class="s4">, </span><span class="s1">state</span><span class="s4">)</span>
+
+            <span class="s3">if </span><span class="s1">stop</span><span class="s4">:</span>
+                <span class="s3">break</span>
+
+        <span class="s2"># If we got any unknown options we recombine the string of the</span>
+        <span class="s2"># remaining options and re-attach the prefix, then report that</span>
+        <span class="s2"># to the state as new larg.  This way there is basic combinatorics</span>
+        <span class="s2"># that can be achieved while still ignoring unknown arguments.</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">ignore_unknown_options </span><span class="s3">and </span><span class="s1">unknown_options</span><span class="s4">:</span>
+            <span class="s1">state</span><span class="s4">.</span><span class="s1">largs</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s5">f&quot;</span><span class="s3">{</span><span class="s1">prefix</span><span class="s3">}{</span><span class="s5">''</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">unknown_options</span><span class="s4">)</span><span class="s3">}</span><span class="s5">&quot;</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_get_value_from_state</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">, </span><span class="s1">option_name</span><span class="s4">: </span><span class="s1">str</span><span class="s4">, </span><span class="s1">option</span><span class="s4">: </span><span class="s1">Option</span><span class="s4">, </span><span class="s1">state</span><span class="s4">: </span><span class="s1">ParsingState</span>
+    <span class="s4">) </span><span class="s1">-&gt; t</span><span class="s4">.</span><span class="s1">Any</span><span class="s4">:</span>
+        <span class="s1">nargs </span><span class="s4">= </span><span class="s1">option</span><span class="s4">.</span><span class="s1">nargs</span>
+
+        <span class="s3">if </span><span class="s1">len</span><span class="s4">(</span><span class="s1">state</span><span class="s4">.</span><span class="s1">rargs</span><span class="s4">) &lt; </span><span class="s1">nargs</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">option</span><span class="s4">.</span><span class="s1">obj</span><span class="s4">.</span><span class="s1">_flag_needs_value</span><span class="s4">:</span>
+                <span class="s2"># Option allows omitting the value.</span>
+                <span class="s1">value </span><span class="s4">= </span><span class="s1">_flag_needs_value</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">BadOptionUsage</span><span class="s4">(</span>
+                    <span class="s1">option_name</span><span class="s4">,</span>
+                    <span class="s1">ngettext</span><span class="s4">(</span>
+                        <span class="s5">&quot;Option {name!r} requires an argument.&quot;</span><span class="s4">,</span>
+                        <span class="s5">&quot;Option {name!r} requires {nargs} arguments.&quot;</span><span class="s4">,</span>
+                        <span class="s1">nargs</span><span class="s4">,</span>
+                    <span class="s4">).</span><span class="s1">format</span><span class="s4">(</span><span class="s1">name</span><span class="s4">=</span><span class="s1">option_name</span><span class="s4">, </span><span class="s1">nargs</span><span class="s4">=</span><span class="s1">nargs</span><span class="s4">),</span>
+                <span class="s4">)</span>
+        <span class="s3">elif </span><span class="s1">nargs </span><span class="s4">== </span><span class="s6">1</span><span class="s4">:</span>
+            <span class="s1">next_rarg </span><span class="s4">= </span><span class="s1">state</span><span class="s4">.</span><span class="s1">rargs</span><span class="s4">[</span><span class="s6">0</span><span class="s4">]</span>
+
+            <span class="s3">if </span><span class="s4">(</span>
+                <span class="s1">option</span><span class="s4">.</span><span class="s1">obj</span><span class="s4">.</span><span class="s1">_flag_needs_value</span>
+                <span class="s3">and </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">next_rarg</span><span class="s4">, </span><span class="s1">str</span><span class="s4">)</span>
+                <span class="s3">and </span><span class="s1">next_rarg</span><span class="s4">[:</span><span class="s6">1</span><span class="s4">] </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_opt_prefixes</span>
+                <span class="s3">and </span><span class="s1">len</span><span class="s4">(</span><span class="s1">next_rarg</span><span class="s4">) &gt; </span><span class="s6">1</span>
+            <span class="s4">):</span>
+                <span class="s2"># The next arg looks like the start of an option, don't</span>
+                <span class="s2"># use it as the value if omitting the value is allowed.</span>
+                <span class="s1">value </span><span class="s4">= </span><span class="s1">_flag_needs_value</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">value </span><span class="s4">= </span><span class="s1">state</span><span class="s4">.</span><span class="s1">rargs</span><span class="s4">.</span><span class="s1">pop</span><span class="s4">(</span><span class="s6">0</span><span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">value </span><span class="s4">= </span><span class="s1">tuple</span><span class="s4">(</span><span class="s1">state</span><span class="s4">.</span><span class="s1">rargs</span><span class="s4">[:</span><span class="s1">nargs</span><span class="s4">])</span>
+            <span class="s3">del </span><span class="s1">state</span><span class="s4">.</span><span class="s1">rargs</span><span class="s4">[:</span><span class="s1">nargs</span><span class="s4">]</span>
+
+        <span class="s3">return </span><span class="s1">value</span>
+
+    <span class="s3">def </span><span class="s1">_process_opts</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">arg</span><span class="s4">: </span><span class="s1">str</span><span class="s4">, </span><span class="s1">state</span><span class="s4">: </span><span class="s1">ParsingState</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s1">explicit_value </span><span class="s4">= </span><span class="s3">None</span>
+        <span class="s2"># Long option handling happens in two parts.  The first part is</span>
+        <span class="s2"># supporting explicitly attached values.  In any case, we will try</span>
+        <span class="s2"># to long match the option first.</span>
+        <span class="s3">if </span><span class="s5">&quot;=&quot; </span><span class="s3">in </span><span class="s1">arg</span><span class="s4">:</span>
+            <span class="s1">long_opt</span><span class="s4">, </span><span class="s1">explicit_value </span><span class="s4">= </span><span class="s1">arg</span><span class="s4">.</span><span class="s1">split</span><span class="s4">(</span><span class="s5">&quot;=&quot;</span><span class="s4">, </span><span class="s6">1</span><span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">long_opt </span><span class="s4">= </span><span class="s1">arg</span>
+        <span class="s1">norm_long_opt </span><span class="s4">= </span><span class="s1">normalize_opt</span><span class="s4">(</span><span class="s1">long_opt</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">ctx</span><span class="s4">)</span>
+
+        <span class="s2"># At this point we will match the (assumed) long option through</span>
+        <span class="s2"># the long option matching code.  Note that this allows options</span>
+        <span class="s2"># like &quot;-foo&quot; to be matched as long options.</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_match_long_opt</span><span class="s4">(</span><span class="s1">norm_long_opt</span><span class="s4">, </span><span class="s1">explicit_value</span><span class="s4">, </span><span class="s1">state</span><span class="s4">)</span>
+        <span class="s3">except </span><span class="s1">NoSuchOption</span><span class="s4">:</span>
+            <span class="s2"># At this point the long option matching failed, and we need</span>
+            <span class="s2"># to try with short options.  However there is a special rule</span>
+            <span class="s2"># which says, that if we have a two character options prefix</span>
+            <span class="s2"># (applies to &quot;--foo&quot; for instance), we do not dispatch to the</span>
+            <span class="s2"># short option code and will instead raise the no option</span>
+            <span class="s2"># error.</span>
+            <span class="s3">if </span><span class="s1">arg</span><span class="s4">[:</span><span class="s6">2</span><span class="s4">] </span><span class="s3">not in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_opt_prefixes</span><span class="s4">:</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">_match_short_opt</span><span class="s4">(</span><span class="s1">arg</span><span class="s4">, </span><span class="s1">state</span><span class="s4">)</span>
+                <span class="s3">return</span>
+
+            <span class="s3">if not </span><span class="s1">self</span><span class="s4">.</span><span class="s1">ignore_unknown_options</span><span class="s4">:</span>
+                <span class="s3">raise</span>
+
+            <span class="s1">state</span><span class="s4">.</span><span class="s1">largs</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">arg</span><span class="s4">)</span>
+</pre>
+</body>
+</html>

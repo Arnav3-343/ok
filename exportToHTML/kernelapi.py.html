@@ -1,0 +1,518 @@
+<html>
+<head>
+<title>kernelapi.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+kernelapi.py</font>
+</center></td></tr></table>
+<pre><span class="s0">''' 
+Implements the cuda module as called from within an executing kernel 
+(@cuda.jit-decorated function). 
+'''</span>
+
+<span class="s2">from </span><span class="s1">contextlib </span><span class="s2">import </span><span class="s1">contextmanager</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">import </span><span class="s1">threading</span>
+<span class="s2">import </span><span class="s1">traceback</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">types</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">np </span><span class="s2">import </span><span class="s1">numpy_support</span>
+
+<span class="s2">from </span><span class="s3">.</span><span class="s1">vector_types </span><span class="s2">import </span><span class="s1">vector_types</span>
+
+
+<span class="s2">class </span><span class="s1">Dim3</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s0">''' 
+    Used to implement thread/block indices/dimensions 
+    '''</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">z</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">x </span><span class="s3">= </span><span class="s1">x</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">y </span><span class="s3">= </span><span class="s1">y</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">z </span><span class="s3">= </span><span class="s1">z</span>
+
+    <span class="s2">def </span><span class="s1">__str__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s4">'(%s, %s, %s)' </span><span class="s3">% (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">x</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">y</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">z</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s4">'Dim3(%s, %s, %s)' </span><span class="s3">% (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">x</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">y</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">z</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__iter__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">yield </span><span class="s1">self</span><span class="s3">.</span><span class="s1">x</span>
+        <span class="s2">yield </span><span class="s1">self</span><span class="s3">.</span><span class="s1">y</span>
+        <span class="s2">yield </span><span class="s1">self</span><span class="s3">.</span><span class="s1">z</span>
+
+
+<span class="s2">class </span><span class="s1">GridGroup</span><span class="s3">:</span>
+    <span class="s0">''' 
+    Used to implement the grid group. 
+    '''</span>
+
+    <span class="s2">def </span><span class="s1">sync</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5"># Synchronization of the grid group is equivalent to synchronization of</span>
+        <span class="s5"># the thread block, because we only support cooperative grids with one</span>
+        <span class="s5"># block.</span>
+        <span class="s1">threading</span><span class="s3">.</span><span class="s1">current_thread</span><span class="s3">().</span><span class="s1">syncthreads</span><span class="s3">()</span>
+
+
+<span class="s2">class </span><span class="s1">FakeCUDACg</span><span class="s3">:</span>
+    <span class="s0">''' 
+    CUDA Cooperative Groups 
+    '''</span>
+    <span class="s2">def </span><span class="s1">this_grid</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">GridGroup</span><span class="s3">()</span>
+
+
+<span class="s2">class </span><span class="s1">FakeCUDALocal</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s0">''' 
+    CUDA Local arrays 
+    '''</span>
+    <span class="s2">def </span><span class="s1">array</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">shape</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">Type</span><span class="s3">):</span>
+            <span class="s1">dtype </span><span class="s3">= </span><span class="s1">numpy_support</span><span class="s3">.</span><span class="s1">as_dtype</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">FakeCUDAConst</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s0">''' 
+    CUDA Const arrays 
+    '''</span>
+    <span class="s2">def </span><span class="s1">array_like</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">ary</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">ary</span>
+
+
+<span class="s2">class </span><span class="s1">FakeCUDAShared</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s0">''' 
+    CUDA Shared arrays. 
+ 
+    Limitations: assumes that only one call to cuda.shared.array is on a line, 
+    and that that line is only executed once per thread. i.e.:: 
+ 
+        a = cuda.shared.array(...); b = cuda.shared.array(...) 
+ 
+    will erroneously alias a and b, and:: 
+ 
+        for i in range(10): 
+            sharedarrs[i] = cuda.shared.array(...) 
+ 
+    will alias all arrays created at that point (though it is not certain that 
+    this would be supported by Numba anyway). 
+    '''</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">dynshared_size</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_allocations </span><span class="s3">= {}</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_dynshared_size </span><span class="s3">= </span><span class="s1">dynshared_size</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_dynshared </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">dynshared_size</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">byte</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">array</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">shape</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">Type</span><span class="s3">):</span>
+            <span class="s1">dtype </span><span class="s3">= </span><span class="s1">numpy_support</span><span class="s3">.</span><span class="s1">as_dtype</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">)</span>
+        <span class="s5"># Dynamic shared memory is requested with size 0 - this all shares the</span>
+        <span class="s5"># same underlying memory</span>
+        <span class="s2">if </span><span class="s1">shape </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s5"># Count must be the maximum number of whole elements that fit in the</span>
+            <span class="s5"># buffer (Numpy complains if the buffer is not a multiple of the</span>
+            <span class="s5"># element size)</span>
+            <span class="s1">count </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_dynshared_size </span><span class="s3">// </span><span class="s1">dtype</span><span class="s3">.</span><span class="s1">itemsize</span>
+            <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">frombuffer</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_dynshared</span><span class="s3">.</span><span class="s1">data</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">count</span><span class="s3">=</span><span class="s1">count</span><span class="s3">)</span>
+
+        <span class="s5"># Otherwise, identify allocations by source file and line number</span>
+        <span class="s5"># We pass the reference frame explicitly to work around</span>
+        <span class="s5"># http://bugs.python.org/issue25108</span>
+        <span class="s1">stack </span><span class="s3">= </span><span class="s1">traceback</span><span class="s3">.</span><span class="s1">extract_stack</span><span class="s3">(</span><span class="s1">sys</span><span class="s3">.</span><span class="s1">_getframe</span><span class="s3">())</span>
+        <span class="s1">caller </span><span class="s3">= </span><span class="s1">stack</span><span class="s3">[-</span><span class="s6">2</span><span class="s3">][</span><span class="s6">0</span><span class="s3">:</span><span class="s6">2</span><span class="s3">]</span>
+        <span class="s1">res </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_allocations</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">caller</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">res </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_allocations</span><span class="s3">[</span><span class="s1">caller</span><span class="s3">] = </span><span class="s1">res</span>
+        <span class="s2">return </span><span class="s1">res</span>
+
+
+<span class="s1">addlock </span><span class="s3">= </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">Lock</span><span class="s3">()</span>
+<span class="s1">sublock </span><span class="s3">= </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">Lock</span><span class="s3">()</span>
+<span class="s1">andlock </span><span class="s3">= </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">Lock</span><span class="s3">()</span>
+<span class="s1">orlock </span><span class="s3">= </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">Lock</span><span class="s3">()</span>
+<span class="s1">xorlock </span><span class="s3">= </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">Lock</span><span class="s3">()</span>
+<span class="s1">maxlock </span><span class="s3">= </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">Lock</span><span class="s3">()</span>
+<span class="s1">minlock </span><span class="s3">= </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">Lock</span><span class="s3">()</span>
+<span class="s1">compare_and_swaplock </span><span class="s3">= </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">Lock</span><span class="s3">()</span>
+<span class="s1">caslock </span><span class="s3">= </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">Lock</span><span class="s3">()</span>
+<span class="s1">inclock </span><span class="s3">= </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">Lock</span><span class="s3">()</span>
+<span class="s1">declock </span><span class="s3">= </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">Lock</span><span class="s3">()</span>
+<span class="s1">exchlock </span><span class="s3">= </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">Lock</span><span class="s3">()</span>
+
+
+<span class="s2">class </span><span class="s1">FakeCUDAAtomic</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s2">def </span><span class="s1">add</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">array</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">addlock</span><span class="s3">:</span>
+            <span class="s1">old </span><span class="s3">= </span><span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">]</span>
+            <span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">] += </span><span class="s1">val</span>
+        <span class="s2">return </span><span class="s1">old</span>
+
+    <span class="s2">def </span><span class="s1">sub</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">array</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">sublock</span><span class="s3">:</span>
+            <span class="s1">old </span><span class="s3">= </span><span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">]</span>
+            <span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">] -= </span><span class="s1">val</span>
+        <span class="s2">return </span><span class="s1">old</span>
+
+    <span class="s2">def </span><span class="s1">and_</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">array</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">andlock</span><span class="s3">:</span>
+            <span class="s1">old </span><span class="s3">= </span><span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">]</span>
+            <span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">] &amp;= </span><span class="s1">val</span>
+        <span class="s2">return </span><span class="s1">old</span>
+
+    <span class="s2">def </span><span class="s1">or_</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">array</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">orlock</span><span class="s3">:</span>
+            <span class="s1">old </span><span class="s3">= </span><span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">]</span>
+            <span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">] |= </span><span class="s1">val</span>
+        <span class="s2">return </span><span class="s1">old</span>
+
+    <span class="s2">def </span><span class="s1">xor</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">array</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">xorlock</span><span class="s3">:</span>
+            <span class="s1">old </span><span class="s3">= </span><span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">]</span>
+            <span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">] ^= </span><span class="s1">val</span>
+        <span class="s2">return </span><span class="s1">old</span>
+
+    <span class="s2">def </span><span class="s1">inc</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">array</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">inclock</span><span class="s3">:</span>
+            <span class="s1">old </span><span class="s3">= </span><span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">old </span><span class="s3">&gt;= </span><span class="s1">val</span><span class="s3">:</span>
+                <span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">] = </span><span class="s6">0</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">] += </span><span class="s6">1</span>
+        <span class="s2">return </span><span class="s1">old</span>
+
+    <span class="s2">def </span><span class="s1">dec</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">array</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">declock</span><span class="s3">:</span>
+            <span class="s1">old </span><span class="s3">= </span><span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s3">(</span><span class="s1">old </span><span class="s3">== </span><span class="s6">0</span><span class="s3">) </span><span class="s2">or </span><span class="s3">(</span><span class="s1">old </span><span class="s3">&gt; </span><span class="s1">val</span><span class="s3">):</span>
+                <span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">] = </span><span class="s1">val</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">] -= </span><span class="s6">1</span>
+        <span class="s2">return </span><span class="s1">old</span>
+
+    <span class="s2">def </span><span class="s1">exch</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">array</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">exchlock</span><span class="s3">:</span>
+            <span class="s1">old </span><span class="s3">= </span><span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">]</span>
+            <span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">] = </span><span class="s1">val</span>
+        <span class="s2">return </span><span class="s1">old</span>
+
+    <span class="s2">def </span><span class="s1">max</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">array</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">maxlock</span><span class="s3">:</span>
+            <span class="s1">old </span><span class="s3">= </span><span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">]</span>
+            <span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">] = </span><span class="s1">max</span><span class="s3">(</span><span class="s1">old</span><span class="s3">, </span><span class="s1">val</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">old</span>
+
+    <span class="s2">def </span><span class="s1">min</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">array</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">minlock</span><span class="s3">:</span>
+            <span class="s1">old </span><span class="s3">= </span><span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">]</span>
+            <span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">] = </span><span class="s1">min</span><span class="s3">(</span><span class="s1">old</span><span class="s3">, </span><span class="s1">val</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">old</span>
+
+    <span class="s2">def </span><span class="s1">nanmax</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">array</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">maxlock</span><span class="s3">:</span>
+            <span class="s1">old </span><span class="s3">= </span><span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">]</span>
+            <span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">] = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nanmax</span><span class="s3">([</span><span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">], </span><span class="s1">val</span><span class="s3">])</span>
+        <span class="s2">return </span><span class="s1">old</span>
+
+    <span class="s2">def </span><span class="s1">nanmin</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">array</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">minlock</span><span class="s3">:</span>
+            <span class="s1">old </span><span class="s3">= </span><span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">]</span>
+            <span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">] = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nanmin</span><span class="s3">([</span><span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">], </span><span class="s1">val</span><span class="s3">])</span>
+        <span class="s2">return </span><span class="s1">old</span>
+
+    <span class="s2">def </span><span class="s1">compare_and_swap</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">array</span><span class="s3">, </span><span class="s1">old</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">compare_and_swaplock</span><span class="s3">:</span>
+            <span class="s1">index </span><span class="s3">= (</span><span class="s6">0</span><span class="s3">,) * </span><span class="s1">array</span><span class="s3">.</span><span class="s1">ndim</span>
+            <span class="s1">loaded </span><span class="s3">= </span><span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">loaded </span><span class="s3">== </span><span class="s1">old</span><span class="s3">:</span>
+                <span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">] = </span><span class="s1">val</span>
+            <span class="s2">return </span><span class="s1">loaded</span>
+
+    <span class="s2">def </span><span class="s1">cas</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">array</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">old</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">caslock</span><span class="s3">:</span>
+            <span class="s1">loaded </span><span class="s3">= </span><span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">loaded </span><span class="s3">== </span><span class="s1">old</span><span class="s3">:</span>
+                <span class="s1">array</span><span class="s3">[</span><span class="s1">index</span><span class="s3">] = </span><span class="s1">val</span>
+            <span class="s2">return </span><span class="s1">loaded</span>
+
+
+<span class="s2">class </span><span class="s1">FakeCUDAFp16</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s2">def </span><span class="s1">hadd</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">a </span><span class="s3">+ </span><span class="s1">b</span>
+
+    <span class="s2">def </span><span class="s1">hsub</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">a </span><span class="s3">- </span><span class="s1">b</span>
+
+    <span class="s2">def </span><span class="s1">hmul</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">a </span><span class="s3">* </span><span class="s1">b</span>
+
+    <span class="s2">def </span><span class="s1">hdiv</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">a </span><span class="s3">/ </span><span class="s1">b</span>
+
+    <span class="s2">def </span><span class="s1">hfma</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">c</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">a </span><span class="s3">* </span><span class="s1">b </span><span class="s3">+ </span><span class="s1">c</span>
+
+    <span class="s2">def </span><span class="s1">hneg</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s3">-</span><span class="s1">a</span>
+
+    <span class="s2">def </span><span class="s1">habs</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">a</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">hsin</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sin</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float16</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">hcos</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">cos</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float16</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">hlog</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float16</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">hlog2</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">log2</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float16</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">hlog10</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">log10</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float16</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">hexp</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">exp</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float16</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">hexp2</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">exp2</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float16</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">hexp10</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">float16</span><span class="s3">(</span><span class="s6">10 </span><span class="s3">** </span><span class="s1">x</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">hsqrt</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sqrt</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float16</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">hrsqrt</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">float16</span><span class="s3">(</span><span class="s1">x </span><span class="s3">** -</span><span class="s6">0.5</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">hceil</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ceil</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float16</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">hfloor</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ceil</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float16</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">hrcp</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">reciprocal</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float16</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">htrunc</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">trunc</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float16</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">hrint</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">rint</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float16</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">heq</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">a </span><span class="s3">== </span><span class="s1">b</span>
+
+    <span class="s2">def </span><span class="s1">hne</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">a </span><span class="s3">!= </span><span class="s1">b</span>
+
+    <span class="s2">def </span><span class="s1">hge</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">a </span><span class="s3">&gt;= </span><span class="s1">b</span>
+
+    <span class="s2">def </span><span class="s1">hgt</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">a </span><span class="s3">&gt; </span><span class="s1">b</span>
+
+    <span class="s2">def </span><span class="s1">hle</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">a </span><span class="s3">&lt;= </span><span class="s1">b</span>
+
+    <span class="s2">def </span><span class="s1">hlt</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">a </span><span class="s3">&lt; </span><span class="s1">b</span>
+
+    <span class="s2">def </span><span class="s1">hmax</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">max</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">hmin</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">min</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">FakeCUDAModule</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s0">''' 
+    An instance of this class will be injected into the __globals__ for an 
+    executing function in order to implement calls to cuda.*. This will fail to 
+    work correctly if the user code does:: 
+ 
+        from numba import cuda as something_else 
+ 
+    In other words, the CUDA module must be called cuda. 
+    '''</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">grid_dim</span><span class="s3">, </span><span class="s1">block_dim</span><span class="s3">, </span><span class="s1">dynshared_size</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">gridDim </span><span class="s3">= </span><span class="s1">Dim3</span><span class="s3">(*</span><span class="s1">grid_dim</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">blockDim </span><span class="s3">= </span><span class="s1">Dim3</span><span class="s3">(*</span><span class="s1">block_dim</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_cg </span><span class="s3">= </span><span class="s1">FakeCUDACg</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_local </span><span class="s3">= </span><span class="s1">FakeCUDALocal</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_shared </span><span class="s3">= </span><span class="s1">FakeCUDAShared</span><span class="s3">(</span><span class="s1">dynshared_size</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_const </span><span class="s3">= </span><span class="s1">FakeCUDAConst</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_atomic </span><span class="s3">= </span><span class="s1">FakeCUDAAtomic</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_fp16 </span><span class="s3">= </span><span class="s1">FakeCUDAFp16</span><span class="s3">()</span>
+        <span class="s5"># Insert the vector types into the kernel context</span>
+        <span class="s5"># Note that we need to do this in addition to exposing them as module</span>
+        <span class="s5"># variables in `simulator.__init__.py`, because the test cases need</span>
+        <span class="s5"># to access the actual cuda module as well as the fake cuda module</span>
+        <span class="s5"># for vector types.</span>
+        <span class="s2">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">svty </span><span class="s2">in </span><span class="s1">vector_types</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+            <span class="s1">setattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">svty</span><span class="s3">)</span>
+            <span class="s2">for </span><span class="s1">alias </span><span class="s2">in </span><span class="s1">svty</span><span class="s3">.</span><span class="s1">aliases</span><span class="s3">:</span>
+                <span class="s1">setattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">alias</span><span class="s3">, </span><span class="s1">svty</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">cg</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cg</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">local</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_local</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">shared</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_shared</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">const</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_const</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">atomic</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_atomic</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">fp16</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fp16</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">threadIdx</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">current_thread</span><span class="s3">().</span><span class="s1">threadIdx</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">blockIdx</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">current_thread</span><span class="s3">().</span><span class="s1">blockIdx</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">warpsize</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s6">32</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">laneid</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">current_thread</span><span class="s3">().</span><span class="s1">thread_id </span><span class="s3">% </span><span class="s6">32</span>
+
+    <span class="s2">def </span><span class="s1">syncthreads</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">threading</span><span class="s3">.</span><span class="s1">current_thread</span><span class="s3">().</span><span class="s1">syncthreads</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">threadfence</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5"># No-op</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">threadfence_block</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5"># No-op</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">threadfence_system</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5"># No-op</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">syncthreads_count</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">current_thread</span><span class="s3">().</span><span class="s1">syncthreads_count</span><span class="s3">(</span><span class="s1">val</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">syncthreads_and</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">current_thread</span><span class="s3">().</span><span class="s1">syncthreads_and</span><span class="s3">(</span><span class="s1">val</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">syncthreads_or</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">current_thread</span><span class="s3">().</span><span class="s1">syncthreads_or</span><span class="s3">(</span><span class="s1">val</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">popc</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">bin</span><span class="s3">(</span><span class="s1">val</span><span class="s3">).</span><span class="s1">count</span><span class="s3">(</span><span class="s4">&quot;1&quot;</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">fma</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">c</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">a </span><span class="s3">* </span><span class="s1">b </span><span class="s3">+ </span><span class="s1">c</span>
+
+    <span class="s2">def </span><span class="s1">cbrt</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">a </span><span class="s3">** (</span><span class="s6">1 </span><span class="s3">/ </span><span class="s6">3</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">brev</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">int</span><span class="s3">(</span><span class="s4">'{:032b}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">val</span><span class="s3">)[::-</span><span class="s6">1</span><span class="s3">], </span><span class="s6">2</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">clz</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s1">s </span><span class="s3">= </span><span class="s4">'{:032b}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">val</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">len</span><span class="s3">(</span><span class="s1">s</span><span class="s3">) - </span><span class="s1">len</span><span class="s3">(</span><span class="s1">s</span><span class="s3">.</span><span class="s1">lstrip</span><span class="s3">(</span><span class="s4">'0'</span><span class="s3">))</span>
+
+    <span class="s2">def </span><span class="s1">ffs</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+        <span class="s5"># The algorithm is:</span>
+        <span class="s5"># 1. Count the number of trailing zeros.</span>
+        <span class="s5"># 2. Add 1, because the LSB is numbered 1 rather than 0, and so on.</span>
+        <span class="s5"># 3. If we've counted 32 zeros (resulting in 33), there were no bits</span>
+        <span class="s5">#    set so we need to return zero.</span>
+        <span class="s1">s </span><span class="s3">= </span><span class="s4">'{:032b}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">val</span><span class="s3">)</span>
+        <span class="s1">r </span><span class="s3">= (</span><span class="s1">len</span><span class="s3">(</span><span class="s1">s</span><span class="s3">) - </span><span class="s1">len</span><span class="s3">(</span><span class="s1">s</span><span class="s3">.</span><span class="s1">rstrip</span><span class="s3">(</span><span class="s4">'0'</span><span class="s3">)) + </span><span class="s6">1</span><span class="s3">) % </span><span class="s6">33</span>
+        <span class="s2">return </span><span class="s1">r</span>
+
+    <span class="s2">def </span><span class="s1">selp</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">c</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">b </span><span class="s2">if </span><span class="s1">a </span><span class="s2">else </span><span class="s1">c</span>
+
+    <span class="s2">def </span><span class="s1">grid</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">n</span><span class="s3">):</span>
+        <span class="s1">bdim </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">blockDim</span>
+        <span class="s1">bid </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">blockIdx</span>
+        <span class="s1">tid </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">threadIdx</span>
+        <span class="s1">x </span><span class="s3">= </span><span class="s1">bid</span><span class="s3">.</span><span class="s1">x </span><span class="s3">* </span><span class="s1">bdim</span><span class="s3">.</span><span class="s1">x </span><span class="s3">+ </span><span class="s1">tid</span><span class="s3">.</span><span class="s1">x</span>
+        <span class="s2">if </span><span class="s1">n </span><span class="s3">== </span><span class="s6">1</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">x</span>
+        <span class="s1">y </span><span class="s3">= </span><span class="s1">bid</span><span class="s3">.</span><span class="s1">y </span><span class="s3">* </span><span class="s1">bdim</span><span class="s3">.</span><span class="s1">y </span><span class="s3">+ </span><span class="s1">tid</span><span class="s3">.</span><span class="s1">y</span>
+        <span class="s2">if </span><span class="s1">n </span><span class="s3">== </span><span class="s6">2</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+        <span class="s1">z </span><span class="s3">= </span><span class="s1">bid</span><span class="s3">.</span><span class="s1">z </span><span class="s3">* </span><span class="s1">bdim</span><span class="s3">.</span><span class="s1">z </span><span class="s3">+ </span><span class="s1">tid</span><span class="s3">.</span><span class="s1">z</span>
+        <span class="s2">if </span><span class="s1">n </span><span class="s3">== </span><span class="s6">3</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">z</span><span class="s3">)</span>
+
+        <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s4">&quot;Global ID has 1-3 dimensions. %d requested&quot; </span><span class="s3">% </span><span class="s1">n</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">gridsize</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">n</span><span class="s3">):</span>
+        <span class="s1">bdim </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">blockDim</span>
+        <span class="s1">gdim </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">gridDim</span>
+        <span class="s1">x </span><span class="s3">= </span><span class="s1">bdim</span><span class="s3">.</span><span class="s1">x </span><span class="s3">* </span><span class="s1">gdim</span><span class="s3">.</span><span class="s1">x</span>
+        <span class="s2">if </span><span class="s1">n </span><span class="s3">== </span><span class="s6">1</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">x</span>
+        <span class="s1">y </span><span class="s3">= </span><span class="s1">bdim</span><span class="s3">.</span><span class="s1">y </span><span class="s3">* </span><span class="s1">gdim</span><span class="s3">.</span><span class="s1">y</span>
+        <span class="s2">if </span><span class="s1">n </span><span class="s3">== </span><span class="s6">2</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+        <span class="s1">z </span><span class="s3">= </span><span class="s1">bdim</span><span class="s3">.</span><span class="s1">z </span><span class="s3">* </span><span class="s1">gdim</span><span class="s3">.</span><span class="s1">z</span>
+        <span class="s2">if </span><span class="s1">n </span><span class="s3">== </span><span class="s6">3</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">z</span><span class="s3">)</span>
+
+        <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s4">&quot;Global grid has 1-3 dimensions. %d requested&quot; </span><span class="s3">% </span><span class="s1">n</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">contextmanager</span>
+<span class="s2">def </span><span class="s1">swapped_cuda_module</span><span class="s3">(</span><span class="s1">fn</span><span class="s3">, </span><span class="s1">fake_cuda_module</span><span class="s3">):</span>
+    <span class="s2">from </span><span class="s1">numba </span><span class="s2">import </span><span class="s1">cuda</span>
+
+    <span class="s1">fn_globs </span><span class="s3">= </span><span class="s1">fn</span><span class="s3">.</span><span class="s1">__globals__</span>
+    <span class="s5"># get all globals that is the &quot;cuda&quot; module</span>
+    <span class="s1">orig </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">((</span><span class="s1">k</span><span class="s3">, </span><span class="s1">v</span><span class="s3">) </span><span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">fn_globs</span><span class="s3">.</span><span class="s1">items</span><span class="s3">() </span><span class="s2">if </span><span class="s1">v </span><span class="s2">is </span><span class="s1">cuda</span><span class="s3">)</span>
+    <span class="s5"># build replacement dict</span>
+    <span class="s1">repl </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">((</span><span class="s1">k</span><span class="s3">, </span><span class="s1">fake_cuda_module</span><span class="s3">) </span><span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">orig</span><span class="s3">.</span><span class="s1">items</span><span class="s3">())</span>
+    <span class="s5"># replace</span>
+    <span class="s1">fn_globs</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">repl</span><span class="s3">)</span>
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s2">yield</span>
+    <span class="s2">finally</span><span class="s3">:</span>
+        <span class="s5"># revert</span>
+        <span class="s1">fn_globs</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">orig</span><span class="s3">)</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,220 @@
+<html>
+<head>
+<title>gdb_support.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+gdb_support.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Helpers for running gdb related testing&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">re</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">import </span><span class="s1">unittest</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">config</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">misc</span><span class="s3">.</span><span class="s1">gdb_hook </span><span class="s2">import </span><span class="s1">_confirm_gdb</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">misc</span><span class="s3">.</span><span class="s1">numba_gdbinfo </span><span class="s2">import </span><span class="s1">collect_gdbinfo</span>
+
+<span class="s4"># check if gdb is present and working</span>
+<span class="s2">try</span><span class="s3">:</span>
+    <span class="s1">_confirm_gdb</span><span class="s3">(</span><span class="s1">need_ptrace_attach</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)  </span><span class="s4"># The driver launches as `gdb EXE`.</span>
+    <span class="s1">_HAVE_GDB </span><span class="s3">= </span><span class="s2">True</span>
+    <span class="s1">_gdb_info </span><span class="s3">= </span><span class="s1">collect_gdbinfo</span><span class="s3">()</span>
+    <span class="s1">_GDB_HAS_PY3 </span><span class="s3">= </span><span class="s1">_gdb_info</span><span class="s3">.</span><span class="s1">py_ver</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s5">'3'</span><span class="s3">)</span>
+<span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+    <span class="s1">_HAVE_GDB </span><span class="s3">= </span><span class="s2">False</span>
+    <span class="s1">_GDB_HAS_PY3 </span><span class="s3">= </span><span class="s2">False</span>
+
+<span class="s1">_msg </span><span class="s3">= </span><span class="s5">&quot;functioning gdb with correct ptrace permissions is required&quot;</span>
+<span class="s1">needs_gdb </span><span class="s3">= </span><span class="s1">unittest</span><span class="s3">.</span><span class="s1">skipUnless</span><span class="s3">(</span><span class="s1">_HAVE_GDB</span><span class="s3">, </span><span class="s1">_msg</span><span class="s3">)</span>
+
+<span class="s1">_msg </span><span class="s3">= </span><span class="s5">&quot;gdb with python 3 support needed&quot;</span>
+<span class="s1">needs_gdb_py3 </span><span class="s3">= </span><span class="s1">unittest</span><span class="s3">.</span><span class="s1">skipUnless</span><span class="s3">(</span><span class="s1">_GDB_HAS_PY3</span><span class="s3">, </span><span class="s1">_msg</span><span class="s3">)</span>
+
+
+<span class="s2">try</span><span class="s3">:</span>
+    <span class="s2">import </span><span class="s1">pexpect</span>
+    <span class="s1">_HAVE_PEXPECT </span><span class="s3">= </span><span class="s2">True</span>
+<span class="s2">except </span><span class="s1">ImportError</span><span class="s3">:</span>
+    <span class="s1">_HAVE_PEXPECT </span><span class="s3">= </span><span class="s2">False</span>
+
+
+<span class="s1">_msg </span><span class="s3">= </span><span class="s5">&quot;pexpect module needed for test&quot;</span>
+<span class="s1">skip_unless_pexpect </span><span class="s3">= </span><span class="s1">unittest</span><span class="s3">.</span><span class="s1">skipUnless</span><span class="s3">(</span><span class="s1">_HAVE_PEXPECT</span><span class="s3">, </span><span class="s1">_msg</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">GdbMIDriver</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Driver class for the GDB machine interface: 
+    https://sourceware.org/gdb/onlinedocs/gdb/GDB_002fMI.html 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">file_name</span><span class="s3">, </span><span class="s1">debug</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, </span><span class="s1">timeout</span><span class="s3">=</span><span class="s6">120</span><span class="s3">, </span><span class="s1">init_cmds</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s2">if not </span><span class="s1">_HAVE_PEXPECT</span><span class="s3">:</span>
+            <span class="s1">msg </span><span class="s3">= (</span><span class="s5">&quot;This driver requires the pexpect module. This can be &quot;</span>
+                   <span class="s5">&quot;obtained via:</span><span class="s2">\n\n</span><span class="s5">$ conda install pexpect&quot;</span><span class="s3">)</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+        <span class="s2">if not </span><span class="s1">_HAVE_GDB</span><span class="s3">:</span>
+            <span class="s1">msg </span><span class="s3">= (</span><span class="s5">&quot;This driver requires a gdb binary. This can be &quot;</span>
+                   <span class="s5">&quot;obtained via the system package manager.&quot;</span><span class="s3">)</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_gdb_binary </span><span class="s3">= </span><span class="s1">config</span><span class="s3">.</span><span class="s1">GDB_BINARY</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_python </span><span class="s3">= </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">executable</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_debug </span><span class="s3">= </span><span class="s1">debug</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_file_name </span><span class="s3">= </span><span class="s1">file_name</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_timeout </span><span class="s3">= </span><span class="s1">timeout</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_init_cmds </span><span class="s3">= </span><span class="s1">init_cmds</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_drive</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">_drive</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;This function sets up the caputured gdb instance&quot;&quot;&quot;</span>
+        <span class="s2">assert </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">isfile</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_file_name</span><span class="s3">)</span>
+        <span class="s1">cmd </span><span class="s3">= [</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_gdb_binary</span><span class="s3">, </span><span class="s5">'--interpreter'</span><span class="s3">, </span><span class="s5">'mi'</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_init_cmds </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">cmd </span><span class="s3">+= </span><span class="s1">list</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_init_cmds</span><span class="s3">)</span>
+        <span class="s1">cmd </span><span class="s3">+= [</span><span class="s5">'--args'</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_python</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_file_name</span><span class="s3">]</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_captured </span><span class="s3">= </span><span class="s1">pexpect</span><span class="s3">.</span><span class="s1">spawn</span><span class="s3">(</span><span class="s5">' '</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">cmd</span><span class="s3">))</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_debug</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_captured</span><span class="s3">.</span><span class="s1">logfile </span><span class="s3">= </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">stdout</span><span class="s3">.</span><span class="s1">buffer</span>
+
+    <span class="s2">def </span><span class="s1">supports_python</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Returns True if the underlying gdb implementation has python support 
+           False otherwise&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s5">&quot;python&quot; </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">list_features</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">supports_numpy</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Returns True if the underlying gdb implementation has NumPy support 
+           (and by extension Python support) False otherwise&quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">supports_python</span><span class="s3">():</span>
+            <span class="s2">return False</span>
+        <span class="s4"># Some gdb's have python 2!</span>
+        <span class="s1">cmd </span><span class="s3">= (</span><span class="s5">'python from __future__ import print_function;'</span>
+               <span class="s5">'import numpy; print(numpy)'</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">interpreter_exec</span><span class="s3">(</span><span class="s5">'console'</span><span class="s3">, </span><span class="s1">cmd</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s5">&quot;module </span><span class="s2">\'</span><span class="s5">numpy</span><span class="s2">\' </span><span class="s5">from&quot; </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_captured</span><span class="s3">.</span><span class="s1">before</span><span class="s3">.</span><span class="s1">decode</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">_captured_expect</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">expect</span><span class="s3">):</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_captured</span><span class="s3">.</span><span class="s1">expect</span><span class="s3">(</span><span class="s1">expect</span><span class="s3">, </span><span class="s1">timeout</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_timeout</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">pexpect</span><span class="s3">.</span><span class="s1">exceptions</span><span class="s3">.</span><span class="s1">TIMEOUT </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+            <span class="s1">msg </span><span class="s3">= </span><span class="s5">f&quot;Expected value did not arrive: </span><span class="s2">{</span><span class="s1">expect</span><span class="s2">}</span><span class="s5">.&quot;</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">) </span><span class="s2">from </span><span class="s1">e</span>
+
+    <span class="s2">def </span><span class="s1">assert_output</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">expected</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Asserts that the current output string contains the expected.&quot;&quot;&quot;</span>
+        <span class="s1">output </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_captured</span><span class="s3">.</span><span class="s1">after</span>
+        <span class="s1">decoded </span><span class="s3">= </span><span class="s1">output</span><span class="s3">.</span><span class="s1">decode</span><span class="s3">(</span><span class="s5">'utf-8'</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s1">expected </span><span class="s2">in </span><span class="s1">decoded</span><span class="s3">, </span><span class="s5">f'decoded=</span><span class="s2">{</span><span class="s1">decoded</span><span class="s2">}\n</span><span class="s5">expected=</span><span class="s2">{</span><span class="s1">expected</span><span class="s2">}</span><span class="s5">)'</span>
+
+    <span class="s2">def </span><span class="s1">assert_regex_output</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">expected</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Asserts that the current output string contains the expected 
+        regex.&quot;&quot;&quot;</span>
+        <span class="s1">output </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_captured</span><span class="s3">.</span><span class="s1">after</span>
+        <span class="s1">decoded </span><span class="s3">= </span><span class="s1">output</span><span class="s3">.</span><span class="s1">decode</span><span class="s3">(</span><span class="s5">'utf-8'</span><span class="s3">)</span>
+        <span class="s1">done_str </span><span class="s3">= </span><span class="s1">decoded</span><span class="s3">.</span><span class="s1">splitlines</span><span class="s3">()[</span><span class="s6">0</span><span class="s3">]</span>
+        <span class="s1">found </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">expected</span><span class="s3">, </span><span class="s1">done_str</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s1">found</span><span class="s3">, </span><span class="s5">f'decoded=</span><span class="s2">{</span><span class="s1">decoded</span><span class="s2">}\n</span><span class="s5">expected=</span><span class="s2">{</span><span class="s1">expected</span><span class="s2">}</span><span class="s5">)'</span>
+
+    <span class="s2">def </span><span class="s1">_run_command</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">command</span><span class="s3">, </span><span class="s1">expect</span><span class="s3">=</span><span class="s5">''</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_captured</span><span class="s3">.</span><span class="s1">sendline</span><span class="s3">(</span><span class="s1">command</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_captured_expect</span><span class="s3">(</span><span class="s1">expect</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">run</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;gdb command ~= 'run'&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_run_command</span><span class="s3">(</span><span class="s5">'-exec-run'</span><span class="s3">, </span><span class="s1">expect</span><span class="s3">=</span><span class="s5">r'\^running.*\r\n'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">cont</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;gdb command ~= 'continue'&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_run_command</span><span class="s3">(</span><span class="s5">'-exec-continue'</span><span class="s3">, </span><span class="s1">expect</span><span class="s3">=</span><span class="s5">r'\^running.*\r\n'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">quit</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;gdb command ~= 'quit'&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_run_command</span><span class="s3">(</span><span class="s5">'-gdb-exit'</span><span class="s3">, </span><span class="s1">expect</span><span class="s3">=</span><span class="s5">r'-gdb-exit'</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_captured</span><span class="s3">.</span><span class="s1">terminate</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">next</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;gdb command ~= 'next'&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_run_command</span><span class="s3">(</span><span class="s5">'-exec-next'</span><span class="s3">, </span><span class="s1">expect</span><span class="s3">=</span><span class="s5">r'\*stopped,.*\r\n'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">step</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;gdb command ~= 'step'&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_run_command</span><span class="s3">(</span><span class="s5">'-exec-step'</span><span class="s3">, </span><span class="s1">expect</span><span class="s3">=</span><span class="s5">r'\*stopped,.*\r\n'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">set_breakpoint</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">line</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">symbol</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">condition</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;gdb command ~= 'break'&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">line </span><span class="s2">is not None and </span><span class="s1">symbol </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">&quot;Can only supply one of line or symbol&quot;</span><span class="s3">)</span>
+        <span class="s1">bp </span><span class="s3">= </span><span class="s5">'-break-insert '</span>
+        <span class="s2">if </span><span class="s1">condition </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">bp </span><span class="s3">+= </span><span class="s5">f'-c &quot;</span><span class="s2">{</span><span class="s1">condition</span><span class="s2">}</span><span class="s5">&quot; '</span>
+        <span class="s2">if </span><span class="s1">line </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">line</span><span class="s3">, </span><span class="s1">int</span><span class="s3">)</span>
+            <span class="s1">bp </span><span class="s3">+= </span><span class="s5">f'-f </span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_file_name</span><span class="s2">}</span><span class="s5">:</span><span class="s2">{</span><span class="s1">line</span><span class="s2">} </span><span class="s5">'</span>
+        <span class="s2">if </span><span class="s1">symbol </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">symbol</span><span class="s3">, </span><span class="s1">str</span><span class="s3">)</span>
+            <span class="s1">bp </span><span class="s3">+= </span><span class="s5">f'-f </span><span class="s2">{</span><span class="s1">symbol</span><span class="s2">} </span><span class="s5">'</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_run_command</span><span class="s3">(</span><span class="s1">bp</span><span class="s3">, </span><span class="s1">expect</span><span class="s3">=</span><span class="s5">r'\^done'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">check_hit_breakpoint</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">number</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">line</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Checks that a breakpoint has been hit&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_captured_expect</span><span class="s3">(</span><span class="s5">r'\*stopped,.*\r\n'</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_output</span><span class="s3">(</span><span class="s5">'*stopped,reason=&quot;breakpoint-hit&quot;,'</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">number </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">number</span><span class="s3">, </span><span class="s1">int</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_output</span><span class="s3">(</span><span class="s5">f'bkptno=&quot;</span><span class="s2">{</span><span class="s1">number</span><span class="s2">}</span><span class="s5">&quot;'</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">line </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">line</span><span class="s3">, </span><span class="s1">int</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">assert_output</span><span class="s3">(</span><span class="s5">f'line=&quot;</span><span class="s2">{</span><span class="s1">line</span><span class="s2">}</span><span class="s5">&quot;'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">stack_list_arguments</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">print_values</span><span class="s3">=</span><span class="s6">1</span><span class="s3">, </span><span class="s1">low_frame</span><span class="s3">=</span><span class="s6">0</span><span class="s3">, </span><span class="s1">high_frame</span><span class="s3">=</span><span class="s6">0</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;gdb command ~= 'info args'&quot;&quot;&quot;</span>
+        <span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s3">(</span><span class="s1">print_values</span><span class="s3">, </span><span class="s1">low_frame</span><span class="s3">, </span><span class="s1">high_frame</span><span class="s3">):</span>
+            <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">int</span><span class="s3">) </span><span class="s2">and </span><span class="s1">x </span><span class="s2">in </span><span class="s3">(</span><span class="s6">0</span><span class="s3">, </span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">)</span>
+        <span class="s1">cmd </span><span class="s3">= </span><span class="s5">f'-stack-list-arguments </span><span class="s2">{</span><span class="s1">print_values</span><span class="s2">} {</span><span class="s1">low_frame</span><span class="s2">} {</span><span class="s1">high_frame</span><span class="s2">}</span><span class="s5">'</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_run_command</span><span class="s3">(</span><span class="s1">cmd</span><span class="s3">, </span><span class="s1">expect</span><span class="s3">=</span><span class="s5">r'\^done,.*\r\n'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">stack_list_variables</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">print_values</span><span class="s3">=</span><span class="s6">1</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;gdb command ~= 'info locals'&quot;&quot;&quot;</span>
+        <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">print_values</span><span class="s3">, </span><span class="s1">int</span><span class="s3">) </span><span class="s2">and </span><span class="s1">print_values </span><span class="s2">in </span><span class="s3">(</span><span class="s6">0</span><span class="s3">, </span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">)</span>
+        <span class="s1">cmd </span><span class="s3">= </span><span class="s5">f'-stack-list-variables </span><span class="s2">{</span><span class="s1">print_values</span><span class="s2">}</span><span class="s5">'</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_run_command</span><span class="s3">(</span><span class="s1">cmd</span><span class="s3">, </span><span class="s1">expect</span><span class="s3">=</span><span class="s5">r'\^done,.*\r\n'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">interpreter_exec</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">interpreter</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">command</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;gdb command ~= 'interpreter-exec'&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">interpreter </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">&quot;interpreter cannot be None&quot;</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">command </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">&quot;command cannot be None&quot;</span><span class="s3">)</span>
+        <span class="s1">cmd </span><span class="s3">= </span><span class="s5">f'-interpreter-exec </span><span class="s2">{</span><span class="s1">interpreter</span><span class="s2">} </span><span class="s5">&quot;</span><span class="s2">{</span><span class="s1">command</span><span class="s2">}</span><span class="s5">&quot;'</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_run_command</span><span class="s3">(</span><span class="s1">cmd</span><span class="s3">, </span><span class="s1">expect</span><span class="s3">=</span><span class="s5">r'\^(done|error).*\r\n'</span><span class="s3">)  </span><span class="s4"># NOTE no `,`</span>
+
+    <span class="s2">def </span><span class="s1">_list_features_raw</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">cmd </span><span class="s3">= </span><span class="s5">'-list-features'</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_run_command</span><span class="s3">(</span><span class="s1">cmd</span><span class="s3">, </span><span class="s1">expect</span><span class="s3">=</span><span class="s5">r'\^done,.*\r\n'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">list_features</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;No equivalent gdb command? Returns a list of supported gdb 
+           features. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_list_features_raw</span><span class="s3">()</span>
+        <span class="s1">output </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_captured</span><span class="s3">.</span><span class="s1">after</span>
+        <span class="s1">decoded </span><span class="s3">= </span><span class="s1">output</span><span class="s3">.</span><span class="s1">decode</span><span class="s3">(</span><span class="s5">'utf-8'</span><span class="s3">)</span>
+        <span class="s1">m </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s5">'.*features=</span><span class="s2">\\</span><span class="s5">[(.*)</span><span class="s2">\\</span><span class="s5">].*'</span><span class="s3">, </span><span class="s1">decoded</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s1">m </span><span class="s2">is not None</span><span class="s3">, </span><span class="s5">&quot;No match found for features string&quot;</span>
+        <span class="s1">g </span><span class="s3">= </span><span class="s1">m</span><span class="s3">.</span><span class="s1">groups</span><span class="s3">()</span>
+        <span class="s2">assert </span><span class="s1">len</span><span class="s3">(</span><span class="s1">g</span><span class="s3">) == </span><span class="s6">1</span><span class="s3">, </span><span class="s5">&quot;Invalid number of match groups found&quot;</span>
+        <span class="s2">return </span><span class="s1">g</span><span class="s3">[</span><span class="s6">0</span><span class="s3">].</span><span class="s1">replace</span><span class="s3">(</span><span class="s5">'&quot;'</span><span class="s3">, </span><span class="s5">''</span><span class="s3">).</span><span class="s1">split</span><span class="s3">(</span><span class="s5">','</span><span class="s3">)</span>
+</pre>
+</body>
+</html>

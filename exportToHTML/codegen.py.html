@@ -1,0 +1,401 @@
+<html>
+<head>
+<title>codegen.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #7a7e85;}
+.s5 { color: #5f826b; font-style: italic;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+codegen.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">llvmlite </span><span class="s0">import </span><span class="s1">ir</span>
+
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">config</span><span class="s2">, </span><span class="s1">serialize</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">codegen </span><span class="s0">import </span><span class="s1">Codegen</span><span class="s2">, </span><span class="s1">CodeLibrary</span>
+<span class="s0">from </span><span class="s2">.</span><span class="s1">cudadrv </span><span class="s0">import </span><span class="s1">devices</span><span class="s2">, </span><span class="s1">driver</span><span class="s2">, </span><span class="s1">nvvm</span><span class="s2">, </span><span class="s1">runtime</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">cudadrv</span><span class="s2">.</span><span class="s1">libs </span><span class="s0">import </span><span class="s1">get_cudalib</span>
+
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">subprocess</span>
+<span class="s0">import </span><span class="s1">tempfile</span>
+
+
+<span class="s1">CUDA_TRIPLE </span><span class="s2">= </span><span class="s3">'nvptx64-nvidia-cuda'</span>
+
+
+<span class="s0">def </span><span class="s1">run_nvdisasm</span><span class="s2">(</span><span class="s1">cubin</span><span class="s2">, </span><span class="s1">flags</span><span class="s2">):</span>
+    <span class="s4"># nvdisasm only accepts input from a file, so we need to write out to a</span>
+    <span class="s4"># temp file and clean up afterwards.</span>
+    <span class="s1">fd </span><span class="s2">= </span><span class="s0">None</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s0">None</span>
+    <span class="s0">try</span><span class="s2">:</span>
+        <span class="s1">fd</span><span class="s2">, </span><span class="s1">fname </span><span class="s2">= </span><span class="s1">tempfile</span><span class="s2">.</span><span class="s1">mkstemp</span><span class="s2">()</span>
+        <span class="s0">with </span><span class="s1">open</span><span class="s2">(</span><span class="s1">fname</span><span class="s2">, </span><span class="s3">'wb'</span><span class="s2">) </span><span class="s0">as </span><span class="s1">f</span><span class="s2">:</span>
+            <span class="s1">f</span><span class="s2">.</span><span class="s1">write</span><span class="s2">(</span><span class="s1">cubin</span><span class="s2">)</span>
+
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s1">cp </span><span class="s2">= </span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">run</span><span class="s2">([</span><span class="s3">'nvdisasm'</span><span class="s2">, *</span><span class="s1">flags</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">], </span><span class="s1">check</span><span class="s2">=</span><span class="s0">True</span><span class="s2">,</span>
+                                <span class="s1">stdout</span><span class="s2">=</span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">PIPE</span><span class="s2">,</span>
+                                <span class="s1">stderr</span><span class="s2">=</span><span class="s1">subprocess</span><span class="s2">.</span><span class="s1">PIPE</span><span class="s2">)</span>
+        <span class="s0">except </span><span class="s1">FileNotFoundError </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+            <span class="s1">msg </span><span class="s2">= (</span><span class="s3">&quot;nvdisasm has not been found. You may need &quot;</span>
+                   <span class="s3">&quot;to install the CUDA toolkit and ensure that &quot;</span>
+                   <span class="s3">&quot;it is available on your PATH.</span><span class="s0">\n</span><span class="s3">&quot;</span><span class="s2">)</span>
+            <span class="s0">raise </span><span class="s1">RuntimeError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">) </span><span class="s0">from </span><span class="s1">e</span>
+        <span class="s0">return </span><span class="s1">cp</span><span class="s2">.</span><span class="s1">stdout</span><span class="s2">.</span><span class="s1">decode</span><span class="s2">(</span><span class="s3">'utf-8'</span><span class="s2">)</span>
+    <span class="s0">finally</span><span class="s2">:</span>
+        <span class="s0">if </span><span class="s1">fd </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s1">os</span><span class="s2">.</span><span class="s1">close</span><span class="s2">(</span><span class="s1">fd</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">fname </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s1">os</span><span class="s2">.</span><span class="s1">unlink</span><span class="s2">(</span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">disassemble_cubin</span><span class="s2">(</span><span class="s1">cubin</span><span class="s2">):</span>
+    <span class="s4"># Request lineinfo in disassembly</span>
+    <span class="s1">flags </span><span class="s2">= [</span><span class="s3">'-gi'</span><span class="s2">]</span>
+    <span class="s0">return </span><span class="s1">run_nvdisasm</span><span class="s2">(</span><span class="s1">cubin</span><span class="s2">, </span><span class="s1">flags</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">disassemble_cubin_for_cfg</span><span class="s2">(</span><span class="s1">cubin</span><span class="s2">):</span>
+    <span class="s4"># Request control flow graph in disassembly</span>
+    <span class="s1">flags </span><span class="s2">= [</span><span class="s3">'-cfg'</span><span class="s2">]</span>
+    <span class="s0">return </span><span class="s1">run_nvdisasm</span><span class="s2">(</span><span class="s1">cubin</span><span class="s2">, </span><span class="s1">flags</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">CUDACodeLibrary</span><span class="s2">(</span><span class="s1">serialize</span><span class="s2">.</span><span class="s1">ReduceMixin</span><span class="s2">, </span><span class="s1">CodeLibrary</span><span class="s2">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    The CUDACodeLibrary generates PTX, SASS, cubins for multiple different 
+    compute capabilities. It also loads cubins to multiple devices (via 
+    get_cufunc), which may be of different compute capabilities. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">codegen</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">entry_name</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">max_registers</span><span class="s2">=</span><span class="s0">None</span><span class="s2">,</span>
+                 <span class="s1">nvvm_options</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        codegen: 
+            Codegen object. 
+        name: 
+            Name of the function in the source. 
+        entry_name: 
+            Name of the kernel function in the binary, if this is a global 
+            kernel and not a device function. 
+        max_registers: 
+            The maximum register usage to aim for when linking. 
+        nvvm_options: 
+                Dict of options to pass to NVVM. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">codegen</span><span class="s2">, </span><span class="s1">name</span><span class="s2">)</span>
+
+        <span class="s4"># The llvmlite module for this library.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_module </span><span class="s2">= </span><span class="s0">None</span>
+        <span class="s4"># CodeLibrary objects that will be &quot;linked&quot; into this library. The</span>
+        <span class="s4"># modules within them are compiled from NVVM IR to PTX along with the</span>
+        <span class="s4"># IR from this module - in that sense they are &quot;linked&quot; by NVVM at PTX</span>
+        <span class="s4"># generation time, rather than at link time.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_linking_libraries </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+        <span class="s4"># Files to link with the generated PTX. These are linked using the</span>
+        <span class="s4"># Driver API at link time.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_linking_files </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+        <span class="s4"># Should we link libcudadevrt?</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">needs_cudadevrt </span><span class="s2">= </span><span class="s0">False</span>
+
+        <span class="s4"># Cache the LLVM IR string</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_llvm_strs </span><span class="s2">= </span><span class="s0">None</span>
+        <span class="s4"># Maps CC -&gt; PTX string</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_ptx_cache </span><span class="s2">= {}</span>
+        <span class="s4"># Maps CC -&gt; LTO-IR</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_ltoir_cache </span><span class="s2">= {}</span>
+        <span class="s4"># Maps CC -&gt; cubin</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_cubin_cache </span><span class="s2">= {}</span>
+        <span class="s4"># Maps CC -&gt; linker info output for cubin</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_linkerinfo_cache </span><span class="s2">= {}</span>
+        <span class="s4"># Maps Device numeric ID -&gt; cufunc</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_cufunc_cache </span><span class="s2">= {}</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_max_registers </span><span class="s2">= </span><span class="s1">max_registers</span>
+        <span class="s0">if </span><span class="s1">nvvm_options </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s1">nvvm_options </span><span class="s2">= {}</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_nvvm_options </span><span class="s2">= </span><span class="s1">nvvm_options</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_entry_name </span><span class="s2">= </span><span class="s1">entry_name</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">llvm_strs</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_llvm_strs </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_llvm_strs </span><span class="s2">= [</span><span class="s1">str</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">) </span><span class="s0">for </span><span class="s1">mod </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">modules</span><span class="s2">]</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_llvm_strs</span>
+
+    <span class="s0">def </span><span class="s1">get_llvm_str</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s3">&quot;</span><span class="s0">\n\n</span><span class="s3">&quot;</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">llvm_strs</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">_ensure_cc</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">cc</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">cc </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">cc</span>
+
+        <span class="s1">device </span><span class="s2">= </span><span class="s1">devices</span><span class="s2">.</span><span class="s1">get_context</span><span class="s2">().</span><span class="s1">device</span>
+        <span class="s0">return </span><span class="s1">device</span><span class="s2">.</span><span class="s1">compute_capability</span>
+
+    <span class="s0">def </span><span class="s1">get_asm_str</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">cc</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s1">cc </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ensure_cc</span><span class="s2">(</span><span class="s1">cc</span><span class="s2">)</span>
+
+        <span class="s1">ptxes </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ptx_cache</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">cc</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">ptxes</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">ptxes</span>
+
+        <span class="s1">arch </span><span class="s2">= </span><span class="s1">nvvm</span><span class="s2">.</span><span class="s1">get_arch_option</span><span class="s2">(*</span><span class="s1">cc</span><span class="s2">)</span>
+        <span class="s1">options </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_nvvm_options</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">()</span>
+        <span class="s1">options</span><span class="s2">[</span><span class="s3">'arch'</span><span class="s2">] = </span><span class="s1">arch</span>
+
+        <span class="s1">irs </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">llvm_strs</span>
+
+        <span class="s1">ptx </span><span class="s2">= </span><span class="s1">nvvm</span><span class="s2">.</span><span class="s1">compile_ir</span><span class="s2">(</span><span class="s1">irs</span><span class="s2">, **</span><span class="s1">options</span><span class="s2">)</span>
+
+        <span class="s4"># Sometimes the result from NVVM contains trailing whitespace and</span>
+        <span class="s4"># nulls, which we strip so that the assembly dump looks a little</span>
+        <span class="s4"># tidier.</span>
+        <span class="s1">ptx </span><span class="s2">= </span><span class="s1">ptx</span><span class="s2">.</span><span class="s1">decode</span><span class="s2">().</span><span class="s1">strip</span><span class="s2">(</span><span class="s3">'</span><span class="s0">\x00</span><span class="s3">'</span><span class="s2">).</span><span class="s1">strip</span><span class="s2">()</span>
+
+        <span class="s0">if </span><span class="s1">config</span><span class="s2">.</span><span class="s1">DUMP_ASSEMBLY</span><span class="s2">:</span>
+            <span class="s1">print</span><span class="s2">((</span><span class="s3">&quot;ASSEMBLY %s&quot; </span><span class="s2">% </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_name</span><span class="s2">).</span><span class="s1">center</span><span class="s2">(</span><span class="s6">80</span><span class="s2">, </span><span class="s3">'-'</span><span class="s2">))</span>
+            <span class="s1">print</span><span class="s2">(</span><span class="s1">ptx</span><span class="s2">)</span>
+            <span class="s1">print</span><span class="s2">(</span><span class="s3">'=' </span><span class="s2">* </span><span class="s6">80</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_ptx_cache</span><span class="s2">[</span><span class="s1">cc</span><span class="s2">] = </span><span class="s1">ptx</span>
+
+        <span class="s0">return </span><span class="s1">ptx</span>
+
+    <span class="s0">def </span><span class="s1">get_ltoir</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">cc</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s1">cc </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ensure_cc</span><span class="s2">(</span><span class="s1">cc</span><span class="s2">)</span>
+
+        <span class="s1">ltoir </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ltoir_cache</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">cc</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">ltoir </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">ltoir</span>
+
+        <span class="s1">arch </span><span class="s2">= </span><span class="s1">nvvm</span><span class="s2">.</span><span class="s1">get_arch_option</span><span class="s2">(*</span><span class="s1">cc</span><span class="s2">)</span>
+        <span class="s1">options </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_nvvm_options</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">()</span>
+        <span class="s1">options</span><span class="s2">[</span><span class="s3">'arch'</span><span class="s2">] = </span><span class="s1">arch</span>
+        <span class="s1">options</span><span class="s2">[</span><span class="s3">'gen-lto'</span><span class="s2">] = </span><span class="s0">None</span>
+
+        <span class="s1">irs </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">llvm_strs</span>
+        <span class="s1">ltoir </span><span class="s2">= </span><span class="s1">nvvm</span><span class="s2">.</span><span class="s1">compile_ir</span><span class="s2">(</span><span class="s1">irs</span><span class="s2">, **</span><span class="s1">options</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_ltoir_cache</span><span class="s2">[</span><span class="s1">cc</span><span class="s2">] = </span><span class="s1">ltoir</span>
+
+        <span class="s0">return </span><span class="s1">ltoir</span>
+
+    <span class="s0">def </span><span class="s1">get_cubin</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">cc</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s1">cc </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ensure_cc</span><span class="s2">(</span><span class="s1">cc</span><span class="s2">)</span>
+
+        <span class="s1">cubin </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_cubin_cache</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">cc</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">cubin</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">cubin</span>
+
+        <span class="s1">linker </span><span class="s2">= </span><span class="s1">driver</span><span class="s2">.</span><span class="s1">Linker</span><span class="s2">.</span><span class="s1">new</span><span class="s2">(</span><span class="s1">max_registers</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_max_registers</span><span class="s2">, </span><span class="s1">cc</span><span class="s2">=</span><span class="s1">cc</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">linker</span><span class="s2">.</span><span class="s1">lto</span><span class="s2">:</span>
+            <span class="s1">ltoir </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_ltoir</span><span class="s2">(</span><span class="s1">cc</span><span class="s2">=</span><span class="s1">cc</span><span class="s2">)</span>
+            <span class="s1">linker</span><span class="s2">.</span><span class="s1">add_ltoir</span><span class="s2">(</span><span class="s1">ltoir</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">ptx </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_asm_str</span><span class="s2">(</span><span class="s1">cc</span><span class="s2">=</span><span class="s1">cc</span><span class="s2">)</span>
+            <span class="s1">linker</span><span class="s2">.</span><span class="s1">add_ptx</span><span class="s2">(</span><span class="s1">ptx</span><span class="s2">.</span><span class="s1">encode</span><span class="s2">())</span>
+
+        <span class="s0">for </span><span class="s1">path </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_linking_files</span><span class="s2">:</span>
+            <span class="s1">linker</span><span class="s2">.</span><span class="s1">add_file_guess_ext</span><span class="s2">(</span><span class="s1">path</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">needs_cudadevrt</span><span class="s2">:</span>
+            <span class="s1">linker</span><span class="s2">.</span><span class="s1">add_file_guess_ext</span><span class="s2">(</span><span class="s1">get_cudalib</span><span class="s2">(</span><span class="s3">'cudadevrt'</span><span class="s2">, </span><span class="s1">static</span><span class="s2">=</span><span class="s0">True</span><span class="s2">))</span>
+
+        <span class="s1">cubin </span><span class="s2">= </span><span class="s1">linker</span><span class="s2">.</span><span class="s1">complete</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_cubin_cache</span><span class="s2">[</span><span class="s1">cc</span><span class="s2">] = </span><span class="s1">cubin</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_linkerinfo_cache</span><span class="s2">[</span><span class="s1">cc</span><span class="s2">] = </span><span class="s1">linker</span><span class="s2">.</span><span class="s1">info_log</span>
+
+        <span class="s0">return </span><span class="s1">cubin</span>
+
+    <span class="s0">def </span><span class="s1">get_cufunc</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_entry_name </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s1">msg </span><span class="s2">= </span><span class="s3">&quot;Missing entry_name - are you trying to get the cufunc &quot; </span><span class="s1">\</span>
+                  <span class="s3">&quot;for a device function?&quot;</span>
+            <span class="s0">raise </span><span class="s1">RuntimeError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">)</span>
+
+        <span class="s1">ctx </span><span class="s2">= </span><span class="s1">devices</span><span class="s2">.</span><span class="s1">get_context</span><span class="s2">()</span>
+        <span class="s1">device </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">device</span>
+
+        <span class="s1">cufunc </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_cufunc_cache</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">device</span><span class="s2">.</span><span class="s1">id</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">cufunc</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">cufunc</span>
+
+        <span class="s1">cubin </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_cubin</span><span class="s2">(</span><span class="s1">cc</span><span class="s2">=</span><span class="s1">device</span><span class="s2">.</span><span class="s1">compute_capability</span><span class="s2">)</span>
+        <span class="s1">module </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">create_module_image</span><span class="s2">(</span><span class="s1">cubin</span><span class="s2">)</span>
+
+        <span class="s4"># Load</span>
+        <span class="s1">cufunc </span><span class="s2">= </span><span class="s1">module</span><span class="s2">.</span><span class="s1">get_function</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_entry_name</span><span class="s2">)</span>
+
+        <span class="s4"># Populate caches</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_cufunc_cache</span><span class="s2">[</span><span class="s1">device</span><span class="s2">.</span><span class="s1">id</span><span class="s2">] = </span><span class="s1">cufunc</span>
+
+        <span class="s0">return </span><span class="s1">cufunc</span>
+
+    <span class="s0">def </span><span class="s1">get_linkerinfo</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">cc</span><span class="s2">):</span>
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_linkerinfo_cache</span><span class="s2">[</span><span class="s1">cc</span><span class="s2">]</span>
+        <span class="s0">except </span><span class="s1">KeyError</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">KeyError</span><span class="s2">(</span><span class="s3">f'No linkerinfo for CC </span><span class="s0">{</span><span class="s1">cc</span><span class="s0">}</span><span class="s3">'</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">get_sass</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">cc</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">disassemble_cubin</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_cubin</span><span class="s2">(</span><span class="s1">cc</span><span class="s2">=</span><span class="s1">cc</span><span class="s2">))</span>
+
+    <span class="s0">def </span><span class="s1">get_sass_cfg</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">cc</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">disassemble_cubin_for_cfg</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_cubin</span><span class="s2">(</span><span class="s1">cc</span><span class="s2">=</span><span class="s1">cc</span><span class="s2">))</span>
+
+    <span class="s0">def </span><span class="s1">add_ir_module</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">mod</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_raise_if_finalized</span><span class="s2">()</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_module </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">RuntimeError</span><span class="s2">(</span><span class="s3">'CUDACodeLibrary only supports one module'</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_module </span><span class="s2">= </span><span class="s1">mod</span>
+
+    <span class="s0">def </span><span class="s1">add_linking_library</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">library</span><span class="s2">):</span>
+        <span class="s1">library</span><span class="s2">.</span><span class="s1">_ensure_finalized</span><span class="s2">()</span>
+
+        <span class="s4"># We don't want to allow linking more libraries in after finalization</span>
+        <span class="s4"># because our linked libraries are modified by the finalization, and we</span>
+        <span class="s4"># won't be able to finalize again after adding new ones</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_raise_if_finalized</span><span class="s2">()</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_linking_libraries</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">library</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">add_linking_file</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">filepath</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_linking_files</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">filepath</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">get_function</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">):</span>
+        <span class="s0">for </span><span class="s1">fn </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_module</span><span class="s2">.</span><span class="s1">functions</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">fn</span><span class="s2">.</span><span class="s1">name </span><span class="s2">== </span><span class="s1">name</span><span class="s2">:</span>
+                <span class="s0">return </span><span class="s1">fn</span>
+        <span class="s0">raise </span><span class="s1">KeyError</span><span class="s2">(</span><span class="s3">f'Function </span><span class="s0">{</span><span class="s1">name</span><span class="s0">} </span><span class="s3">not found'</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">modules</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s2">[</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_module</span><span class="s2">] + [</span><span class="s1">mod </span><span class="s0">for </span><span class="s1">lib </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_linking_libraries</span>
+                                 <span class="s0">for </span><span class="s1">mod </span><span class="s0">in </span><span class="s1">lib</span><span class="s2">.</span><span class="s1">modules</span><span class="s2">]</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">linking_libraries</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4"># Libraries we link to may link to other libraries, so we recursively</span>
+        <span class="s4"># traverse the linking libraries property to build up a list of all</span>
+        <span class="s4"># linked libraries.</span>
+        <span class="s1">libs </span><span class="s2">= []</span>
+        <span class="s0">for </span><span class="s1">lib </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_linking_libraries</span><span class="s2">:</span>
+            <span class="s1">libs</span><span class="s2">.</span><span class="s1">extend</span><span class="s2">(</span><span class="s1">lib</span><span class="s2">.</span><span class="s1">linking_libraries</span><span class="s2">)</span>
+            <span class="s1">libs</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">lib</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">libs</span>
+
+    <span class="s0">def </span><span class="s1">finalize</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4"># Unlike the CPUCodeLibrary, we don't invoke the binding layer here -</span>
+        <span class="s4"># we only adjust the linkage of functions. Global kernels (with</span>
+        <span class="s4"># external linkage) have their linkage untouched. Device functions are</span>
+        <span class="s4"># set linkonce_odr to prevent them appearing in the PTX.</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_raise_if_finalized</span><span class="s2">()</span>
+
+        <span class="s4"># Note in-place modification of the linkage of functions in linked</span>
+        <span class="s4"># libraries. This presently causes no issues as only device functions</span>
+        <span class="s4"># are shared across code libraries, so they would always need their</span>
+        <span class="s4"># linkage set to linkonce_odr. If in a future scenario some code</span>
+        <span class="s4"># libraries require linkonce_odr linkage of functions in linked</span>
+        <span class="s4"># modules, and another code library requires another linkage, each code</span>
+        <span class="s4"># library will need to take its own private copy of its linked modules.</span>
+        <span class="s4">#</span>
+        <span class="s4"># See also discussion on PR #890:</span>
+        <span class="s4"># https://github.com/numba/numba/pull/890</span>
+        <span class="s0">for </span><span class="s1">library </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_linking_libraries</span><span class="s2">:</span>
+            <span class="s0">for </span><span class="s1">mod </span><span class="s0">in </span><span class="s1">library</span><span class="s2">.</span><span class="s1">modules</span><span class="s2">:</span>
+                <span class="s0">for </span><span class="s1">fn </span><span class="s0">in </span><span class="s1">mod</span><span class="s2">.</span><span class="s1">functions</span><span class="s2">:</span>
+                    <span class="s0">if not </span><span class="s1">fn</span><span class="s2">.</span><span class="s1">is_declaration</span><span class="s2">:</span>
+                        <span class="s1">fn</span><span class="s2">.</span><span class="s1">linkage </span><span class="s2">= </span><span class="s3">'linkonce_odr'</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_finalized </span><span class="s2">= </span><span class="s0">True</span>
+
+    <span class="s0">def </span><span class="s1">_reduce_states</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Reduce the instance for serialization. We retain the PTX and cubins, 
+        but loaded functions are discarded. They are recreated when needed 
+        after deserialization. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_linking_files</span><span class="s2">:</span>
+            <span class="s1">msg </span><span class="s2">= </span><span class="s3">'Cannot pickle CUDACodeLibrary with linking files'</span>
+            <span class="s0">raise </span><span class="s1">RuntimeError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">)</span>
+        <span class="s0">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_finalized</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">RuntimeError</span><span class="s2">(</span><span class="s3">'Cannot pickle unfinalized CUDACodeLibrary'</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">dict</span><span class="s2">(</span>
+            <span class="s1">codegen</span><span class="s2">=</span><span class="s0">None</span><span class="s2">,</span>
+            <span class="s1">name</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">name</span><span class="s2">,</span>
+            <span class="s1">entry_name</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_entry_name</span><span class="s2">,</span>
+            <span class="s1">llvm_strs</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">llvm_strs</span><span class="s2">,</span>
+            <span class="s1">ptx_cache</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ptx_cache</span><span class="s2">,</span>
+            <span class="s1">cubin_cache</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_cubin_cache</span><span class="s2">,</span>
+            <span class="s1">linkerinfo_cache</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_linkerinfo_cache</span><span class="s2">,</span>
+            <span class="s1">max_registers</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_max_registers</span><span class="s2">,</span>
+            <span class="s1">nvvm_options</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_nvvm_options</span><span class="s2">,</span>
+            <span class="s1">needs_cudadevrt</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">needs_cudadevrt</span>
+        <span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">classmethod</span>
+    <span class="s0">def </span><span class="s1">_rebuild</span><span class="s2">(</span><span class="s1">cls</span><span class="s2">, </span><span class="s1">codegen</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">entry_name</span><span class="s2">, </span><span class="s1">llvm_strs</span><span class="s2">, </span><span class="s1">ptx_cache</span><span class="s2">,</span>
+                 <span class="s1">cubin_cache</span><span class="s2">, </span><span class="s1">linkerinfo_cache</span><span class="s2">, </span><span class="s1">max_registers</span><span class="s2">, </span><span class="s1">nvvm_options</span><span class="s2">,</span>
+                 <span class="s1">needs_cudadevrt</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Rebuild an instance. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">instance </span><span class="s2">= </span><span class="s1">cls</span><span class="s2">(</span><span class="s1">codegen</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">entry_name</span><span class="s2">=</span><span class="s1">entry_name</span><span class="s2">)</span>
+
+        <span class="s1">instance</span><span class="s2">.</span><span class="s1">_llvm_strs </span><span class="s2">= </span><span class="s1">llvm_strs</span>
+        <span class="s1">instance</span><span class="s2">.</span><span class="s1">_ptx_cache </span><span class="s2">= </span><span class="s1">ptx_cache</span>
+        <span class="s1">instance</span><span class="s2">.</span><span class="s1">_cubin_cache </span><span class="s2">= </span><span class="s1">cubin_cache</span>
+        <span class="s1">instance</span><span class="s2">.</span><span class="s1">_linkerinfo_cache </span><span class="s2">= </span><span class="s1">linkerinfo_cache</span>
+
+        <span class="s1">instance</span><span class="s2">.</span><span class="s1">_max_registers </span><span class="s2">= </span><span class="s1">max_registers</span>
+        <span class="s1">instance</span><span class="s2">.</span><span class="s1">_nvvm_options </span><span class="s2">= </span><span class="s1">nvvm_options</span>
+        <span class="s1">instance</span><span class="s2">.</span><span class="s1">needs_cudadevrt </span><span class="s2">= </span><span class="s1">needs_cudadevrt</span>
+
+        <span class="s1">instance</span><span class="s2">.</span><span class="s1">_finalized </span><span class="s2">= </span><span class="s0">True</span>
+
+        <span class="s0">return </span><span class="s1">instance</span>
+
+
+<span class="s0">class </span><span class="s1">JITCUDACodegen</span><span class="s2">(</span><span class="s1">Codegen</span><span class="s2">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    This codegen implementation for CUDA only generates optimized LLVM IR. 
+    Generation of PTX code is done separately (see numba.cuda.compiler). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_library_class </span><span class="s2">= </span><span class="s1">CUDACodeLibrary</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">module_name</span><span class="s2">):</span>
+        <span class="s0">pass</span>
+
+    <span class="s0">def </span><span class="s1">_create_empty_module</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">):</span>
+        <span class="s1">ir_module </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Module</span><span class="s2">(</span><span class="s1">name</span><span class="s2">)</span>
+        <span class="s1">ir_module</span><span class="s2">.</span><span class="s1">triple </span><span class="s2">= </span><span class="s1">CUDA_TRIPLE</span>
+        <span class="s1">ir_module</span><span class="s2">.</span><span class="s1">data_layout </span><span class="s2">= </span><span class="s1">nvvm</span><span class="s2">.</span><span class="s1">NVVM</span><span class="s2">().</span><span class="s1">data_layout</span>
+        <span class="s1">nvvm</span><span class="s2">.</span><span class="s1">add_ir_version</span><span class="s2">(</span><span class="s1">ir_module</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">ir_module</span>
+
+    <span class="s0">def </span><span class="s1">_add_module</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">module</span><span class="s2">):</span>
+        <span class="s0">pass</span>
+
+    <span class="s0">def </span><span class="s1">magic_tuple</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Return a tuple unambiguously describing the codegen behaviour. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">ctx </span><span class="s2">= </span><span class="s1">devices</span><span class="s2">.</span><span class="s1">get_context</span><span class="s2">()</span>
+        <span class="s1">cc </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">device</span><span class="s2">.</span><span class="s1">compute_capability</span>
+        <span class="s0">return </span><span class="s2">(</span><span class="s1">runtime</span><span class="s2">.</span><span class="s1">runtime</span><span class="s2">.</span><span class="s1">get_version</span><span class="s2">(), </span><span class="s1">cc</span><span class="s2">)</span>
+</pre>
+</body>
+</html>

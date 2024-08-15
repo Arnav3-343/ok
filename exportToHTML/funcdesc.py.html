@@ -1,0 +1,252 @@
+<html>
+<head>
+<title>funcdesc.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+funcdesc.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Function descriptors. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">defaultdict</span>
+<span class="s2">import </span><span class="s1">importlib</span>
+
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">types</span><span class="s3">, </span><span class="s1">itanium_mangler</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">utils </span><span class="s2">import </span><span class="s1">_dynamic_modname</span><span class="s3">, </span><span class="s1">_dynamic_module</span>
+
+
+<span class="s2">def </span><span class="s1">default_mangler</span><span class="s3">(</span><span class="s1">name</span><span class="s3">, </span><span class="s1">argtypes</span><span class="s3">, *, </span><span class="s1">abi_tags</span><span class="s3">=(), </span><span class="s1">uid</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">itanium_mangler</span><span class="s3">.</span><span class="s1">mangle</span><span class="s3">(</span><span class="s1">name</span><span class="s3">, </span><span class="s1">argtypes</span><span class="s3">, </span><span class="s1">abi_tags</span><span class="s3">=</span><span class="s1">abi_tags</span><span class="s3">, </span><span class="s1">uid</span><span class="s3">=</span><span class="s1">uid</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">qualifying_prefix</span><span class="s3">(</span><span class="s1">modname</span><span class="s3">, </span><span class="s1">qualname</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Returns a new string that is used for the first half of the mangled name. 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># XXX choose a different convention for object mode</span>
+    <span class="s2">return </span><span class="s5">'{}.{}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">modname</span><span class="s3">, </span><span class="s1">qualname</span><span class="s3">) </span><span class="s2">if </span><span class="s1">modname </span><span class="s2">else </span><span class="s1">qualname</span>
+
+
+<span class="s2">class </span><span class="s1">FunctionDescriptor</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Base class for function descriptors: an object used to carry 
+    useful metadata about a natively callable function. 
+ 
+    Note that while `FunctionIdentity` denotes a Python function 
+    which is being concretely compiled by Numba, `FunctionDescriptor` 
+    may be more &quot;abstract&quot;. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">__slots__ </span><span class="s3">= (</span><span class="s5">'native'</span><span class="s3">, </span><span class="s5">'modname'</span><span class="s3">, </span><span class="s5">'qualname'</span><span class="s3">, </span><span class="s5">'doc'</span><span class="s3">, </span><span class="s5">'typemap'</span><span class="s3">,</span>
+                 <span class="s5">'calltypes'</span><span class="s3">, </span><span class="s5">'args'</span><span class="s3">, </span><span class="s5">'kws'</span><span class="s3">, </span><span class="s5">'restype'</span><span class="s3">, </span><span class="s5">'argtypes'</span><span class="s3">,</span>
+                 <span class="s5">'mangled_name'</span><span class="s3">, </span><span class="s5">'unique_name'</span><span class="s3">, </span><span class="s5">'env_name'</span><span class="s3">, </span><span class="s5">'global_dict'</span><span class="s3">,</span>
+                 <span class="s5">'inline'</span><span class="s3">, </span><span class="s5">'noalias'</span><span class="s3">, </span><span class="s5">'abi_tags'</span><span class="s3">, </span><span class="s5">'uid'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">native</span><span class="s3">, </span><span class="s1">modname</span><span class="s3">, </span><span class="s1">qualname</span><span class="s3">, </span><span class="s1">unique_name</span><span class="s3">, </span><span class="s1">doc</span><span class="s3">,</span>
+                 <span class="s1">typemap</span><span class="s3">, </span><span class="s1">restype</span><span class="s3">, </span><span class="s1">calltypes</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">kws</span><span class="s3">, </span><span class="s1">mangler</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                 <span class="s1">argtypes</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">inline</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, </span><span class="s1">noalias</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, </span><span class="s1">env_name</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                 <span class="s1">global_dict</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">abi_tags</span><span class="s3">=(), </span><span class="s1">uid</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">native </span><span class="s3">= </span><span class="s1">native</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">modname </span><span class="s3">= </span><span class="s1">modname</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">global_dict </span><span class="s3">= </span><span class="s1">global_dict</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">qualname </span><span class="s3">= </span><span class="s1">qualname</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">unique_name </span><span class="s3">= </span><span class="s1">unique_name</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">doc </span><span class="s3">= </span><span class="s1">doc</span>
+        <span class="s4"># XXX typemap and calltypes should be on the compile result,</span>
+        <span class="s4"># not the FunctionDescriptor</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">typemap </span><span class="s3">= </span><span class="s1">typemap</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">calltypes </span><span class="s3">= </span><span class="s1">calltypes</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">args </span><span class="s3">= </span><span class="s1">args</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">kws </span><span class="s3">= </span><span class="s1">kws</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">restype </span><span class="s3">= </span><span class="s1">restype</span>
+        <span class="s4"># Argument types</span>
+        <span class="s2">if </span><span class="s1">argtypes </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">argtypes</span><span class="s3">, </span><span class="s1">tuple</span><span class="s3">), </span><span class="s1">argtypes</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">argtypes </span><span class="s3">= </span><span class="s1">argtypes</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s4"># Get argument types from the type inference result</span>
+            <span class="s4"># (note the &quot;arg.FOO&quot; convention as used in typeinfer</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">argtypes </span><span class="s3">= </span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">typemap</span><span class="s3">[</span><span class="s5">'arg.' </span><span class="s3">+ </span><span class="s1">a</span><span class="s3">] </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">args</span><span class="s3">)</span>
+        <span class="s1">mangler </span><span class="s3">= </span><span class="s1">default_mangler </span><span class="s2">if </span><span class="s1">mangler </span><span class="s2">is None else </span><span class="s1">mangler</span>
+        <span class="s4"># The mangled name *must* be unique, else the wrong function can</span>
+        <span class="s4"># be chosen at link time.</span>
+        <span class="s1">qualprefix </span><span class="s3">= </span><span class="s1">qualifying_prefix</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">modname</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">qualname</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">uid </span><span class="s3">= </span><span class="s1">uid</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">mangled_name </span><span class="s3">= </span><span class="s1">mangler</span><span class="s3">(</span>
+            <span class="s1">qualprefix</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">argtypes</span><span class="s3">, </span><span class="s1">abi_tags</span><span class="s3">=</span><span class="s1">abi_tags</span><span class="s3">, </span><span class="s1">uid</span><span class="s3">=</span><span class="s1">uid</span><span class="s3">,</span>
+        <span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">env_name </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">env_name </span><span class="s3">= </span><span class="s1">mangler</span><span class="s3">(</span><span class="s5">&quot;.NumbaEnv.{}&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">qualprefix</span><span class="s3">),</span>
+                               <span class="s1">self</span><span class="s3">.</span><span class="s1">argtypes</span><span class="s3">, </span><span class="s1">abi_tags</span><span class="s3">=</span><span class="s1">abi_tags</span><span class="s3">, </span><span class="s1">uid</span><span class="s3">=</span><span class="s1">uid</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">env_name </span><span class="s3">= </span><span class="s1">env_name</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">inline </span><span class="s3">= </span><span class="s1">inline</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">noalias </span><span class="s3">= </span><span class="s1">noalias</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">abi_tags </span><span class="s3">= </span><span class="s1">abi_tags</span>
+
+    <span class="s2">def </span><span class="s1">lookup_globals</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the global dictionary of the function. 
+        It may not match the Module's globals if the function is created 
+        dynamically (i.e. exec) 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">global_dict </span><span class="s2">or </span><span class="s1">self</span><span class="s3">.</span><span class="s1">lookup_module</span><span class="s3">().</span><span class="s1">__dict__</span>
+
+    <span class="s2">def </span><span class="s1">lookup_module</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the module in which this function is supposed to exist. 
+        This may be a dummy module if the function was dynamically 
+        generated or the module can't be found. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">modname </span><span class="s3">== </span><span class="s1">_dynamic_modname</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">_dynamic_module</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s4"># ensure module exist</span>
+                <span class="s2">return </span><span class="s1">importlib</span><span class="s3">.</span><span class="s1">import_module</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">modname</span><span class="s3">)</span>
+            <span class="s2">except </span><span class="s1">ImportError</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">_dynamic_module</span>
+
+    <span class="s2">def </span><span class="s1">lookup_function</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the original function object described by this object. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">lookup_module</span><span class="s3">(), </span><span class="s1">self</span><span class="s3">.</span><span class="s1">qualname</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">llvm_func_name</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        The LLVM-registered name for the raw function. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">mangled_name</span>
+
+    <span class="s4"># XXX refactor this</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">llvm_cpython_wrapper_name</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        The LLVM-registered name for a CPython-compatible wrapper of the 
+        raw function (i.e. a PyCFunctionWithKeywords). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">itanium_mangler</span><span class="s3">.</span><span class="s1">prepend_namespace</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">mangled_name</span><span class="s3">,</span>
+                                                 <span class="s1">ns</span><span class="s3">=</span><span class="s5">'cpython'</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">llvm_cfunc_wrapper_name</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        The LLVM-registered name for a C-compatible wrapper of the 
+        raw function. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s5">'cfunc.' </span><span class="s3">+ </span><span class="s1">self</span><span class="s3">.</span><span class="s1">mangled_name</span>
+
+    <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s5">&quot;&lt;function descriptor %r&gt;&quot; </span><span class="s3">% (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">unique_name</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">_get_function_info</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns 
+        ------- 
+        qualname, unique_name, modname, doc, args, kws, globals 
+ 
+        ``unique_name`` must be a unique name. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">func </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">func_id</span><span class="s3">.</span><span class="s1">func</span>
+        <span class="s1">qualname </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">func_id</span><span class="s3">.</span><span class="s1">func_qualname</span>
+        <span class="s4"># XXX to func_id</span>
+        <span class="s1">modname </span><span class="s3">= </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__module__</span>
+        <span class="s1">doc </span><span class="s3">= </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__doc__ </span><span class="s2">or </span><span class="s5">''</span>
+        <span class="s1">args </span><span class="s3">= </span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">arg_names</span><span class="s3">)</span>
+        <span class="s1">kws </span><span class="s3">= ()        </span><span class="s4"># TODO</span>
+        <span class="s1">global_dict </span><span class="s3">= </span><span class="s2">None</span>
+
+        <span class="s2">if </span><span class="s1">modname </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s4"># Dynamically generated function.</span>
+            <span class="s1">modname </span><span class="s3">= </span><span class="s1">_dynamic_modname</span>
+            <span class="s4"># Retain a reference to the dictionary of the function.</span>
+            <span class="s4"># This disables caching, serialization and pickling.</span>
+            <span class="s1">global_dict </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">func_id</span><span class="s3">.</span><span class="s1">func</span><span class="s3">.</span><span class="s1">__globals__</span>
+
+        <span class="s1">unique_name </span><span class="s3">= </span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">func_id</span><span class="s3">.</span><span class="s1">unique_name</span>
+
+        <span class="s2">return </span><span class="s1">qualname</span><span class="s3">, </span><span class="s1">unique_name</span><span class="s3">, </span><span class="s1">modname</span><span class="s3">, </span><span class="s1">doc</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">kws</span><span class="s3">, </span><span class="s1">global_dict</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">_from_python_function</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">typemap</span><span class="s3">, </span><span class="s1">restype</span><span class="s3">,</span>
+                              <span class="s1">calltypes</span><span class="s3">, </span><span class="s1">native</span><span class="s3">, </span><span class="s1">mangler</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                              <span class="s1">inline</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, </span><span class="s1">noalias</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, </span><span class="s1">abi_tags</span><span class="s3">=()):</span>
+        <span class="s3">(</span><span class="s1">qualname</span><span class="s3">, </span><span class="s1">unique_name</span><span class="s3">, </span><span class="s1">modname</span><span class="s3">, </span><span class="s1">doc</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">kws</span><span class="s3">, </span><span class="s1">global_dict</span><span class="s3">,</span>
+         <span class="s3">) = </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_get_function_info</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">)</span>
+
+        <span class="s1">self </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">(</span><span class="s1">native</span><span class="s3">, </span><span class="s1">modname</span><span class="s3">, </span><span class="s1">qualname</span><span class="s3">, </span><span class="s1">unique_name</span><span class="s3">, </span><span class="s1">doc</span><span class="s3">,</span>
+                   <span class="s1">typemap</span><span class="s3">, </span><span class="s1">restype</span><span class="s3">, </span><span class="s1">calltypes</span><span class="s3">,</span>
+                   <span class="s1">args</span><span class="s3">, </span><span class="s1">kws</span><span class="s3">, </span><span class="s1">mangler</span><span class="s3">=</span><span class="s1">mangler</span><span class="s3">, </span><span class="s1">inline</span><span class="s3">=</span><span class="s1">inline</span><span class="s3">, </span><span class="s1">noalias</span><span class="s3">=</span><span class="s1">noalias</span><span class="s3">,</span>
+                   <span class="s1">global_dict</span><span class="s3">=</span><span class="s1">global_dict</span><span class="s3">, </span><span class="s1">abi_tags</span><span class="s3">=</span><span class="s1">abi_tags</span><span class="s3">,</span>
+                   <span class="s1">uid</span><span class="s3">=</span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">func_id</span><span class="s3">.</span><span class="s1">unique_id</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">self</span>
+
+
+<span class="s2">class </span><span class="s1">PythonFunctionDescriptor</span><span class="s3">(</span><span class="s1">FunctionDescriptor</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A FunctionDescriptor subclass for Numba-compiled functions. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">__slots__ </span><span class="s3">= ()</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">from_specialized_function</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">typemap</span><span class="s3">, </span><span class="s1">restype</span><span class="s3">, </span><span class="s1">calltypes</span><span class="s3">,</span>
+                                  <span class="s1">mangler</span><span class="s3">, </span><span class="s1">inline</span><span class="s3">, </span><span class="s1">noalias</span><span class="s3">, </span><span class="s1">abi_tags</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Build a FunctionDescriptor for a given specialization of a Python 
+        function (in nopython mode). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_from_python_function</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">typemap</span><span class="s3">, </span><span class="s1">restype</span><span class="s3">, </span><span class="s1">calltypes</span><span class="s3">,</span>
+                                         <span class="s1">native</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">mangler</span><span class="s3">=</span><span class="s1">mangler</span><span class="s3">,</span>
+                                         <span class="s1">inline</span><span class="s3">=</span><span class="s1">inline</span><span class="s3">, </span><span class="s1">noalias</span><span class="s3">=</span><span class="s1">noalias</span><span class="s3">,</span>
+                                         <span class="s1">abi_tags</span><span class="s3">=</span><span class="s1">abi_tags</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">from_object_mode_function</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">func_ir</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Build a FunctionDescriptor for an object mode variant of a Python 
+        function. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">typemap </span><span class="s3">= </span><span class="s1">defaultdict</span><span class="s3">(</span><span class="s2">lambda</span><span class="s3">: </span><span class="s1">types</span><span class="s3">.</span><span class="s1">pyobject</span><span class="s3">)</span>
+        <span class="s1">calltypes </span><span class="s3">= </span><span class="s1">typemap</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+        <span class="s1">restype </span><span class="s3">= </span><span class="s1">types</span><span class="s3">.</span><span class="s1">pyobject</span>
+        <span class="s2">return </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_from_python_function</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">, </span><span class="s1">typemap</span><span class="s3">, </span><span class="s1">restype</span><span class="s3">, </span><span class="s1">calltypes</span><span class="s3">,</span>
+                                         <span class="s1">native</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">ExternalFunctionDescriptor</span><span class="s3">(</span><span class="s1">FunctionDescriptor</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A FunctionDescriptor subclass for opaque external functions 
+    (e.g. raw C functions). 
+    &quot;&quot;&quot;</span>
+    <span class="s1">__slots__ </span><span class="s3">= ()</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">restype</span><span class="s3">, </span><span class="s1">argtypes</span><span class="s3">):</span>
+        <span class="s1">args </span><span class="s3">= [</span><span class="s5">&quot;arg%d&quot; </span><span class="s3">% </span><span class="s1">i </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">argtypes</span><span class="s3">))]</span>
+
+        <span class="s2">def </span><span class="s1">mangler</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">abi_tags</span><span class="s3">, </span><span class="s1">uid</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">a</span>
+        <span class="s1">super</span><span class="s3">(</span><span class="s1">ExternalFunctionDescriptor</span><span class="s3">, </span><span class="s1">self</span>
+              <span class="s3">).</span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">native</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">modname</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">qualname</span><span class="s3">=</span><span class="s1">name</span><span class="s3">,</span>
+                         <span class="s1">unique_name</span><span class="s3">=</span><span class="s1">name</span><span class="s3">, </span><span class="s1">doc</span><span class="s3">=</span><span class="s5">''</span><span class="s3">, </span><span class="s1">typemap</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                         <span class="s1">restype</span><span class="s3">=</span><span class="s1">restype</span><span class="s3">, </span><span class="s1">calltypes</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=</span><span class="s1">args</span><span class="s3">,</span>
+                         <span class="s1">kws</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                         <span class="s1">mangler</span><span class="s3">=</span><span class="s1">mangler</span><span class="s3">,</span>
+                         <span class="s1">argtypes</span><span class="s3">=</span><span class="s1">argtypes</span><span class="s3">)</span>
+</pre>
+</body>
+</html>

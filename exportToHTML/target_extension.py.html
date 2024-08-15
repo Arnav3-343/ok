@@ -1,0 +1,192 @@
+<html>
+<head>
+<title>target_extension.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #2aacb8;}
+.s5 { color: #7a7e85;}
+.s6 { color: #5f826b; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+target_extension.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">abc </span><span class="s0">import </span><span class="s1">ABC</span><span class="s2">, </span><span class="s1">abstractmethod</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">registry </span><span class="s0">import </span><span class="s1">DelayedRegistry</span><span class="s2">, </span><span class="s1">CPUDispatcher</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">decorators </span><span class="s0">import </span><span class="s1">jit</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">errors </span><span class="s0">import </span><span class="s2">(</span><span class="s1">InternalTargetMismatchError</span><span class="s2">,</span>
+                               <span class="s1">NonexistentTargetError</span><span class="s2">)</span>
+<span class="s0">from </span><span class="s1">threading </span><span class="s0">import </span><span class="s1">local </span><span class="s0">as </span><span class="s1">tls</span>
+
+
+<span class="s1">_active_context </span><span class="s2">= </span><span class="s1">tls</span><span class="s2">()</span>
+<span class="s1">_active_context_default </span><span class="s2">= </span><span class="s3">'cpu'</span>
+
+
+<span class="s0">class </span><span class="s1">_TargetRegistry</span><span class="s2">(</span><span class="s1">DelayedRegistry</span><span class="s2">):</span>
+
+    <span class="s0">def </span><span class="s1">__getitem__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">item</span><span class="s2">):</span>
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">super</span><span class="s2">().</span><span class="s1">__getitem__</span><span class="s2">(</span><span class="s1">item</span><span class="s2">)</span>
+        <span class="s0">except </span><span class="s1">KeyError</span><span class="s2">:</span>
+            <span class="s1">msg </span><span class="s2">= </span><span class="s3">&quot;No target is registered against '{}', known targets:</span><span class="s0">\n</span><span class="s3">{}&quot;</span>
+            <span class="s1">known </span><span class="s2">= </span><span class="s3">'</span><span class="s0">\n</span><span class="s3">'</span><span class="s2">.</span><span class="s1">join</span><span class="s2">([</span><span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">k</span><span class="s0">: </span><span class="s3">&lt;</span><span class="s0">{</span><span class="s4">10</span><span class="s0">}} </span><span class="s3">-&gt; </span><span class="s0">{</span><span class="s1">v</span><span class="s0">}</span><span class="s3">&quot;</span>
+                               <span class="s0">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">target_registry</span><span class="s2">.</span><span class="s1">items</span><span class="s2">()])</span>
+            <span class="s0">raise </span><span class="s1">NonexistentTargetError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">item</span><span class="s2">, </span><span class="s1">known</span><span class="s2">)) </span><span class="s0">from None</span>
+
+
+<span class="s5"># Registry mapping target name strings to Target classes</span>
+<span class="s1">target_registry </span><span class="s2">= </span><span class="s1">_TargetRegistry</span><span class="s2">()</span>
+
+<span class="s5"># Registry mapping Target classes the @jit decorator for that target</span>
+<span class="s1">jit_registry </span><span class="s2">= </span><span class="s1">DelayedRegistry</span><span class="s2">()</span>
+
+
+<span class="s0">class </span><span class="s1">target_override</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot;Context manager to temporarily override the current target with that 
+       prescribed.&quot;&quot;&quot;</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_orig_target </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">_active_context</span><span class="s2">, </span><span class="s3">'target'</span><span class="s2">,</span>
+                                    <span class="s1">_active_context_default</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">target </span><span class="s2">= </span><span class="s1">name</span>
+
+    <span class="s0">def </span><span class="s1">__enter__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">_active_context</span><span class="s2">.</span><span class="s1">target </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">target</span>
+
+    <span class="s0">def </span><span class="s1">__exit__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ty</span><span class="s2">, </span><span class="s1">val</span><span class="s2">, </span><span class="s1">tb</span><span class="s2">):</span>
+        <span class="s1">_active_context</span><span class="s2">.</span><span class="s1">target </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_orig_target</span>
+
+
+<span class="s0">def </span><span class="s1">current_target</span><span class="s2">():</span>
+    <span class="s6">&quot;&quot;&quot;Returns the current target 
+    &quot;&quot;&quot;</span>
+    <span class="s0">return </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">_active_context</span><span class="s2">, </span><span class="s3">'target'</span><span class="s2">, </span><span class="s1">_active_context_default</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">get_local_target</span><span class="s2">(</span><span class="s1">context</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    Gets the local target from the call stack if available and the TLS 
+    override if not. 
+    &quot;&quot;&quot;</span>
+    <span class="s5"># TODO: Should this logic be reversed to prefer TLS override?</span>
+    <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">context</span><span class="s2">.</span><span class="s1">callstack</span><span class="s2">.</span><span class="s1">_stack</span><span class="s2">) &gt; </span><span class="s4">0</span><span class="s2">:</span>
+        <span class="s1">target </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">callstack</span><span class="s2">[</span><span class="s4">0</span><span class="s2">].</span><span class="s1">target</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s1">target </span><span class="s2">= </span><span class="s1">target_registry</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">current_target</span><span class="s2">(), </span><span class="s0">None</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">target </span><span class="s0">is None</span><span class="s2">:</span>
+        <span class="s1">msg </span><span class="s2">= (</span><span class="s3">&quot;The target found is not registered.&quot;</span>
+               <span class="s3">&quot;Given target was {}.&quot;</span><span class="s2">)</span>
+        <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">target</span><span class="s2">))</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">target</span>
+
+
+<span class="s0">def </span><span class="s1">resolve_target_str</span><span class="s2">(</span><span class="s1">target_str</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot;Resolves a target specified as a string to its Target class.&quot;&quot;&quot;</span>
+    <span class="s0">return </span><span class="s1">target_registry</span><span class="s2">[</span><span class="s1">target_str</span><span class="s2">]</span>
+
+
+<span class="s0">def </span><span class="s1">resolve_dispatcher_from_str</span><span class="s2">(</span><span class="s1">target_str</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot;Returns the dispatcher associated with a target string&quot;&quot;&quot;</span>
+    <span class="s1">target_hw </span><span class="s2">= </span><span class="s1">resolve_target_str</span><span class="s2">(</span><span class="s1">target_str</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">dispatcher_registry</span><span class="s2">[</span><span class="s1">target_hw</span><span class="s2">]</span>
+
+
+<span class="s0">def </span><span class="s1">_get_local_target_checked</span><span class="s2">(</span><span class="s1">tyctx</span><span class="s2">, </span><span class="s1">hwstr</span><span class="s2">, </span><span class="s1">reason</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot;Returns the local target if it is compatible with the given target 
+    name during a type resolution; otherwise, raises an exception. 
+ 
+    Parameters 
+    ---------- 
+    tyctx: typing context 
+    hwstr: str 
+        target name to check against 
+    reason: str 
+        Reason for the resolution. Expects a noun. 
+    Returns 
+    ------- 
+    target_hw : Target 
+ 
+    Raises 
+    ------ 
+    InternalTargetMismatchError 
+    &quot;&quot;&quot;</span>
+    <span class="s5"># Get the class for the target declared by the function</span>
+    <span class="s1">hw_clazz </span><span class="s2">= </span><span class="s1">resolve_target_str</span><span class="s2">(</span><span class="s1">hwstr</span><span class="s2">)</span>
+    <span class="s5"># get the local target</span>
+    <span class="s1">target_hw </span><span class="s2">= </span><span class="s1">get_local_target</span><span class="s2">(</span><span class="s1">tyctx</span><span class="s2">)</span>
+    <span class="s5"># make sure the target_hw is in the MRO for hw_clazz else bail</span>
+    <span class="s0">if not </span><span class="s1">target_hw</span><span class="s2">.</span><span class="s1">inherits_from</span><span class="s2">(</span><span class="s1">hw_clazz</span><span class="s2">):</span>
+        <span class="s0">raise </span><span class="s1">InternalTargetMismatchError</span><span class="s2">(</span><span class="s1">reason</span><span class="s2">, </span><span class="s1">target_hw</span><span class="s2">, </span><span class="s1">hw_clazz</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">target_hw</span>
+
+
+<span class="s0">class </span><span class="s1">JitDecorator</span><span class="s2">(</span><span class="s1">ABC</span><span class="s2">):</span>
+
+    <span class="s2">@</span><span class="s1">abstractmethod</span>
+    <span class="s0">def </span><span class="s1">__call__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">NotImplemented</span>
+
+
+<span class="s0">class </span><span class="s1">Target</span><span class="s2">(</span><span class="s1">ABC</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; Implements a target &quot;&quot;&quot;</span>
+
+    <span class="s2">@</span><span class="s1">classmethod</span>
+    <span class="s0">def </span><span class="s1">inherits_from</span><span class="s2">(</span><span class="s1">cls</span><span class="s2">, </span><span class="s1">other</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot;Returns True if this target inherits from 'other' False otherwise&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">issubclass</span><span class="s2">(</span><span class="s1">cls</span><span class="s2">, </span><span class="s1">other</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">Generic</span><span class="s2">(</span><span class="s1">Target</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot;Mark the target as generic, i.e. suitable for compilation on 
+    any target. All must inherit from this. 
+    &quot;&quot;&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">CPU</span><span class="s2">(</span><span class="s1">Generic</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot;Mark the target as CPU. 
+    &quot;&quot;&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">GPU</span><span class="s2">(</span><span class="s1">Generic</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot;Mark the target as GPU, i.e. suitable for compilation on a GPU 
+    target. 
+    &quot;&quot;&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">CUDA</span><span class="s2">(</span><span class="s1">GPU</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot;Mark the target as CUDA. 
+    &quot;&quot;&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">NPyUfunc</span><span class="s2">(</span><span class="s1">Target</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot;Mark the target as a ufunc 
+    &quot;&quot;&quot;</span>
+
+
+<span class="s1">target_registry</span><span class="s2">[</span><span class="s3">'generic'</span><span class="s2">] = </span><span class="s1">Generic</span>
+<span class="s1">target_registry</span><span class="s2">[</span><span class="s3">'CPU'</span><span class="s2">] = </span><span class="s1">CPU</span>
+<span class="s1">target_registry</span><span class="s2">[</span><span class="s3">'cpu'</span><span class="s2">] = </span><span class="s1">CPU</span>
+<span class="s1">target_registry</span><span class="s2">[</span><span class="s3">'GPU'</span><span class="s2">] = </span><span class="s1">GPU</span>
+<span class="s1">target_registry</span><span class="s2">[</span><span class="s3">'gpu'</span><span class="s2">] = </span><span class="s1">GPU</span>
+<span class="s1">target_registry</span><span class="s2">[</span><span class="s3">'CUDA'</span><span class="s2">] = </span><span class="s1">CUDA</span>
+<span class="s1">target_registry</span><span class="s2">[</span><span class="s3">'cuda'</span><span class="s2">] = </span><span class="s1">CUDA</span>
+<span class="s1">target_registry</span><span class="s2">[</span><span class="s3">'npyufunc'</span><span class="s2">] = </span><span class="s1">NPyUfunc</span>
+
+<span class="s1">dispatcher_registry </span><span class="s2">= </span><span class="s1">DelayedRegistry</span><span class="s2">(</span><span class="s1">key_type</span><span class="s2">=</span><span class="s1">Target</span><span class="s2">)</span>
+
+
+<span class="s5"># Register the cpu target token with its dispatcher and jit</span>
+<span class="s1">cpu_target </span><span class="s2">= </span><span class="s1">target_registry</span><span class="s2">[</span><span class="s3">'cpu'</span><span class="s2">]</span>
+<span class="s1">dispatcher_registry</span><span class="s2">[</span><span class="s1">cpu_target</span><span class="s2">] = </span><span class="s1">CPUDispatcher</span>
+<span class="s1">jit_registry</span><span class="s2">[</span><span class="s1">cpu_target</span><span class="s2">] = </span><span class="s1">jit</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,610 @@
+<html>
+<head>
+<title>motionevent.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #cf8e6d;}
+.s5 { color: #2aacb8;}
+.s6 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+motionevent.py</font>
+</center></td></tr></table>
+<pre><span class="s0">''' 
+.. _motionevent: 
+ 
+Motion Event 
+============ 
+ 
+The :class:`MotionEvent` is the base class used for events provided by 
+pointing devices (touch and non-touch). This class defines all the properties 
+and methods needed to handle 2D and 3D movements but has many more 
+capabilities. 
+ 
+Usually you would never need to create the :class:`MotionEvent` yourself as 
+this is the role of the :mod:`~kivy.input.providers`. 
+ 
+Flow of the motion events 
+------------------------- 
+ 
+1. The :class:`MotionEvent` 's are gathered from input providers by 
+   :class:`~kivy.base.EventLoopBase`. 
+2. Post processing is performed by registered processors 
+   :mod:`~kivy.input.postproc`. 
+3. :class:`~kivy.base.EventLoopBase` dispatches all motion events using 
+   `on_motion` event to all registered listeners including the 
+   :class:`~kivy.core.window.WindowBase`. 
+4. Once received in :meth:`~kivy.core.window.WindowBase.on_motion` events 
+   (touch or non-touch) are all registered managers. If a touch event is not 
+   handled by at least one manager, then it is dispatched through 
+   :meth:`~kivy.core.window.WindowBase.on_touch_down`, 
+   :meth:`~kivy.core.window.WindowBase.on_touch_move` and 
+   :meth:`~kivy.core.window.WindowBase.on_touch_up`. 
+5. Widgets receive events in :meth:`~kivy.uix.widget.Widget.on_motion` method 
+   (if passed by a manager) or on `on_touch_xxx` methods. 
+ 
+Motion events and event managers 
+-------------------------------- 
+ 
+A motion event is a touch event if its :attr:`MotionEvent.is_touch` is set to 
+`True`. Beside `is_touch` attribute, :attr:`MotionEvent.type_id` can be used to 
+check for event's general type. Currently two types are dispatched by 
+input providers: &quot;touch&quot; and &quot;hover&quot;. 
+ 
+Event managers can be used to dispatch any motion event throughout the widget 
+tree and a manager uses `type_id` to specify which event types it want to 
+receive. See :mod:`~kivy.eventmanager` to learn how to define and register 
+an event manager. 
+ 
+A manager can also assign a new `type_id` to 
+:attr:`MotionEvent.type_id` before dispatching it to the widgets. This useful 
+when dispatching a specific event:: 
+ 
+    class MouseTouchManager(EventManagerBase): 
+ 
+        type_ids = ('touch',) 
+ 
+        def dispatch(self, etype, me): 
+            accepted = False 
+            if me.device == 'mouse': 
+                me.push() # Save current type_id and other values 
+                me.type_id = 'mouse_touch' 
+                self.window.transform_motion_event_2d(me) 
+                # Dispatch mouse touch event to widgets which registered 
+                # to receive 'mouse_touch' 
+                for widget in self.window.children[:]: 
+                    if widget.dispatch('on_motion', etype, me): 
+                        accepted = True 
+                        break 
+                me.pop() # Restore 
+            return accepted 
+ 
+Listening to a motion event 
+--------------------------- 
+ 
+If you want to receive all motion events, touch or not, you can bind the 
+MotionEvent from the :class:`~kivy.core.window.Window` to your own callback:: 
+ 
+    def on_motion(self, etype, me): 
+        # will receive all motion events. 
+        pass 
+ 
+    Window.bind(on_motion=on_motion) 
+ 
+You can also listen to changes of the mouse position by watching 
+:attr:`~kivy.core.window.WindowBase.mouse_pos`. 
+ 
+Profiles 
+-------- 
+ 
+The :class:`MotionEvent` stores device specific information in various 
+properties listed in the :attr:`~MotionEvent.profile`. 
+For example, you can receive a MotionEvent that has an angle, a fiducial 
+ID, or even a shape. You can check the :attr:`~MotionEvent.profile` 
+attribute to see what is currently supported by the MotionEvent provider. 
+ 
+This is a short list of the profile values supported by default. Please check 
+the :attr:`MotionEvent.profile` property to see what profile values are 
+available. 
+ 
+============== ================================================================ 
+Profile value   Description 
+-------------- ---------------------------------------------------------------- 
+angle          2D angle. Accessed via the `a` property. 
+button         Mouse button ('left', 'right', 'middle', 'scrollup' or 
+               'scrolldown'). Accessed via the `button` property. 
+markerid       Marker or Fiducial ID. Accessed via the `fid` property. 
+pos            2D position. Accessed via the `x`, `y` or `pos` properties. 
+pos3d          3D position. Accessed via the `x`, `y` or `z` properties. 
+pressure       Pressure of the contact. Accessed via the `pressure` property. 
+shape          Contact shape. Accessed via the `shape` property . 
+============== ================================================================ 
+ 
+If you want to know whether the current :class:`MotionEvent` has an angle:: 
+ 
+    def on_touch_move(self, touch): 
+        if 'angle' in touch.profile: 
+            print('The touch angle is', touch.a) 
+ 
+If you want to select only the fiducials:: 
+ 
+    def on_touch_move(self, touch): 
+        if 'markerid' not in touch.profile: 
+            return 
+ 
+'''</span>
+
+<span class="s1">__all__ </span><span class="s2">= (</span><span class="s3">'MotionEvent'</span><span class="s2">, )</span>
+
+<span class="s4">import </span><span class="s1">weakref</span>
+<span class="s4">from </span><span class="s1">inspect </span><span class="s4">import </span><span class="s1">isroutine</span>
+<span class="s4">from </span><span class="s1">copy </span><span class="s4">import </span><span class="s1">copy</span>
+<span class="s4">from </span><span class="s1">time </span><span class="s4">import </span><span class="s1">time</span>
+
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">eventmanager </span><span class="s4">import </span><span class="s1">MODE_DEFAULT_DISPATCH</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">vector </span><span class="s4">import </span><span class="s1">Vector</span>
+
+
+<span class="s4">class </span><span class="s1">EnhancedDictionary</span><span class="s2">(</span><span class="s1">dict</span><span class="s2">):</span>
+
+    <span class="s4">def </span><span class="s1">__getattr__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">attr</span><span class="s2">):</span>
+        <span class="s4">try</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">__getitem__</span><span class="s2">(</span><span class="s1">attr</span><span class="s2">)</span>
+        <span class="s4">except </span><span class="s1">KeyError</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s1">super</span><span class="s2">(</span><span class="s1">EnhancedDictionary</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__getattr__</span><span class="s2">(</span><span class="s1">attr</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">__setattr__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">attr</span><span class="s2">, </span><span class="s1">value</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">__setitem__</span><span class="s2">(</span><span class="s1">attr</span><span class="s2">, </span><span class="s1">value</span><span class="s2">)</span>
+
+
+<span class="s4">class </span><span class="s1">MotionEventMetaclass</span><span class="s2">(</span><span class="s1">type</span><span class="s2">):</span>
+
+    <span class="s4">def </span><span class="s1">__new__</span><span class="s2">(</span><span class="s1">mcs</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">bases</span><span class="s2">, </span><span class="s1">attrs</span><span class="s2">):</span>
+        <span class="s1">__attrs__ </span><span class="s2">= []</span>
+        <span class="s4">for </span><span class="s1">base </span><span class="s4">in </span><span class="s1">bases</span><span class="s2">:</span>
+            <span class="s4">if </span><span class="s1">hasattr</span><span class="s2">(</span><span class="s1">base</span><span class="s2">, </span><span class="s3">'__attrs__'</span><span class="s2">):</span>
+                <span class="s1">__attrs__</span><span class="s2">.</span><span class="s1">extend</span><span class="s2">(</span><span class="s1">base</span><span class="s2">.</span><span class="s1">__attrs__</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s3">'__attrs__' </span><span class="s4">in </span><span class="s1">attrs</span><span class="s2">:</span>
+            <span class="s1">__attrs__</span><span class="s2">.</span><span class="s1">extend</span><span class="s2">(</span><span class="s1">attrs</span><span class="s2">[</span><span class="s3">'__attrs__'</span><span class="s2">])</span>
+        <span class="s1">attrs</span><span class="s2">[</span><span class="s3">'__attrs__'</span><span class="s2">] = </span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">__attrs__</span><span class="s2">)</span>
+        <span class="s4">return </span><span class="s1">super</span><span class="s2">(</span><span class="s1">MotionEventMetaclass</span><span class="s2">, </span><span class="s1">mcs</span><span class="s2">).</span><span class="s1">__new__</span><span class="s2">(</span><span class="s1">mcs</span><span class="s2">, </span><span class="s1">name</span><span class="s2">,</span>
+                                                        <span class="s1">bases</span><span class="s2">, </span><span class="s1">attrs</span><span class="s2">)</span>
+
+
+<span class="s1">MotionEventBase </span><span class="s2">= </span><span class="s1">MotionEventMetaclass</span><span class="s2">(</span><span class="s3">'MotionEvent'</span><span class="s2">, (</span><span class="s1">object</span><span class="s2">, ), {})</span>
+
+
+<span class="s4">class </span><span class="s1">MotionEvent</span><span class="s2">(</span><span class="s1">MotionEventBase</span><span class="s2">):</span>
+    <span class="s0">'''Abstract class that represents an input event. 
+ 
+    :Parameters: 
+        `id`: str 
+            unique ID of the MotionEvent 
+        `args`: list 
+            list of parameters, passed to the depack() function 
+    '''</span>
+
+    <span class="s1">__uniq_id </span><span class="s2">= </span><span class="s5">0</span>
+    <span class="s1">__attrs__ </span><span class="s2">= </span><span class="s1">\</span>
+        <span class="s2">(</span><span class="s3">'device'</span><span class="s2">, </span><span class="s3">'push_attrs'</span><span class="s2">, </span><span class="s3">'push_attrs_stack'</span><span class="s2">,</span>
+         <span class="s3">'is_touch'</span><span class="s2">, </span><span class="s3">'type_id'</span><span class="s2">, </span><span class="s3">'id'</span><span class="s2">, </span><span class="s3">'dispatch_mode'</span><span class="s2">, </span><span class="s3">'shape'</span><span class="s2">, </span><span class="s3">'profile'</span><span class="s2">,</span>
+         <span class="s6"># current position, in 0-1 range</span>
+         <span class="s3">'sx'</span><span class="s2">, </span><span class="s3">'sy'</span><span class="s2">, </span><span class="s3">'sz'</span><span class="s2">,</span>
+         <span class="s6"># first position set, in 0-1 range</span>
+         <span class="s3">'osx'</span><span class="s2">, </span><span class="s3">'osy'</span><span class="s2">, </span><span class="s3">'osz'</span><span class="s2">,</span>
+         <span class="s6"># last position set, in 0-1 range</span>
+         <span class="s3">'psx'</span><span class="s2">, </span><span class="s3">'psy'</span><span class="s2">, </span><span class="s3">'psz'</span><span class="s2">,</span>
+         <span class="s6"># delta from the last position and current one, in 0-1 range</span>
+         <span class="s3">'dsx'</span><span class="s2">, </span><span class="s3">'dsy'</span><span class="s2">, </span><span class="s3">'dsz'</span><span class="s2">,</span>
+         <span class="s6"># current position, in screen range</span>
+         <span class="s3">'x'</span><span class="s2">, </span><span class="s3">'y'</span><span class="s2">, </span><span class="s3">'z'</span><span class="s2">,</span>
+         <span class="s6"># first position set, in screen range</span>
+         <span class="s3">'ox'</span><span class="s2">, </span><span class="s3">'oy'</span><span class="s2">, </span><span class="s3">'oz'</span><span class="s2">,</span>
+         <span class="s6"># last position set, in 0-1 range</span>
+         <span class="s3">'px'</span><span class="s2">, </span><span class="s3">'py'</span><span class="s2">, </span><span class="s3">'pz'</span><span class="s2">,</span>
+         <span class="s6"># delta from the last position and current one, in screen range</span>
+         <span class="s3">'dx'</span><span class="s2">, </span><span class="s3">'dy'</span><span class="s2">, </span><span class="s3">'dz'</span><span class="s2">,</span>
+         <span class="s3">'time_start'</span><span class="s2">,</span>
+         <span class="s3">'is_double_tap'</span><span class="s2">, </span><span class="s3">'double_tap_time'</span><span class="s2">,</span>
+         <span class="s3">'is_triple_tap'</span><span class="s2">, </span><span class="s3">'triple_tap_time'</span><span class="s2">,</span>
+         <span class="s3">'ud'</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">device</span><span class="s2">, </span><span class="s1">id</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">is_touch</span><span class="s2">=</span><span class="s4">False</span><span class="s2">, </span><span class="s1">type_id</span><span class="s2">=</span><span class="s4">None</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">__class__ </span><span class="s2">== </span><span class="s1">MotionEvent</span><span class="s2">:</span>
+            <span class="s4">raise </span><span class="s1">NotImplementedError</span><span class="s2">(</span><span class="s3">'class MotionEvent is abstract'</span><span class="s2">)</span>
+        <span class="s1">MotionEvent</span><span class="s2">.</span><span class="s1">__uniq_id </span><span class="s2">+= </span><span class="s5">1</span>
+
+        <span class="s6">#: True if the MotionEvent is a touch.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">is_touch </span><span class="s2">= </span><span class="s1">is_touch</span>
+
+        <span class="s6">#: (Experimental) String to identify event type.</span>
+        <span class="s6">#:</span>
+        <span class="s6">#: .. versionadded:: 2.1.0</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">type_id </span><span class="s2">= </span><span class="s1">type_id</span>
+
+        <span class="s6">#: (Experimental) Used by a event manager or a widget to assign</span>
+        <span class="s6">#: the dispatching mode. Defaults to</span>
+        <span class="s6">#: :const:`~kivy.eventmanager.MODE_DEFAULT_DISPATCH`. See</span>
+        <span class="s6">#: :mod:`~kivy.eventmanager` for available modes.</span>
+        <span class="s6">#:</span>
+        <span class="s6">#: .. versionadded:: 2.1.0</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch_mode </span><span class="s2">= </span><span class="s1">MODE_DEFAULT_DISPATCH</span>
+
+        <span class="s6">#: Attributes to push by default, when we use :meth:`push` : x, y, z,</span>
+        <span class="s6">#: dx, dy, dz, ox, oy, oz, px, py, pz.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">push_attrs_stack </span><span class="s2">= []</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">push_attrs </span><span class="s2">= (</span><span class="s3">'x'</span><span class="s2">, </span><span class="s3">'y'</span><span class="s2">, </span><span class="s3">'z'</span><span class="s2">, </span><span class="s3">'dx'</span><span class="s2">, </span><span class="s3">'dy'</span><span class="s2">, </span><span class="s3">'dz'</span><span class="s2">, </span><span class="s3">'ox'</span><span class="s2">, </span><span class="s3">'oy'</span><span class="s2">, </span><span class="s3">'oz'</span><span class="s2">,</span>
+                           <span class="s3">'px'</span><span class="s2">, </span><span class="s3">'py'</span><span class="s2">, </span><span class="s3">'pz'</span><span class="s2">, </span><span class="s3">'pos'</span><span class="s2">, </span><span class="s3">'type_id'</span><span class="s2">, </span><span class="s3">'dispatch_mode'</span><span class="s2">)</span>
+
+        <span class="s6">#: Uniq ID of the event. You can safely use this property, it will be</span>
+        <span class="s6">#: never the same across all existing events.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">uid </span><span class="s2">= </span><span class="s1">MotionEvent</span><span class="s2">.</span><span class="s1">__uniq_id</span>
+
+        <span class="s6">#: Device used for creating this event.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">device </span><span class="s2">= </span><span class="s1">device</span>
+
+        <span class="s6"># For grab</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">grab_list </span><span class="s2">= []</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">grab_exclusive_class </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">grab_state </span><span class="s2">= </span><span class="s4">False</span>
+
+        <span class="s6">#: Used to determine which widget the event is being dispatched to.</span>
+        <span class="s6">#: Check the :meth:`grab` function for more information.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">grab_current </span><span class="s2">= </span><span class="s4">None</span>
+
+        <span class="s6">#: Currently pressed button.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">button </span><span class="s2">= </span><span class="s4">None</span>
+
+        <span class="s6">#: Profiles currently used in the event.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">profile </span><span class="s2">= []</span>
+
+        <span class="s6">#: Id of the event, not unique. This is generally the Id set by the</span>
+        <span class="s6">#: input provider, like ID in TUIO. If you have multiple TUIO sources,</span>
+        <span class="s6">#: then same id can be used. Prefer to use :attr:`uid` attribute</span>
+        <span class="s6">#: instead.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">id </span><span class="s2">= </span><span class="s1">id</span>
+
+        <span class="s6">#: Shape of the touch event, subclass of</span>
+        <span class="s6">#: :class:`~kivy.input.shape.Shape`.</span>
+        <span class="s6">#: By default, the property is set to None.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">shape </span><span class="s2">= </span><span class="s4">None</span>
+
+        <span class="s6">#: X position, in 0-1 range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">sx </span><span class="s2">= </span><span class="s5">0.0</span>
+        <span class="s6">#: Y position, in 0-1 range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">sy </span><span class="s2">= </span><span class="s5">0.0</span>
+        <span class="s6">#: Z position, in 0-1 range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">sz </span><span class="s2">= </span><span class="s5">0.0</span>
+        <span class="s6">#: Origin X position, in 0-1 range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">osx </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s6">#: Origin Y position, in 0-1 range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">osy </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s6">#: Origin Z position, in 0-1 range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">osz </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s6">#: Previous X position, in 0-1 range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">psx </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s6">#: Previous Y position, in 0-1 range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">psy </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s6">#: Previous Z position, in 0-1 range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">psz </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s6">#: Delta between self.sx and self.psx, in 0-1 range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dsx </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s6">#: Delta between self.sy and self.psy, in 0-1 range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dsy </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s6">#: Delta between self.sz and self.psz, in 0-1 range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dsz </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s6">#: X position, in window range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">x </span><span class="s2">= </span><span class="s5">0.0</span>
+        <span class="s6">#: Y position, in window range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">y </span><span class="s2">= </span><span class="s5">0.0</span>
+        <span class="s6">#: Z position, in window range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">z </span><span class="s2">= </span><span class="s5">0.0</span>
+        <span class="s6">#: Origin X position, in window range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">ox </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s6">#: Origin Y position, in window range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">oy </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s6">#: Origin Z position, in window range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">oz </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s6">#: Previous X position, in window range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">px </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s6">#: Previous Y position, in window range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">py </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s6">#: Previous Z position, in window range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">pz </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s6">#: Delta between self.x and self.px, in window range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dx </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s6">#: Delta between self.y and self.py, in window range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dy </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s6">#: Delta between self.z and self.pz, in window range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dz </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s6">#: Position (X, Y), in window range.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">pos </span><span class="s2">= (</span><span class="s5">0.0</span><span class="s2">, </span><span class="s5">0.0</span><span class="s2">)</span>
+
+        <span class="s6">#: Initial time of the event creation.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">time_start </span><span class="s2">= </span><span class="s1">time</span><span class="s2">()</span>
+
+        <span class="s6">#: Time of the last update.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">time_update </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">time_start</span>
+
+        <span class="s6">#: Time of the end event (last event usage).</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">time_end </span><span class="s2">= -</span><span class="s5">1</span>
+
+        <span class="s6">#: Indicate if the touch event is a double tap or not.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">is_double_tap </span><span class="s2">= </span><span class="s4">False</span>
+
+        <span class="s6">#: Indicate if the touch event is a triple tap or not.</span>
+        <span class="s6">#:</span>
+        <span class="s6">#: .. versionadded:: 1.7.0</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">is_triple_tap </span><span class="s2">= </span><span class="s4">False</span>
+
+        <span class="s6">#: If the touch is a :attr:`is_double_tap`, this is the time</span>
+        <span class="s6">#: between the previous tap and the current touch.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">double_tap_time </span><span class="s2">= </span><span class="s5">0</span>
+
+        <span class="s6">#: If the touch is a :attr:`is_triple_tap`, this is the time</span>
+        <span class="s6">#: between the first tap and the current touch.</span>
+        <span class="s6">#:</span>
+        <span class="s6">#: .. versionadded:: 1.7.0</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">triple_tap_time </span><span class="s2">= </span><span class="s5">0</span>
+
+        <span class="s6">#: User data dictionary. Use this dictionary to save your own data on</span>
+        <span class="s6">#: the event.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">ud </span><span class="s2">= </span><span class="s1">EnhancedDictionary</span><span class="s2">()</span>
+
+        <span class="s6">#: If set to `True` (default) keeps first previous position</span>
+        <span class="s6">#: (X, Y, Z in 0-1 range) and ignore all other until</span>
+        <span class="s6">#: :meth:`MotionEvent.dispatch_done` is called from the `EventLoop`.</span>
+        <span class="s6">#:</span>
+        <span class="s6">#: This attribute is needed because event provider can make many calls</span>
+        <span class="s6">#: to :meth:`MotionEvent.move`, but for all those calls event is</span>
+        <span class="s6">#: dispatched to the listeners only once. Assigning `False` will keep</span>
+        <span class="s6">#: latest previous position. See :meth:`MotionEvent.move`.</span>
+        <span class="s6">#:</span>
+        <span class="s6">#: .. versionadded:: 2.1.0</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">sync_with_dispatch </span><span class="s2">= </span><span class="s4">True</span>
+
+        <span class="s6">#: Keep first previous position if :attr:`sync_with_dispatch` is</span>
+        <span class="s6">#: `True`.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_keep_prev_pos </span><span class="s2">= </span><span class="s4">True</span>
+
+        <span class="s6">#: Flag that first dispatch of this event is done.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_first_dispatch_done </span><span class="s2">= </span><span class="s4">False</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">depack</span><span class="s2">(</span><span class="s1">args</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">depack</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">):</span>
+        <span class="s0">'''Depack `args` into attributes of the class'''</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">osx </span><span class="s4">is None </span><span class="s1">\</span>
+                <span class="s4">or </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sync_with_dispatch </span><span class="s4">and not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_first_dispatch_done</span><span class="s2">:</span>
+            <span class="s6"># Sync origin/previous/current positions until the first</span>
+            <span class="s6"># dispatch (etype == 'begin') is done.</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">osx </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">psx </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sx</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">osy </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">psy </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sy</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">osz </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">psz </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sz</span>
+        <span class="s6"># update the delta</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dsx </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sx </span><span class="s2">- </span><span class="s1">self</span><span class="s2">.</span><span class="s1">psx</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dsy </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sy </span><span class="s2">- </span><span class="s1">self</span><span class="s2">.</span><span class="s1">psy</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dsz </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sz </span><span class="s2">- </span><span class="s1">self</span><span class="s2">.</span><span class="s1">psz</span>
+
+    <span class="s4">def </span><span class="s1">grab</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">class_instance</span><span class="s2">, </span><span class="s1">exclusive</span><span class="s2">=</span><span class="s4">False</span><span class="s2">):</span>
+        <span class="s0">'''Grab this motion event. 
+ 
+        If this event is a touch you can grab it if you want to receive 
+        subsequent :meth:`~kivy.uix.widget.Widget.on_touch_move` and 
+        :meth:`~kivy.uix.widget.Widget.on_touch_up` events, even if the touch 
+        is not dispatched by the parent: 
+ 
+        .. code-block:: python 
+ 
+            def on_touch_down(self, touch): 
+                touch.grab(self) 
+ 
+            def on_touch_move(self, touch): 
+                if touch.grab_current is self: 
+                    # I received my grabbed touch 
+                else: 
+                    # it's a normal touch 
+ 
+            def on_touch_up(self, touch): 
+                if touch.grab_current is self: 
+                    # I receive my grabbed touch, I must ungrab it! 
+                    touch.ungrab(self) 
+                else: 
+                    # it's a normal touch 
+                    pass 
+ 
+        .. versionchanged:: 2.1.0 
+            Allowed grab for non-touch events. 
+        '''</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">grab_exclusive_class </span><span class="s4">is not None</span><span class="s2">:</span>
+            <span class="s4">raise </span><span class="s1">Exception</span><span class="s2">(</span><span class="s3">'Event is exclusive and cannot be grabbed'</span><span class="s2">)</span>
+        <span class="s1">class_instance </span><span class="s2">= </span><span class="s1">weakref</span><span class="s2">.</span><span class="s1">ref</span><span class="s2">(</span><span class="s1">class_instance</span><span class="s2">.</span><span class="s1">__self__</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s1">exclusive</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">grab_exclusive_class </span><span class="s2">= </span><span class="s1">class_instance</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">grab_list</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">class_instance</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">ungrab</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">class_instance</span><span class="s2">):</span>
+        <span class="s0">'''Ungrab a previously grabbed motion event. 
+        '''</span>
+        <span class="s1">class_instance </span><span class="s2">= </span><span class="s1">weakref</span><span class="s2">.</span><span class="s1">ref</span><span class="s2">(</span><span class="s1">class_instance</span><span class="s2">.</span><span class="s1">__self__</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">grab_exclusive_class </span><span class="s2">== </span><span class="s1">class_instance</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">grab_exclusive_class </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s4">if </span><span class="s1">class_instance </span><span class="s4">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">grab_list</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">grab_list</span><span class="s2">.</span><span class="s1">remove</span><span class="s2">(</span><span class="s1">class_instance</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">dispatch_done</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Notify that dispatch to the listeners is done. 
+ 
+        Called by the :meth:`EventLoopBase.post_dispatch_input`. 
+ 
+        .. versionadded:: 2.1.0 
+        '''</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_keep_prev_pos </span><span class="s2">= </span><span class="s4">True</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_first_dispatch_done </span><span class="s2">= </span><span class="s4">True</span>
+
+    <span class="s4">def </span><span class="s1">move</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">args</span><span class="s2">):</span>
+        <span class="s0">'''Move to another position. 
+        '''</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sync_with_dispatch</span><span class="s2">:</span>
+            <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_keep_prev_pos</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">psx</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">psy</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">psz </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sx</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sy</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sz</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_keep_prev_pos </span><span class="s2">= </span><span class="s4">False</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">psx</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">psy</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">psz </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sx</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sy</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sz</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">time_update </span><span class="s2">= </span><span class="s1">time</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">depack</span><span class="s2">(</span><span class="s1">args</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">scale_for_screen</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">w</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">p</span><span class="s2">=</span><span class="s4">None</span><span class="s2">, </span><span class="s1">rotation</span><span class="s2">=</span><span class="s5">0</span><span class="s2">,</span>
+                         <span class="s1">smode</span><span class="s2">=</span><span class="s3">'None'</span><span class="s2">, </span><span class="s1">kheight</span><span class="s2">=</span><span class="s5">0</span><span class="s2">):</span>
+        <span class="s0">'''Scale position for the screen. 
+ 
+        .. versionchanged:: 2.1.0 
+            Max value for `x`, `y` and `z` is changed respectively to `w` - 1, 
+            `h` - 1 and `p` - 1. 
+        '''</span>
+        <span class="s1">x_max</span><span class="s2">, </span><span class="s1">y_max </span><span class="s2">= </span><span class="s1">max</span><span class="s2">(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">w </span><span class="s2">- </span><span class="s5">1</span><span class="s2">), </span><span class="s1">max</span><span class="s2">(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">h </span><span class="s2">- </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">absolute </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">to_absolute_pos</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">x</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">y </span><span class="s2">= </span><span class="s1">absolute</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">sx</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sy</span><span class="s2">, </span><span class="s1">x_max</span><span class="s2">, </span><span class="s1">y_max</span><span class="s2">, </span><span class="s1">rotation</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">ox</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">oy </span><span class="s2">= </span><span class="s1">absolute</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">osx</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">osy</span><span class="s2">, </span><span class="s1">x_max</span><span class="s2">, </span><span class="s1">y_max</span><span class="s2">, </span><span class="s1">rotation</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">px</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">py </span><span class="s2">= </span><span class="s1">absolute</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">psx</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">psy</span><span class="s2">, </span><span class="s1">x_max</span><span class="s2">, </span><span class="s1">y_max</span><span class="s2">, </span><span class="s1">rotation</span><span class="s2">)</span>
+        <span class="s1">z_max </span><span class="s2">= </span><span class="s5">0 </span><span class="s4">if </span><span class="s1">p </span><span class="s4">is None else </span><span class="s1">max</span><span class="s2">(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">p </span><span class="s2">- </span><span class="s5">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">z </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sz </span><span class="s2">* </span><span class="s1">z_max</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">oz </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">osz </span><span class="s2">* </span><span class="s1">z_max</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">pz </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">psz </span><span class="s2">* </span><span class="s1">z_max</span>
+        <span class="s4">if </span><span class="s1">smode</span><span class="s2">:</span>
+            <span class="s6"># Adjust y for keyboard height</span>
+            <span class="s4">if </span><span class="s1">smode </span><span class="s2">== </span><span class="s3">'pan' </span><span class="s4">or </span><span class="s1">smode </span><span class="s2">== </span><span class="s3">'below_target'</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">y </span><span class="s2">-= </span><span class="s1">kheight</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">oy </span><span class="s2">-= </span><span class="s1">kheight</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">py </span><span class="s2">-= </span><span class="s1">kheight</span>
+            <span class="s4">elif </span><span class="s1">smode </span><span class="s2">== </span><span class="s3">'scale'</span><span class="s2">:</span>
+                <span class="s1">offset </span><span class="s2">= </span><span class="s1">kheight </span><span class="s2">* (</span><span class="s1">self</span><span class="s2">.</span><span class="s1">y </span><span class="s2">- </span><span class="s1">h</span><span class="s2">) / (</span><span class="s1">h </span><span class="s2">- </span><span class="s1">kheight</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">y </span><span class="s2">+= </span><span class="s1">offset</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">oy </span><span class="s2">+= </span><span class="s1">offset</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">py </span><span class="s2">+= </span><span class="s1">offset</span>
+        <span class="s6"># Update delta values</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dx </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">x </span><span class="s2">- </span><span class="s1">self</span><span class="s2">.</span><span class="s1">px</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dy </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">y </span><span class="s2">- </span><span class="s1">self</span><span class="s2">.</span><span class="s1">py</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dz </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">z </span><span class="s2">- </span><span class="s1">self</span><span class="s2">.</span><span class="s1">pz</span>
+        <span class="s6"># Cache position</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">pos </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">x</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">y</span>
+
+    <span class="s4">def </span><span class="s1">to_absolute_pos</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">nx</span><span class="s2">, </span><span class="s1">ny</span><span class="s2">, </span><span class="s1">x_max</span><span class="s2">, </span><span class="s1">y_max</span><span class="s2">, </span><span class="s1">rotation</span><span class="s2">):</span>
+        <span class="s0">'''Transforms normalized (0-1) coordinates `nx` and `ny` to absolute 
+        coordinates using `x_max`, `y_max` and `rotation`. 
+ 
+        :raises: 
+            `ValueError`: If `rotation` is not one of: 0, 90, 180 or 270 
+ 
+        .. versionadded:: 2.1.0 
+        '''</span>
+        <span class="s4">if </span><span class="s1">rotation </span><span class="s2">== </span><span class="s5">0</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s1">nx </span><span class="s2">* </span><span class="s1">x_max</span><span class="s2">, </span><span class="s1">ny </span><span class="s2">* </span><span class="s1">y_max</span>
+        <span class="s4">elif </span><span class="s1">rotation </span><span class="s2">== </span><span class="s5">90</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s1">ny </span><span class="s2">* </span><span class="s1">y_max</span><span class="s2">, (</span><span class="s5">1 </span><span class="s2">- </span><span class="s1">nx</span><span class="s2">) * </span><span class="s1">x_max</span>
+        <span class="s4">elif </span><span class="s1">rotation </span><span class="s2">== </span><span class="s5">180</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s2">(</span><span class="s5">1 </span><span class="s2">- </span><span class="s1">nx</span><span class="s2">) * </span><span class="s1">x_max</span><span class="s2">, (</span><span class="s5">1 </span><span class="s2">- </span><span class="s1">ny</span><span class="s2">) * </span><span class="s1">y_max</span>
+        <span class="s4">elif </span><span class="s1">rotation </span><span class="s2">== </span><span class="s5">270</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s2">(</span><span class="s5">1 </span><span class="s2">- </span><span class="s1">ny</span><span class="s2">) * </span><span class="s1">y_max</span><span class="s2">, </span><span class="s1">nx </span><span class="s2">* </span><span class="s1">x_max</span>
+        <span class="s4">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s3">'Invalid rotation %s, '</span>
+                         <span class="s3">'valid values are 0, 90, 180 or 270' </span><span class="s2">% </span><span class="s1">rotation</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">push</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">attrs</span><span class="s2">=</span><span class="s4">None</span><span class="s2">):</span>
+        <span class="s0">'''Push attribute values in `attrs` onto the stack. 
+        '''</span>
+        <span class="s4">if </span><span class="s1">attrs </span><span class="s4">is None</span><span class="s2">:</span>
+            <span class="s1">attrs </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">push_attrs</span>
+        <span class="s1">values </span><span class="s2">= [</span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">) </span><span class="s4">for </span><span class="s1">x </span><span class="s4">in </span><span class="s1">attrs</span><span class="s2">]</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">push_attrs_stack</span><span class="s2">.</span><span class="s1">append</span><span class="s2">((</span><span class="s1">attrs</span><span class="s2">, </span><span class="s1">values</span><span class="s2">))</span>
+
+    <span class="s4">def </span><span class="s1">pop</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Pop attributes values from the stack. 
+        '''</span>
+        <span class="s1">attrs</span><span class="s2">, </span><span class="s1">values </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">push_attrs_stack</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">()</span>
+        <span class="s4">for </span><span class="s1">i </span><span class="s4">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">attrs</span><span class="s2">)):</span>
+            <span class="s1">setattr</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">attrs</span><span class="s2">[</span><span class="s1">i</span><span class="s2">], </span><span class="s1">values</span><span class="s2">[</span><span class="s1">i</span><span class="s2">])</span>
+
+    <span class="s4">def </span><span class="s1">apply_transform_2d</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">transform</span><span class="s2">):</span>
+        <span class="s0">'''Apply a transformation on x, y, z, px, py, pz, 
+        ox, oy, oz, dx, dy, dz. 
+        '''</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">x</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">y </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">pos </span><span class="s2">= </span><span class="s1">transform</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">x</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">y</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">px</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">py </span><span class="s2">= </span><span class="s1">transform</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">px</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">py</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">ox</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">oy </span><span class="s2">= </span><span class="s1">transform</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">ox</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">oy</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dx </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">x </span><span class="s2">- </span><span class="s1">self</span><span class="s2">.</span><span class="s1">px</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dy </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">y </span><span class="s2">- </span><span class="s1">self</span><span class="s2">.</span><span class="s1">py</span>
+
+    <span class="s4">def </span><span class="s1">copy_to</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">to</span><span class="s2">):</span>
+        <span class="s0">'''Copy some attribute to another motion event object.'''</span>
+        <span class="s4">for </span><span class="s1">attr </span><span class="s4">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">__attrs__</span><span class="s2">:</span>
+            <span class="s1">to</span><span class="s2">.</span><span class="s1">__setattr__</span><span class="s2">(</span><span class="s1">attr</span><span class="s2">, </span><span class="s1">copy</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">__getattribute__</span><span class="s2">(</span><span class="s1">attr</span><span class="s2">)))</span>
+
+    <span class="s4">def </span><span class="s1">distance</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">other_touch</span><span class="s2">):</span>
+        <span class="s0">'''Return the distance between the two events. 
+        '''</span>
+        <span class="s4">return </span><span class="s1">Vector</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">pos</span><span class="s2">).</span><span class="s1">distance</span><span class="s2">(</span><span class="s1">other_touch</span><span class="s2">.</span><span class="s1">pos</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">update_time_end</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">time_end </span><span class="s2">= </span><span class="s1">time</span><span class="s2">()</span>
+
+    <span class="s6"># facilities</span>
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s4">def </span><span class="s1">dpos</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Return delta between last position and current position, in the 
+        screen coordinate system (self.dx, self.dy).'''</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">dx</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">dy</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s4">def </span><span class="s1">opos</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Return the initial position of the motion event in the screen 
+        coordinate system (self.ox, self.oy).'''</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">ox</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">oy</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s4">def </span><span class="s1">ppos</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Return the previous position of the motion event in the screen 
+        coordinate system (self.px, self.py).'''</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">px</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">py</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s4">def </span><span class="s1">spos</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Return the position in the 0-1 coordinate system (self.sx, self.sy). 
+        '''</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sx</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sy</span>
+
+    <span class="s4">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">basename </span><span class="s2">= </span><span class="s1">str</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">__class__</span><span class="s2">)</span>
+        <span class="s1">classname </span><span class="s2">= </span><span class="s1">basename</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s3">'.'</span><span class="s2">)[-</span><span class="s5">1</span><span class="s2">].</span><span class="s1">replace</span><span class="s2">(</span><span class="s3">'&gt;'</span><span class="s2">, </span><span class="s3">''</span><span class="s2">).</span><span class="s1">replace</span><span class="s2">(</span><span class="s3">'</span><span class="s4">\'</span><span class="s3">'</span><span class="s2">, </span><span class="s3">''</span><span class="s2">)</span>
+        <span class="s4">return </span><span class="s3">'&lt;%s spos=%s pos=%s&gt;' </span><span class="s2">% (</span><span class="s1">classname</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">spos</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">pos</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">__repr__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">out </span><span class="s2">= []</span>
+        <span class="s4">for </span><span class="s1">x </span><span class="s4">in </span><span class="s1">dir</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+            <span class="s1">v </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">)</span>
+            <span class="s4">if </span><span class="s1">x</span><span class="s2">[</span><span class="s5">0</span><span class="s2">] == </span><span class="s3">'_'</span><span class="s2">:</span>
+                <span class="s4">continue</span>
+            <span class="s4">if </span><span class="s1">isroutine</span><span class="s2">(</span><span class="s1">v</span><span class="s2">):</span>
+                <span class="s4">continue</span>
+            <span class="s1">out</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s3">'%s=&quot;%s&quot;' </span><span class="s2">% (</span><span class="s1">x</span><span class="s2">, </span><span class="s1">v</span><span class="s2">))</span>
+        <span class="s4">return </span><span class="s3">'&lt;%s %s&gt;' </span><span class="s2">% (</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">__class__</span><span class="s2">.</span><span class="s1">__name__</span><span class="s2">,</span>
+            <span class="s3">' '</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">out</span><span class="s2">))</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s4">def </span><span class="s1">is_mouse_scrolling</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">):</span>
+        <span class="s0">'''Returns True if the touch event is a mousewheel scrolling 
+ 
+        .. versionadded:: 1.6.0 
+        '''</span>
+        <span class="s4">return </span><span class="s3">'button' </span><span class="s4">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">profile </span><span class="s4">and </span><span class="s3">'scroll' </span><span class="s4">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">button</span>
+</pre>
+</body>
+</html>

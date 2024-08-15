@@ -1,0 +1,171 @@
+<html>
+<head>
+<title>test_ptds.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #7a7e85;}
+.s4 { color: #2aacb8;}
+.s5 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_ptds.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">multiprocessing </span><span class="s0">as </span><span class="s1">mp</span>
+<span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">import </span><span class="s1">traceback</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">testing </span><span class="s0">import </span><span class="s1">unittest</span><span class="s2">, </span><span class="s1">CUDATestCase</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">testing </span><span class="s0">import </span><span class="s2">(</span><span class="s1">skip_on_cudasim</span><span class="s2">, </span><span class="s1">skip_with_cuda_python</span><span class="s2">,</span>
+                                <span class="s1">skip_under_cuda_memcheck</span><span class="s2">)</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">tests</span><span class="s2">.</span><span class="s1">support </span><span class="s0">import </span><span class="s1">linux_only</span>
+
+
+<span class="s0">def </span><span class="s1">child_test</span><span class="s2">():</span>
+    <span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">cuda</span><span class="s2">, </span><span class="s1">int32</span><span class="s2">, </span><span class="s1">void</span>
+    <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">config</span>
+    <span class="s0">import </span><span class="s1">io</span>
+    <span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+    <span class="s0">import </span><span class="s1">threading</span>
+
+    <span class="s3"># Enable PTDS before we make any CUDA driver calls.  Enabling it first</span>
+    <span class="s3"># ensures that PTDS APIs are used because the CUDA driver looks up API</span>
+    <span class="s3"># functions on first use and memoizes them.</span>
+    <span class="s1">config</span><span class="s2">.</span><span class="s1">CUDA_PER_THREAD_DEFAULT_STREAM </span><span class="s2">= </span><span class="s4">1</span>
+
+    <span class="s3"># Set up log capture for the Driver API so we can see what API calls were</span>
+    <span class="s3"># used.</span>
+    <span class="s1">logbuf </span><span class="s2">= </span><span class="s1">io</span><span class="s2">.</span><span class="s1">StringIO</span><span class="s2">()</span>
+    <span class="s1">handler </span><span class="s2">= </span><span class="s1">logging</span><span class="s2">.</span><span class="s1">StreamHandler</span><span class="s2">(</span><span class="s1">logbuf</span><span class="s2">)</span>
+    <span class="s1">cudadrv_logger </span><span class="s2">= </span><span class="s1">logging</span><span class="s2">.</span><span class="s1">getLogger</span><span class="s2">(</span><span class="s5">'numba.cuda.cudadrv.driver'</span><span class="s2">)</span>
+    <span class="s1">cudadrv_logger</span><span class="s2">.</span><span class="s1">addHandler</span><span class="s2">(</span><span class="s1">handler</span><span class="s2">)</span>
+    <span class="s1">cudadrv_logger</span><span class="s2">.</span><span class="s1">setLevel</span><span class="s2">(</span><span class="s1">logging</span><span class="s2">.</span><span class="s1">DEBUG</span><span class="s2">)</span>
+
+    <span class="s3"># Set up data for our test, and copy over to the device</span>
+    <span class="s1">N </span><span class="s2">= </span><span class="s4">2 </span><span class="s2">** </span><span class="s4">16</span>
+    <span class="s1">N_THREADS </span><span class="s2">= </span><span class="s4">10</span>
+    <span class="s1">N_ADDITIONS </span><span class="s2">= </span><span class="s4">4096</span>
+
+    <span class="s3"># Seed the RNG for repeatability</span>
+    <span class="s1">np</span><span class="s2">.</span><span class="s1">random</span><span class="s2">.</span><span class="s1">seed</span><span class="s2">(</span><span class="s4">1</span><span class="s2">)</span>
+    <span class="s1">x </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">random</span><span class="s2">.</span><span class="s1">randint</span><span class="s2">(</span><span class="s1">low</span><span class="s2">=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">high</span><span class="s2">=</span><span class="s4">1000</span><span class="s2">, </span><span class="s1">size</span><span class="s2">=</span><span class="s1">N</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">)</span>
+    <span class="s1">r </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros_like</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+
+    <span class="s3"># One input and output array for each thread</span>
+    <span class="s1">xs </span><span class="s2">= [</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">x</span><span class="s2">) </span><span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">N_THREADS</span><span class="s2">)]</span>
+    <span class="s1">rs </span><span class="s2">= [</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">r</span><span class="s2">) </span><span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">N_THREADS</span><span class="s2">)]</span>
+
+    <span class="s3"># Compute the grid size and get the [per-thread] default stream</span>
+    <span class="s1">n_threads </span><span class="s2">= </span><span class="s4">256</span>
+    <span class="s1">n_blocks </span><span class="s2">= </span><span class="s1">N </span><span class="s2">// </span><span class="s1">n_threads</span>
+    <span class="s1">stream </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">default_stream</span><span class="s2">()</span>
+
+    <span class="s3"># A simple multiplication-by-addition kernel. What it does exactly is not</span>
+    <span class="s3"># too important; only that we have a kernel that does something.</span>
+    <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">void</span><span class="s2">(</span><span class="s1">int32</span><span class="s2">[::</span><span class="s4">1</span><span class="s2">], </span><span class="s1">int32</span><span class="s2">[::</span><span class="s4">1</span><span class="s2">]))</span>
+    <span class="s0">def </span><span class="s1">f</span><span class="s2">(</span><span class="s1">r</span><span class="s2">, </span><span class="s1">x</span><span class="s2">):</span>
+        <span class="s1">i </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">grid</span><span class="s2">(</span><span class="s4">1</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">i </span><span class="s2">&gt; </span><span class="s1">len</span><span class="s2">(</span><span class="s1">r</span><span class="s2">):</span>
+            <span class="s0">return</span>
+
+        <span class="s3"># Accumulate x into r</span>
+        <span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">N_ADDITIONS</span><span class="s2">):</span>
+            <span class="s1">r</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] += </span><span class="s1">x</span><span class="s2">[</span><span class="s1">i</span><span class="s2">]</span>
+
+    <span class="s3"># This function will be used to launch the kernel from each thread on its</span>
+    <span class="s3"># own unique data.</span>
+    <span class="s0">def </span><span class="s1">kernel_thread</span><span class="s2">(</span><span class="s1">n</span><span class="s2">):</span>
+        <span class="s1">f</span><span class="s2">[</span><span class="s1">n_blocks</span><span class="s2">, </span><span class="s1">n_threads</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">](</span><span class="s1">rs</span><span class="s2">[</span><span class="s1">n</span><span class="s2">], </span><span class="s1">xs</span><span class="s2">[</span><span class="s1">n</span><span class="s2">])</span>
+
+    <span class="s3"># Create threads</span>
+    <span class="s1">threads </span><span class="s2">= [</span><span class="s1">threading</span><span class="s2">.</span><span class="s1">Thread</span><span class="s2">(</span><span class="s1">target</span><span class="s2">=</span><span class="s1">kernel_thread</span><span class="s2">, </span><span class="s1">args</span><span class="s2">=(</span><span class="s1">i</span><span class="s2">,))</span>
+               <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">N_THREADS</span><span class="s2">)]</span>
+
+    <span class="s3"># Start all threads</span>
+    <span class="s0">for </span><span class="s1">thread </span><span class="s0">in </span><span class="s1">threads</span><span class="s2">:</span>
+        <span class="s1">thread</span><span class="s2">.</span><span class="s1">start</span><span class="s2">()</span>
+
+    <span class="s3"># Wait for all threads to finish, to ensure that we don't synchronize with</span>
+    <span class="s3"># the device until all kernels are scheduled.</span>
+    <span class="s0">for </span><span class="s1">thread </span><span class="s0">in </span><span class="s1">threads</span><span class="s2">:</span>
+        <span class="s1">thread</span><span class="s2">.</span><span class="s1">join</span><span class="s2">()</span>
+
+    <span class="s3"># Synchronize with the device</span>
+    <span class="s1">cuda</span><span class="s2">.</span><span class="s1">synchronize</span><span class="s2">()</span>
+
+    <span class="s3"># Check output is as expected</span>
+    <span class="s1">expected </span><span class="s2">= </span><span class="s1">x </span><span class="s2">* </span><span class="s1">N_ADDITIONS</span>
+    <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">N_THREADS</span><span class="s2">):</span>
+        <span class="s1">np</span><span class="s2">.</span><span class="s1">testing</span><span class="s2">.</span><span class="s1">assert_equal</span><span class="s2">(</span><span class="s1">rs</span><span class="s2">[</span><span class="s1">i</span><span class="s2">].</span><span class="s1">copy_to_host</span><span class="s2">(), </span><span class="s1">expected</span><span class="s2">)</span>
+
+    <span class="s3"># Return the driver log output to the calling process for checking</span>
+    <span class="s1">handler</span><span class="s2">.</span><span class="s1">flush</span><span class="s2">()</span>
+    <span class="s0">return </span><span class="s1">logbuf</span><span class="s2">.</span><span class="s1">getvalue</span><span class="s2">()</span>
+
+
+<span class="s0">def </span><span class="s1">child_test_wrapper</span><span class="s2">(</span><span class="s1">result_queue</span><span class="s2">):</span>
+    <span class="s0">try</span><span class="s2">:</span>
+        <span class="s1">output </span><span class="s2">= </span><span class="s1">child_test</span><span class="s2">()</span>
+        <span class="s1">success </span><span class="s2">= </span><span class="s0">True</span>
+    <span class="s3"># Catch anything raised so it can be propagated</span>
+    <span class="s0">except</span><span class="s2">: </span><span class="s3"># noqa: E722</span>
+        <span class="s1">output </span><span class="s2">= </span><span class="s1">traceback</span><span class="s2">.</span><span class="s1">format_exc</span><span class="s2">()</span>
+        <span class="s1">success </span><span class="s2">= </span><span class="s0">False</span>
+
+    <span class="s1">result_queue</span><span class="s2">.</span><span class="s1">put</span><span class="s2">((</span><span class="s1">success</span><span class="s2">, </span><span class="s1">output</span><span class="s2">))</span>
+
+
+<span class="s3"># Run on Linux only until the reason for test hangs on Windows (Issue #8635,</span>
+<span class="s3"># https://github.com/numba/numba/issues/8635) is diagnosed</span>
+<span class="s2">@</span><span class="s1">linux_only</span>
+<span class="s2">@</span><span class="s1">skip_under_cuda_memcheck</span><span class="s2">(</span><span class="s5">'Hangs cuda-memcheck'</span><span class="s2">)</span>
+<span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s5">'Streams not supported on the simulator'</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">TestPTDS</span><span class="s2">(</span><span class="s1">CUDATestCase</span><span class="s2">):</span>
+    <span class="s2">@</span><span class="s1">skip_with_cuda_python</span><span class="s2">(</span><span class="s5">'Function names unchanged for PTDS with NV Binding'</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">test_ptds</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># Run a test with PTDS enabled in a child process</span>
+        <span class="s1">ctx </span><span class="s2">= </span><span class="s1">mp</span><span class="s2">.</span><span class="s1">get_context</span><span class="s2">(</span><span class="s5">'spawn'</span><span class="s2">)</span>
+        <span class="s1">result_queue </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">Queue</span><span class="s2">()</span>
+        <span class="s1">proc </span><span class="s2">= </span><span class="s1">ctx</span><span class="s2">.</span><span class="s1">Process</span><span class="s2">(</span><span class="s1">target</span><span class="s2">=</span><span class="s1">child_test_wrapper</span><span class="s2">, </span><span class="s1">args</span><span class="s2">=(</span><span class="s1">result_queue</span><span class="s2">,))</span>
+        <span class="s1">proc</span><span class="s2">.</span><span class="s1">start</span><span class="s2">()</span>
+        <span class="s1">proc</span><span class="s2">.</span><span class="s1">join</span><span class="s2">()</span>
+        <span class="s1">success</span><span class="s2">, </span><span class="s1">output </span><span class="s2">= </span><span class="s1">result_queue</span><span class="s2">.</span><span class="s1">get</span><span class="s2">()</span>
+
+        <span class="s3"># Ensure the child process ran to completion before checking its output</span>
+        <span class="s0">if not </span><span class="s1">success</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">fail</span><span class="s2">(</span><span class="s1">output</span><span class="s2">)</span>
+
+        <span class="s3"># Functions with a per-thread default stream variant that we expect to</span>
+        <span class="s3"># see in the output</span>
+        <span class="s1">ptds_functions </span><span class="s2">= (</span><span class="s5">'cuMemcpyHtoD_v2_ptds'</span><span class="s2">, </span><span class="s5">'cuLaunchKernel_ptsz'</span><span class="s2">,</span>
+                          <span class="s5">'cuMemcpyDtoH_v2_ptds'</span><span class="s2">)</span>
+
+        <span class="s0">for </span><span class="s1">fn </span><span class="s0">in </span><span class="s1">ptds_functions</span><span class="s2">:</span>
+            <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">subTest</span><span class="s2">(</span><span class="s1">fn</span><span class="s2">=</span><span class="s1">fn</span><span class="s2">, </span><span class="s1">expected</span><span class="s2">=</span><span class="s0">True</span><span class="s2">):</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s1">fn</span><span class="s2">, </span><span class="s1">output</span><span class="s2">)</span>
+
+        <span class="s3"># Non-PTDS versions of the functions that we should not see in the</span>
+        <span class="s3"># output:</span>
+        <span class="s1">legacy_functions </span><span class="s2">= (</span><span class="s5">'cuMemcpyHtoD_v2'</span><span class="s2">, </span><span class="s5">'cuLaunchKernel'</span><span class="s2">,</span>
+                            <span class="s5">'cuMemcpyDtoH_v2'</span><span class="s2">)</span>
+
+        <span class="s0">for </span><span class="s1">fn </span><span class="s0">in </span><span class="s1">legacy_functions</span><span class="s2">:</span>
+            <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">subTest</span><span class="s2">(</span><span class="s1">fn</span><span class="s2">=</span><span class="s1">fn</span><span class="s2">, </span><span class="s1">expected</span><span class="s2">=</span><span class="s0">False</span><span class="s2">):</span>
+                <span class="s3"># Ensure we only spot these function names appearing without a</span>
+                <span class="s3"># _ptds or _ptsz suffix by checking including the end of the</span>
+                <span class="s3"># line in the log</span>
+                <span class="s1">fn_at_end </span><span class="s2">= </span><span class="s5">f'</span><span class="s0">{</span><span class="s1">fn</span><span class="s0">}\n</span><span class="s5">'</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">assertNotIn</span><span class="s2">(</span><span class="s1">fn_at_end</span><span class="s2">, </span><span class="s1">output</span><span class="s2">)</span>
+
+
+<span class="s0">if </span><span class="s1">__name__ </span><span class="s2">== </span><span class="s5">'__main__'</span><span class="s2">:</span>
+    <span class="s1">unittest</span><span class="s2">.</span><span class="s1">main</span><span class="s2">()</span>
+</pre>
+</body>
+</html>

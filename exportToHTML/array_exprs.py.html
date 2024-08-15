@@ -1,0 +1,451 @@
+<html>
+<head>
+<title>array_exprs.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #5f826b; font-style: italic;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+array_exprs.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">ast</span>
+<span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">defaultdict</span><span class="s2">, </span><span class="s1">OrderedDict</span>
+<span class="s0">import </span><span class="s1">contextlib</span>
+<span class="s0">import </span><span class="s1">sys</span>
+<span class="s0">from </span><span class="s1">types </span><span class="s0">import </span><span class="s1">SimpleNamespace</span>
+
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">import </span><span class="s1">operator</span>
+
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">types</span><span class="s2">, </span><span class="s1">targetconfig</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">, </span><span class="s1">rewrites</span><span class="s2">, </span><span class="s1">compiler</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">typing </span><span class="s0">import </span><span class="s1">npydecl</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">np</span><span class="s2">.</span><span class="s1">ufunc</span><span class="s2">.</span><span class="s1">dufunc </span><span class="s0">import </span><span class="s1">DUFunc</span>
+
+
+<span class="s0">def </span><span class="s1">_is_ufunc</span><span class="s2">(</span><span class="s1">func</span><span class="s2">):</span>
+    <span class="s0">return </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">func</span><span class="s2">, (</span><span class="s1">np</span><span class="s2">.</span><span class="s1">ufunc</span><span class="s2">, </span><span class="s1">DUFunc</span><span class="s2">))</span>
+
+
+<span class="s2">@</span><span class="s1">rewrites</span><span class="s2">.</span><span class="s1">register_rewrite</span><span class="s2">(</span><span class="s3">'after-inference'</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">RewriteArrayExprs</span><span class="s2">(</span><span class="s1">rewrites</span><span class="s2">.</span><span class="s1">Rewrite</span><span class="s2">):</span>
+    <span class="s4">'''The RewriteArrayExprs class is responsible for finding array 
+    expressions in Numba intermediate representation code, and 
+    rewriting those expressions to a single operation that will expand 
+    into something similar to a ufunc call. 
+    '''</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">state</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kws</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">RewriteArrayExprs</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">state</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kws</span><span class="s2">)</span>
+        <span class="s5"># Install a lowering hook if we are using this rewrite.</span>
+        <span class="s1">special_ops </span><span class="s2">= </span><span class="s1">state</span><span class="s2">.</span><span class="s1">targetctx</span><span class="s2">.</span><span class="s1">special_ops</span>
+        <span class="s0">if </span><span class="s3">'arrayexpr' </span><span class="s0">not in </span><span class="s1">special_ops</span><span class="s2">:</span>
+            <span class="s1">special_ops</span><span class="s2">[</span><span class="s3">'arrayexpr'</span><span class="s2">] = </span><span class="s1">_lower_array_expr</span>
+
+    <span class="s0">def </span><span class="s1">match</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func_ir</span><span class="s2">, </span><span class="s1">block</span><span class="s2">, </span><span class="s1">typemap</span><span class="s2">, </span><span class="s1">calltypes</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Using typing and a basic block, search the basic block for array 
+        expressions. 
+        Return True when one or more matches were found, False otherwise. 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># We can trivially reject everything if there are no</span>
+        <span class="s5"># calls in the type results.</span>
+        <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">calltypes</span><span class="s2">) == </span><span class="s6">0</span><span class="s2">:</span>
+            <span class="s0">return False</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">crnt_block </span><span class="s2">= </span><span class="s1">block</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">typemap </span><span class="s2">= </span><span class="s1">typemap</span>
+        <span class="s5"># { variable name: IR assignment (of a function call or operator) }</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">array_assigns </span><span class="s2">= </span><span class="s1">OrderedDict</span><span class="s2">()</span>
+        <span class="s5"># { variable name: IR assignment (of a constant) }</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">const_assigns </span><span class="s2">= {}</span>
+
+        <span class="s1">assignments </span><span class="s2">= </span><span class="s1">block</span><span class="s2">.</span><span class="s1">find_insts</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Assign</span><span class="s2">)</span>
+        <span class="s0">for </span><span class="s1">instr </span><span class="s0">in </span><span class="s1">assignments</span><span class="s2">:</span>
+            <span class="s1">target_name </span><span class="s2">= </span><span class="s1">instr</span><span class="s2">.</span><span class="s1">target</span><span class="s2">.</span><span class="s1">name</span>
+            <span class="s1">expr </span><span class="s2">= </span><span class="s1">instr</span><span class="s2">.</span><span class="s1">value</span>
+            <span class="s5"># Does it assign an expression to an array variable?</span>
+            <span class="s0">if </span><span class="s2">(</span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">expr</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Expr</span><span class="s2">) </span><span class="s0">and</span>
+                <span class="s1">isinstance</span><span class="s2">(</span><span class="s1">typemap</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">target_name</span><span class="s2">, </span><span class="s0">None</span><span class="s2">), </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">)):</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_match_array_expr</span><span class="s2">(</span><span class="s1">instr</span><span class="s2">, </span><span class="s1">expr</span><span class="s2">, </span><span class="s1">target_name</span><span class="s2">)</span>
+            <span class="s0">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">expr</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Const</span><span class="s2">):</span>
+                <span class="s5"># Track constants since we might need them for an</span>
+                <span class="s5"># array expression.</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">const_assigns</span><span class="s2">[</span><span class="s1">target_name</span><span class="s2">] = </span><span class="s1">expr</span>
+
+        <span class="s0">return </span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">array_assigns</span><span class="s2">) &gt; </span><span class="s6">0</span>
+
+    <span class="s0">def </span><span class="s1">_match_array_expr</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">instr</span><span class="s2">, </span><span class="s1">expr</span><span class="s2">, </span><span class="s1">target_name</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Find whether the given assignment (*instr*) of an expression (*expr*) 
+        to variable *target_name* is an array expression. 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># We've matched a subexpression assignment to an</span>
+        <span class="s5"># array variable.  Now see if the expression is an</span>
+        <span class="s5"># array expression.</span>
+        <span class="s1">expr_op </span><span class="s2">= </span><span class="s1">expr</span><span class="s2">.</span><span class="s1">op</span>
+        <span class="s1">array_assigns </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">array_assigns</span>
+
+        <span class="s0">if </span><span class="s2">((</span><span class="s1">expr_op </span><span class="s0">in </span><span class="s2">(</span><span class="s3">'unary'</span><span class="s2">, </span><span class="s3">'binop'</span><span class="s2">)) </span><span class="s0">and </span><span class="s2">(</span>
+                <span class="s1">expr</span><span class="s2">.</span><span class="s1">fn </span><span class="s0">in </span><span class="s1">npydecl</span><span class="s2">.</span><span class="s1">supported_array_operators</span><span class="s2">)):</span>
+            <span class="s5"># It is an array operator that maps to a ufunc.</span>
+            <span class="s5"># check that all args have internal types</span>
+            <span class="s0">if </span><span class="s1">all</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">typemap</span><span class="s2">[</span><span class="s1">var</span><span class="s2">.</span><span class="s1">name</span><span class="s2">].</span><span class="s1">is_internal</span>
+                   <span class="s0">for </span><span class="s1">var </span><span class="s0">in </span><span class="s1">expr</span><span class="s2">.</span><span class="s1">list_vars</span><span class="s2">()):</span>
+                <span class="s1">array_assigns</span><span class="s2">[</span><span class="s1">target_name</span><span class="s2">] = </span><span class="s1">instr</span>
+
+        <span class="s0">elif </span><span class="s2">((</span><span class="s1">expr_op </span><span class="s2">== </span><span class="s3">'call'</span><span class="s2">) </span><span class="s0">and </span><span class="s2">(</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">func</span><span class="s2">.</span><span class="s1">name </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">typemap</span><span class="s2">)):</span>
+            <span class="s5"># It could be a match for a known ufunc call.</span>
+            <span class="s1">func_type </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">typemap</span><span class="s2">[</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">func</span><span class="s2">.</span><span class="s1">name</span><span class="s2">]</span>
+            <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">func_type</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">):</span>
+                <span class="s1">func_key </span><span class="s2">= </span><span class="s1">func_type</span><span class="s2">.</span><span class="s1">typing_key</span>
+                <span class="s0">if </span><span class="s1">_is_ufunc</span><span class="s2">(</span><span class="s1">func_key</span><span class="s2">):</span>
+                    <span class="s5"># If so, check whether an explicit output is passed.</span>
+                    <span class="s0">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_has_explicit_output</span><span class="s2">(</span><span class="s1">expr</span><span class="s2">, </span><span class="s1">func_key</span><span class="s2">):</span>
+                        <span class="s5"># If not, match it as a (sub)expression.</span>
+                        <span class="s1">array_assigns</span><span class="s2">[</span><span class="s1">target_name</span><span class="s2">] = </span><span class="s1">instr</span>
+
+    <span class="s0">def </span><span class="s1">_has_explicit_output</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">expr</span><span class="s2">, </span><span class="s1">func</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Return whether the *expr* call to *func* (a ufunc) features an 
+        explicit output argument. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">nargs </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">args</span><span class="s2">) + </span><span class="s1">len</span><span class="s2">(</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">kws</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">expr</span><span class="s2">.</span><span class="s1">vararg </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s5"># XXX *args unsupported here, assume there may be an explicit</span>
+            <span class="s5"># output</span>
+            <span class="s0">return True</span>
+        <span class="s0">return </span><span class="s1">nargs </span><span class="s2">&gt; </span><span class="s1">func</span><span class="s2">.</span><span class="s1">nin</span>
+
+    <span class="s0">def </span><span class="s1">_get_array_operator</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ir_expr</span><span class="s2">):</span>
+        <span class="s1">ir_op </span><span class="s2">= </span><span class="s1">ir_expr</span><span class="s2">.</span><span class="s1">op</span>
+        <span class="s0">if </span><span class="s1">ir_op </span><span class="s0">in </span><span class="s2">(</span><span class="s3">'unary'</span><span class="s2">, </span><span class="s3">'binop'</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">ir_expr</span><span class="s2">.</span><span class="s1">fn</span>
+        <span class="s0">elif </span><span class="s1">ir_op </span><span class="s2">== </span><span class="s3">'call'</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">typemap</span><span class="s2">[</span><span class="s1">ir_expr</span><span class="s2">.</span><span class="s1">func</span><span class="s2">.</span><span class="s1">name</span><span class="s2">].</span><span class="s1">typing_key</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span><span class="s2">(</span>
+            <span class="s3">&quot;Don't know how to find the operator for '{0}' expressions.&quot;</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span>
+                <span class="s1">ir_op</span><span class="s2">))</span>
+
+    <span class="s0">def </span><span class="s1">_get_operands</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ir_expr</span><span class="s2">):</span>
+        <span class="s4">'''Given a Numba IR expression, return the operands to the expression 
+        in order they appear in the expression. 
+        '''</span>
+        <span class="s1">ir_op </span><span class="s2">= </span><span class="s1">ir_expr</span><span class="s2">.</span><span class="s1">op</span>
+        <span class="s0">if </span><span class="s1">ir_op </span><span class="s2">== </span><span class="s3">'binop'</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">ir_expr</span><span class="s2">.</span><span class="s1">lhs</span><span class="s2">, </span><span class="s1">ir_expr</span><span class="s2">.</span><span class="s1">rhs</span>
+        <span class="s0">elif </span><span class="s1">ir_op </span><span class="s2">== </span><span class="s3">'unary'</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">ir_expr</span><span class="s2">.</span><span class="s1">list_vars</span><span class="s2">()</span>
+        <span class="s0">elif </span><span class="s1">ir_op </span><span class="s2">== </span><span class="s3">'call'</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">ir_expr</span><span class="s2">.</span><span class="s1">args</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span><span class="s2">(</span>
+            <span class="s3">&quot;Don't know how to find the operands for '{0}' expressions.&quot;</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span>
+                <span class="s1">ir_op</span><span class="s2">))</span>
+
+    <span class="s0">def </span><span class="s1">_translate_expr</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ir_expr</span><span class="s2">):</span>
+        <span class="s4">'''Translate the given expression from Numba IR to an array expression 
+        tree. 
+        '''</span>
+        <span class="s1">ir_op </span><span class="s2">= </span><span class="s1">ir_expr</span><span class="s2">.</span><span class="s1">op</span>
+        <span class="s0">if </span><span class="s1">ir_op </span><span class="s2">== </span><span class="s3">'arrayexpr'</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">ir_expr</span><span class="s2">.</span><span class="s1">expr</span>
+        <span class="s1">operands_or_args </span><span class="s2">= [</span><span class="s1">self</span><span class="s2">.</span><span class="s1">const_assigns</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">op_var</span><span class="s2">.</span><span class="s1">name</span><span class="s2">, </span><span class="s1">op_var</span><span class="s2">)</span>
+                            <span class="s0">for </span><span class="s1">op_var </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_operands</span><span class="s2">(</span><span class="s1">ir_expr</span><span class="s2">)]</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_array_operator</span><span class="s2">(</span><span class="s1">ir_expr</span><span class="s2">), </span><span class="s1">operands_or_args</span>
+
+    <span class="s0">def </span><span class="s1">_handle_matches</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">'''Iterate over the matches, trying to find which instructions should 
+        be rewritten, deleted, or moved. 
+        '''</span>
+        <span class="s1">replace_map </span><span class="s2">= {}</span>
+        <span class="s1">dead_vars </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+        <span class="s1">used_vars </span><span class="s2">= </span><span class="s1">defaultdict</span><span class="s2">(</span><span class="s1">int</span><span class="s2">)</span>
+        <span class="s0">for </span><span class="s1">instr </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">array_assigns</span><span class="s2">.</span><span class="s1">values</span><span class="s2">():</span>
+            <span class="s1">expr </span><span class="s2">= </span><span class="s1">instr</span><span class="s2">.</span><span class="s1">value</span>
+            <span class="s1">arr_inps </span><span class="s2">= []</span>
+            <span class="s1">arr_expr </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_array_operator</span><span class="s2">(</span><span class="s1">expr</span><span class="s2">), </span><span class="s1">arr_inps</span>
+            <span class="s1">new_expr </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Expr</span><span class="s2">(</span><span class="s1">op</span><span class="s2">=</span><span class="s3">'arrayexpr'</span><span class="s2">,</span>
+                               <span class="s1">loc</span><span class="s2">=</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">,</span>
+                               <span class="s1">expr</span><span class="s2">=</span><span class="s1">arr_expr</span><span class="s2">,</span>
+                               <span class="s1">ty</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">typemap</span><span class="s2">[</span><span class="s1">instr</span><span class="s2">.</span><span class="s1">target</span><span class="s2">.</span><span class="s1">name</span><span class="s2">])</span>
+            <span class="s1">new_instr </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Assign</span><span class="s2">(</span><span class="s1">new_expr</span><span class="s2">, </span><span class="s1">instr</span><span class="s2">.</span><span class="s1">target</span><span class="s2">, </span><span class="s1">instr</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">)</span>
+            <span class="s1">replace_map</span><span class="s2">[</span><span class="s1">instr</span><span class="s2">] = </span><span class="s1">new_instr</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">array_assigns</span><span class="s2">[</span><span class="s1">instr</span><span class="s2">.</span><span class="s1">target</span><span class="s2">.</span><span class="s1">name</span><span class="s2">] = </span><span class="s1">new_instr</span>
+            <span class="s0">for </span><span class="s1">operand </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_operands</span><span class="s2">(</span><span class="s1">expr</span><span class="s2">):</span>
+                <span class="s1">operand_name </span><span class="s2">= </span><span class="s1">operand</span><span class="s2">.</span><span class="s1">name</span>
+                <span class="s0">if </span><span class="s1">operand</span><span class="s2">.</span><span class="s1">is_temp </span><span class="s0">and </span><span class="s1">operand_name </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">array_assigns</span><span class="s2">:</span>
+                    <span class="s1">child_assign </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">array_assigns</span><span class="s2">[</span><span class="s1">operand_name</span><span class="s2">]</span>
+                    <span class="s1">child_expr </span><span class="s2">= </span><span class="s1">child_assign</span><span class="s2">.</span><span class="s1">value</span>
+                    <span class="s1">child_operands </span><span class="s2">= </span><span class="s1">child_expr</span><span class="s2">.</span><span class="s1">list_vars</span><span class="s2">()</span>
+                    <span class="s0">for </span><span class="s1">operand </span><span class="s0">in </span><span class="s1">child_operands</span><span class="s2">:</span>
+                        <span class="s1">used_vars</span><span class="s2">[</span><span class="s1">operand</span><span class="s2">.</span><span class="s1">name</span><span class="s2">] += </span><span class="s6">1</span>
+                    <span class="s1">arr_inps</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_translate_expr</span><span class="s2">(</span><span class="s1">child_expr</span><span class="s2">))</span>
+                    <span class="s0">if </span><span class="s1">child_assign</span><span class="s2">.</span><span class="s1">target</span><span class="s2">.</span><span class="s1">is_temp</span><span class="s2">:</span>
+                        <span class="s1">dead_vars</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">child_assign</span><span class="s2">.</span><span class="s1">target</span><span class="s2">.</span><span class="s1">name</span><span class="s2">)</span>
+                        <span class="s1">replace_map</span><span class="s2">[</span><span class="s1">child_assign</span><span class="s2">] = </span><span class="s0">None</span>
+                <span class="s0">elif </span><span class="s1">operand_name </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">const_assigns</span><span class="s2">:</span>
+                    <span class="s1">arr_inps</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">const_assigns</span><span class="s2">[</span><span class="s1">operand_name</span><span class="s2">])</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s1">used_vars</span><span class="s2">[</span><span class="s1">operand</span><span class="s2">.</span><span class="s1">name</span><span class="s2">] += </span><span class="s6">1</span>
+                    <span class="s1">arr_inps</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">operand</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">replace_map</span><span class="s2">, </span><span class="s1">dead_vars</span><span class="s2">, </span><span class="s1">used_vars</span>
+
+    <span class="s0">def </span><span class="s1">_get_final_replacement</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">replacement_map</span><span class="s2">, </span><span class="s1">instr</span><span class="s2">):</span>
+        <span class="s4">'''Find the final replacement instruction for a given initial 
+        instruction by chasing instructions in a map from instructions 
+        to replacement instructions. 
+        '''</span>
+        <span class="s1">replacement </span><span class="s2">= </span><span class="s1">replacement_map</span><span class="s2">[</span><span class="s1">instr</span><span class="s2">]</span>
+        <span class="s0">while </span><span class="s1">replacement </span><span class="s0">in </span><span class="s1">replacement_map</span><span class="s2">:</span>
+            <span class="s1">replacement </span><span class="s2">= </span><span class="s1">replacement_map</span><span class="s2">[</span><span class="s1">replacement</span><span class="s2">]</span>
+        <span class="s0">return </span><span class="s1">replacement</span>
+
+    <span class="s0">def </span><span class="s1">apply</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">'''When we've found array expressions in a basic block, rewrite that 
+        block, returning a new, transformed block. 
+        '''</span>
+        <span class="s5"># Part 1: Figure out what instructions should be rewritten</span>
+        <span class="s5"># based on the matches found.</span>
+        <span class="s1">replace_map</span><span class="s2">, </span><span class="s1">dead_vars</span><span class="s2">, </span><span class="s1">used_vars </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_handle_matches</span><span class="s2">()</span>
+        <span class="s5"># Part 2: Using the information above, rewrite the target</span>
+        <span class="s5"># basic block.</span>
+        <span class="s1">result </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">crnt_block</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">()</span>
+        <span class="s1">result</span><span class="s2">.</span><span class="s1">clear</span><span class="s2">()</span>
+        <span class="s1">delete_map </span><span class="s2">= {}</span>
+        <span class="s0">for </span><span class="s1">instr </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">crnt_block</span><span class="s2">.</span><span class="s1">body</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">instr</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Assign</span><span class="s2">):</span>
+                <span class="s0">if </span><span class="s1">instr </span><span class="s0">in </span><span class="s1">replace_map</span><span class="s2">:</span>
+                    <span class="s1">replacement </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_get_final_replacement</span><span class="s2">(</span>
+                        <span class="s1">replace_map</span><span class="s2">, </span><span class="s1">instr</span><span class="s2">)</span>
+                    <span class="s0">if </span><span class="s1">replacement</span><span class="s2">:</span>
+                        <span class="s1">result</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">replacement</span><span class="s2">)</span>
+                        <span class="s0">for </span><span class="s1">var </span><span class="s0">in </span><span class="s1">replacement</span><span class="s2">.</span><span class="s1">value</span><span class="s2">.</span><span class="s1">list_vars</span><span class="s2">():</span>
+                            <span class="s1">var_name </span><span class="s2">= </span><span class="s1">var</span><span class="s2">.</span><span class="s1">name</span>
+                            <span class="s0">if </span><span class="s1">var_name </span><span class="s0">in </span><span class="s1">delete_map</span><span class="s2">:</span>
+                                <span class="s1">result</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">delete_map</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s1">var_name</span><span class="s2">))</span>
+                            <span class="s0">if </span><span class="s1">used_vars</span><span class="s2">[</span><span class="s1">var_name</span><span class="s2">] &gt; </span><span class="s6">0</span><span class="s2">:</span>
+                                <span class="s1">used_vars</span><span class="s2">[</span><span class="s1">var_name</span><span class="s2">] -= </span><span class="s6">1</span>
+
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s1">result</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">instr</span><span class="s2">)</span>
+            <span class="s0">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">instr</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Del</span><span class="s2">):</span>
+                <span class="s1">instr_value </span><span class="s2">= </span><span class="s1">instr</span><span class="s2">.</span><span class="s1">value</span>
+                <span class="s0">if </span><span class="s1">used_vars</span><span class="s2">[</span><span class="s1">instr_value</span><span class="s2">] &gt; </span><span class="s6">0</span><span class="s2">:</span>
+                    <span class="s1">used_vars</span><span class="s2">[</span><span class="s1">instr_value</span><span class="s2">] -= </span><span class="s6">1</span>
+                    <span class="s1">delete_map</span><span class="s2">[</span><span class="s1">instr_value</span><span class="s2">] = </span><span class="s1">instr</span>
+                <span class="s0">elif </span><span class="s1">instr_value </span><span class="s0">not in </span><span class="s1">dead_vars</span><span class="s2">:</span>
+                    <span class="s1">result</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">instr</span><span class="s2">)</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s1">result</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">instr</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">delete_map</span><span class="s2">:</span>
+            <span class="s0">for </span><span class="s1">instr </span><span class="s0">in </span><span class="s1">delete_map</span><span class="s2">.</span><span class="s1">values</span><span class="s2">():</span>
+                <span class="s1">result</span><span class="s2">.</span><span class="s1">insert_before_terminator</span><span class="s2">(</span><span class="s1">instr</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">result</span>
+
+
+<span class="s1">_unaryops </span><span class="s2">= {</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">pos</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">UAdd</span><span class="s2">,</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">neg</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">USub</span><span class="s2">,</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">invert</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">Invert</span><span class="s2">,</span>
+<span class="s2">}</span>
+
+<span class="s1">_binops </span><span class="s2">= {</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">add</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">Add</span><span class="s2">,</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">sub</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">Sub</span><span class="s2">,</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">mul</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">Mult</span><span class="s2">,</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">truediv</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">Div</span><span class="s2">,</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">mod</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">Mod</span><span class="s2">,</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">or_</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">BitOr</span><span class="s2">,</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">rshift</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">RShift</span><span class="s2">,</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">xor</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">BitXor</span><span class="s2">,</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">lshift</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">LShift</span><span class="s2">,</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">and_</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">BitAnd</span><span class="s2">,</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">pow</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">Pow</span><span class="s2">,</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">floordiv</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">FloorDiv</span><span class="s2">,</span>
+<span class="s2">}</span>
+
+
+<span class="s1">_cmpops </span><span class="s2">= {</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">eq</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">Eq</span><span class="s2">,</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">ne</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">NotEq</span><span class="s2">,</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">lt</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">Lt</span><span class="s2">,</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">le</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">LtE</span><span class="s2">,</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">gt</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">Gt</span><span class="s2">,</span>
+    <span class="s1">operator</span><span class="s2">.</span><span class="s1">ge</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">GtE</span><span class="s2">,</span>
+<span class="s2">}</span>
+
+
+<span class="s0">def </span><span class="s1">_arr_expr_to_ast</span><span class="s2">(</span><span class="s1">expr</span><span class="s2">):</span>
+    <span class="s4">'''Build a Python expression AST from an array expression built by 
+    RewriteArrayExprs. 
+    '''</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">expr</span><span class="s2">, </span><span class="s1">tuple</span><span class="s2">):</span>
+        <span class="s1">op</span><span class="s2">, </span><span class="s1">arr_expr_args </span><span class="s2">= </span><span class="s1">expr</span>
+        <span class="s1">ast_args </span><span class="s2">= []</span>
+        <span class="s1">env </span><span class="s2">= {}</span>
+        <span class="s0">for </span><span class="s1">arg </span><span class="s0">in </span><span class="s1">arr_expr_args</span><span class="s2">:</span>
+            <span class="s1">ast_arg</span><span class="s2">, </span><span class="s1">child_env </span><span class="s2">= </span><span class="s1">_arr_expr_to_ast</span><span class="s2">(</span><span class="s1">arg</span><span class="s2">)</span>
+            <span class="s1">ast_args</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">ast_arg</span><span class="s2">)</span>
+            <span class="s1">env</span><span class="s2">.</span><span class="s1">update</span><span class="s2">(</span><span class="s1">child_env</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">op </span><span class="s0">in </span><span class="s1">npydecl</span><span class="s2">.</span><span class="s1">supported_array_operators</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">ast_args</span><span class="s2">) == </span><span class="s6">2</span><span class="s2">:</span>
+                <span class="s0">if </span><span class="s1">op </span><span class="s0">in </span><span class="s1">_binops</span><span class="s2">:</span>
+                    <span class="s0">return </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">BinOp</span><span class="s2">(</span>
+                        <span class="s1">ast_args</span><span class="s2">[</span><span class="s6">0</span><span class="s2">], </span><span class="s1">_binops</span><span class="s2">[</span><span class="s1">op</span><span class="s2">](), </span><span class="s1">ast_args</span><span class="s2">[</span><span class="s6">1</span><span class="s2">]), </span><span class="s1">env</span>
+                <span class="s0">if </span><span class="s1">op </span><span class="s0">in </span><span class="s1">_cmpops</span><span class="s2">:</span>
+                    <span class="s0">return </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">Compare</span><span class="s2">(</span>
+                        <span class="s1">ast_args</span><span class="s2">[</span><span class="s6">0</span><span class="s2">], [</span><span class="s1">_cmpops</span><span class="s2">[</span><span class="s1">op</span><span class="s2">]()], [</span><span class="s1">ast_args</span><span class="s2">[</span><span class="s6">1</span><span class="s2">]]), </span><span class="s1">env</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s0">assert </span><span class="s1">op </span><span class="s0">in </span><span class="s1">_unaryops</span>
+                <span class="s0">return </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">UnaryOp</span><span class="s2">(</span><span class="s1">_unaryops</span><span class="s2">[</span><span class="s1">op</span><span class="s2">](), </span><span class="s1">ast_args</span><span class="s2">[</span><span class="s6">0</span><span class="s2">]), </span><span class="s1">env</span>
+        <span class="s0">elif </span><span class="s1">_is_ufunc</span><span class="s2">(</span><span class="s1">op</span><span class="s2">):</span>
+            <span class="s1">fn_name </span><span class="s2">= </span><span class="s3">&quot;__ufunc_or_dufunc_{0}&quot;</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span>
+                <span class="s1">hex</span><span class="s2">(</span><span class="s1">hash</span><span class="s2">(</span><span class="s1">op</span><span class="s2">)).</span><span class="s1">replace</span><span class="s2">(</span><span class="s3">&quot;-&quot;</span><span class="s2">, </span><span class="s3">&quot;_&quot;</span><span class="s2">))</span>
+            <span class="s1">fn_ast_name </span><span class="s2">= </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">Name</span><span class="s2">(</span><span class="s1">fn_name</span><span class="s2">, </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">Load</span><span class="s2">())</span>
+            <span class="s1">env</span><span class="s2">[</span><span class="s1">fn_name</span><span class="s2">] = </span><span class="s1">op </span><span class="s5"># Stash the ufunc or DUFunc in the environment</span>
+            <span class="s1">ast_call </span><span class="s2">= </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">Call</span><span class="s2">(</span><span class="s1">fn_ast_name</span><span class="s2">, </span><span class="s1">ast_args</span><span class="s2">, [])</span>
+            <span class="s0">return </span><span class="s1">ast_call</span><span class="s2">, </span><span class="s1">env</span>
+    <span class="s0">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">expr</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Var</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">Name</span><span class="s2">(</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">name</span><span class="s2">, </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">Load</span><span class="s2">(),</span>
+                        <span class="s1">lineno</span><span class="s2">=</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">.</span><span class="s1">line</span><span class="s2">,</span>
+                        <span class="s1">col_offset</span><span class="s2">=</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">.</span><span class="s1">col </span><span class="s0">if </span><span class="s1">expr</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">.</span><span class="s1">col </span><span class="s0">else </span><span class="s6">0</span><span class="s2">), {}</span>
+    <span class="s0">elif </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">expr</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Const</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">Constant</span><span class="s2">(</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">value</span><span class="s2">), {}</span>
+    <span class="s0">raise </span><span class="s1">NotImplementedError</span><span class="s2">(</span>
+        <span class="s3">&quot;Don't know how to translate array expression '%r'&quot; </span><span class="s2">% (</span><span class="s1">expr</span><span class="s2">,))</span>
+
+
+<span class="s2">@</span><span class="s1">contextlib</span><span class="s2">.</span><span class="s1">contextmanager</span>
+<span class="s0">def </span><span class="s1">_legalize_parameter_names</span><span class="s2">(</span><span class="s1">var_list</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Legalize names in the variable list for use as a Python function's 
+    parameter names. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">var_map </span><span class="s2">= </span><span class="s1">OrderedDict</span><span class="s2">()</span>
+    <span class="s0">for </span><span class="s1">var </span><span class="s0">in </span><span class="s1">var_list</span><span class="s2">:</span>
+        <span class="s1">old_name </span><span class="s2">= </span><span class="s1">var</span><span class="s2">.</span><span class="s1">name</span>
+        <span class="s1">new_name </span><span class="s2">= </span><span class="s1">var</span><span class="s2">.</span><span class="s1">scope</span><span class="s2">.</span><span class="s1">redefine</span><span class="s2">(</span><span class="s1">old_name</span><span class="s2">, </span><span class="s1">loc</span><span class="s2">=</span><span class="s1">var</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">).</span><span class="s1">name</span>
+        <span class="s1">new_name </span><span class="s2">= </span><span class="s1">new_name</span><span class="s2">.</span><span class="s1">replace</span><span class="s2">(</span><span class="s3">&quot;$&quot;</span><span class="s2">, </span><span class="s3">&quot;_&quot;</span><span class="s2">).</span><span class="s1">replace</span><span class="s2">(</span><span class="s3">&quot;.&quot;</span><span class="s2">, </span><span class="s3">&quot;_&quot;</span><span class="s2">)</span>
+        <span class="s5"># Caller should ensure the names are unique</span>
+        <span class="s0">if </span><span class="s1">new_name </span><span class="s0">in </span><span class="s1">var_map</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">AssertionError</span><span class="s2">(</span><span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">new_name</span><span class="s0">!r} </span><span class="s3">not unique&quot;</span><span class="s2">)</span>
+        <span class="s1">var_map</span><span class="s2">[</span><span class="s1">new_name</span><span class="s2">] = </span><span class="s1">var</span><span class="s2">, </span><span class="s1">old_name</span>
+        <span class="s1">var</span><span class="s2">.</span><span class="s1">name </span><span class="s2">= </span><span class="s1">new_name</span>
+    <span class="s1">param_names </span><span class="s2">= </span><span class="s1">list</span><span class="s2">(</span><span class="s1">var_map</span><span class="s2">)</span>
+    <span class="s0">try</span><span class="s2">:</span>
+        <span class="s0">yield </span><span class="s1">param_names</span>
+    <span class="s0">finally</span><span class="s2">:</span>
+        <span class="s5"># Make sure the old names are restored, to avoid confusing</span>
+        <span class="s5"># other parts of Numba (see issue #1466)</span>
+        <span class="s0">for </span><span class="s1">var</span><span class="s2">, </span><span class="s1">old_name </span><span class="s0">in </span><span class="s1">var_map</span><span class="s2">.</span><span class="s1">values</span><span class="s2">():</span>
+            <span class="s1">var</span><span class="s2">.</span><span class="s1">name </span><span class="s2">= </span><span class="s1">old_name</span>
+
+
+<span class="s0">class </span><span class="s1">_EraseInvalidLineRanges</span><span class="s2">(</span><span class="s1">ast</span><span class="s2">.</span><span class="s1">NodeTransformer</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">generic_visit</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">node</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">AST</span><span class="s2">) </span><span class="s1">-&gt; ast</span><span class="s2">.</span><span class="s1">AST</span><span class="s2">:</span>
+        <span class="s1">node </span><span class="s2">= </span><span class="s1">super</span><span class="s2">().</span><span class="s1">generic_visit</span><span class="s2">(</span><span class="s1">node</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">hasattr</span><span class="s2">(</span><span class="s1">node</span><span class="s2">, </span><span class="s3">&quot;lineno&quot;</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">node</span><span class="s2">, </span><span class="s3">&quot;end_lineno&quot;</span><span class="s2">, </span><span class="s0">None</span><span class="s2">) </span><span class="s0">is not None</span><span class="s2">:</span>
+                <span class="s0">if </span><span class="s1">node</span><span class="s2">.</span><span class="s1">lineno </span><span class="s2">&gt; </span><span class="s1">node</span><span class="s2">.</span><span class="s1">end_lineno</span><span class="s2">:</span>
+                    <span class="s0">del </span><span class="s1">node</span><span class="s2">.</span><span class="s1">lineno</span>
+                    <span class="s0">del </span><span class="s1">node</span><span class="s2">.</span><span class="s1">end_lineno</span>
+        <span class="s0">return </span><span class="s1">node</span>
+
+
+<span class="s0">def </span><span class="s1">_fix_invalid_lineno_ranges</span><span class="s2">(</span><span class="s1">astree</span><span class="s2">: </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">AST</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot;Inplace fixes invalid lineno ranges. 
+    &quot;&quot;&quot;</span>
+    <span class="s5"># Make sure lineno and end_lineno are present</span>
+    <span class="s1">ast</span><span class="s2">.</span><span class="s1">fix_missing_locations</span><span class="s2">(</span><span class="s1">astree</span><span class="s2">)</span>
+    <span class="s5"># Delete invalid lineno ranges</span>
+    <span class="s1">_EraseInvalidLineRanges</span><span class="s2">().</span><span class="s1">visit</span><span class="s2">(</span><span class="s1">astree</span><span class="s2">)</span>
+    <span class="s5"># Make sure lineno and end_lineno are present</span>
+    <span class="s1">ast</span><span class="s2">.</span><span class="s1">fix_missing_locations</span><span class="s2">(</span><span class="s1">astree</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">_lower_array_expr</span><span class="s2">(</span><span class="s1">lowerer</span><span class="s2">, </span><span class="s1">expr</span><span class="s2">):</span>
+    <span class="s4">'''Lower an array expression built by RewriteArrayExprs. 
+    '''</span>
+    <span class="s1">expr_name </span><span class="s2">= </span><span class="s3">&quot;__numba_array_expr_%s&quot; </span><span class="s2">% (</span><span class="s1">hex</span><span class="s2">(</span><span class="s1">hash</span><span class="s2">(</span><span class="s1">expr</span><span class="s2">)).</span><span class="s1">replace</span><span class="s2">(</span><span class="s3">&quot;-&quot;</span><span class="s2">, </span><span class="s3">&quot;_&quot;</span><span class="s2">))</span>
+    <span class="s1">expr_filename </span><span class="s2">= </span><span class="s1">expr</span><span class="s2">.</span><span class="s1">loc</span><span class="s2">.</span><span class="s1">filename</span>
+    <span class="s1">expr_var_list </span><span class="s2">= </span><span class="s1">expr</span><span class="s2">.</span><span class="s1">list_vars</span><span class="s2">()</span>
+    <span class="s5"># The expression may use a given variable several times, but we</span>
+    <span class="s5"># should only create one parameter for it.</span>
+    <span class="s1">expr_var_unique </span><span class="s2">= </span><span class="s1">sorted</span><span class="s2">(</span><span class="s1">set</span><span class="s2">(</span><span class="s1">expr_var_list</span><span class="s2">), </span><span class="s1">key</span><span class="s2">=</span><span class="s0">lambda </span><span class="s1">var</span><span class="s2">: </span><span class="s1">var</span><span class="s2">.</span><span class="s1">name</span><span class="s2">)</span>
+
+    <span class="s5"># Arguments are the names external to the new closure</span>
+    <span class="s1">expr_args </span><span class="s2">= [</span><span class="s1">var</span><span class="s2">.</span><span class="s1">name </span><span class="s0">for </span><span class="s1">var </span><span class="s0">in </span><span class="s1">expr_var_unique</span><span class="s2">]</span>
+
+    <span class="s5"># 1. Create an AST tree from the array expression.</span>
+    <span class="s0">with </span><span class="s1">_legalize_parameter_names</span><span class="s2">(</span><span class="s1">expr_var_unique</span><span class="s2">) </span><span class="s0">as </span><span class="s1">expr_params</span><span class="s2">:</span>
+        <span class="s1">ast_args </span><span class="s2">= [</span><span class="s1">ast</span><span class="s2">.</span><span class="s1">arg</span><span class="s2">(</span><span class="s1">param_name</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+                    <span class="s0">for </span><span class="s1">param_name </span><span class="s0">in </span><span class="s1">expr_params</span><span class="s2">]</span>
+        <span class="s5"># Parse a stub function to ensure the AST is populated with</span>
+        <span class="s5"># reasonable defaults for the Python version.</span>
+        <span class="s1">ast_module </span><span class="s2">= </span><span class="s1">ast</span><span class="s2">.</span><span class="s1">parse</span><span class="s2">(</span><span class="s3">'def {0}(): return'</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">expr_name</span><span class="s2">),</span>
+                               <span class="s1">expr_filename</span><span class="s2">, </span><span class="s3">'exec'</span><span class="s2">)</span>
+        <span class="s0">assert </span><span class="s1">hasattr</span><span class="s2">(</span><span class="s1">ast_module</span><span class="s2">, </span><span class="s3">'body'</span><span class="s2">) </span><span class="s0">and </span><span class="s1">len</span><span class="s2">(</span><span class="s1">ast_module</span><span class="s2">.</span><span class="s1">body</span><span class="s2">) == </span><span class="s6">1</span>
+        <span class="s1">ast_fn </span><span class="s2">= </span><span class="s1">ast_module</span><span class="s2">.</span><span class="s1">body</span><span class="s2">[</span><span class="s6">0</span><span class="s2">]</span>
+        <span class="s1">ast_fn</span><span class="s2">.</span><span class="s1">args</span><span class="s2">.</span><span class="s1">args </span><span class="s2">= </span><span class="s1">ast_args</span>
+        <span class="s1">ast_fn</span><span class="s2">.</span><span class="s1">body</span><span class="s2">[</span><span class="s6">0</span><span class="s2">].</span><span class="s1">value</span><span class="s2">, </span><span class="s1">namespace </span><span class="s2">= </span><span class="s1">_arr_expr_to_ast</span><span class="s2">(</span><span class="s1">expr</span><span class="s2">.</span><span class="s1">expr</span><span class="s2">)</span>
+        <span class="s1">_fix_invalid_lineno_ranges</span><span class="s2">(</span><span class="s1">ast_module</span><span class="s2">)</span>
+
+    <span class="s5"># 2. Compile the AST module and extract the Python function.</span>
+    <span class="s1">code_obj </span><span class="s2">= </span><span class="s1">compile</span><span class="s2">(</span><span class="s1">ast_module</span><span class="s2">, </span><span class="s1">expr_filename</span><span class="s2">, </span><span class="s3">'exec'</span><span class="s2">)</span>
+    <span class="s1">exec</span><span class="s2">(</span><span class="s1">code_obj</span><span class="s2">, </span><span class="s1">namespace</span><span class="s2">)</span>
+    <span class="s1">impl </span><span class="s2">= </span><span class="s1">namespace</span><span class="s2">[</span><span class="s1">expr_name</span><span class="s2">]</span>
+
+    <span class="s5"># 3. Now compile a ufunc using the Python function as kernel.</span>
+
+    <span class="s1">context </span><span class="s2">= </span><span class="s1">lowerer</span><span class="s2">.</span><span class="s1">context</span>
+    <span class="s1">builder </span><span class="s2">= </span><span class="s1">lowerer</span><span class="s2">.</span><span class="s1">builder</span>
+    <span class="s1">outer_sig </span><span class="s2">= </span><span class="s1">expr</span><span class="s2">.</span><span class="s1">ty</span><span class="s2">(*(</span><span class="s1">lowerer</span><span class="s2">.</span><span class="s1">typeof</span><span class="s2">(</span><span class="s1">name</span><span class="s2">) </span><span class="s0">for </span><span class="s1">name </span><span class="s0">in </span><span class="s1">expr_args</span><span class="s2">))</span>
+    <span class="s1">inner_sig_args </span><span class="s2">= []</span>
+    <span class="s0">for </span><span class="s1">argty </span><span class="s0">in </span><span class="s1">outer_sig</span><span class="s2">.</span><span class="s1">args</span><span class="s2">:</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">argty</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Optional</span><span class="s2">):</span>
+            <span class="s1">argty </span><span class="s2">= </span><span class="s1">argty</span><span class="s2">.</span><span class="s1">type</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">argty</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">):</span>
+            <span class="s1">inner_sig_args</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">argty</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">inner_sig_args</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">argty</span><span class="s2">)</span>
+    <span class="s1">inner_sig </span><span class="s2">= </span><span class="s1">outer_sig</span><span class="s2">.</span><span class="s1">return_type</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">(*</span><span class="s1">inner_sig_args</span><span class="s2">)</span>
+
+    <span class="s1">flags </span><span class="s2">= </span><span class="s1">targetconfig</span><span class="s2">.</span><span class="s1">ConfigStack</span><span class="s2">().</span><span class="s1">top_or_none</span><span class="s2">()</span>
+    <span class="s1">flags </span><span class="s2">= </span><span class="s1">compiler</span><span class="s2">.</span><span class="s1">Flags</span><span class="s2">() </span><span class="s0">if </span><span class="s1">flags </span><span class="s0">is None else </span><span class="s1">flags</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">() </span><span class="s5"># make sure it's a clone or a fresh instance</span>
+    <span class="s5"># Follow the Numpy error model.  Note this also allows e.g. vectorizing</span>
+    <span class="s5"># division (issue #1223).</span>
+    <span class="s1">flags</span><span class="s2">.</span><span class="s1">error_model </span><span class="s2">= </span><span class="s3">'numpy'</span>
+    <span class="s1">cres </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">compile_subroutine</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">impl</span><span class="s2">, </span><span class="s1">inner_sig</span><span class="s2">, </span><span class="s1">flags</span><span class="s2">=</span><span class="s1">flags</span><span class="s2">,</span>
+                                      <span class="s1">caching</span><span class="s2">=</span><span class="s0">False</span><span class="s2">)</span>
+
+    <span class="s5"># Create kernel subclass calling our native function</span>
+    <span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">np </span><span class="s0">import </span><span class="s1">npyimpl</span>
+
+    <span class="s0">class </span><span class="s1">ExprKernel</span><span class="s2">(</span><span class="s1">npyimpl</span><span class="s2">.</span><span class="s1">_Kernel</span><span class="s2">):</span>
+        <span class="s0">def </span><span class="s1">generate</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">):</span>
+            <span class="s1">arg_zip </span><span class="s2">= </span><span class="s1">zip</span><span class="s2">(</span><span class="s1">args</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">outer_sig</span><span class="s2">.</span><span class="s1">args</span><span class="s2">, </span><span class="s1">inner_sig</span><span class="s2">.</span><span class="s1">args</span><span class="s2">)</span>
+            <span class="s1">cast_args </span><span class="s2">= [</span><span class="s1">self</span><span class="s2">.</span><span class="s1">cast</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">inty</span><span class="s2">, </span><span class="s1">outty</span><span class="s2">)</span>
+                         <span class="s0">for </span><span class="s1">val</span><span class="s2">, </span><span class="s1">inty</span><span class="s2">, </span><span class="s1">outty </span><span class="s0">in </span><span class="s1">arg_zip</span><span class="s2">]</span>
+            <span class="s1">result </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">call_internal</span><span class="s2">(</span>
+                <span class="s1">builder</span><span class="s2">, </span><span class="s1">cres</span><span class="s2">.</span><span class="s1">fndesc</span><span class="s2">, </span><span class="s1">inner_sig</span><span class="s2">, </span><span class="s1">cast_args</span><span class="s2">)</span>
+            <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">cast</span><span class="s2">(</span><span class="s1">result</span><span class="s2">, </span><span class="s1">inner_sig</span><span class="s2">.</span><span class="s1">return_type</span><span class="s2">,</span>
+                             <span class="s1">self</span><span class="s2">.</span><span class="s1">outer_sig</span><span class="s2">.</span><span class="s1">return_type</span><span class="s2">)</span>
+
+    <span class="s5"># create a fake ufunc object which is enough to trick numpy_ufunc_kernel</span>
+    <span class="s1">ufunc </span><span class="s2">= </span><span class="s1">SimpleNamespace</span><span class="s2">(</span><span class="s1">nin</span><span class="s2">=</span><span class="s1">len</span><span class="s2">(</span><span class="s1">expr_args</span><span class="s2">), </span><span class="s1">nout</span><span class="s2">=</span><span class="s6">1</span><span class="s2">, </span><span class="s1">__name__</span><span class="s2">=</span><span class="s1">expr_name</span><span class="s2">)</span>
+    <span class="s1">ufunc</span><span class="s2">.</span><span class="s1">nargs </span><span class="s2">= </span><span class="s1">ufunc</span><span class="s2">.</span><span class="s1">nin </span><span class="s2">+ </span><span class="s1">ufunc</span><span class="s2">.</span><span class="s1">nout</span>
+
+    <span class="s1">args </span><span class="s2">= [</span><span class="s1">lowerer</span><span class="s2">.</span><span class="s1">loadvar</span><span class="s2">(</span><span class="s1">name</span><span class="s2">) </span><span class="s0">for </span><span class="s1">name </span><span class="s0">in </span><span class="s1">expr_args</span><span class="s2">]</span>
+    <span class="s0">return </span><span class="s1">npyimpl</span><span class="s2">.</span><span class="s1">numpy_ufunc_kernel</span><span class="s2">(</span>
+        <span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">outer_sig</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">ufunc</span><span class="s2">, </span><span class="s1">ExprKernel</span><span class="s2">)</span>
+</pre>
+</body>
+</html>

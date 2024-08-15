@@ -1,0 +1,208 @@
+<html>
+<head>
+<title>audio_ffpyplayer.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #cf8e6d;}
+.s5 { color: #2aacb8;}
+.s6 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+audio_ffpyplayer.py</font>
+</center></td></tr></table>
+<pre><span class="s0">''' 
+FFmpeg based audio player 
+========================= 
+ 
+To use, you need to install ffpyplayer and have a compiled ffmpeg shared 
+library. 
+ 
+    https://github.com/matham/ffpyplayer 
+ 
+The docs there describe how to set this up. But briefly, first you need to 
+compile ffmpeg using the shared flags while disabling the static flags (you'll 
+probably have to set the fPIC flag, e.g. CFLAGS=-fPIC). Here's some 
+instructions: https://trac.ffmpeg.org/wiki/CompilationGuide. For Windows, you 
+can download compiled GPL binaries from http://ffmpeg.zeranoe.com/builds/. 
+Similarly, you should download SDL. 
+ 
+Now, you should a ffmpeg and sdl directory. In each, you should have a include, 
+bin, and lib directory, where e.g. for Windows, lib contains the .dll.a files, 
+while bin contains the actual dlls. The include directory holds the headers. 
+The bin directory is only needed if the shared libraries are not already on 
+the path. In the environment define FFMPEG_ROOT and SDL_ROOT, each pointing to 
+the ffmpeg, and SDL directories, respectively. (If you're using SDL2, 
+the include directory will contain a directory called SDL2, which then holds 
+the headers). 
+ 
+Once defined, download the ffpyplayer git and run 
+ 
+    python setup.py build_ext --inplace 
+ 
+Finally, before running you need to ensure that ffpyplayer is in python's path. 
+ 
+..Note:: 
+ 
+    When kivy exits by closing the window while the audio is playing, 
+    it appears that the __del__method of SoundFFPy 
+    is not called. Because of this the SoundFFPy object is not 
+    properly deleted when kivy exits. The consequence is that because 
+    MediaPlayer creates internal threads which do not have their daemon 
+    flag set, when the main threads exists it'll hang and wait for the other 
+    MediaPlayer threads to exit. But since __del__ is not called to delete the 
+    MediaPlayer object, those threads will remain alive hanging kivy. What this 
+    means is that you have to be sure to delete the MediaPlayer object before 
+    kivy exits by setting it to None. 
+'''</span>
+
+<span class="s1">__all__ </span><span class="s2">= (</span><span class="s3">'SoundFFPy'</span><span class="s2">, )</span>
+
+<span class="s4">try</span><span class="s2">:</span>
+    <span class="s4">import </span><span class="s1">ffpyplayer</span>
+    <span class="s4">from </span><span class="s1">ffpyplayer</span><span class="s2">.</span><span class="s1">player </span><span class="s4">import </span><span class="s1">MediaPlayer</span>
+    <span class="s4">from </span><span class="s1">ffpyplayer</span><span class="s2">.</span><span class="s1">tools </span><span class="s4">import </span><span class="s1">set_log_callback</span><span class="s2">, </span><span class="s1">get_log_callback</span><span class="s2">, </span><span class="s1">formats_in</span>
+<span class="s4">except</span><span class="s2">:</span>
+    <span class="s4">raise</span>
+
+
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">clock </span><span class="s4">import </span><span class="s1">Clock</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">logger </span><span class="s4">import </span><span class="s1">Logger</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">audio </span><span class="s4">import </span><span class="s1">Sound</span><span class="s2">, </span><span class="s1">SoundLoader</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">weakmethod </span><span class="s4">import </span><span class="s1">WeakMethod</span>
+<span class="s4">import </span><span class="s1">time</span>
+
+<span class="s4">try</span><span class="s2">:</span>
+    <span class="s1">Logger</span><span class="s2">.</span><span class="s1">info</span><span class="s2">(</span>
+        <span class="s3">'SoundFFPy: Using ffpyplayer {}'</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">ffpyplayer</span><span class="s2">.</span><span class="s1">__version__</span><span class="s2">))</span>
+<span class="s4">except</span><span class="s2">:</span>
+    <span class="s1">Logger</span><span class="s2">.</span><span class="s1">info</span><span class="s2">(</span><span class="s3">'SoundFFPy: Using ffpyplayer {}'</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">ffpyplayer</span><span class="s2">.</span><span class="s1">version</span><span class="s2">))</span>
+
+
+<span class="s1">logger_func </span><span class="s2">= {</span><span class="s3">'quiet'</span><span class="s2">: </span><span class="s1">Logger</span><span class="s2">.</span><span class="s1">critical</span><span class="s2">, </span><span class="s3">'panic'</span><span class="s2">: </span><span class="s1">Logger</span><span class="s2">.</span><span class="s1">critical</span><span class="s2">,</span>
+               <span class="s3">'fatal'</span><span class="s2">: </span><span class="s1">Logger</span><span class="s2">.</span><span class="s1">critical</span><span class="s2">, </span><span class="s3">'error'</span><span class="s2">: </span><span class="s1">Logger</span><span class="s2">.</span><span class="s1">error</span><span class="s2">,</span>
+               <span class="s3">'warning'</span><span class="s2">: </span><span class="s1">Logger</span><span class="s2">.</span><span class="s1">warning</span><span class="s2">, </span><span class="s3">'info'</span><span class="s2">: </span><span class="s1">Logger</span><span class="s2">.</span><span class="s1">info</span><span class="s2">,</span>
+               <span class="s3">'verbose'</span><span class="s2">: </span><span class="s1">Logger</span><span class="s2">.</span><span class="s1">debug</span><span class="s2">, </span><span class="s3">'debug'</span><span class="s2">: </span><span class="s1">Logger</span><span class="s2">.</span><span class="s1">debug</span><span class="s2">}</span>
+
+
+<span class="s4">def </span><span class="s1">_log_callback</span><span class="s2">(</span><span class="s1">message</span><span class="s2">, </span><span class="s1">level</span><span class="s2">):</span>
+    <span class="s1">message </span><span class="s2">= </span><span class="s1">message</span><span class="s2">.</span><span class="s1">strip</span><span class="s2">()</span>
+    <span class="s4">if </span><span class="s1">message</span><span class="s2">:</span>
+        <span class="s1">logger_func</span><span class="s2">[</span><span class="s1">level</span><span class="s2">](</span><span class="s3">'ffpyplayer: {}'</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">message</span><span class="s2">))</span>
+
+
+<span class="s4">class </span><span class="s1">SoundFFPy</span><span class="s2">(</span><span class="s1">Sound</span><span class="s2">):</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s4">def </span><span class="s1">extensions</span><span class="s2">():</span>
+        <span class="s4">return </span><span class="s1">formats_in</span>
+
+    <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">quitted </span><span class="s2">= </span><span class="s4">False</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_log_callback_set </span><span class="s2">= </span><span class="s4">False</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s2">= </span><span class="s3">''</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">state </span><span class="s2">= </span><span class="s3">'stop'</span>
+
+        <span class="s4">if not </span><span class="s1">get_log_callback</span><span class="s2">():</span>
+            <span class="s1">set_log_callback</span><span class="s2">(</span><span class="s1">_log_callback</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_log_callback_set </span><span class="s2">= </span><span class="s4">True</span>
+
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">SoundFFPy</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">(**</span><span class="s1">kwargs</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">__del__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">unload</span><span class="s2">()</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_log_callback_set</span><span class="s2">:</span>
+            <span class="s1">set_log_callback</span><span class="s2">(</span><span class="s4">None</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">_player_callback</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">selector</span><span class="s2">, </span><span class="s1">value</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer </span><span class="s4">is None</span><span class="s2">:</span>
+            <span class="s4">return</span>
+        <span class="s4">if </span><span class="s1">selector </span><span class="s2">== </span><span class="s3">'quit'</span><span class="s2">:</span>
+            <span class="s4">def </span><span class="s1">close</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">):</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">quitted </span><span class="s2">= </span><span class="s4">True</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">unload</span><span class="s2">()</span>
+            <span class="s1">Clock</span><span class="s2">.</span><span class="s1">schedule_once</span><span class="s2">(</span><span class="s1">close</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+        <span class="s4">elif </span><span class="s1">selector </span><span class="s2">== </span><span class="s3">'eof'</span><span class="s2">:</span>
+            <span class="s1">Clock</span><span class="s2">.</span><span class="s1">schedule_once</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_do_eos</span><span class="s2">, </span><span class="s5">0</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">load</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">unload</span><span class="s2">()</span>
+        <span class="s1">ff_opts </span><span class="s2">= {</span><span class="s3">'vn'</span><span class="s2">: </span><span class="s4">True</span><span class="s2">, </span><span class="s3">'sn'</span><span class="s2">: </span><span class="s4">True</span><span class="s2">}  </span><span class="s6"># only audio</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer </span><span class="s2">= </span><span class="s1">MediaPlayer</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">source</span><span class="s2">,</span>
+                                     <span class="s1">callback</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_player_callback</span><span class="s2">,</span>
+                                     <span class="s1">loglevel</span><span class="s2">=</span><span class="s3">'info'</span><span class="s2">, </span><span class="s1">ff_opts</span><span class="s2">=</span><span class="s1">ff_opts</span><span class="s2">)</span>
+        <span class="s1">player </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span>
+        <span class="s1">player</span><span class="s2">.</span><span class="s1">set_volume</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">volume</span><span class="s2">)</span>
+        <span class="s1">player</span><span class="s2">.</span><span class="s1">toggle_pause</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s2">= </span><span class="s3">'paused'</span>
+        <span class="s6"># wait until loaded or failed, shouldn't take long, but just to make</span>
+        <span class="s6"># sure metadata is available.</span>
+        <span class="s1">s </span><span class="s2">= </span><span class="s1">time</span><span class="s2">.</span><span class="s1">perf_counter</span><span class="s2">()</span>
+        <span class="s4">while </span><span class="s2">(</span><span class="s1">player</span><span class="s2">.</span><span class="s1">get_metadata</span><span class="s2">()[</span><span class="s3">'duration'</span><span class="s2">] </span><span class="s4">is None and</span>
+               <span class="s4">not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">quitted </span><span class="s4">and </span><span class="s1">time</span><span class="s2">.</span><span class="s1">perf_counter</span><span class="s2">() - </span><span class="s1">s </span><span class="s2">&lt; </span><span class="s5">10.</span><span class="s2">):</span>
+            <span class="s1">time</span><span class="s2">.</span><span class="s1">sleep</span><span class="s2">(</span><span class="s5">0.005</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">unload</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s2">= </span><span class="s3">''</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">state </span><span class="s2">= </span><span class="s3">'stop'</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">quitted </span><span class="s2">= </span><span class="s4">False</span>
+
+    <span class="s4">def </span><span class="s1">play</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s2">== </span><span class="s3">'playing'</span><span class="s2">:</span>
+            <span class="s1">super</span><span class="s2">(</span><span class="s1">SoundFFPy</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">play</span><span class="s2">()</span>
+            <span class="s4">return</span>
+        <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">load</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span><span class="s2">.</span><span class="s1">toggle_pause</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s2">= </span><span class="s3">'playing'</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">state </span><span class="s2">= </span><span class="s3">'play'</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">SoundFFPy</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">play</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">seek</span><span class="s2">(</span><span class="s5">0</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">stop</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer </span><span class="s4">and </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s2">== </span><span class="s3">'playing'</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span><span class="s2">.</span><span class="s1">toggle_pause</span><span class="s2">()</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_state </span><span class="s2">= </span><span class="s3">'paused'</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">state </span><span class="s2">= </span><span class="s3">'stop'</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">SoundFFPy</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">stop</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">seek</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">position</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer </span><span class="s4">is None</span><span class="s2">:</span>
+            <span class="s4">return</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span><span class="s2">.</span><span class="s1">seek</span><span class="s2">(</span><span class="s1">position</span><span class="s2">, </span><span class="s1">relative</span><span class="s2">=</span><span class="s4">False</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">get_pos</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer </span><span class="s4">is not None</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span><span class="s2">.</span><span class="s1">get_pts</span><span class="s2">()</span>
+        <span class="s4">return </span><span class="s5">0</span>
+
+    <span class="s4">def </span><span class="s1">on_volume</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">instance</span><span class="s2">, </span><span class="s1">volume</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer </span><span class="s4">is not None</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span><span class="s2">.</span><span class="s1">set_volume</span><span class="s2">(</span><span class="s1">volume</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">_get_length</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer </span><span class="s4">is None</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s1">super</span><span class="s2">(</span><span class="s1">SoundFFPy</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">_get_length</span><span class="s2">()</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_ffplayer</span><span class="s2">.</span><span class="s1">get_metadata</span><span class="s2">()[</span><span class="s3">'duration'</span><span class="s2">]</span>
+
+    <span class="s4">def </span><span class="s1">_do_eos</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">):</span>
+        <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">loop</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">stop</span><span class="s2">()</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">seek</span><span class="s2">(</span><span class="s5">0.</span><span class="s2">)</span>
+
+
+<span class="s1">SoundLoader</span><span class="s2">.</span><span class="s1">register</span><span class="s2">(</span><span class="s1">SoundFFPy</span><span class="s2">)</span>
+</pre>
+</body>
+</html>

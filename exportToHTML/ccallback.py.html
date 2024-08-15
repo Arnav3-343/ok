@@ -1,0 +1,158 @@
+<html>
+<head>
+<title>ccallback.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ccallback.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Implementation of compiled C callbacks (@cfunc). 
+&quot;&quot;&quot;</span>
+
+
+<span class="s2">import </span><span class="s1">ctypes</span>
+<span class="s2">from </span><span class="s1">functools </span><span class="s2">import </span><span class="s1">cached_property</span>
+
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">compiler</span><span class="s3">, </span><span class="s1">registry</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">caching </span><span class="s2">import </span><span class="s1">NullCache</span><span class="s3">, </span><span class="s1">FunctionCache</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">dispatcher </span><span class="s2">import </span><span class="s1">_FunctionCompiler</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">typing </span><span class="s2">import </span><span class="s1">signature</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">typing</span><span class="s3">.</span><span class="s1">ctypes_utils </span><span class="s2">import </span><span class="s1">to_ctypes</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">compiler_lock </span><span class="s2">import </span><span class="s1">global_compiler_lock</span>
+
+
+<span class="s2">class </span><span class="s1">_CFuncCompiler</span><span class="s3">(</span><span class="s1">_FunctionCompiler</span><span class="s3">):</span>
+
+    <span class="s2">def </span><span class="s1">_customize_flags</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">flags</span><span class="s3">):</span>
+        <span class="s1">flags</span><span class="s3">.</span><span class="s1">no_cpython_wrapper </span><span class="s3">= </span><span class="s2">True</span>
+        <span class="s1">flags</span><span class="s3">.</span><span class="s1">no_cfunc_wrapper </span><span class="s3">= </span><span class="s2">False</span>
+        <span class="s4"># Disable compilation of the IR module, because we first want to</span>
+        <span class="s4"># add the cfunc wrapper.</span>
+        <span class="s1">flags</span><span class="s3">.</span><span class="s1">no_compile </span><span class="s3">= </span><span class="s2">True</span>
+        <span class="s4"># Object mode is not currently supported in C callbacks</span>
+        <span class="s4"># (no reliable way to get the environment)</span>
+        <span class="s1">flags</span><span class="s3">.</span><span class="s1">enable_pyobject </span><span class="s3">= </span><span class="s2">False</span>
+        <span class="s2">if </span><span class="s1">flags</span><span class="s3">.</span><span class="s1">force_pyobject</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">NotImplementedError</span><span class="s3">(</span><span class="s5">&quot;object mode not allowed in C callbacks&quot;</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">flags</span>
+
+
+<span class="s2">class </span><span class="s1">CFunc</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A compiled C callback, as created by the @cfunc decorator. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_targetdescr </span><span class="s3">= </span><span class="s1">registry</span><span class="s3">.</span><span class="s1">cpu_target</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">pyfunc</span><span class="s3">, </span><span class="s1">sig</span><span class="s3">, </span><span class="s1">locals</span><span class="s3">, </span><span class="s1">options</span><span class="s3">,</span>
+                 <span class="s1">pipeline_class</span><span class="s3">=</span><span class="s1">compiler</span><span class="s3">.</span><span class="s1">Compiler</span><span class="s3">):</span>
+        <span class="s1">args</span><span class="s3">, </span><span class="s1">return_type </span><span class="s3">= </span><span class="s1">sig</span>
+        <span class="s2">if </span><span class="s1">return_type </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">TypeError</span><span class="s3">(</span><span class="s5">&quot;C callback needs an explicit return type&quot;</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">__name__ </span><span class="s3">= </span><span class="s1">pyfunc</span><span class="s3">.</span><span class="s1">__name__</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">__qualname__ </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">pyfunc</span><span class="s3">, </span><span class="s5">'__qualname__'</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">__wrapped__ </span><span class="s3">= </span><span class="s1">pyfunc</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_pyfunc </span><span class="s3">= </span><span class="s1">pyfunc</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_sig </span><span class="s3">= </span><span class="s1">signature</span><span class="s3">(</span><span class="s1">return_type</span><span class="s3">, *</span><span class="s1">args</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_compiler </span><span class="s3">= </span><span class="s1">_CFuncCompiler</span><span class="s3">(</span><span class="s1">pyfunc</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_targetdescr</span><span class="s3">,</span>
+                                        <span class="s1">options</span><span class="s3">, </span><span class="s1">locals</span><span class="s3">,</span>
+                                        <span class="s1">pipeline_class</span><span class="s3">=</span><span class="s1">pipeline_class</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_wrapper_name </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_wrapper_address </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_cache </span><span class="s3">= </span><span class="s1">NullCache</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_hits </span><span class="s3">= </span><span class="s6">0</span>
+
+    <span class="s2">def </span><span class="s1">enable_caching</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_cache </span><span class="s3">= </span><span class="s1">FunctionCache</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pyfunc</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">global_compiler_lock</span>
+    <span class="s2">def </span><span class="s1">compile</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s4"># Try to load from cache</span>
+        <span class="s1">cres </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cache</span><span class="s3">.</span><span class="s1">load_overload</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_sig</span><span class="s3">,</span>
+                                         <span class="s1">self</span><span class="s3">.</span><span class="s1">_targetdescr</span><span class="s3">.</span><span class="s1">target_context</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">cres </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">cres </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_compile_uncached</span><span class="s3">()</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_cache</span><span class="s3">.</span><span class="s1">save_overload</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_sig</span><span class="s3">, </span><span class="s1">cres</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_hits </span><span class="s3">+= </span><span class="s6">1</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_library </span><span class="s3">= </span><span class="s1">cres</span><span class="s3">.</span><span class="s1">library</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_wrapper_name </span><span class="s3">= </span><span class="s1">cres</span><span class="s3">.</span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">llvm_cfunc_wrapper_name</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_wrapper_address </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_library</span><span class="s3">.</span><span class="s1">get_pointer_to_function</span><span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_wrapper_name</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_compile_uncached</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">sig </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_sig</span>
+
+        <span class="s4"># Compile native function as well as cfunc wrapper</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_compiler</span><span class="s3">.</span><span class="s1">compile</span><span class="s3">(</span><span class="s1">sig</span><span class="s3">.</span><span class="s1">args</span><span class="s3">, </span><span class="s1">sig</span><span class="s3">.</span><span class="s1">return_type</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">native_name</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        The process-wide symbol the C callback is exposed as. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># Note from our point of view, the C callback is the wrapper around</span>
+        <span class="s4"># the native function.</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_wrapper_name</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">address</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        The address of the C callback. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_wrapper_address</span>
+
+    <span class="s3">@</span><span class="s1">cached_property</span>
+    <span class="s2">def </span><span class="s1">cffi</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        A cffi function pointer representing the C callback. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">import </span><span class="s1">cffi</span>
+        <span class="s1">ffi </span><span class="s3">= </span><span class="s1">cffi</span><span class="s3">.</span><span class="s1">FFI</span><span class="s3">()</span>
+        <span class="s4"># cffi compares types by name, so using precise types would risk</span>
+        <span class="s4"># spurious mismatches (such as &quot;int32_t&quot; vs. &quot;int&quot;).</span>
+        <span class="s2">return </span><span class="s1">ffi</span><span class="s3">.</span><span class="s1">cast</span><span class="s3">(</span><span class="s5">&quot;void *&quot;</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">address</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">cached_property</span>
+    <span class="s2">def </span><span class="s1">ctypes</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        A ctypes function object representing the C callback. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">ctypes_args </span><span class="s3">= [</span><span class="s1">to_ctypes</span><span class="s3">(</span><span class="s1">ty</span><span class="s3">) </span><span class="s2">for </span><span class="s1">ty </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_sig</span><span class="s3">.</span><span class="s1">args</span><span class="s3">]</span>
+        <span class="s1">ctypes_restype </span><span class="s3">= </span><span class="s1">to_ctypes</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_sig</span><span class="s3">.</span><span class="s1">return_type</span><span class="s3">)</span>
+        <span class="s1">functype </span><span class="s3">= </span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">CFUNCTYPE</span><span class="s3">(</span><span class="s1">ctypes_restype</span><span class="s3">, *</span><span class="s1">ctypes_args</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">functype</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">address</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">inspect_llvm</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the LLVM IR of the C callback definition. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_library</span><span class="s3">.</span><span class="s1">get_llvm_str</span><span class="s3">()</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">cache_hits</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_hits</span>
+
+    <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s5">&quot;&lt;Numba C callback %r&gt;&quot; </span><span class="s3">% (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">__qualname__</span><span class="s3">,)</span>
+
+    <span class="s2">def </span><span class="s1">__call__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, *</span><span class="s1">args</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pyfunc</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">)</span>
+</pre>
+</body>
+</html>

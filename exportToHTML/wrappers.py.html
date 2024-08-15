@@ -1,0 +1,766 @@
+<html>
+<head>
+<title>wrappers.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #7a7e85;}
+.s5 { color: #5f826b; font-style: italic;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+wrappers.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">namedtuple</span>
+
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+
+<span class="s0">from </span><span class="s1">llvmlite</span><span class="s2">.</span><span class="s1">ir </span><span class="s0">import </span><span class="s1">Constant</span><span class="s2">, </span><span class="s1">IRBuilder</span>
+<span class="s0">from </span><span class="s1">llvmlite </span><span class="s0">import </span><span class="s1">ir</span>
+
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">types</span><span class="s2">, </span><span class="s1">cgutils</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">compiler_lock </span><span class="s0">import </span><span class="s1">global_compiler_lock</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">caching </span><span class="s0">import </span><span class="s1">make_library_cache</span><span class="s2">, </span><span class="s1">NullCache</span>
+
+
+<span class="s1">_wrapper_info </span><span class="s2">= </span><span class="s1">namedtuple</span><span class="s2">(</span><span class="s3">'_wrapper_info'</span><span class="s2">, [</span><span class="s3">'library'</span><span class="s2">, </span><span class="s3">'env'</span><span class="s2">, </span><span class="s3">'name'</span><span class="s2">])</span>
+
+
+<span class="s0">def </span><span class="s1">_build_ufunc_loop_body</span><span class="s2">(</span><span class="s1">load</span><span class="s2">, </span><span class="s1">store</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">arrays</span><span class="s2">, </span><span class="s1">out</span><span class="s2">,</span>
+                           <span class="s1">offsets</span><span class="s2">, </span><span class="s1">store_offset</span><span class="s2">, </span><span class="s1">signature</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">, </span><span class="s1">env</span><span class="s2">):</span>
+    <span class="s1">elems </span><span class="s2">= </span><span class="s1">load</span><span class="s2">()</span>
+
+    <span class="s4"># Compute</span>
+    <span class="s1">status</span><span class="s2">, </span><span class="s1">retval </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">call_conv</span><span class="s2">.</span><span class="s1">call_function</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">func</span><span class="s2">,</span>
+                                                     <span class="s1">signature</span><span class="s2">.</span><span class="s1">return_type</span><span class="s2">,</span>
+                                                     <span class="s1">signature</span><span class="s2">.</span><span class="s1">args</span><span class="s2">, </span><span class="s1">elems</span><span class="s2">)</span>
+
+    <span class="s4"># Store</span>
+    <span class="s0">with </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">if_else</span><span class="s2">(</span><span class="s1">status</span><span class="s2">.</span><span class="s1">is_ok</span><span class="s2">, </span><span class="s1">likely</span><span class="s2">=</span><span class="s0">True</span><span class="s2">) </span><span class="s0">as </span><span class="s2">(</span><span class="s1">if_ok</span><span class="s2">, </span><span class="s1">if_error</span><span class="s2">):</span>
+        <span class="s0">with </span><span class="s1">if_ok</span><span class="s2">:</span>
+            <span class="s1">store</span><span class="s2">(</span><span class="s1">retval</span><span class="s2">)</span>
+        <span class="s0">with </span><span class="s1">if_error</span><span class="s2">:</span>
+            <span class="s1">gil </span><span class="s2">= </span><span class="s1">pyapi</span><span class="s2">.</span><span class="s1">gil_ensure</span><span class="s2">()</span>
+            <span class="s1">context</span><span class="s2">.</span><span class="s1">call_conv</span><span class="s2">.</span><span class="s1">raise_error</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">, </span><span class="s1">status</span><span class="s2">)</span>
+            <span class="s1">pyapi</span><span class="s2">.</span><span class="s1">gil_release</span><span class="s2">(</span><span class="s1">gil</span><span class="s2">)</span>
+
+    <span class="s4"># increment indices</span>
+    <span class="s0">for </span><span class="s1">off</span><span class="s2">, </span><span class="s1">ary </span><span class="s0">in </span><span class="s1">zip</span><span class="s2">(</span><span class="s1">offsets</span><span class="s2">, </span><span class="s1">arrays</span><span class="s2">):</span>
+        <span class="s1">builder</span><span class="s2">.</span><span class="s1">store</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">off</span><span class="s2">), </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">step</span><span class="s2">), </span><span class="s1">off</span><span class="s2">)</span>
+
+    <span class="s1">builder</span><span class="s2">.</span><span class="s1">store</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">store_offset</span><span class="s2">), </span><span class="s1">out</span><span class="s2">.</span><span class="s1">step</span><span class="s2">),</span>
+                  <span class="s1">store_offset</span><span class="s2">)</span>
+
+    <span class="s0">return </span><span class="s1">status</span><span class="s2">.</span><span class="s1">code</span>
+
+
+<span class="s0">def </span><span class="s1">_build_ufunc_loop_body_objmode</span><span class="s2">(</span><span class="s1">load</span><span class="s2">, </span><span class="s1">store</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">,</span>
+                                   <span class="s1">arrays</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">offsets</span><span class="s2">, </span><span class="s1">store_offset</span><span class="s2">,</span>
+                                   <span class="s1">signature</span><span class="s2">, </span><span class="s1">env</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">):</span>
+    <span class="s1">elems </span><span class="s2">= </span><span class="s1">load</span><span class="s2">()</span>
+
+    <span class="s4"># Compute</span>
+    <span class="s1">_objargs </span><span class="s2">= [</span><span class="s1">types</span><span class="s2">.</span><span class="s1">pyobject</span><span class="s2">] * </span><span class="s1">len</span><span class="s2">(</span><span class="s1">signature</span><span class="s2">.</span><span class="s1">args</span><span class="s2">)</span>
+    <span class="s4"># We need to push the error indicator to avoid it messing with</span>
+    <span class="s4"># the ufunc's execution.  We restore it unless the ufunc raised</span>
+    <span class="s4"># a new error.</span>
+    <span class="s0">with </span><span class="s1">pyapi</span><span class="s2">.</span><span class="s1">err_push</span><span class="s2">(</span><span class="s1">keep_new</span><span class="s2">=</span><span class="s0">True</span><span class="s2">):</span>
+        <span class="s1">status</span><span class="s2">, </span><span class="s1">retval </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">call_conv</span><span class="s2">.</span><span class="s1">call_function</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">func</span><span class="s2">,</span>
+                                                         <span class="s1">types</span><span class="s2">.</span><span class="s1">pyobject</span><span class="s2">,</span>
+                                                         <span class="s1">_objargs</span><span class="s2">, </span><span class="s1">elems</span><span class="s2">)</span>
+        <span class="s4"># Release owned reference to arguments</span>
+        <span class="s0">for </span><span class="s1">elem </span><span class="s0">in </span><span class="s1">elems</span><span class="s2">:</span>
+            <span class="s1">pyapi</span><span class="s2">.</span><span class="s1">decref</span><span class="s2">(</span><span class="s1">elem</span><span class="s2">)</span>
+    <span class="s4"># NOTE: if an error occurred, it will be caught by the Numpy machinery</span>
+
+    <span class="s4"># Store</span>
+    <span class="s1">store</span><span class="s2">(</span><span class="s1">retval</span><span class="s2">)</span>
+
+    <span class="s4"># increment indices</span>
+    <span class="s0">for </span><span class="s1">off</span><span class="s2">, </span><span class="s1">ary </span><span class="s0">in </span><span class="s1">zip</span><span class="s2">(</span><span class="s1">offsets</span><span class="s2">, </span><span class="s1">arrays</span><span class="s2">):</span>
+        <span class="s1">builder</span><span class="s2">.</span><span class="s1">store</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">off</span><span class="s2">), </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">step</span><span class="s2">), </span><span class="s1">off</span><span class="s2">)</span>
+
+    <span class="s1">builder</span><span class="s2">.</span><span class="s1">store</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">store_offset</span><span class="s2">), </span><span class="s1">out</span><span class="s2">.</span><span class="s1">step</span><span class="s2">),</span>
+                  <span class="s1">store_offset</span><span class="s2">)</span>
+
+    <span class="s0">return </span><span class="s1">status</span><span class="s2">.</span><span class="s1">code</span>
+
+
+<span class="s0">def </span><span class="s1">build_slow_loop_body</span><span class="s2">(</span><span class="s1">context</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">arrays</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">offsets</span><span class="s2">,</span>
+                         <span class="s1">store_offset</span><span class="s2">, </span><span class="s1">signature</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">, </span><span class="s1">env</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">load</span><span class="s2">():</span>
+        <span class="s1">elems </span><span class="s2">= [</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">load_direct</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">off</span><span class="s2">))</span>
+                 <span class="s0">for </span><span class="s1">off</span><span class="s2">, </span><span class="s1">ary </span><span class="s0">in </span><span class="s1">zip</span><span class="s2">(</span><span class="s1">offsets</span><span class="s2">, </span><span class="s1">arrays</span><span class="s2">)]</span>
+        <span class="s0">return </span><span class="s1">elems</span>
+
+    <span class="s0">def </span><span class="s1">store</span><span class="s2">(</span><span class="s1">retval</span><span class="s2">):</span>
+        <span class="s1">out</span><span class="s2">.</span><span class="s1">store_direct</span><span class="s2">(</span><span class="s1">retval</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">store_offset</span><span class="s2">))</span>
+
+    <span class="s0">return </span><span class="s1">_build_ufunc_loop_body</span><span class="s2">(</span><span class="s1">load</span><span class="s2">, </span><span class="s1">store</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">arrays</span><span class="s2">,</span>
+                                  <span class="s1">out</span><span class="s2">, </span><span class="s1">offsets</span><span class="s2">, </span><span class="s1">store_offset</span><span class="s2">, </span><span class="s1">signature</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">,</span>
+                                  <span class="s1">env</span><span class="s2">=</span><span class="s1">env</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">build_obj_loop_body</span><span class="s2">(</span><span class="s1">context</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">arrays</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">offsets</span><span class="s2">,</span>
+                        <span class="s1">store_offset</span><span class="s2">, </span><span class="s1">signature</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">, </span><span class="s1">envptr</span><span class="s2">, </span><span class="s1">env</span><span class="s2">):</span>
+    <span class="s1">env_body </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_env_body</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">envptr</span><span class="s2">)</span>
+    <span class="s1">env_manager </span><span class="s2">= </span><span class="s1">pyapi</span><span class="s2">.</span><span class="s1">get_env_manager</span><span class="s2">(</span><span class="s1">env</span><span class="s2">, </span><span class="s1">env_body</span><span class="s2">, </span><span class="s1">envptr</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">load</span><span class="s2">():</span>
+        <span class="s4"># Load</span>
+        <span class="s1">elems </span><span class="s2">= [</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">load_direct</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">off</span><span class="s2">))</span>
+                 <span class="s0">for </span><span class="s1">off</span><span class="s2">, </span><span class="s1">ary </span><span class="s0">in </span><span class="s1">zip</span><span class="s2">(</span><span class="s1">offsets</span><span class="s2">, </span><span class="s1">arrays</span><span class="s2">)]</span>
+        <span class="s4"># Box</span>
+        <span class="s1">elems </span><span class="s2">= [</span><span class="s1">pyapi</span><span class="s2">.</span><span class="s1">from_native_value</span><span class="s2">(</span><span class="s1">t</span><span class="s2">, </span><span class="s1">v</span><span class="s2">, </span><span class="s1">env_manager</span><span class="s2">)</span>
+                 <span class="s0">for </span><span class="s1">v</span><span class="s2">, </span><span class="s1">t </span><span class="s0">in </span><span class="s1">zip</span><span class="s2">(</span><span class="s1">elems</span><span class="s2">, </span><span class="s1">signature</span><span class="s2">.</span><span class="s1">args</span><span class="s2">)]</span>
+        <span class="s0">return </span><span class="s1">elems</span>
+
+    <span class="s0">def </span><span class="s1">store</span><span class="s2">(</span><span class="s1">retval</span><span class="s2">):</span>
+        <span class="s1">is_ok </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">is_not_null</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">retval</span><span class="s2">)</span>
+        <span class="s4"># If an error is raised by the object mode ufunc, it will</span>
+        <span class="s4"># simply get caught by the Numpy ufunc machinery.</span>
+        <span class="s0">with </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">if_then</span><span class="s2">(</span><span class="s1">is_ok</span><span class="s2">, </span><span class="s1">likely</span><span class="s2">=</span><span class="s0">True</span><span class="s2">):</span>
+            <span class="s4"># Unbox</span>
+            <span class="s1">native </span><span class="s2">= </span><span class="s1">pyapi</span><span class="s2">.</span><span class="s1">to_native_value</span><span class="s2">(</span><span class="s1">signature</span><span class="s2">.</span><span class="s1">return_type</span><span class="s2">, </span><span class="s1">retval</span><span class="s2">)</span>
+            <span class="s0">assert </span><span class="s1">native</span><span class="s2">.</span><span class="s1">cleanup </span><span class="s0">is None</span>
+            <span class="s4"># Store</span>
+            <span class="s1">out</span><span class="s2">.</span><span class="s1">store_direct</span><span class="s2">(</span><span class="s1">native</span><span class="s2">.</span><span class="s1">value</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">store_offset</span><span class="s2">))</span>
+            <span class="s4"># Release owned reference</span>
+            <span class="s1">pyapi</span><span class="s2">.</span><span class="s1">decref</span><span class="s2">(</span><span class="s1">retval</span><span class="s2">)</span>
+
+    <span class="s0">return </span><span class="s1">_build_ufunc_loop_body_objmode</span><span class="s2">(</span><span class="s1">load</span><span class="s2">, </span><span class="s1">store</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">,</span>
+                                          <span class="s1">arrays</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">offsets</span><span class="s2">, </span><span class="s1">store_offset</span><span class="s2">,</span>
+                                          <span class="s1">signature</span><span class="s2">, </span><span class="s1">envptr</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">build_fast_loop_body</span><span class="s2">(</span><span class="s1">context</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">arrays</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">offsets</span><span class="s2">,</span>
+                         <span class="s1">store_offset</span><span class="s2">, </span><span class="s1">signature</span><span class="s2">, </span><span class="s1">ind</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">, </span><span class="s1">env</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">load</span><span class="s2">():</span>
+        <span class="s1">elems </span><span class="s2">= [</span><span class="s1">ary</span><span class="s2">.</span><span class="s1">load_aligned</span><span class="s2">(</span><span class="s1">ind</span><span class="s2">)</span>
+                 <span class="s0">for </span><span class="s1">ary </span><span class="s0">in </span><span class="s1">arrays</span><span class="s2">]</span>
+        <span class="s0">return </span><span class="s1">elems</span>
+
+    <span class="s0">def </span><span class="s1">store</span><span class="s2">(</span><span class="s1">retval</span><span class="s2">):</span>
+        <span class="s1">out</span><span class="s2">.</span><span class="s1">store_aligned</span><span class="s2">(</span><span class="s1">retval</span><span class="s2">, </span><span class="s1">ind</span><span class="s2">)</span>
+
+    <span class="s0">return </span><span class="s1">_build_ufunc_loop_body</span><span class="s2">(</span><span class="s1">load</span><span class="s2">, </span><span class="s1">store</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">arrays</span><span class="s2">,</span>
+                                  <span class="s1">out</span><span class="s2">, </span><span class="s1">offsets</span><span class="s2">, </span><span class="s1">store_offset</span><span class="s2">, </span><span class="s1">signature</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">,</span>
+                                  <span class="s1">env</span><span class="s2">=</span><span class="s1">env</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">build_ufunc_wrapper</span><span class="s2">(</span><span class="s1">library</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">, </span><span class="s1">signature</span><span class="s2">, </span><span class="s1">objmode</span><span class="s2">, </span><span class="s1">cres</span><span class="s2">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Wrap the scalar function with a loop that iterates over the arguments 
+ 
+    Returns 
+    ------- 
+    (library, env, name) 
+    &quot;&quot;&quot;</span>
+    <span class="s0">assert </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">fname</span><span class="s2">, </span><span class="s1">str</span><span class="s2">)</span>
+    <span class="s1">byte_t </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s6">8</span><span class="s2">)</span>
+    <span class="s1">byte_ptr_t </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">byte_t</span><span class="s2">)</span>
+    <span class="s1">byte_ptr_ptr_t </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">byte_ptr_t</span><span class="s2">)</span>
+    <span class="s1">intp_t </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_value_type</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">)</span>
+    <span class="s1">intp_ptr_t </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">intp_t</span><span class="s2">)</span>
+
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">VoidType</span><span class="s2">(), [</span><span class="s1">byte_ptr_ptr_t</span><span class="s2">, </span><span class="s1">intp_ptr_t</span><span class="s2">,</span>
+                                           <span class="s1">intp_ptr_t</span><span class="s2">, </span><span class="s1">byte_ptr_t</span><span class="s2">])</span>
+
+    <span class="s1">wrapperlib </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">codegen</span><span class="s2">().</span><span class="s1">create_library</span><span class="s2">(</span><span class="s3">'ufunc_wrapper'</span><span class="s2">)</span>
+    <span class="s1">wrapper_module </span><span class="s2">= </span><span class="s1">wrapperlib</span><span class="s2">.</span><span class="s1">create_ir_module</span><span class="s2">(</span><span class="s3">''</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">objmode</span><span class="s2">:</span>
+        <span class="s1">func_type </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">call_conv</span><span class="s2">.</span><span class="s1">get_function_type</span><span class="s2">(</span>
+            <span class="s1">types</span><span class="s2">.</span><span class="s1">pyobject</span><span class="s2">, [</span><span class="s1">types</span><span class="s2">.</span><span class="s1">pyobject</span><span class="s2">] * </span><span class="s1">len</span><span class="s2">(</span><span class="s1">signature</span><span class="s2">.</span><span class="s1">args</span><span class="s2">))</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s1">func_type </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">call_conv</span><span class="s2">.</span><span class="s1">get_function_type</span><span class="s2">(</span>
+            <span class="s1">signature</span><span class="s2">.</span><span class="s1">return_type</span><span class="s2">, </span><span class="s1">signature</span><span class="s2">.</span><span class="s1">args</span><span class="s2">)</span>
+
+    <span class="s1">func </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">wrapper_module</span><span class="s2">, </span><span class="s1">func_type</span><span class="s2">, </span><span class="s1">name</span><span class="s2">=</span><span class="s1">fname</span><span class="s2">)</span>
+    <span class="s1">func</span><span class="s2">.</span><span class="s1">attributes</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s3">&quot;alwaysinline&quot;</span><span class="s2">)</span>
+
+    <span class="s1">wrapper </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">wrapper_module</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s3">&quot;__ufunc__.&quot; </span><span class="s2">+ </span><span class="s1">func</span><span class="s2">.</span><span class="s1">name</span><span class="s2">)</span>
+    <span class="s1">arg_args</span><span class="s2">, </span><span class="s1">arg_dims</span><span class="s2">, </span><span class="s1">arg_steps</span><span class="s2">, </span><span class="s1">arg_data </span><span class="s2">= </span><span class="s1">wrapper</span><span class="s2">.</span><span class="s1">args</span>
+    <span class="s1">arg_args</span><span class="s2">.</span><span class="s1">name </span><span class="s2">= </span><span class="s3">&quot;args&quot;</span>
+    <span class="s1">arg_dims</span><span class="s2">.</span><span class="s1">name </span><span class="s2">= </span><span class="s3">&quot;dims&quot;</span>
+    <span class="s1">arg_steps</span><span class="s2">.</span><span class="s1">name </span><span class="s2">= </span><span class="s3">&quot;steps&quot;</span>
+    <span class="s1">arg_data</span><span class="s2">.</span><span class="s1">name </span><span class="s2">= </span><span class="s3">&quot;data&quot;</span>
+
+    <span class="s1">builder </span><span class="s2">= </span><span class="s1">IRBuilder</span><span class="s2">(</span><span class="s1">wrapper</span><span class="s2">.</span><span class="s1">append_basic_block</span><span class="s2">(</span><span class="s3">&quot;entry&quot;</span><span class="s2">))</span>
+
+    <span class="s4"># Prepare Environment</span>
+    <span class="s1">envname </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_env_name</span><span class="s2">(</span><span class="s1">cres</span><span class="s2">.</span><span class="s1">fndesc</span><span class="s2">)</span>
+    <span class="s1">env </span><span class="s2">= </span><span class="s1">cres</span><span class="s2">.</span><span class="s1">environment</span>
+    <span class="s1">envptr </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">context</span><span class="s2">.</span><span class="s1">declare_env_global</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">module</span><span class="s2">, </span><span class="s1">envname</span><span class="s2">))</span>
+
+    <span class="s4"># Emit loop</span>
+    <span class="s1">loopcount </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">arg_dims</span><span class="s2">, </span><span class="s1">name</span><span class="s2">=</span><span class="s3">&quot;loopcount&quot;</span><span class="s2">)</span>
+
+    <span class="s4"># Prepare inputs</span>
+    <span class="s1">arrays </span><span class="s2">= []</span>
+    <span class="s0">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">typ </span><span class="s0">in </span><span class="s1">enumerate</span><span class="s2">(</span><span class="s1">signature</span><span class="s2">.</span><span class="s1">args</span><span class="s2">):</span>
+        <span class="s1">arrays</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">UArrayArg</span><span class="s2">(</span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">arg_args</span><span class="s2">, </span><span class="s1">arg_steps</span><span class="s2">, </span><span class="s1">i</span><span class="s2">, </span><span class="s1">typ</span><span class="s2">))</span>
+
+    <span class="s4"># Prepare output</span>
+    <span class="s1">out </span><span class="s2">= </span><span class="s1">UArrayArg</span><span class="s2">(</span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">arg_args</span><span class="s2">, </span><span class="s1">arg_steps</span><span class="s2">, </span><span class="s1">len</span><span class="s2">(</span><span class="s1">arrays</span><span class="s2">),</span>
+                    <span class="s1">signature</span><span class="s2">.</span><span class="s1">return_type</span><span class="s2">)</span>
+
+    <span class="s4"># Setup indices</span>
+    <span class="s1">offsets </span><span class="s2">= []</span>
+    <span class="s1">zero </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_constant</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">, </span><span class="s6">0</span><span class="s2">)</span>
+    <span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">arrays</span><span class="s2">:</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">alloca_once</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">intp_t</span><span class="s2">)</span>
+        <span class="s1">offsets</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">p</span><span class="s2">)</span>
+        <span class="s1">builder</span><span class="s2">.</span><span class="s1">store</span><span class="s2">(</span><span class="s1">zero</span><span class="s2">, </span><span class="s1">p</span><span class="s2">)</span>
+
+    <span class="s1">store_offset </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">alloca_once</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">intp_t</span><span class="s2">)</span>
+    <span class="s1">builder</span><span class="s2">.</span><span class="s1">store</span><span class="s2">(</span><span class="s1">zero</span><span class="s2">, </span><span class="s1">store_offset</span><span class="s2">)</span>
+
+    <span class="s1">unit_strided </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">true_bit</span>
+    <span class="s0">for </span><span class="s1">ary </span><span class="s0">in </span><span class="s1">arrays</span><span class="s2">:</span>
+        <span class="s1">unit_strided </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">and_</span><span class="s2">(</span><span class="s1">unit_strided</span><span class="s2">, </span><span class="s1">ary</span><span class="s2">.</span><span class="s1">is_unit_strided</span><span class="s2">)</span>
+
+    <span class="s1">pyapi </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_python_api</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">objmode</span><span class="s2">:</span>
+        <span class="s4"># General loop</span>
+        <span class="s1">gil </span><span class="s2">= </span><span class="s1">pyapi</span><span class="s2">.</span><span class="s1">gil_ensure</span><span class="s2">()</span>
+        <span class="s0">with </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">for_range</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">loopcount</span><span class="s2">, </span><span class="s1">intp</span><span class="s2">=</span><span class="s1">intp_t</span><span class="s2">):</span>
+            <span class="s1">build_obj_loop_body</span><span class="s2">(</span>
+                <span class="s1">context</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">arrays</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">offsets</span><span class="s2">,</span>
+                <span class="s1">store_offset</span><span class="s2">, </span><span class="s1">signature</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">, </span><span class="s1">envptr</span><span class="s2">, </span><span class="s1">env</span><span class="s2">,</span>
+            <span class="s2">)</span>
+        <span class="s1">pyapi</span><span class="s2">.</span><span class="s1">gil_release</span><span class="s2">(</span><span class="s1">gil</span><span class="s2">)</span>
+        <span class="s1">builder</span><span class="s2">.</span><span class="s1">ret_void</span><span class="s2">()</span>
+
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s0">with </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">if_else</span><span class="s2">(</span><span class="s1">unit_strided</span><span class="s2">) </span><span class="s0">as </span><span class="s2">(</span><span class="s1">is_unit_strided</span><span class="s2">, </span><span class="s1">is_strided</span><span class="s2">):</span>
+            <span class="s0">with </span><span class="s1">is_unit_strided</span><span class="s2">:</span>
+                <span class="s0">with </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">for_range</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">loopcount</span><span class="s2">, </span><span class="s1">intp</span><span class="s2">=</span><span class="s1">intp_t</span><span class="s2">) </span><span class="s0">as </span><span class="s1">loop</span><span class="s2">:</span>
+                    <span class="s1">build_fast_loop_body</span><span class="s2">(</span>
+                        <span class="s1">context</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">arrays</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">offsets</span><span class="s2">,</span>
+                        <span class="s1">store_offset</span><span class="s2">, </span><span class="s1">signature</span><span class="s2">, </span><span class="s1">loop</span><span class="s2">.</span><span class="s1">index</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">,</span>
+                        <span class="s1">env</span><span class="s2">=</span><span class="s1">envptr</span><span class="s2">,</span>
+                    <span class="s2">)</span>
+
+            <span class="s0">with </span><span class="s1">is_strided</span><span class="s2">:</span>
+                <span class="s4"># General loop</span>
+                <span class="s0">with </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">for_range</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">loopcount</span><span class="s2">, </span><span class="s1">intp</span><span class="s2">=</span><span class="s1">intp_t</span><span class="s2">):</span>
+                    <span class="s1">build_slow_loop_body</span><span class="s2">(</span>
+                        <span class="s1">context</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">arrays</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">offsets</span><span class="s2">,</span>
+                        <span class="s1">store_offset</span><span class="s2">, </span><span class="s1">signature</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">,</span>
+                        <span class="s1">env</span><span class="s2">=</span><span class="s1">envptr</span><span class="s2">,</span>
+                    <span class="s2">)</span>
+
+        <span class="s1">builder</span><span class="s2">.</span><span class="s1">ret_void</span><span class="s2">()</span>
+    <span class="s0">del </span><span class="s1">builder</span>
+
+    <span class="s4"># Link and finalize</span>
+    <span class="s1">wrapperlib</span><span class="s2">.</span><span class="s1">add_ir_module</span><span class="s2">(</span><span class="s1">wrapper_module</span><span class="s2">)</span>
+    <span class="s1">wrapperlib</span><span class="s2">.</span><span class="s1">add_linking_library</span><span class="s2">(</span><span class="s1">library</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">_wrapper_info</span><span class="s2">(</span><span class="s1">library</span><span class="s2">=</span><span class="s1">wrapperlib</span><span class="s2">, </span><span class="s1">env</span><span class="s2">=</span><span class="s1">env</span><span class="s2">, </span><span class="s1">name</span><span class="s2">=</span><span class="s1">wrapper</span><span class="s2">.</span><span class="s1">name</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">UArrayArg</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">steps</span><span class="s2">, </span><span class="s1">i</span><span class="s2">, </span><span class="s1">fe_type</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">context </span><span class="s2">= </span><span class="s1">context</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">builder </span><span class="s2">= </span><span class="s1">builder</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">fe_type </span><span class="s2">= </span><span class="s1">fe_type</span>
+        <span class="s1">offset </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_constant</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">, </span><span class="s1">i</span><span class="s2">)</span>
+        <span class="s1">offseted_args </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">gep</span><span class="s2">(</span><span class="s1">args</span><span class="s2">, [</span><span class="s1">offset</span><span class="s2">]))</span>
+        <span class="s1">data_type </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_data_type</span><span class="s2">(</span><span class="s1">fe_type</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dataptr </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">bitcast</span><span class="s2">(</span><span class="s1">offseted_args</span><span class="s2">,</span>
+                                            <span class="s1">data_type</span><span class="s2">.</span><span class="s1">as_pointer</span><span class="s2">())</span>
+        <span class="s1">sizeof </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_abi_sizeof</span><span class="s2">(</span><span class="s1">data_type</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">abisize </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_constant</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">, </span><span class="s1">sizeof</span><span class="s2">)</span>
+        <span class="s1">offseted_step </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">gep</span><span class="s2">(</span><span class="s1">steps</span><span class="s2">, [</span><span class="s1">offset</span><span class="s2">])</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">step </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">offseted_step</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">is_unit_strided </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">icmp_unsigned</span><span class="s2">(</span><span class="s3">'=='</span><span class="s2">,</span>
+                                                     <span class="s1">self</span><span class="s2">.</span><span class="s1">abisize</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">step</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">builder </span><span class="s2">= </span><span class="s1">builder</span>
+
+    <span class="s0">def </span><span class="s1">load_direct</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">byteoffset</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Generic load from the given *byteoffset*.  load_aligned() is 
+        preferred if possible. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">ptr </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">pointer_add</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">dataptr</span><span class="s2">, </span><span class="s1">byteoffset</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">unpack_value</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">fe_type</span><span class="s2">, </span><span class="s1">ptr</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">load_aligned</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ind</span><span class="s2">):</span>
+        <span class="s4"># Using gep() instead of explicit pointer addition helps LLVM</span>
+        <span class="s4"># vectorize the loop.</span>
+        <span class="s1">ptr </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">gep</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">dataptr</span><span class="s2">, [</span><span class="s1">ind</span><span class="s2">])</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">unpack_value</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">fe_type</span><span class="s2">, </span><span class="s1">ptr</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">store_direct</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">value</span><span class="s2">, </span><span class="s1">byteoffset</span><span class="s2">):</span>
+        <span class="s1">ptr </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">pointer_add</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">dataptr</span><span class="s2">, </span><span class="s1">byteoffset</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">pack_value</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">fe_type</span><span class="s2">, </span><span class="s1">value</span><span class="s2">, </span><span class="s1">ptr</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">store_aligned</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">value</span><span class="s2">, </span><span class="s1">ind</span><span class="s2">):</span>
+        <span class="s1">ptr </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">gep</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">dataptr</span><span class="s2">, [</span><span class="s1">ind</span><span class="s2">])</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">pack_value</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">fe_type</span><span class="s2">, </span><span class="s1">value</span><span class="s2">, </span><span class="s1">ptr</span><span class="s2">)</span>
+
+
+<span class="s1">GufWrapperCache </span><span class="s2">= </span><span class="s1">make_library_cache</span><span class="s2">(</span><span class="s3">'guf'</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">_GufuncWrapper</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">py_func</span><span class="s2">, </span><span class="s1">cres</span><span class="s2">, </span><span class="s1">sin</span><span class="s2">, </span><span class="s1">sout</span><span class="s2">, </span><span class="s1">cache</span><span class="s2">, </span><span class="s1">is_parfors</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        The *is_parfors* argument is a boolean that indicates if the GUfunc 
+        being built is to be used as a ParFors kernel. If True, it disables 
+        the caching on the wrapper as a separate unit because it will be linked 
+        into the caller function and cached along with it. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">py_func </span><span class="s2">= </span><span class="s1">py_func</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">cres </span><span class="s2">= </span><span class="s1">cres</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">sin </span><span class="s2">= </span><span class="s1">sin</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">sout </span><span class="s2">= </span><span class="s1">sout</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">is_objectmode </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">signature</span><span class="s2">.</span><span class="s1">return_type </span><span class="s2">== </span><span class="s1">types</span><span class="s2">.</span><span class="s1">pyobject</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">cache </span><span class="s2">= (</span><span class="s1">GufWrapperCache</span><span class="s2">(</span><span class="s1">py_func</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">py_func</span><span class="s2">)</span>
+                      <span class="s0">if </span><span class="s1">cache </span><span class="s0">else </span><span class="s1">NullCache</span><span class="s2">())</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">is_parfors </span><span class="s2">= </span><span class="s1">bool</span><span class="s2">(</span><span class="s1">is_parfors</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">library</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">cres</span><span class="s2">.</span><span class="s1">library</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">context</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">cres</span><span class="s2">.</span><span class="s1">target_context</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">call_conv</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">call_conv</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">cres</span><span class="s2">.</span><span class="s1">signature</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">fndesc</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">cres</span><span class="s2">.</span><span class="s1">fndesc</span>
+
+    <span class="s2">@</span><span class="s1">property</span>
+    <span class="s0">def </span><span class="s1">env</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">cres</span><span class="s2">.</span><span class="s1">environment</span>
+
+    <span class="s0">def </span><span class="s1">_wrapper_function_type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">byte_t </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s6">8</span><span class="s2">)</span>
+        <span class="s1">byte_ptr_t </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">byte_t</span><span class="s2">)</span>
+        <span class="s1">byte_ptr_ptr_t </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">byte_ptr_t</span><span class="s2">)</span>
+        <span class="s1">intp_t </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_value_type</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">)</span>
+        <span class="s1">intp_ptr_t </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">intp_t</span><span class="s2">)</span>
+
+        <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">VoidType</span><span class="s2">(), [</span><span class="s1">byte_ptr_ptr_t</span><span class="s2">, </span><span class="s1">intp_ptr_t</span><span class="s2">,</span>
+                                               <span class="s1">intp_ptr_t</span><span class="s2">, </span><span class="s1">byte_ptr_t</span><span class="s2">])</span>
+        <span class="s0">return </span><span class="s1">fnty</span>
+
+    <span class="s0">def </span><span class="s1">_build_wrapper</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">library</span><span class="s2">, </span><span class="s1">name</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        The LLVM IRBuilder code to create the gufunc wrapper. 
+        The *library* arg is the CodeLibrary to which the wrapper should 
+        be added.  The *name* arg is the name of the wrapper function being 
+        created. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">intp_t </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_value_type</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">)</span>
+        <span class="s1">fnty </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_wrapper_function_type</span><span class="s2">()</span>
+
+        <span class="s1">wrapper_module </span><span class="s2">= </span><span class="s1">library</span><span class="s2">.</span><span class="s1">create_ir_module</span><span class="s2">(</span><span class="s3">'_gufunc_wrapper'</span><span class="s2">)</span>
+        <span class="s1">func_type </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">call_conv</span><span class="s2">.</span><span class="s1">get_function_type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">fndesc</span><span class="s2">.</span><span class="s1">restype</span><span class="s2">,</span>
+                                                     <span class="s1">self</span><span class="s2">.</span><span class="s1">fndesc</span><span class="s2">.</span><span class="s1">argtypes</span><span class="s2">)</span>
+        <span class="s1">fname </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">fndesc</span><span class="s2">.</span><span class="s1">llvm_func_name</span>
+        <span class="s1">func </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">wrapper_module</span><span class="s2">, </span><span class="s1">func_type</span><span class="s2">, </span><span class="s1">name</span><span class="s2">=</span><span class="s1">fname</span><span class="s2">)</span>
+
+        <span class="s1">func</span><span class="s2">.</span><span class="s1">attributes</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s3">&quot;alwaysinline&quot;</span><span class="s2">)</span>
+        <span class="s1">wrapper </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">Function</span><span class="s2">(</span><span class="s1">wrapper_module</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">name</span><span class="s2">)</span>
+        <span class="s4"># The use of weak_odr linkage avoids the function being dropped due</span>
+        <span class="s4"># to the order in which the wrappers and the user function are linked.</span>
+        <span class="s1">wrapper</span><span class="s2">.</span><span class="s1">linkage </span><span class="s2">= </span><span class="s3">'weak_odr'</span>
+        <span class="s1">arg_args</span><span class="s2">, </span><span class="s1">arg_dims</span><span class="s2">, </span><span class="s1">arg_steps</span><span class="s2">, </span><span class="s1">arg_data </span><span class="s2">= </span><span class="s1">wrapper</span><span class="s2">.</span><span class="s1">args</span>
+        <span class="s1">arg_args</span><span class="s2">.</span><span class="s1">name </span><span class="s2">= </span><span class="s3">&quot;args&quot;</span>
+        <span class="s1">arg_dims</span><span class="s2">.</span><span class="s1">name </span><span class="s2">= </span><span class="s3">&quot;dims&quot;</span>
+        <span class="s1">arg_steps</span><span class="s2">.</span><span class="s1">name </span><span class="s2">= </span><span class="s3">&quot;steps&quot;</span>
+        <span class="s1">arg_data</span><span class="s2">.</span><span class="s1">name </span><span class="s2">= </span><span class="s3">&quot;data&quot;</span>
+
+        <span class="s1">builder </span><span class="s2">= </span><span class="s1">IRBuilder</span><span class="s2">(</span><span class="s1">wrapper</span><span class="s2">.</span><span class="s1">append_basic_block</span><span class="s2">(</span><span class="s3">&quot;entry&quot;</span><span class="s2">))</span>
+        <span class="s1">loopcount </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">arg_dims</span><span class="s2">, </span><span class="s1">name</span><span class="s2">=</span><span class="s3">&quot;loopcount&quot;</span><span class="s2">)</span>
+        <span class="s1">pyapi </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_python_api</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">)</span>
+
+        <span class="s4"># Unpack shapes</span>
+        <span class="s1">unique_syms </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+        <span class="s0">for </span><span class="s1">grp </span><span class="s0">in </span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">sin</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sout</span><span class="s2">):</span>
+            <span class="s0">for </span><span class="s1">syms </span><span class="s0">in </span><span class="s1">grp</span><span class="s2">:</span>
+                <span class="s1">unique_syms </span><span class="s2">|= </span><span class="s1">set</span><span class="s2">(</span><span class="s1">syms</span><span class="s2">)</span>
+
+        <span class="s1">sym_map </span><span class="s2">= {}</span>
+        <span class="s0">for </span><span class="s1">syms </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sin</span><span class="s2">:</span>
+            <span class="s0">for </span><span class="s1">s </span><span class="s0">in </span><span class="s1">syms</span><span class="s2">:</span>
+                <span class="s0">if </span><span class="s1">s </span><span class="s0">not in </span><span class="s1">sym_map</span><span class="s2">:</span>
+                    <span class="s1">sym_map</span><span class="s2">[</span><span class="s1">s</span><span class="s2">] = </span><span class="s1">len</span><span class="s2">(</span><span class="s1">sym_map</span><span class="s2">)</span>
+
+        <span class="s1">sym_dim </span><span class="s2">= {}</span>
+        <span class="s0">for </span><span class="s1">s</span><span class="s2">, </span><span class="s1">i </span><span class="s0">in </span><span class="s1">sym_map</span><span class="s2">.</span><span class="s1">items</span><span class="s2">():</span>
+            <span class="s1">sym_dim</span><span class="s2">[</span><span class="s1">s</span><span class="s2">] = </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">gep</span><span class="s2">(</span><span class="s1">arg_dims</span><span class="s2">,</span>
+                                                  <span class="s2">[</span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_constant</span><span class="s2">(</span>
+                                                      <span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">,</span>
+                                                      <span class="s1">i </span><span class="s2">+ </span><span class="s6">1</span><span class="s2">)]))</span>
+
+        <span class="s4"># Prepare inputs</span>
+        <span class="s1">arrays </span><span class="s2">= []</span>
+        <span class="s1">step_offset </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">sin</span><span class="s2">) + </span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">sout</span><span class="s2">)</span>
+        <span class="s0">for </span><span class="s1">i</span><span class="s2">, (</span><span class="s1">typ</span><span class="s2">, </span><span class="s1">sym</span><span class="s2">) </span><span class="s0">in </span><span class="s1">enumerate</span><span class="s2">(</span><span class="s1">zip</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">signature</span><span class="s2">.</span><span class="s1">args</span><span class="s2">,</span>
+                                           <span class="s1">self</span><span class="s2">.</span><span class="s1">sin </span><span class="s2">+ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">sout</span><span class="s2">)):</span>
+            <span class="s1">ary </span><span class="s2">= </span><span class="s1">GUArrayArg</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">arg_args</span><span class="s2">,</span>
+                             <span class="s1">arg_steps</span><span class="s2">, </span><span class="s1">i</span><span class="s2">, </span><span class="s1">step_offset</span><span class="s2">, </span><span class="s1">typ</span><span class="s2">, </span><span class="s1">sym</span><span class="s2">, </span><span class="s1">sym_dim</span><span class="s2">)</span>
+            <span class="s1">step_offset </span><span class="s2">+= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">sym</span><span class="s2">)</span>
+            <span class="s1">arrays</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">ary</span><span class="s2">)</span>
+
+        <span class="s1">bbreturn </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">append_basic_block</span><span class="s2">(</span><span class="s3">'.return'</span><span class="s2">)</span>
+
+        <span class="s4"># Prologue</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">gen_prologue</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">)</span>
+
+        <span class="s4"># Loop</span>
+        <span class="s0">with </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">for_range</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">loopcount</span><span class="s2">, </span><span class="s1">intp</span><span class="s2">=</span><span class="s1">intp_t</span><span class="s2">) </span><span class="s0">as </span><span class="s1">loop</span><span class="s2">:</span>
+            <span class="s1">args </span><span class="s2">= [</span><span class="s1">a</span><span class="s2">.</span><span class="s1">get_array_at_offset</span><span class="s2">(</span><span class="s1">loop</span><span class="s2">.</span><span class="s1">index</span><span class="s2">) </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">arrays</span><span class="s2">]</span>
+            <span class="s1">innercall</span><span class="s2">, </span><span class="s1">error </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">gen_loop_body</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">args</span><span class="s2">)</span>
+            <span class="s4"># If error, escape</span>
+            <span class="s1">cgutils</span><span class="s2">.</span><span class="s1">cbranch_or_continue</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">error</span><span class="s2">, </span><span class="s1">bbreturn</span><span class="s2">)</span>
+
+        <span class="s1">builder</span><span class="s2">.</span><span class="s1">branch</span><span class="s2">(</span><span class="s1">bbreturn</span><span class="s2">)</span>
+        <span class="s1">builder</span><span class="s2">.</span><span class="s1">position_at_end</span><span class="s2">(</span><span class="s1">bbreturn</span><span class="s2">)</span>
+
+        <span class="s4"># Epilogue</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">gen_epilogue</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">)</span>
+
+        <span class="s1">builder</span><span class="s2">.</span><span class="s1">ret_void</span><span class="s2">()</span>
+
+        <span class="s4"># Link</span>
+        <span class="s1">library</span><span class="s2">.</span><span class="s1">add_ir_module</span><span class="s2">(</span><span class="s1">wrapper_module</span><span class="s2">)</span>
+        <span class="s1">library</span><span class="s2">.</span><span class="s1">add_linking_library</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">library</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">_compile_wrapper</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">wrapper_name</span><span class="s2">):</span>
+        <span class="s4"># Gufunc created by Parfors?</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">is_parfors</span><span class="s2">:</span>
+            <span class="s4"># No wrapper caching for parfors</span>
+            <span class="s1">wrapperlib </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">codegen</span><span class="s2">().</span><span class="s1">create_library</span><span class="s2">(</span><span class="s1">str</span><span class="s2">(</span><span class="s1">self</span><span class="s2">))</span>
+            <span class="s4"># Build wrapper</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_build_wrapper</span><span class="s2">(</span><span class="s1">wrapperlib</span><span class="s2">, </span><span class="s1">wrapper_name</span><span class="s2">)</span>
+        <span class="s4"># Non-parfors?</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s4"># Use cache and compiler in a critical section</span>
+            <span class="s1">wrapperlib </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">cache</span><span class="s2">.</span><span class="s1">load_overload</span><span class="s2">(</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">cres</span><span class="s2">.</span><span class="s1">signature</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">cres</span><span class="s2">.</span><span class="s1">target_context</span><span class="s2">,</span>
+            <span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">wrapperlib </span><span class="s0">is None</span><span class="s2">:</span>
+                <span class="s4"># Create library and enable caching</span>
+                <span class="s1">wrapperlib </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">codegen</span><span class="s2">().</span><span class="s1">create_library</span><span class="s2">(</span><span class="s1">str</span><span class="s2">(</span><span class="s1">self</span><span class="s2">))</span>
+                <span class="s1">wrapperlib</span><span class="s2">.</span><span class="s1">enable_object_caching</span><span class="s2">()</span>
+                <span class="s4"># Build wrapper</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_build_wrapper</span><span class="s2">(</span><span class="s1">wrapperlib</span><span class="s2">, </span><span class="s1">wrapper_name</span><span class="s2">)</span>
+                <span class="s4"># Cache</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">cache</span><span class="s2">.</span><span class="s1">save_overload</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">cres</span><span class="s2">.</span><span class="s1">signature</span><span class="s2">, </span><span class="s1">wrapperlib</span><span class="s2">)</span>
+
+        <span class="s0">return </span><span class="s1">wrapperlib</span>
+
+    <span class="s2">@</span><span class="s1">global_compiler_lock</span>
+    <span class="s0">def </span><span class="s1">build</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">wrapper_name </span><span class="s2">= </span><span class="s3">&quot;__gufunc__.&quot; </span><span class="s2">+ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">fndesc</span><span class="s2">.</span><span class="s1">mangled_name</span>
+        <span class="s1">wrapperlib </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_compile_wrapper</span><span class="s2">(</span><span class="s1">wrapper_name</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">_wrapper_info</span><span class="s2">(</span>
+            <span class="s1">library</span><span class="s2">=</span><span class="s1">wrapperlib</span><span class="s2">, </span><span class="s1">env</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">env</span><span class="s2">, </span><span class="s1">name</span><span class="s2">=</span><span class="s1">wrapper_name</span><span class="s2">,</span>
+        <span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">gen_loop_body</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">args</span><span class="s2">):</span>
+        <span class="s1">status</span><span class="s2">, </span><span class="s1">retval </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">call_conv</span><span class="s2">.</span><span class="s1">call_function</span><span class="s2">(</span>
+            <span class="s1">builder</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">signature</span><span class="s2">.</span><span class="s1">return_type</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">signature</span><span class="s2">.</span><span class="s1">args</span><span class="s2">,</span>
+            <span class="s1">args</span><span class="s2">)</span>
+
+        <span class="s0">with </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">if_then</span><span class="s2">(</span><span class="s1">status</span><span class="s2">.</span><span class="s1">is_error</span><span class="s2">, </span><span class="s1">likely</span><span class="s2">=</span><span class="s0">False</span><span class="s2">):</span>
+            <span class="s1">gil </span><span class="s2">= </span><span class="s1">pyapi</span><span class="s2">.</span><span class="s1">gil_ensure</span><span class="s2">()</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">call_conv</span><span class="s2">.</span><span class="s1">raise_error</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">, </span><span class="s1">status</span><span class="s2">)</span>
+            <span class="s1">pyapi</span><span class="s2">.</span><span class="s1">gil_release</span><span class="s2">(</span><span class="s1">gil</span><span class="s2">)</span>
+
+        <span class="s0">return </span><span class="s1">status</span><span class="s2">.</span><span class="s1">code</span><span class="s2">, </span><span class="s1">status</span><span class="s2">.</span><span class="s1">is_error</span>
+
+    <span class="s0">def </span><span class="s1">gen_prologue</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">):</span>
+        <span class="s0">pass        </span><span class="s4"># Do nothing</span>
+
+    <span class="s0">def </span><span class="s1">gen_epilogue</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">):</span>
+        <span class="s0">pass        </span><span class="s4"># Do nothing</span>
+
+
+<span class="s0">class </span><span class="s1">_GufuncObjectWrapper</span><span class="s2">(</span><span class="s1">_GufuncWrapper</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">gen_loop_body</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">args</span><span class="s2">):</span>
+        <span class="s1">innercall</span><span class="s2">, </span><span class="s1">error </span><span class="s2">= </span><span class="s1">_prepare_call_to_object_mode</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">,</span>
+                                                        <span class="s1">builder</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">, </span><span class="s1">func</span><span class="s2">,</span>
+                                                        <span class="s1">self</span><span class="s2">.</span><span class="s1">signature</span><span class="s2">,</span>
+                                                        <span class="s1">args</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">innercall</span><span class="s2">, </span><span class="s1">error</span>
+
+    <span class="s0">def </span><span class="s1">gen_prologue</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">):</span>
+        <span class="s4"># Acquire the GIL</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">gil </span><span class="s2">= </span><span class="s1">pyapi</span><span class="s2">.</span><span class="s1">gil_ensure</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">gen_epilogue</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">):</span>
+        <span class="s4"># Release GIL</span>
+        <span class="s1">pyapi</span><span class="s2">.</span><span class="s1">gil_release</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">gil</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">build_gufunc_wrapper</span><span class="s2">(</span><span class="s1">py_func</span><span class="s2">, </span><span class="s1">cres</span><span class="s2">, </span><span class="s1">sin</span><span class="s2">, </span><span class="s1">sout</span><span class="s2">, </span><span class="s1">cache</span><span class="s2">, </span><span class="s1">is_parfors</span><span class="s2">):</span>
+    <span class="s1">signature </span><span class="s2">= </span><span class="s1">cres</span><span class="s2">.</span><span class="s1">signature</span>
+    <span class="s1">wrapcls </span><span class="s2">= (</span><span class="s1">_GufuncObjectWrapper</span>
+               <span class="s0">if </span><span class="s1">signature</span><span class="s2">.</span><span class="s1">return_type </span><span class="s2">== </span><span class="s1">types</span><span class="s2">.</span><span class="s1">pyobject</span>
+               <span class="s0">else </span><span class="s1">_GufuncWrapper</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">wrapcls</span><span class="s2">(</span>
+        <span class="s1">py_func</span><span class="s2">, </span><span class="s1">cres</span><span class="s2">, </span><span class="s1">sin</span><span class="s2">, </span><span class="s1">sout</span><span class="s2">, </span><span class="s1">cache</span><span class="s2">, </span><span class="s1">is_parfors</span><span class="s2">=</span><span class="s1">is_parfors</span><span class="s2">,</span>
+    <span class="s2">).</span><span class="s1">build</span><span class="s2">()</span>
+
+
+<span class="s0">def </span><span class="s1">_prepare_call_to_object_mode</span><span class="s2">(</span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">pyapi</span><span class="s2">, </span><span class="s1">func</span><span class="s2">,</span>
+                                 <span class="s1">signature</span><span class="s2">, </span><span class="s1">args</span><span class="s2">):</span>
+    <span class="s1">mod </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">module</span>
+
+    <span class="s1">bb_core_return </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">append_basic_block</span><span class="s2">(</span><span class="s3">'ufunc.core.return'</span><span class="s2">)</span>
+
+    <span class="s4"># Call to</span>
+    <span class="s4"># PyObject* ndarray_new(int nd,</span>
+    <span class="s4">#       npy_intp *dims,   /* shape */</span>
+    <span class="s4">#       npy_intp *strides,</span>
+    <span class="s4">#       void* data,</span>
+    <span class="s4">#       int type_num,</span>
+    <span class="s4">#       int itemsize)</span>
+
+    <span class="s1">ll_int </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_value_type</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">)</span>
+    <span class="s1">ll_intp </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_value_type</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">)</span>
+    <span class="s1">ll_intp_ptr </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ll_intp</span><span class="s2">)</span>
+    <span class="s1">ll_voidptr </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_value_type</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">voidptr</span><span class="s2">)</span>
+    <span class="s1">ll_pyobj </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_value_type</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">pyobject</span><span class="s2">)</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ll_pyobj</span><span class="s2">, [</span><span class="s1">ll_int</span><span class="s2">, </span><span class="s1">ll_intp_ptr</span><span class="s2">,</span>
+                                      <span class="s1">ll_intp_ptr</span><span class="s2">, </span><span class="s1">ll_voidptr</span><span class="s2">,</span>
+                                      <span class="s1">ll_int</span><span class="s2">, </span><span class="s1">ll_int</span><span class="s2">])</span>
+
+    <span class="s1">fn_array_new </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">mod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">,</span>
+                                                  <span class="s3">&quot;numba_ndarray_new&quot;</span><span class="s2">)</span>
+
+    <span class="s4"># Convert each llarray into pyobject</span>
+    <span class="s1">error_pointer </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">alloca_once</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s6">1</span><span class="s2">), </span><span class="s1">name</span><span class="s2">=</span><span class="s3">'error'</span><span class="s2">)</span>
+    <span class="s1">builder</span><span class="s2">.</span><span class="s1">store</span><span class="s2">(</span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">true_bit</span><span class="s2">, </span><span class="s1">error_pointer</span><span class="s2">)</span>
+
+    <span class="s4"># The PyObject* arguments to the kernel function</span>
+    <span class="s1">object_args </span><span class="s2">= []</span>
+    <span class="s1">object_pointers </span><span class="s2">= []</span>
+
+    <span class="s0">for </span><span class="s1">i</span><span class="s2">, (</span><span class="s1">arg</span><span class="s2">, </span><span class="s1">argty</span><span class="s2">) </span><span class="s0">in </span><span class="s1">enumerate</span><span class="s2">(</span><span class="s1">zip</span><span class="s2">(</span><span class="s1">args</span><span class="s2">, </span><span class="s1">signature</span><span class="s2">.</span><span class="s1">args</span><span class="s2">)):</span>
+        <span class="s4"># Allocate NULL-initialized slot for this argument</span>
+        <span class="s1">objptr </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">alloca_once</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">ll_pyobj</span><span class="s2">, </span><span class="s1">zfill</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+        <span class="s1">object_pointers</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">objptr</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">argty</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">):</span>
+            <span class="s4"># Special case arrays: we don't need full-blown NRT reflection</span>
+            <span class="s4"># since the argument will be gone at the end of the kernel</span>
+            <span class="s1">arycls </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">make_array</span><span class="s2">(</span><span class="s1">argty</span><span class="s2">)</span>
+            <span class="s1">array </span><span class="s2">= </span><span class="s1">arycls</span><span class="s2">(</span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">value</span><span class="s2">=</span><span class="s1">arg</span><span class="s2">)</span>
+
+            <span class="s1">zero </span><span class="s2">= </span><span class="s1">Constant</span><span class="s2">(</span><span class="s1">ll_int</span><span class="s2">, </span><span class="s6">0</span><span class="s2">)</span>
+
+            <span class="s4"># Extract members of the llarray</span>
+            <span class="s1">nd </span><span class="s2">= </span><span class="s1">Constant</span><span class="s2">(</span><span class="s1">ll_int</span><span class="s2">, </span><span class="s1">argty</span><span class="s2">.</span><span class="s1">ndim</span><span class="s2">)</span>
+            <span class="s1">dims </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">gep</span><span class="s2">(</span><span class="s1">array</span><span class="s2">.</span><span class="s1">_get_ptr_by_name</span><span class="s2">(</span><span class="s3">'shape'</span><span class="s2">), [</span><span class="s1">zero</span><span class="s2">, </span><span class="s1">zero</span><span class="s2">])</span>
+            <span class="s1">strides </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">gep</span><span class="s2">(</span><span class="s1">array</span><span class="s2">.</span><span class="s1">_get_ptr_by_name</span><span class="s2">(</span><span class="s3">'strides'</span><span class="s2">),</span>
+                                  <span class="s2">[</span><span class="s1">zero</span><span class="s2">, </span><span class="s1">zero</span><span class="s2">])</span>
+            <span class="s1">data </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">bitcast</span><span class="s2">(</span><span class="s1">array</span><span class="s2">.</span><span class="s1">data</span><span class="s2">, </span><span class="s1">ll_voidptr</span><span class="s2">)</span>
+            <span class="s1">dtype </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">(</span><span class="s1">str</span><span class="s2">(</span><span class="s1">argty</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">))</span>
+
+            <span class="s4"># Prepare other info for reconstruction of the PyArray</span>
+            <span class="s1">type_num </span><span class="s2">= </span><span class="s1">Constant</span><span class="s2">(</span><span class="s1">ll_int</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">num</span><span class="s2">)</span>
+            <span class="s1">itemsize </span><span class="s2">= </span><span class="s1">Constant</span><span class="s2">(</span><span class="s1">ll_int</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">itemsize</span><span class="s2">)</span>
+
+            <span class="s4"># Call helper to reconstruct PyArray objects</span>
+            <span class="s1">obj </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">call</span><span class="s2">(</span><span class="s1">fn_array_new</span><span class="s2">, [</span><span class="s1">nd</span><span class="s2">, </span><span class="s1">dims</span><span class="s2">, </span><span class="s1">strides</span><span class="s2">, </span><span class="s1">data</span><span class="s2">,</span>
+                                              <span class="s1">type_num</span><span class="s2">, </span><span class="s1">itemsize</span><span class="s2">])</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s4"># Other argument types =&gt; use generic boxing</span>
+            <span class="s1">obj </span><span class="s2">= </span><span class="s1">pyapi</span><span class="s2">.</span><span class="s1">from_native_value</span><span class="s2">(</span><span class="s1">argty</span><span class="s2">, </span><span class="s1">arg</span><span class="s2">)</span>
+
+        <span class="s1">builder</span><span class="s2">.</span><span class="s1">store</span><span class="s2">(</span><span class="s1">obj</span><span class="s2">, </span><span class="s1">objptr</span><span class="s2">)</span>
+        <span class="s1">object_args</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">obj</span><span class="s2">)</span>
+
+        <span class="s1">obj_is_null </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">is_null</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">obj</span><span class="s2">)</span>
+        <span class="s1">builder</span><span class="s2">.</span><span class="s1">store</span><span class="s2">(</span><span class="s1">obj_is_null</span><span class="s2">, </span><span class="s1">error_pointer</span><span class="s2">)</span>
+        <span class="s1">cgutils</span><span class="s2">.</span><span class="s1">cbranch_or_continue</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">obj_is_null</span><span class="s2">, </span><span class="s1">bb_core_return</span><span class="s2">)</span>
+
+    <span class="s4"># Call ufunc core function</span>
+    <span class="s1">object_sig </span><span class="s2">= [</span><span class="s1">types</span><span class="s2">.</span><span class="s1">pyobject</span><span class="s2">] * </span><span class="s1">len</span><span class="s2">(</span><span class="s1">object_args</span><span class="s2">)</span>
+
+    <span class="s1">status</span><span class="s2">, </span><span class="s1">retval </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">call_conv</span><span class="s2">.</span><span class="s1">call_function</span><span class="s2">(</span>
+        <span class="s1">builder</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">pyobject</span><span class="s2">, </span><span class="s1">object_sig</span><span class="s2">,</span>
+        <span class="s1">object_args</span><span class="s2">)</span>
+    <span class="s1">builder</span><span class="s2">.</span><span class="s1">store</span><span class="s2">(</span><span class="s1">status</span><span class="s2">.</span><span class="s1">is_error</span><span class="s2">, </span><span class="s1">error_pointer</span><span class="s2">)</span>
+
+    <span class="s4"># Release returned object</span>
+    <span class="s1">pyapi</span><span class="s2">.</span><span class="s1">decref</span><span class="s2">(</span><span class="s1">retval</span><span class="s2">)</span>
+
+    <span class="s1">builder</span><span class="s2">.</span><span class="s1">branch</span><span class="s2">(</span><span class="s1">bb_core_return</span><span class="s2">)</span>
+    <span class="s4"># At return block</span>
+    <span class="s1">builder</span><span class="s2">.</span><span class="s1">position_at_end</span><span class="s2">(</span><span class="s1">bb_core_return</span><span class="s2">)</span>
+
+    <span class="s4"># Release argument objects</span>
+    <span class="s0">for </span><span class="s1">objptr </span><span class="s0">in </span><span class="s1">object_pointers</span><span class="s2">:</span>
+        <span class="s1">pyapi</span><span class="s2">.</span><span class="s1">decref</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">objptr</span><span class="s2">))</span>
+
+    <span class="s1">innercall </span><span class="s2">= </span><span class="s1">status</span><span class="s2">.</span><span class="s1">code</span>
+    <span class="s0">return </span><span class="s1">innercall</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">error_pointer</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">GUArrayArg</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">steps</span><span class="s2">, </span><span class="s1">i</span><span class="s2">, </span><span class="s1">step_offset</span><span class="s2">,</span>
+                 <span class="s1">typ</span><span class="s2">, </span><span class="s1">syms</span><span class="s2">, </span><span class="s1">sym_dim</span><span class="s2">):</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">context </span><span class="s2">= </span><span class="s1">context</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">builder </span><span class="s2">= </span><span class="s1">builder</span>
+
+        <span class="s1">offset </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_constant</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">, </span><span class="s1">i</span><span class="s2">)</span>
+
+        <span class="s1">data </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">gep</span><span class="s2">(</span><span class="s1">args</span><span class="s2">, [</span><span class="s1">offset</span><span class="s2">], </span><span class="s1">name</span><span class="s2">=</span><span class="s3">&quot;data.ptr&quot;</span><span class="s2">),</span>
+                            <span class="s1">name</span><span class="s2">=</span><span class="s3">&quot;data&quot;</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">data </span><span class="s2">= </span><span class="s1">data</span>
+
+        <span class="s1">core_step_ptr </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">gep</span><span class="s2">(</span><span class="s1">steps</span><span class="s2">, [</span><span class="s1">offset</span><span class="s2">], </span><span class="s1">name</span><span class="s2">=</span><span class="s3">&quot;core.step.ptr&quot;</span><span class="s2">)</span>
+        <span class="s1">core_step </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">core_step_ptr</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">typ</span><span class="s2">, </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">):</span>
+            <span class="s1">as_scalar </span><span class="s2">= </span><span class="s0">not </span><span class="s1">syms</span>
+
+            <span class="s4"># number of symbol in the shape spec should match the dimension</span>
+            <span class="s4"># of the array type.</span>
+            <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">syms</span><span class="s2">) != </span><span class="s1">typ</span><span class="s2">.</span><span class="s1">ndim</span><span class="s2">:</span>
+                <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">syms</span><span class="s2">) == </span><span class="s6">0 </span><span class="s0">and </span><span class="s1">typ</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">== </span><span class="s6">1</span><span class="s2">:</span>
+                    <span class="s4"># This is an exception for handling scalar argument.</span>
+                    <span class="s4"># The type can be 1D array for scalar.</span>
+                    <span class="s4"># In the future, we may deprecate this exception.</span>
+                    <span class="s0">pass</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s0">raise </span><span class="s1">TypeError</span><span class="s2">(</span><span class="s3">&quot;type and shape signature mismatch for arg &quot;</span>
+                                    <span class="s3">&quot;#{0}&quot;</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">i </span><span class="s2">+ </span><span class="s6">1</span><span class="s2">))</span>
+
+            <span class="s1">ndim </span><span class="s2">= </span><span class="s1">typ</span><span class="s2">.</span><span class="s1">ndim</span>
+            <span class="s1">shape </span><span class="s2">= [</span><span class="s1">sym_dim</span><span class="s2">[</span><span class="s1">s</span><span class="s2">] </span><span class="s0">for </span><span class="s1">s </span><span class="s0">in </span><span class="s1">syms</span><span class="s2">]</span>
+            <span class="s1">strides </span><span class="s2">= []</span>
+
+            <span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">ndim</span><span class="s2">):</span>
+                <span class="s1">stepptr </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">gep</span><span class="s2">(</span><span class="s1">steps</span><span class="s2">,</span>
+                                      <span class="s2">[</span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_constant</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">,</span>
+                                                            <span class="s1">step_offset </span><span class="s2">+ </span><span class="s1">j</span><span class="s2">)],</span>
+                                      <span class="s1">name</span><span class="s2">=</span><span class="s3">&quot;step.ptr&quot;</span><span class="s2">)</span>
+                <span class="s1">step </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">stepptr</span><span class="s2">)</span>
+                <span class="s1">strides</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">step</span><span class="s2">)</span>
+
+            <span class="s1">ldcls </span><span class="s2">= (</span><span class="s1">_ArrayAsScalarArgLoader</span>
+                     <span class="s0">if </span><span class="s1">as_scalar</span>
+                     <span class="s0">else </span><span class="s1">_ArrayArgLoader</span><span class="s2">)</span>
+
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_loader </span><span class="s2">= </span><span class="s1">ldcls</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">typ</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">,</span>
+                                 <span class="s1">ndim</span><span class="s2">=</span><span class="s1">ndim</span><span class="s2">,</span>
+                                 <span class="s1">core_step</span><span class="s2">=</span><span class="s1">core_step</span><span class="s2">,</span>
+                                 <span class="s1">as_scalar</span><span class="s2">=</span><span class="s1">as_scalar</span><span class="s2">,</span>
+                                 <span class="s1">shape</span><span class="s2">=</span><span class="s1">shape</span><span class="s2">,</span>
+                                 <span class="s1">strides</span><span class="s2">=</span><span class="s1">strides</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s4"># If typ is not an array</span>
+            <span class="s0">if </span><span class="s1">syms</span><span class="s2">:</span>
+                <span class="s0">raise </span><span class="s1">TypeError</span><span class="s2">(</span><span class="s3">&quot;scalar type {0} given for non scalar &quot;</span>
+                                <span class="s3">&quot;argument #{1}&quot;</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span><span class="s1">typ</span><span class="s2">, </span><span class="s1">i </span><span class="s2">+ </span><span class="s6">1</span><span class="s2">))</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_loader </span><span class="s2">= </span><span class="s1">_ScalarArgLoader</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">typ</span><span class="s2">, </span><span class="s1">stride</span><span class="s2">=</span><span class="s1">core_step</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">get_array_at_offset</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">ind</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_loader</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">context</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">,</span>
+                                 <span class="s1">data</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">data</span><span class="s2">, </span><span class="s1">ind</span><span class="s2">=</span><span class="s1">ind</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">_ScalarArgLoader</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Handle GFunc argument loading where a scalar type is used in the core 
+    function. 
+    Note: It still has a stride because the input to the gufunc can be an array 
+          for this argument. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">stride</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dtype </span><span class="s2">= </span><span class="s1">dtype</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">stride </span><span class="s2">= </span><span class="s1">stride</span>
+
+    <span class="s0">def </span><span class="s1">load</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">ind</span><span class="s2">):</span>
+        <span class="s4"># Load at base + ind * stride</span>
+        <span class="s1">data </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">gep</span><span class="s2">(</span><span class="s1">data</span><span class="s2">, [</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">mul</span><span class="s2">(</span><span class="s1">ind</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">stride</span><span class="s2">)])</span>
+        <span class="s1">dptr </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">bitcast</span><span class="s2">(</span><span class="s1">data</span><span class="s2">,</span>
+                               <span class="s1">context</span><span class="s2">.</span><span class="s1">get_data_type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">).</span><span class="s1">as_pointer</span><span class="s2">())</span>
+        <span class="s0">return </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">dptr</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">_ArrayArgLoader</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Handle GUFunc argument loading where an array is expected. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">ndim</span><span class="s2">, </span><span class="s1">core_step</span><span class="s2">, </span><span class="s1">as_scalar</span><span class="s2">, </span><span class="s1">shape</span><span class="s2">, </span><span class="s1">strides</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dtype </span><span class="s2">= </span><span class="s1">dtype</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">= </span><span class="s1">ndim</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">core_step </span><span class="s2">= </span><span class="s1">core_step</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">as_scalar </span><span class="s2">= </span><span class="s1">as_scalar</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">shape </span><span class="s2">= </span><span class="s1">shape</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">strides </span><span class="s2">= </span><span class="s1">strides</span>
+
+    <span class="s0">def </span><span class="s1">load</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">ind</span><span class="s2">):</span>
+        <span class="s1">arytyp </span><span class="s2">= </span><span class="s1">types</span><span class="s2">.</span><span class="s1">Array</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">ndim</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">ndim</span><span class="s2">, </span><span class="s1">layout</span><span class="s2">=</span><span class="s3">&quot;A&quot;</span><span class="s2">)</span>
+        <span class="s1">arycls </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">make_array</span><span class="s2">(</span><span class="s1">arytyp</span><span class="s2">)</span>
+
+        <span class="s1">array </span><span class="s2">= </span><span class="s1">arycls</span><span class="s2">(</span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">)</span>
+        <span class="s1">offseted_data </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">pointer_add</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">,</span>
+                                            <span class="s1">data</span><span class="s2">,</span>
+                                            <span class="s1">builder</span><span class="s2">.</span><span class="s1">mul</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">core_step</span><span class="s2">,</span>
+                                                        <span class="s1">ind</span><span class="s2">))</span>
+
+        <span class="s1">shape</span><span class="s2">, </span><span class="s1">strides </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_shape_and_strides</span><span class="s2">(</span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">)</span>
+
+        <span class="s1">itemsize </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_abi_sizeof</span><span class="s2">(</span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_data_type</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">))</span>
+        <span class="s1">context</span><span class="s2">.</span><span class="s1">populate_array</span><span class="s2">(</span><span class="s1">array</span><span class="s2">,</span>
+                               <span class="s1">data</span><span class="s2">=</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">bitcast</span><span class="s2">(</span><span class="s1">offseted_data</span><span class="s2">,</span>
+                                                    <span class="s1">array</span><span class="s2">.</span><span class="s1">data</span><span class="s2">.</span><span class="s1">type</span><span class="s2">),</span>
+                               <span class="s1">shape</span><span class="s2">=</span><span class="s1">shape</span><span class="s2">,</span>
+                               <span class="s1">strides</span><span class="s2">=</span><span class="s1">strides</span><span class="s2">,</span>
+                               <span class="s1">itemsize</span><span class="s2">=</span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_constant</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">,</span>
+                                                             <span class="s1">itemsize</span><span class="s2">),</span>
+                               <span class="s1">meminfo</span><span class="s2">=</span><span class="s0">None</span><span class="s2">)</span>
+
+        <span class="s0">return </span><span class="s1">array</span><span class="s2">.</span><span class="s1">_getvalue</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">_shape_and_strides</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">):</span>
+        <span class="s1">shape </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">pack_array</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">)</span>
+        <span class="s1">strides </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">pack_array</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">strides</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">shape</span><span class="s2">, </span><span class="s1">strides</span>
+
+
+<span class="s0">class </span><span class="s1">_ArrayAsScalarArgLoader</span><span class="s2">(</span><span class="s1">_ArrayArgLoader</span><span class="s2">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Handle GUFunc argument loading where the shape signature specifies 
+    a scalar &quot;()&quot; but a 1D array is used for the type of the core function. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">_shape_and_strides</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">context</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">):</span>
+        <span class="s4"># Set shape and strides for a 1D size 1 array</span>
+        <span class="s1">one </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_constant</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">, </span><span class="s6">1</span><span class="s2">)</span>
+        <span class="s1">zero </span><span class="s2">= </span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_constant</span><span class="s2">(</span><span class="s1">types</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">, </span><span class="s6">0</span><span class="s2">)</span>
+        <span class="s1">shape </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">pack_array</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, [</span><span class="s1">one</span><span class="s2">])</span>
+        <span class="s1">strides </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">pack_array</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, [</span><span class="s1">zero</span><span class="s2">])</span>
+        <span class="s0">return </span><span class="s1">shape</span><span class="s2">, </span><span class="s1">strides</span>
+</pre>
+</body>
+</html>

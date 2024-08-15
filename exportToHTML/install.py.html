@@ -1,0 +1,838 @@
+<html>
+<head>
+<title>install.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #2aacb8;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+install.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Installation utilities for Python ISAPI filters and extensions.&quot;&quot;&quot;</span>
+
+<span class="s2"># this code adapted from &quot;Tomcat JK2 ISAPI redirector&quot;, part of Apache</span>
+<span class="s2"># Created July 2004, Mark Hammond.</span>
+<span class="s3">import </span><span class="s1">imp</span>
+<span class="s3">import </span><span class="s1">os</span>
+<span class="s3">import </span><span class="s1">shutil</span>
+<span class="s3">import </span><span class="s1">stat</span>
+<span class="s3">import </span><span class="s1">sys</span>
+<span class="s3">import </span><span class="s1">traceback</span>
+
+<span class="s3">import </span><span class="s1">pythoncom</span>
+<span class="s3">import </span><span class="s1">win32api</span>
+<span class="s3">import </span><span class="s1">winerror</span>
+<span class="s3">from </span><span class="s1">win32com</span><span class="s4">.</span><span class="s1">client </span><span class="s3">import </span><span class="s1">Dispatch</span><span class="s4">, </span><span class="s1">GetObject</span>
+<span class="s3">from </span><span class="s1">win32com</span><span class="s4">.</span><span class="s1">client</span><span class="s4">.</span><span class="s1">gencache </span><span class="s3">import </span><span class="s1">EnsureDispatch</span><span class="s4">, </span><span class="s1">EnsureModule</span>
+
+<span class="s1">_APP_INPROC </span><span class="s4">= </span><span class="s5">0</span>
+<span class="s1">_APP_OUTPROC </span><span class="s4">= </span><span class="s5">1</span>
+<span class="s1">_APP_POOLED </span><span class="s4">= </span><span class="s5">2</span>
+<span class="s1">_IIS_OBJECT </span><span class="s4">= </span><span class="s6">&quot;IIS://LocalHost/W3SVC&quot;</span>
+<span class="s1">_IIS_SERVER </span><span class="s4">= </span><span class="s6">&quot;IIsWebServer&quot;</span>
+<span class="s1">_IIS_WEBDIR </span><span class="s4">= </span><span class="s6">&quot;IIsWebDirectory&quot;</span>
+<span class="s1">_IIS_WEBVIRTUALDIR </span><span class="s4">= </span><span class="s6">&quot;IIsWebVirtualDir&quot;</span>
+<span class="s1">_IIS_FILTERS </span><span class="s4">= </span><span class="s6">&quot;IIsFilters&quot;</span>
+<span class="s1">_IIS_FILTER </span><span class="s4">= </span><span class="s6">&quot;IIsFilter&quot;</span>
+
+<span class="s1">_DEFAULT_SERVER_NAME </span><span class="s4">= </span><span class="s6">&quot;Default Web Site&quot;</span>
+<span class="s1">_DEFAULT_HEADERS </span><span class="s4">= </span><span class="s6">&quot;X-Powered-By: Python&quot;</span>
+<span class="s1">_DEFAULT_PROTECTION </span><span class="s4">= </span><span class="s1">_APP_POOLED</span>
+
+<span class="s2"># Default is for 'execute' only access - ie, only the extension</span>
+<span class="s2"># can be used.  This can be overridden via your install script.</span>
+<span class="s1">_DEFAULT_ACCESS_EXECUTE </span><span class="s4">= </span><span class="s3">True</span>
+<span class="s1">_DEFAULT_ACCESS_READ </span><span class="s4">= </span><span class="s3">False</span>
+<span class="s1">_DEFAULT_ACCESS_WRITE </span><span class="s4">= </span><span class="s3">False</span>
+<span class="s1">_DEFAULT_ACCESS_SCRIPT </span><span class="s4">= </span><span class="s3">False</span>
+<span class="s1">_DEFAULT_CONTENT_INDEXED </span><span class="s4">= </span><span class="s3">False</span>
+<span class="s1">_DEFAULT_ENABLE_DIR_BROWSING </span><span class="s4">= </span><span class="s3">False</span>
+<span class="s1">_DEFAULT_ENABLE_DEFAULT_DOC </span><span class="s4">= </span><span class="s3">False</span>
+
+<span class="s1">_extensions </span><span class="s4">= [</span><span class="s1">ext </span><span class="s3">for </span><span class="s1">ext</span><span class="s4">, </span><span class="s1">_</span><span class="s4">, </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">imp</span><span class="s4">.</span><span class="s1">get_suffixes</span><span class="s4">()]</span>
+<span class="s1">is_debug_build </span><span class="s4">= </span><span class="s6">&quot;_d.pyd&quot; </span><span class="s3">in </span><span class="s1">_extensions</span>
+
+<span class="s1">this_dir </span><span class="s4">= </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">abspath</span><span class="s4">(</span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">dirname</span><span class="s4">(</span><span class="s1">__file__</span><span class="s4">))</span>
+
+
+<span class="s3">class </span><span class="s1">FilterParameters</span><span class="s4">:</span>
+    <span class="s1">Name </span><span class="s4">= </span><span class="s3">None</span>
+    <span class="s1">Description </span><span class="s4">= </span><span class="s3">None</span>
+    <span class="s1">Path </span><span class="s4">= </span><span class="s3">None</span>
+    <span class="s1">Server </span><span class="s4">= </span><span class="s3">None</span>
+    <span class="s2"># Params that control if/how AddExtensionFile is called.</span>
+    <span class="s1">AddExtensionFile </span><span class="s4">= </span><span class="s3">True</span>
+    <span class="s1">AddExtensionFile_Enabled </span><span class="s4">= </span><span class="s3">True</span>
+    <span class="s1">AddExtensionFile_GroupID </span><span class="s4">= </span><span class="s3">None  </span><span class="s2"># defaults to Name</span>
+    <span class="s1">AddExtensionFile_CanDelete </span><span class="s4">= </span><span class="s3">True</span>
+    <span class="s1">AddExtensionFile_Description </span><span class="s4">= </span><span class="s3">None  </span><span class="s2"># defaults to Description.</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, **</span><span class="s1">kw</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">__dict__</span><span class="s4">.</span><span class="s1">update</span><span class="s4">(</span><span class="s1">kw</span><span class="s4">)</span>
+
+
+<span class="s3">class </span><span class="s1">VirtualDirParameters</span><span class="s4">:</span>
+    <span class="s1">Name </span><span class="s4">= </span><span class="s3">None  </span><span class="s2"># Must be provided.</span>
+    <span class="s1">Description </span><span class="s4">= </span><span class="s3">None  </span><span class="s2"># defaults to Name</span>
+    <span class="s1">AppProtection </span><span class="s4">= </span><span class="s1">_DEFAULT_PROTECTION</span>
+    <span class="s1">Headers </span><span class="s4">= </span><span class="s1">_DEFAULT_HEADERS</span>
+    <span class="s1">Path </span><span class="s4">= </span><span class="s3">None  </span><span class="s2"># defaults to WWW root.</span>
+    <span class="s1">Type </span><span class="s4">= </span><span class="s1">_IIS_WEBVIRTUALDIR</span>
+    <span class="s1">AccessExecute </span><span class="s4">= </span><span class="s1">_DEFAULT_ACCESS_EXECUTE</span>
+    <span class="s1">AccessRead </span><span class="s4">= </span><span class="s1">_DEFAULT_ACCESS_READ</span>
+    <span class="s1">AccessWrite </span><span class="s4">= </span><span class="s1">_DEFAULT_ACCESS_WRITE</span>
+    <span class="s1">AccessScript </span><span class="s4">= </span><span class="s1">_DEFAULT_ACCESS_SCRIPT</span>
+    <span class="s1">ContentIndexed </span><span class="s4">= </span><span class="s1">_DEFAULT_CONTENT_INDEXED</span>
+    <span class="s1">EnableDirBrowsing </span><span class="s4">= </span><span class="s1">_DEFAULT_ENABLE_DIR_BROWSING</span>
+    <span class="s1">EnableDefaultDoc </span><span class="s4">= </span><span class="s1">_DEFAULT_ENABLE_DEFAULT_DOC</span>
+    <span class="s1">DefaultDoc </span><span class="s4">= </span><span class="s3">None  </span><span class="s2"># Only set in IIS if not None</span>
+    <span class="s1">ScriptMaps </span><span class="s4">= []</span>
+    <span class="s1">ScriptMapUpdate </span><span class="s4">= </span><span class="s6">&quot;end&quot;  </span><span class="s2"># can be 'start', 'end', 'replace'</span>
+    <span class="s1">Server </span><span class="s4">= </span><span class="s3">None</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, **</span><span class="s1">kw</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">__dict__</span><span class="s4">.</span><span class="s1">update</span><span class="s4">(</span><span class="s1">kw</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">is_root</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;This virtual directory is a root directory if parent and name are blank&quot;</span>
+        <span class="s1">parent</span><span class="s4">, </span><span class="s1">name </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">split_path</span><span class="s4">()</span>
+        <span class="s3">return not </span><span class="s1">parent </span><span class="s3">and not </span><span class="s1">name</span>
+
+    <span class="s3">def </span><span class="s1">split_path</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">split_path</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">)</span>
+
+
+<span class="s3">class </span><span class="s1">ScriptMapParams</span><span class="s4">:</span>
+    <span class="s1">Extension </span><span class="s4">= </span><span class="s3">None</span>
+    <span class="s1">Module </span><span class="s4">= </span><span class="s3">None</span>
+    <span class="s1">Flags </span><span class="s4">= </span><span class="s5">5</span>
+    <span class="s1">Verbs </span><span class="s4">= </span><span class="s6">&quot;&quot;</span>
+    <span class="s2"># Params that control if/how AddExtensionFile is called.</span>
+    <span class="s1">AddExtensionFile </span><span class="s4">= </span><span class="s3">True</span>
+    <span class="s1">AddExtensionFile_Enabled </span><span class="s4">= </span><span class="s3">True</span>
+    <span class="s1">AddExtensionFile_GroupID </span><span class="s4">= </span><span class="s3">None  </span><span class="s2"># defaults to Name</span>
+    <span class="s1">AddExtensionFile_CanDelete </span><span class="s4">= </span><span class="s3">True</span>
+    <span class="s1">AddExtensionFile_Description </span><span class="s4">= </span><span class="s3">None  </span><span class="s2"># defaults to Description.</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, **</span><span class="s1">kw</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">__dict__</span><span class="s4">.</span><span class="s1">update</span><span class="s4">(</span><span class="s1">kw</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__str__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;Format this parameter suitable for IIS&quot;</span>
+        <span class="s1">items </span><span class="s4">= [</span><span class="s1">self</span><span class="s4">.</span><span class="s1">Extension</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">Module</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">Flags</span><span class="s4">]</span>
+        <span class="s2"># IIS gets upset if there is a trailing verb comma, but no verbs</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">Verbs</span><span class="s4">:</span>
+            <span class="s1">items</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">Verbs</span><span class="s4">)</span>
+        <span class="s1">items </span><span class="s4">= [</span><span class="s1">str</span><span class="s4">(</span><span class="s1">item</span><span class="s4">) </span><span class="s3">for </span><span class="s1">item </span><span class="s3">in </span><span class="s1">items</span><span class="s4">]</span>
+        <span class="s3">return </span><span class="s6">&quot;,&quot;</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">items</span><span class="s4">)</span>
+
+
+<span class="s3">class </span><span class="s1">ISAPIParameters</span><span class="s4">:</span>
+    <span class="s1">ServerName </span><span class="s4">= </span><span class="s1">_DEFAULT_SERVER_NAME</span>
+    <span class="s2"># Description = None</span>
+    <span class="s1">Filters </span><span class="s4">= []</span>
+    <span class="s1">VirtualDirs </span><span class="s4">= []</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, **</span><span class="s1">kw</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">__dict__</span><span class="s4">.</span><span class="s1">update</span><span class="s4">(</span><span class="s1">kw</span><span class="s4">)</span>
+
+
+<span class="s1">verbose </span><span class="s4">= </span><span class="s5">1  </span><span class="s2"># The level - 0 is quiet.</span>
+
+
+<span class="s3">def </span><span class="s1">log</span><span class="s4">(</span><span class="s1">level</span><span class="s4">, </span><span class="s1">what</span><span class="s4">):</span>
+    <span class="s3">if </span><span class="s1">verbose </span><span class="s4">&gt;= </span><span class="s1">level</span><span class="s4">:</span>
+        <span class="s1">print</span><span class="s4">(</span><span class="s1">what</span><span class="s4">)</span>
+
+
+<span class="s2"># Convert an ADSI COM exception to the Win32 error code embedded in it.</span>
+<span class="s3">def </span><span class="s1">_GetWin32ErrorCode</span><span class="s4">(</span><span class="s1">com_exc</span><span class="s4">):</span>
+    <span class="s1">hr </span><span class="s4">= </span><span class="s1">com_exc</span><span class="s4">.</span><span class="s1">hresult</span>
+    <span class="s2"># If we have more details in the 'excepinfo' struct, use it.</span>
+    <span class="s3">if </span><span class="s1">com_exc</span><span class="s4">.</span><span class="s1">excepinfo</span><span class="s4">:</span>
+        <span class="s1">hr </span><span class="s4">= </span><span class="s1">com_exc</span><span class="s4">.</span><span class="s1">excepinfo</span><span class="s4">[-</span><span class="s5">1</span><span class="s4">]</span>
+    <span class="s3">if </span><span class="s1">winerror</span><span class="s4">.</span><span class="s1">HRESULT_FACILITY</span><span class="s4">(</span><span class="s1">hr</span><span class="s4">) != </span><span class="s1">winerror</span><span class="s4">.</span><span class="s1">FACILITY_WIN32</span><span class="s4">:</span>
+        <span class="s3">raise</span>
+    <span class="s3">return </span><span class="s1">winerror</span><span class="s4">.</span><span class="s1">SCODE_CODE</span><span class="s4">(</span><span class="s1">hr</span><span class="s4">)</span>
+
+
+<span class="s3">class </span><span class="s1">InstallationError</span><span class="s4">(</span><span class="s1">Exception</span><span class="s4">):</span>
+    <span class="s3">pass</span>
+
+
+<span class="s3">class </span><span class="s1">ItemNotFound</span><span class="s4">(</span><span class="s1">InstallationError</span><span class="s4">):</span>
+    <span class="s3">pass</span>
+
+
+<span class="s3">class </span><span class="s1">ConfigurationError</span><span class="s4">(</span><span class="s1">InstallationError</span><span class="s4">):</span>
+    <span class="s3">pass</span>
+
+
+<span class="s3">def </span><span class="s1">FindPath</span><span class="s4">(</span><span class="s1">options</span><span class="s4">, </span><span class="s1">server</span><span class="s4">, </span><span class="s1">name</span><span class="s4">):</span>
+    <span class="s3">if </span><span class="s1">name</span><span class="s4">.</span><span class="s1">lower</span><span class="s4">().</span><span class="s1">startswith</span><span class="s4">(</span><span class="s6">&quot;iis://&quot;</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">name</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s3">if </span><span class="s1">name </span><span class="s3">and </span><span class="s1">name</span><span class="s4">[</span><span class="s5">0</span><span class="s4">] != </span><span class="s6">&quot;/&quot;</span><span class="s4">:</span>
+            <span class="s1">name </span><span class="s4">= </span><span class="s6">&quot;/&quot; </span><span class="s4">+ </span><span class="s1">name</span>
+        <span class="s3">return </span><span class="s1">FindWebServer</span><span class="s4">(</span><span class="s1">options</span><span class="s4">, </span><span class="s1">server</span><span class="s4">) + </span><span class="s6">&quot;/ROOT&quot; </span><span class="s4">+ </span><span class="s1">name</span>
+
+
+<span class="s3">def </span><span class="s1">LocateWebServerPath</span><span class="s4">(</span><span class="s1">description</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Find an IIS web server whose name or comment matches the provided 
+    description (case-insensitive). 
+ 
+    &gt;&gt;&gt; LocateWebServerPath('Default Web Site') # doctest: +SKIP 
+ 
+    or 
+ 
+    &gt;&gt;&gt; LocateWebServerPath('1') #doctest: +SKIP 
+    &quot;&quot;&quot;</span>
+    <span class="s3">assert </span><span class="s1">len</span><span class="s4">(</span><span class="s1">description</span><span class="s4">) &gt;= </span><span class="s5">1</span><span class="s4">, </span><span class="s6">&quot;Server name or comment is required&quot;</span>
+    <span class="s1">iis </span><span class="s4">= </span><span class="s1">GetObject</span><span class="s4">(</span><span class="s1">_IIS_OBJECT</span><span class="s4">)</span>
+    <span class="s1">description </span><span class="s4">= </span><span class="s1">description</span><span class="s4">.</span><span class="s1">lower</span><span class="s4">().</span><span class="s1">strip</span><span class="s4">()</span>
+    <span class="s3">for </span><span class="s1">site </span><span class="s3">in </span><span class="s1">iis</span><span class="s4">:</span>
+        <span class="s2"># Name is generally a number, but no need to assume that.</span>
+        <span class="s1">site_attributes </span><span class="s4">= [</span>
+            <span class="s1">getattr</span><span class="s4">(</span><span class="s1">site</span><span class="s4">, </span><span class="s1">attr</span><span class="s4">, </span><span class="s6">&quot;&quot;</span><span class="s4">).</span><span class="s1">lower</span><span class="s4">().</span><span class="s1">strip</span><span class="s4">()</span>
+            <span class="s3">for </span><span class="s1">attr </span><span class="s3">in </span><span class="s4">(</span><span class="s6">&quot;Name&quot;</span><span class="s4">, </span><span class="s6">&quot;ServerComment&quot;</span><span class="s4">)</span>
+        <span class="s4">]</span>
+        <span class="s3">if </span><span class="s1">description </span><span class="s3">in </span><span class="s1">site_attributes</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">site</span><span class="s4">.</span><span class="s1">AdsPath</span>
+    <span class="s1">msg </span><span class="s4">= </span><span class="s6">&quot;No web sites match the description '%s'&quot; </span><span class="s4">% </span><span class="s1">description</span>
+    <span class="s3">raise </span><span class="s1">ItemNotFound</span><span class="s4">(</span><span class="s1">msg</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">GetWebServer</span><span class="s4">(</span><span class="s1">description</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Load the web server instance (COM object) for a given instance 
+    or description. 
+    If None is specified, the default website is retrieved (indicated 
+    by the identifier 1. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">description </span><span class="s4">= </span><span class="s1">description </span><span class="s3">or </span><span class="s6">&quot;1&quot;</span>
+    <span class="s1">path </span><span class="s4">= </span><span class="s1">LocateWebServerPath</span><span class="s4">(</span><span class="s1">description</span><span class="s4">)</span>
+    <span class="s1">server </span><span class="s4">= </span><span class="s1">LoadWebServer</span><span class="s4">(</span><span class="s1">path</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">server</span>
+
+
+<span class="s3">def </span><span class="s1">LoadWebServer</span><span class="s4">(</span><span class="s1">path</span><span class="s4">):</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s1">server </span><span class="s4">= </span><span class="s1">GetObject</span><span class="s4">(</span><span class="s1">path</span><span class="s4">)</span>
+    <span class="s3">except </span><span class="s1">pythoncom</span><span class="s4">.</span><span class="s1">com_error </span><span class="s3">as </span><span class="s1">details</span><span class="s4">:</span>
+        <span class="s1">msg </span><span class="s4">= </span><span class="s1">details</span><span class="s4">.</span><span class="s1">strerror</span>
+        <span class="s3">if </span><span class="s1">exc</span><span class="s4">.</span><span class="s1">excepinfo </span><span class="s3">and </span><span class="s1">exc</span><span class="s4">.</span><span class="s1">excepinfo</span><span class="s4">[</span><span class="s5">2</span><span class="s4">]:</span>
+            <span class="s1">msg </span><span class="s4">= </span><span class="s1">exc</span><span class="s4">.</span><span class="s1">excepinfo</span><span class="s4">[</span><span class="s5">2</span><span class="s4">]</span>
+        <span class="s1">msg </span><span class="s4">= </span><span class="s6">&quot;WebServer %s: %s&quot; </span><span class="s4">% (</span><span class="s1">path</span><span class="s4">, </span><span class="s1">msg</span><span class="s4">)</span>
+        <span class="s3">raise </span><span class="s1">ItemNotFound</span><span class="s4">(</span><span class="s1">msg</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">server</span>
+
+
+<span class="s3">def </span><span class="s1">FindWebServer</span><span class="s4">(</span><span class="s1">options</span><span class="s4">, </span><span class="s1">server_desc</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Legacy function to allow options to define a .server property 
+    to override the other parameter.  Use GetWebServer instead. 
+    &quot;&quot;&quot;</span>
+    <span class="s2"># options takes precedence</span>
+    <span class="s1">server_desc </span><span class="s4">= </span><span class="s1">options</span><span class="s4">.</span><span class="s1">server </span><span class="s3">or </span><span class="s1">server_desc</span>
+    <span class="s2"># make sure server_desc is unicode (could be mbcs if passed in</span>
+    <span class="s2">#  sys.argv).</span>
+    <span class="s3">if </span><span class="s1">server_desc </span><span class="s3">and not </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">server_desc</span><span class="s4">, </span><span class="s1">str</span><span class="s4">):</span>
+        <span class="s1">server_desc </span><span class="s4">= </span><span class="s1">server_desc</span><span class="s4">.</span><span class="s1">decode</span><span class="s4">(</span><span class="s6">&quot;mbcs&quot;</span><span class="s4">)</span>
+
+    <span class="s2"># get the server (if server_desc is None, the default site is acquired)</span>
+    <span class="s1">server </span><span class="s4">= </span><span class="s1">GetWebServer</span><span class="s4">(</span><span class="s1">server_desc</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">server</span><span class="s4">.</span><span class="s1">adsPath</span>
+
+
+<span class="s3">def </span><span class="s1">split_path</span><span class="s4">(</span><span class="s1">path</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Get the parent path and basename. 
+ 
+    &gt;&gt;&gt; split_path('/') 
+    ['', ''] 
+ 
+    &gt;&gt;&gt; split_path('') 
+    ['', ''] 
+ 
+    &gt;&gt;&gt; split_path('foo') 
+    ['', 'foo'] 
+ 
+    &gt;&gt;&gt; split_path('/foo') 
+    ['', 'foo'] 
+ 
+    &gt;&gt;&gt; split_path('/foo/bar') 
+    ['/foo', 'bar'] 
+ 
+    &gt;&gt;&gt; split_path('foo/bar') 
+    ['/foo', 'bar'] 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">if not </span><span class="s1">path</span><span class="s4">.</span><span class="s1">startswith</span><span class="s4">(</span><span class="s6">&quot;/&quot;</span><span class="s4">):</span>
+        <span class="s1">path </span><span class="s4">= </span><span class="s6">&quot;/&quot; </span><span class="s4">+ </span><span class="s1">path</span>
+    <span class="s3">return </span><span class="s1">path</span><span class="s4">.</span><span class="s1">rsplit</span><span class="s4">(</span><span class="s6">&quot;/&quot;</span><span class="s4">, </span><span class="s5">1</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">_CreateDirectory</span><span class="s4">(</span><span class="s1">iis_dir</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">params</span><span class="s4">):</span>
+    <span class="s2"># We used to go to lengths to keep an existing virtual directory</span>
+    <span class="s2"># in place.  However, in some cases the existing directories got</span>
+    <span class="s2"># into a bad state, and an update failed to get them working.</span>
+    <span class="s2"># So we nuke it first.  If this is a problem, we could consider adding</span>
+    <span class="s2"># a --keep-existing option.</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s2"># Also seen the Class change to a generic IISObject - so nuke</span>
+        <span class="s2"># *any* existing object, regardless of Class</span>
+        <span class="s3">assert </span><span class="s1">name</span><span class="s4">.</span><span class="s1">strip</span><span class="s4">(</span><span class="s6">&quot;/&quot;</span><span class="s4">), </span><span class="s6">&quot;mustn't delete the root!&quot;</span>
+        <span class="s1">iis_dir</span><span class="s4">.</span><span class="s1">Delete</span><span class="s4">(</span><span class="s6">&quot;&quot;</span><span class="s4">, </span><span class="s1">name</span><span class="s4">)</span>
+        <span class="s1">log</span><span class="s4">(</span><span class="s5">2</span><span class="s4">, </span><span class="s6">&quot;Deleted old directory '%s'&quot; </span><span class="s4">% (</span><span class="s1">name</span><span class="s4">,))</span>
+    <span class="s3">except </span><span class="s1">pythoncom</span><span class="s4">.</span><span class="s1">com_error</span><span class="s4">:</span>
+        <span class="s3">pass</span>
+
+    <span class="s1">newDir </span><span class="s4">= </span><span class="s1">iis_dir</span><span class="s4">.</span><span class="s1">Create</span><span class="s4">(</span><span class="s1">params</span><span class="s4">.</span><span class="s1">Type</span><span class="s4">, </span><span class="s1">name</span><span class="s4">)</span>
+    <span class="s1">log</span><span class="s4">(</span><span class="s5">2</span><span class="s4">, </span><span class="s6">&quot;Creating new directory '%s' in %s...&quot; </span><span class="s4">% (</span><span class="s1">name</span><span class="s4">, </span><span class="s1">iis_dir</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">))</span>
+
+    <span class="s1">friendly </span><span class="s4">= </span><span class="s1">params</span><span class="s4">.</span><span class="s1">Description </span><span class="s3">or </span><span class="s1">params</span><span class="s4">.</span><span class="s1">Name</span>
+    <span class="s1">newDir</span><span class="s4">.</span><span class="s1">AppFriendlyName </span><span class="s4">= </span><span class="s1">friendly</span>
+
+    <span class="s2"># Note that the new directory won't be visible in the IIS UI</span>
+    <span class="s2"># unless the directory exists on the filesystem.</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s1">path </span><span class="s4">= </span><span class="s1">params</span><span class="s4">.</span><span class="s1">Path </span><span class="s3">or </span><span class="s1">iis_dir</span><span class="s4">.</span><span class="s1">Path</span>
+        <span class="s1">newDir</span><span class="s4">.</span><span class="s1">Path </span><span class="s4">= </span><span class="s1">path</span>
+    <span class="s3">except </span><span class="s1">AttributeError</span><span class="s4">:</span>
+        <span class="s2"># If params.Type is IIS_WEBDIRECTORY, an exception is thrown</span>
+        <span class="s3">pass</span>
+    <span class="s1">newDir</span><span class="s4">.</span><span class="s1">AppCreate2</span><span class="s4">(</span><span class="s1">params</span><span class="s4">.</span><span class="s1">AppProtection</span><span class="s4">)</span>
+    <span class="s2"># XXX - note that these Headers only work in IIS6 and earlier.  IIS7</span>
+    <span class="s2"># only supports them on the w3svc node - not even on individial sites,</span>
+    <span class="s2"># let alone individual extensions in the site!</span>
+    <span class="s3">if </span><span class="s1">params</span><span class="s4">.</span><span class="s1">Headers</span><span class="s4">:</span>
+        <span class="s1">newDir</span><span class="s4">.</span><span class="s1">HttpCustomHeaders </span><span class="s4">= </span><span class="s1">params</span><span class="s4">.</span><span class="s1">Headers</span>
+
+    <span class="s1">log</span><span class="s4">(</span><span class="s5">2</span><span class="s4">, </span><span class="s6">&quot;Setting directory options...&quot;</span><span class="s4">)</span>
+    <span class="s1">newDir</span><span class="s4">.</span><span class="s1">AccessExecute </span><span class="s4">= </span><span class="s1">params</span><span class="s4">.</span><span class="s1">AccessExecute</span>
+    <span class="s1">newDir</span><span class="s4">.</span><span class="s1">AccessRead </span><span class="s4">= </span><span class="s1">params</span><span class="s4">.</span><span class="s1">AccessRead</span>
+    <span class="s1">newDir</span><span class="s4">.</span><span class="s1">AccessWrite </span><span class="s4">= </span><span class="s1">params</span><span class="s4">.</span><span class="s1">AccessWrite</span>
+    <span class="s1">newDir</span><span class="s4">.</span><span class="s1">AccessScript </span><span class="s4">= </span><span class="s1">params</span><span class="s4">.</span><span class="s1">AccessScript</span>
+    <span class="s1">newDir</span><span class="s4">.</span><span class="s1">ContentIndexed </span><span class="s4">= </span><span class="s1">params</span><span class="s4">.</span><span class="s1">ContentIndexed</span>
+    <span class="s1">newDir</span><span class="s4">.</span><span class="s1">EnableDirBrowsing </span><span class="s4">= </span><span class="s1">params</span><span class="s4">.</span><span class="s1">EnableDirBrowsing</span>
+    <span class="s1">newDir</span><span class="s4">.</span><span class="s1">EnableDefaultDoc </span><span class="s4">= </span><span class="s1">params</span><span class="s4">.</span><span class="s1">EnableDefaultDoc</span>
+    <span class="s3">if </span><span class="s1">params</span><span class="s4">.</span><span class="s1">DefaultDoc </span><span class="s3">is not None</span><span class="s4">:</span>
+        <span class="s1">newDir</span><span class="s4">.</span><span class="s1">DefaultDoc </span><span class="s4">= </span><span class="s1">params</span><span class="s4">.</span><span class="s1">DefaultDoc</span>
+    <span class="s1">newDir</span><span class="s4">.</span><span class="s1">SetInfo</span><span class="s4">()</span>
+    <span class="s3">return </span><span class="s1">newDir</span>
+
+
+<span class="s3">def </span><span class="s1">CreateDirectory</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s1">options</span><span class="s4">):</span>
+    <span class="s1">_CallHook</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s6">&quot;PreInstall&quot;</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+    <span class="s3">if not </span><span class="s1">params</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">ConfigurationError</span><span class="s4">(</span><span class="s6">&quot;No Name param&quot;</span><span class="s4">)</span>
+    <span class="s1">parent</span><span class="s4">, </span><span class="s1">name </span><span class="s4">= </span><span class="s1">params</span><span class="s4">.</span><span class="s1">split_path</span><span class="s4">()</span>
+    <span class="s1">target_dir </span><span class="s4">= </span><span class="s1">GetObject</span><span class="s4">(</span><span class="s1">FindPath</span><span class="s4">(</span><span class="s1">options</span><span class="s4">, </span><span class="s1">params</span><span class="s4">.</span><span class="s1">Server</span><span class="s4">, </span><span class="s1">parent</span><span class="s4">))</span>
+
+    <span class="s3">if not </span><span class="s1">params</span><span class="s4">.</span><span class="s1">is_root</span><span class="s4">():</span>
+        <span class="s1">target_dir </span><span class="s4">= </span><span class="s1">_CreateDirectory</span><span class="s4">(</span><span class="s1">target_dir</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">params</span><span class="s4">)</span>
+
+    <span class="s1">AssignScriptMaps</span><span class="s4">(</span><span class="s1">params</span><span class="s4">.</span><span class="s1">ScriptMaps</span><span class="s4">, </span><span class="s1">target_dir</span><span class="s4">, </span><span class="s1">params</span><span class="s4">.</span><span class="s1">ScriptMapUpdate</span><span class="s4">)</span>
+
+    <span class="s1">_CallHook</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s6">&quot;PostInstall&quot;</span><span class="s4">, </span><span class="s1">options</span><span class="s4">, </span><span class="s1">target_dir</span><span class="s4">)</span>
+    <span class="s1">log</span><span class="s4">(</span><span class="s5">1</span><span class="s4">, </span><span class="s6">&quot;Configured Virtual Directory: %s&quot; </span><span class="s4">% (</span><span class="s1">params</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">,))</span>
+    <span class="s3">return </span><span class="s1">target_dir</span>
+
+
+<span class="s3">def </span><span class="s1">AssignScriptMaps</span><span class="s4">(</span><span class="s1">script_maps</span><span class="s4">, </span><span class="s1">target</span><span class="s4">, </span><span class="s1">update</span><span class="s4">=</span><span class="s6">&quot;replace&quot;</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Updates IIS with the supplied script map information. 
+ 
+    script_maps is a list of ScriptMapParameter objects 
+ 
+    target is an IIS Virtual Directory to assign the script maps to 
+ 
+    update is a string indicating how to update the maps, one of  ('start', 
+    'end', or 'replace') 
+    &quot;&quot;&quot;</span>
+    <span class="s2"># determine which function to use to assign script maps</span>
+    <span class="s1">script_map_func </span><span class="s4">= </span><span class="s6">&quot;_AssignScriptMaps&quot; </span><span class="s4">+ </span><span class="s1">update</span><span class="s4">.</span><span class="s1">capitalize</span><span class="s4">()</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s1">script_map_func </span><span class="s4">= </span><span class="s1">eval</span><span class="s4">(</span><span class="s1">script_map_func</span><span class="s4">)</span>
+    <span class="s3">except </span><span class="s1">NameError</span><span class="s4">:</span>
+        <span class="s1">msg </span><span class="s4">= </span><span class="s6">&quot;Unknown ScriptMapUpdate option '%s'&quot; </span><span class="s4">% </span><span class="s1">update</span>
+        <span class="s3">raise </span><span class="s1">ConfigurationError</span><span class="s4">(</span><span class="s1">msg</span><span class="s4">)</span>
+    <span class="s2"># use the str method to format the script maps for IIS</span>
+    <span class="s1">script_maps </span><span class="s4">= [</span><span class="s1">str</span><span class="s4">(</span><span class="s1">s</span><span class="s4">) </span><span class="s3">for </span><span class="s1">s </span><span class="s3">in </span><span class="s1">script_maps</span><span class="s4">]</span>
+    <span class="s2"># call the correct function</span>
+    <span class="s1">script_map_func</span><span class="s4">(</span><span class="s1">target</span><span class="s4">, </span><span class="s1">script_maps</span><span class="s4">)</span>
+    <span class="s1">target</span><span class="s4">.</span><span class="s1">SetInfo</span><span class="s4">()</span>
+
+
+<span class="s3">def </span><span class="s1">get_unique_items</span><span class="s4">(</span><span class="s1">sequence</span><span class="s4">, </span><span class="s1">reference</span><span class="s4">):</span>
+    <span class="s0">&quot;Return items in sequence that can't be found in reference.&quot;</span>
+    <span class="s3">return </span><span class="s1">tuple</span><span class="s4">([</span><span class="s1">item </span><span class="s3">for </span><span class="s1">item </span><span class="s3">in </span><span class="s1">sequence </span><span class="s3">if </span><span class="s1">item </span><span class="s3">not in </span><span class="s1">reference</span><span class="s4">])</span>
+
+
+<span class="s3">def </span><span class="s1">_AssignScriptMapsReplace</span><span class="s4">(</span><span class="s1">target</span><span class="s4">, </span><span class="s1">script_maps</span><span class="s4">):</span>
+    <span class="s1">target</span><span class="s4">.</span><span class="s1">ScriptMaps </span><span class="s4">= </span><span class="s1">script_maps</span>
+
+
+<span class="s3">def </span><span class="s1">_AssignScriptMapsEnd</span><span class="s4">(</span><span class="s1">target</span><span class="s4">, </span><span class="s1">script_maps</span><span class="s4">):</span>
+    <span class="s1">unique_new_maps </span><span class="s4">= </span><span class="s1">get_unique_items</span><span class="s4">(</span><span class="s1">script_maps</span><span class="s4">, </span><span class="s1">target</span><span class="s4">.</span><span class="s1">ScriptMaps</span><span class="s4">)</span>
+    <span class="s1">target</span><span class="s4">.</span><span class="s1">ScriptMaps </span><span class="s4">= </span><span class="s1">target</span><span class="s4">.</span><span class="s1">ScriptMaps </span><span class="s4">+ </span><span class="s1">unique_new_maps</span>
+
+
+<span class="s3">def </span><span class="s1">_AssignScriptMapsStart</span><span class="s4">(</span><span class="s1">target</span><span class="s4">, </span><span class="s1">script_maps</span><span class="s4">):</span>
+    <span class="s1">unique_new_maps </span><span class="s4">= </span><span class="s1">get_unique_items</span><span class="s4">(</span><span class="s1">script_maps</span><span class="s4">, </span><span class="s1">target</span><span class="s4">.</span><span class="s1">ScriptMaps</span><span class="s4">)</span>
+    <span class="s1">target</span><span class="s4">.</span><span class="s1">ScriptMaps </span><span class="s4">= </span><span class="s1">unique_new_maps </span><span class="s4">+ </span><span class="s1">target</span><span class="s4">.</span><span class="s1">ScriptMaps</span>
+
+
+<span class="s3">def </span><span class="s1">CreateISAPIFilter</span><span class="s4">(</span><span class="s1">filterParams</span><span class="s4">, </span><span class="s1">options</span><span class="s4">):</span>
+    <span class="s1">server </span><span class="s4">= </span><span class="s1">FindWebServer</span><span class="s4">(</span><span class="s1">options</span><span class="s4">, </span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Server</span><span class="s4">)</span>
+    <span class="s1">_CallHook</span><span class="s4">(</span><span class="s1">filterParams</span><span class="s4">, </span><span class="s6">&quot;PreInstall&quot;</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s1">filters </span><span class="s4">= </span><span class="s1">GetObject</span><span class="s4">(</span><span class="s1">server </span><span class="s4">+ </span><span class="s6">&quot;/Filters&quot;</span><span class="s4">)</span>
+    <span class="s3">except </span><span class="s1">pythoncom</span><span class="s4">.</span><span class="s1">com_error </span><span class="s3">as </span><span class="s1">exc</span><span class="s4">:</span>
+        <span class="s2"># Brand new sites don't have the '/Filters' collection - create it.</span>
+        <span class="s2"># Any errors other than 'not found' we shouldn't ignore.</span>
+        <span class="s3">if </span><span class="s4">(</span>
+            <span class="s1">winerror</span><span class="s4">.</span><span class="s1">HRESULT_FACILITY</span><span class="s4">(</span><span class="s1">exc</span><span class="s4">.</span><span class="s1">hresult</span><span class="s4">) != </span><span class="s1">winerror</span><span class="s4">.</span><span class="s1">FACILITY_WIN32</span>
+            <span class="s3">or </span><span class="s1">winerror</span><span class="s4">.</span><span class="s1">HRESULT_CODE</span><span class="s4">(</span><span class="s1">exc</span><span class="s4">.</span><span class="s1">hresult</span><span class="s4">) != </span><span class="s1">winerror</span><span class="s4">.</span><span class="s1">ERROR_PATH_NOT_FOUND</span>
+        <span class="s4">):</span>
+            <span class="s3">raise</span>
+        <span class="s1">server_ob </span><span class="s4">= </span><span class="s1">GetObject</span><span class="s4">(</span><span class="s1">server</span><span class="s4">)</span>
+        <span class="s1">filters </span><span class="s4">= </span><span class="s1">server_ob</span><span class="s4">.</span><span class="s1">Create</span><span class="s4">(</span><span class="s1">_IIS_FILTERS</span><span class="s4">, </span><span class="s6">&quot;Filters&quot;</span><span class="s4">)</span>
+        <span class="s1">filters</span><span class="s4">.</span><span class="s1">FilterLoadOrder </span><span class="s4">= </span><span class="s6">&quot;&quot;</span>
+        <span class="s1">filters</span><span class="s4">.</span><span class="s1">SetInfo</span><span class="s4">()</span>
+
+    <span class="s2"># As for VirtualDir, delete an existing one.</span>
+    <span class="s3">assert </span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">.</span><span class="s1">strip</span><span class="s4">(</span><span class="s6">&quot;/&quot;</span><span class="s4">), </span><span class="s6">&quot;mustn't delete the root!&quot;</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s1">filters</span><span class="s4">.</span><span class="s1">Delete</span><span class="s4">(</span><span class="s1">_IIS_FILTER</span><span class="s4">, </span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">)</span>
+        <span class="s1">log</span><span class="s4">(</span><span class="s5">2</span><span class="s4">, </span><span class="s6">&quot;Deleted old filter '%s'&quot; </span><span class="s4">% (</span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">,))</span>
+    <span class="s3">except </span><span class="s1">pythoncom</span><span class="s4">.</span><span class="s1">com_error</span><span class="s4">:</span>
+        <span class="s3">pass</span>
+    <span class="s1">newFilter </span><span class="s4">= </span><span class="s1">filters</span><span class="s4">.</span><span class="s1">Create</span><span class="s4">(</span><span class="s1">_IIS_FILTER</span><span class="s4">, </span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">)</span>
+    <span class="s1">log</span><span class="s4">(</span><span class="s5">2</span><span class="s4">, </span><span class="s6">&quot;Created new ISAPI filter...&quot;</span><span class="s4">)</span>
+    <span class="s3">assert </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">isfile</span><span class="s4">(</span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Path</span><span class="s4">)</span>
+    <span class="s1">newFilter</span><span class="s4">.</span><span class="s1">FilterPath </span><span class="s4">= </span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Path</span>
+    <span class="s1">newFilter</span><span class="s4">.</span><span class="s1">FilterDescription </span><span class="s4">= </span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Description</span>
+    <span class="s1">newFilter</span><span class="s4">.</span><span class="s1">SetInfo</span><span class="s4">()</span>
+    <span class="s1">load_order </span><span class="s4">= [</span><span class="s1">b</span><span class="s4">.</span><span class="s1">strip</span><span class="s4">() </span><span class="s3">for </span><span class="s1">b </span><span class="s3">in </span><span class="s1">filters</span><span class="s4">.</span><span class="s1">FilterLoadOrder</span><span class="s4">.</span><span class="s1">split</span><span class="s4">(</span><span class="s6">&quot;,&quot;</span><span class="s4">) </span><span class="s3">if </span><span class="s1">b</span><span class="s4">]</span>
+    <span class="s3">if </span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Name </span><span class="s3">not in </span><span class="s1">load_order</span><span class="s4">:</span>
+        <span class="s1">load_order</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">)</span>
+        <span class="s1">filters</span><span class="s4">.</span><span class="s1">FilterLoadOrder </span><span class="s4">= </span><span class="s6">&quot;,&quot;</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">load_order</span><span class="s4">)</span>
+        <span class="s1">filters</span><span class="s4">.</span><span class="s1">SetInfo</span><span class="s4">()</span>
+    <span class="s1">_CallHook</span><span class="s4">(</span><span class="s1">filterParams</span><span class="s4">, </span><span class="s6">&quot;PostInstall&quot;</span><span class="s4">, </span><span class="s1">options</span><span class="s4">, </span><span class="s1">newFilter</span><span class="s4">)</span>
+    <span class="s1">log</span><span class="s4">(</span><span class="s5">1</span><span class="s4">, </span><span class="s6">&quot;Configured Filter: %s&quot; </span><span class="s4">% (</span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">,))</span>
+    <span class="s3">return </span><span class="s1">newFilter</span>
+
+
+<span class="s3">def </span><span class="s1">DeleteISAPIFilter</span><span class="s4">(</span><span class="s1">filterParams</span><span class="s4">, </span><span class="s1">options</span><span class="s4">):</span>
+    <span class="s1">_CallHook</span><span class="s4">(</span><span class="s1">filterParams</span><span class="s4">, </span><span class="s6">&quot;PreRemove&quot;</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+    <span class="s1">server </span><span class="s4">= </span><span class="s1">FindWebServer</span><span class="s4">(</span><span class="s1">options</span><span class="s4">, </span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Server</span><span class="s4">)</span>
+    <span class="s1">ob_path </span><span class="s4">= </span><span class="s1">server </span><span class="s4">+ </span><span class="s6">&quot;/Filters&quot;</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s1">filters </span><span class="s4">= </span><span class="s1">GetObject</span><span class="s4">(</span><span class="s1">ob_path</span><span class="s4">)</span>
+    <span class="s3">except </span><span class="s1">pythoncom</span><span class="s4">.</span><span class="s1">com_error </span><span class="s3">as </span><span class="s1">details</span><span class="s4">:</span>
+        <span class="s2"># failure to open the filters just means a totally clean IIS install</span>
+        <span class="s2"># (IIS5 at least has no 'Filters' key when freshly installed).</span>
+        <span class="s1">log</span><span class="s4">(</span><span class="s5">2</span><span class="s4">, </span><span class="s6">&quot;ISAPI filter path '%s' did not exist.&quot; </span><span class="s4">% (</span><span class="s1">ob_path</span><span class="s4">,))</span>
+        <span class="s3">return</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s3">assert </span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">.</span><span class="s1">strip</span><span class="s4">(</span><span class="s6">&quot;/&quot;</span><span class="s4">), </span><span class="s6">&quot;mustn't delete the root!&quot;</span>
+        <span class="s1">filters</span><span class="s4">.</span><span class="s1">Delete</span><span class="s4">(</span><span class="s1">_IIS_FILTER</span><span class="s4">, </span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">)</span>
+        <span class="s1">log</span><span class="s4">(</span><span class="s5">2</span><span class="s4">, </span><span class="s6">&quot;Deleted ISAPI filter '%s'&quot; </span><span class="s4">% (</span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">,))</span>
+    <span class="s3">except </span><span class="s1">pythoncom</span><span class="s4">.</span><span class="s1">com_error </span><span class="s3">as </span><span class="s1">details</span><span class="s4">:</span>
+        <span class="s1">rc </span><span class="s4">= </span><span class="s1">_GetWin32ErrorCode</span><span class="s4">(</span><span class="s1">details</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">rc </span><span class="s4">!= </span><span class="s1">winerror</span><span class="s4">.</span><span class="s1">ERROR_PATH_NOT_FOUND</span><span class="s4">:</span>
+            <span class="s3">raise</span>
+        <span class="s1">log</span><span class="s4">(</span><span class="s5">2</span><span class="s4">, </span><span class="s6">&quot;ISAPI filter '%s' did not exist.&quot; </span><span class="s4">% (</span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">,))</span>
+    <span class="s2"># Remove from the load order</span>
+    <span class="s1">load_order </span><span class="s4">= [</span><span class="s1">b</span><span class="s4">.</span><span class="s1">strip</span><span class="s4">() </span><span class="s3">for </span><span class="s1">b </span><span class="s3">in </span><span class="s1">filters</span><span class="s4">.</span><span class="s1">FilterLoadOrder</span><span class="s4">.</span><span class="s1">split</span><span class="s4">(</span><span class="s6">&quot;,&quot;</span><span class="s4">) </span><span class="s3">if </span><span class="s1">b</span><span class="s4">]</span>
+    <span class="s3">if </span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Name </span><span class="s3">in </span><span class="s1">load_order</span><span class="s4">:</span>
+        <span class="s1">load_order</span><span class="s4">.</span><span class="s1">remove</span><span class="s4">(</span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">)</span>
+        <span class="s1">filters</span><span class="s4">.</span><span class="s1">FilterLoadOrder </span><span class="s4">= </span><span class="s6">&quot;,&quot;</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">load_order</span><span class="s4">)</span>
+        <span class="s1">filters</span><span class="s4">.</span><span class="s1">SetInfo</span><span class="s4">()</span>
+    <span class="s1">_CallHook</span><span class="s4">(</span><span class="s1">filterParams</span><span class="s4">, </span><span class="s6">&quot;PostRemove&quot;</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+    <span class="s1">log</span><span class="s4">(</span><span class="s5">1</span><span class="s4">, </span><span class="s6">&quot;Deleted Filter: %s&quot; </span><span class="s4">% (</span><span class="s1">filterParams</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">,))</span>
+
+
+<span class="s3">def </span><span class="s1">_AddExtensionFile</span><span class="s4">(</span><span class="s1">module</span><span class="s4">, </span><span class="s1">def_groupid</span><span class="s4">, </span><span class="s1">def_desc</span><span class="s4">, </span><span class="s1">params</span><span class="s4">, </span><span class="s1">options</span><span class="s4">):</span>
+    <span class="s1">group_id </span><span class="s4">= </span><span class="s1">params</span><span class="s4">.</span><span class="s1">AddExtensionFile_GroupID </span><span class="s3">or </span><span class="s1">def_groupid</span>
+    <span class="s1">desc </span><span class="s4">= </span><span class="s1">params</span><span class="s4">.</span><span class="s1">AddExtensionFile_Description </span><span class="s3">or </span><span class="s1">def_desc</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s1">ob </span><span class="s4">= </span><span class="s1">GetObject</span><span class="s4">(</span><span class="s1">_IIS_OBJECT</span><span class="s4">)</span>
+        <span class="s1">ob</span><span class="s4">.</span><span class="s1">AddExtensionFile</span><span class="s4">(</span>
+            <span class="s1">module</span><span class="s4">,</span>
+            <span class="s1">params</span><span class="s4">.</span><span class="s1">AddExtensionFile_Enabled</span><span class="s4">,</span>
+            <span class="s1">group_id</span><span class="s4">,</span>
+            <span class="s1">params</span><span class="s4">.</span><span class="s1">AddExtensionFile_CanDelete</span><span class="s4">,</span>
+            <span class="s1">desc</span><span class="s4">,</span>
+        <span class="s4">)</span>
+        <span class="s1">log</span><span class="s4">(</span><span class="s5">2</span><span class="s4">, </span><span class="s6">&quot;Added extension file '%s' (%s)&quot; </span><span class="s4">% (</span><span class="s1">module</span><span class="s4">, </span><span class="s1">desc</span><span class="s4">))</span>
+    <span class="s3">except </span><span class="s4">(</span><span class="s1">pythoncom</span><span class="s4">.</span><span class="s1">com_error</span><span class="s4">, </span><span class="s1">AttributeError</span><span class="s4">) </span><span class="s3">as </span><span class="s1">details</span><span class="s4">:</span>
+        <span class="s2"># IIS5 always fails.  Probably should upgrade this to</span>
+        <span class="s2"># complain more loudly if IIS6 fails.</span>
+        <span class="s1">log</span><span class="s4">(</span><span class="s5">2</span><span class="s4">, </span><span class="s6">&quot;Failed to add extension file '%s': %s&quot; </span><span class="s4">% (</span><span class="s1">module</span><span class="s4">, </span><span class="s1">details</span><span class="s4">))</span>
+
+
+<span class="s3">def </span><span class="s1">AddExtensionFiles</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s1">options</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Register the modules used by the filters/extensions as a trusted 
+    'extension module' - required by the default IIS6 security settings.&quot;&quot;&quot;</span>
+    <span class="s2"># Add each module only once.</span>
+    <span class="s1">added </span><span class="s4">= {}</span>
+    <span class="s3">for </span><span class="s1">vd </span><span class="s3">in </span><span class="s1">params</span><span class="s4">.</span><span class="s1">VirtualDirs</span><span class="s4">:</span>
+        <span class="s3">for </span><span class="s1">smp </span><span class="s3">in </span><span class="s1">vd</span><span class="s4">.</span><span class="s1">ScriptMaps</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">smp</span><span class="s4">.</span><span class="s1">Module </span><span class="s3">not in </span><span class="s1">added </span><span class="s3">and </span><span class="s1">smp</span><span class="s4">.</span><span class="s1">AddExtensionFile</span><span class="s4">:</span>
+                <span class="s1">_AddExtensionFile</span><span class="s4">(</span><span class="s1">smp</span><span class="s4">.</span><span class="s1">Module</span><span class="s4">, </span><span class="s1">vd</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">, </span><span class="s1">vd</span><span class="s4">.</span><span class="s1">Description</span><span class="s4">, </span><span class="s1">smp</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+                <span class="s1">added</span><span class="s4">[</span><span class="s1">smp</span><span class="s4">.</span><span class="s1">Module</span><span class="s4">] = </span><span class="s3">True</span>
+
+    <span class="s3">for </span><span class="s1">fd </span><span class="s3">in </span><span class="s1">params</span><span class="s4">.</span><span class="s1">Filters</span><span class="s4">:</span>
+        <span class="s3">if </span><span class="s1">fd</span><span class="s4">.</span><span class="s1">Path </span><span class="s3">not in </span><span class="s1">added </span><span class="s3">and </span><span class="s1">fd</span><span class="s4">.</span><span class="s1">AddExtensionFile</span><span class="s4">:</span>
+            <span class="s1">_AddExtensionFile</span><span class="s4">(</span><span class="s1">fd</span><span class="s4">.</span><span class="s1">Path</span><span class="s4">, </span><span class="s1">fd</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">, </span><span class="s1">fd</span><span class="s4">.</span><span class="s1">Description</span><span class="s4">, </span><span class="s1">fd</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+            <span class="s1">added</span><span class="s4">[</span><span class="s1">fd</span><span class="s4">.</span><span class="s1">Path</span><span class="s4">] = </span><span class="s3">True</span>
+
+
+<span class="s3">def </span><span class="s1">_DeleteExtensionFileRecord</span><span class="s4">(</span><span class="s1">module</span><span class="s4">, </span><span class="s1">options</span><span class="s4">):</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s1">ob </span><span class="s4">= </span><span class="s1">GetObject</span><span class="s4">(</span><span class="s1">_IIS_OBJECT</span><span class="s4">)</span>
+        <span class="s1">ob</span><span class="s4">.</span><span class="s1">DeleteExtensionFileRecord</span><span class="s4">(</span><span class="s1">module</span><span class="s4">)</span>
+        <span class="s1">log</span><span class="s4">(</span><span class="s5">2</span><span class="s4">, </span><span class="s6">&quot;Deleted extension file record for '%s'&quot; </span><span class="s4">% </span><span class="s1">module</span><span class="s4">)</span>
+    <span class="s3">except </span><span class="s4">(</span><span class="s1">pythoncom</span><span class="s4">.</span><span class="s1">com_error</span><span class="s4">, </span><span class="s1">AttributeError</span><span class="s4">) </span><span class="s3">as </span><span class="s1">details</span><span class="s4">:</span>
+        <span class="s1">log</span><span class="s4">(</span><span class="s5">2</span><span class="s4">, </span><span class="s6">&quot;Failed to remove extension file '%s': %s&quot; </span><span class="s4">% (</span><span class="s1">module</span><span class="s4">, </span><span class="s1">details</span><span class="s4">))</span>
+
+
+<span class="s3">def </span><span class="s1">DeleteExtensionFileRecords</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s1">options</span><span class="s4">):</span>
+    <span class="s1">deleted </span><span class="s4">= {}  </span><span class="s2"># only remove each .dll once.</span>
+    <span class="s3">for </span><span class="s1">vd </span><span class="s3">in </span><span class="s1">params</span><span class="s4">.</span><span class="s1">VirtualDirs</span><span class="s4">:</span>
+        <span class="s3">for </span><span class="s1">smp </span><span class="s3">in </span><span class="s1">vd</span><span class="s4">.</span><span class="s1">ScriptMaps</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">smp</span><span class="s4">.</span><span class="s1">Module </span><span class="s3">not in </span><span class="s1">deleted </span><span class="s3">and </span><span class="s1">smp</span><span class="s4">.</span><span class="s1">AddExtensionFile</span><span class="s4">:</span>
+                <span class="s1">_DeleteExtensionFileRecord</span><span class="s4">(</span><span class="s1">smp</span><span class="s4">.</span><span class="s1">Module</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+                <span class="s1">deleted</span><span class="s4">[</span><span class="s1">smp</span><span class="s4">.</span><span class="s1">Module</span><span class="s4">] = </span><span class="s3">True</span>
+
+    <span class="s3">for </span><span class="s1">filter_def </span><span class="s3">in </span><span class="s1">params</span><span class="s4">.</span><span class="s1">Filters</span><span class="s4">:</span>
+        <span class="s3">if </span><span class="s1">filter_def</span><span class="s4">.</span><span class="s1">Path </span><span class="s3">not in </span><span class="s1">deleted </span><span class="s3">and </span><span class="s1">filter_def</span><span class="s4">.</span><span class="s1">AddExtensionFile</span><span class="s4">:</span>
+            <span class="s1">_DeleteExtensionFileRecord</span><span class="s4">(</span><span class="s1">filter_def</span><span class="s4">.</span><span class="s1">Path</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+            <span class="s1">deleted</span><span class="s4">[</span><span class="s1">filter_def</span><span class="s4">.</span><span class="s1">Path</span><span class="s4">] = </span><span class="s3">True</span>
+
+
+<span class="s3">def </span><span class="s1">CheckLoaderModule</span><span class="s4">(</span><span class="s1">dll_name</span><span class="s4">):</span>
+    <span class="s1">suffix </span><span class="s4">= </span><span class="s6">&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">is_debug_build</span><span class="s4">:</span>
+        <span class="s1">suffix </span><span class="s4">= </span><span class="s6">&quot;_d&quot;</span>
+    <span class="s1">template </span><span class="s4">= </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">this_dir</span><span class="s4">, </span><span class="s6">&quot;PyISAPI_loader&quot; </span><span class="s4">+ </span><span class="s1">suffix </span><span class="s4">+ </span><span class="s6">&quot;.dll&quot;</span><span class="s4">)</span>
+    <span class="s3">if not </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">isfile</span><span class="s4">(</span><span class="s1">template</span><span class="s4">):</span>
+        <span class="s3">raise </span><span class="s1">ConfigurationError</span><span class="s4">(</span><span class="s6">&quot;Template loader '%s' does not exist&quot; </span><span class="s4">% (</span><span class="s1">template</span><span class="s4">,))</span>
+    <span class="s2"># We can't do a simple &quot;is newer&quot; check, as the DLL is specific to the</span>
+    <span class="s2"># Python version.  So we check the date-time and size are identical,</span>
+    <span class="s2"># and skip the copy in that case.</span>
+    <span class="s1">src_stat </span><span class="s4">= </span><span class="s1">os</span><span class="s4">.</span><span class="s1">stat</span><span class="s4">(</span><span class="s1">template</span><span class="s4">)</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s1">dest_stat </span><span class="s4">= </span><span class="s1">os</span><span class="s4">.</span><span class="s1">stat</span><span class="s4">(</span><span class="s1">dll_name</span><span class="s4">)</span>
+    <span class="s3">except </span><span class="s1">os</span><span class="s4">.</span><span class="s1">error</span><span class="s4">:</span>
+        <span class="s1">same </span><span class="s4">= </span><span class="s5">0</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s1">same </span><span class="s4">= (</span>
+            <span class="s1">src_stat</span><span class="s4">[</span><span class="s1">stat</span><span class="s4">.</span><span class="s1">ST_SIZE</span><span class="s4">] == </span><span class="s1">dest_stat</span><span class="s4">[</span><span class="s1">stat</span><span class="s4">.</span><span class="s1">ST_SIZE</span><span class="s4">]</span>
+            <span class="s3">and </span><span class="s1">src_stat</span><span class="s4">[</span><span class="s1">stat</span><span class="s4">.</span><span class="s1">ST_MTIME</span><span class="s4">] == </span><span class="s1">dest_stat</span><span class="s4">[</span><span class="s1">stat</span><span class="s4">.</span><span class="s1">ST_MTIME</span><span class="s4">]</span>
+        <span class="s4">)</span>
+    <span class="s3">if not </span><span class="s1">same</span><span class="s4">:</span>
+        <span class="s1">log</span><span class="s4">(</span><span class="s5">2</span><span class="s4">, </span><span class="s6">&quot;Updating %s-&gt;%s&quot; </span><span class="s4">% (</span><span class="s1">template</span><span class="s4">, </span><span class="s1">dll_name</span><span class="s4">))</span>
+        <span class="s1">shutil</span><span class="s4">.</span><span class="s1">copyfile</span><span class="s4">(</span><span class="s1">template</span><span class="s4">, </span><span class="s1">dll_name</span><span class="s4">)</span>
+        <span class="s1">shutil</span><span class="s4">.</span><span class="s1">copystat</span><span class="s4">(</span><span class="s1">template</span><span class="s4">, </span><span class="s1">dll_name</span><span class="s4">)</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s1">log</span><span class="s4">(</span><span class="s5">2</span><span class="s4">, </span><span class="s6">&quot;%s is up to date.&quot; </span><span class="s4">% (</span><span class="s1">dll_name</span><span class="s4">,))</span>
+
+
+<span class="s3">def </span><span class="s1">_CallHook</span><span class="s4">(</span><span class="s1">ob</span><span class="s4">, </span><span class="s1">hook_name</span><span class="s4">, </span><span class="s1">options</span><span class="s4">, *</span><span class="s1">extra_args</span><span class="s4">):</span>
+    <span class="s1">func </span><span class="s4">= </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">ob</span><span class="s4">, </span><span class="s1">hook_name</span><span class="s4">, </span><span class="s3">None</span><span class="s4">)</span>
+    <span class="s3">if </span><span class="s1">func </span><span class="s3">is not None</span><span class="s4">:</span>
+        <span class="s1">args </span><span class="s4">= (</span><span class="s1">ob</span><span class="s4">, </span><span class="s1">options</span><span class="s4">) + </span><span class="s1">extra_args</span>
+        <span class="s1">func</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">Install</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s1">options</span><span class="s4">):</span>
+    <span class="s1">_CallHook</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s6">&quot;PreInstall&quot;</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+    <span class="s3">for </span><span class="s1">vd </span><span class="s3">in </span><span class="s1">params</span><span class="s4">.</span><span class="s1">VirtualDirs</span><span class="s4">:</span>
+        <span class="s1">CreateDirectory</span><span class="s4">(</span><span class="s1">vd</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+
+    <span class="s3">for </span><span class="s1">filter_def </span><span class="s3">in </span><span class="s1">params</span><span class="s4">.</span><span class="s1">Filters</span><span class="s4">:</span>
+        <span class="s1">CreateISAPIFilter</span><span class="s4">(</span><span class="s1">filter_def</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+
+    <span class="s1">AddExtensionFiles</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+
+    <span class="s1">_CallHook</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s6">&quot;PostInstall&quot;</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">RemoveDirectory</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s1">options</span><span class="s4">):</span>
+    <span class="s3">if </span><span class="s1">params</span><span class="s4">.</span><span class="s1">is_root</span><span class="s4">():</span>
+        <span class="s3">return</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s1">directory </span><span class="s4">= </span><span class="s1">GetObject</span><span class="s4">(</span><span class="s1">FindPath</span><span class="s4">(</span><span class="s1">options</span><span class="s4">, </span><span class="s1">params</span><span class="s4">.</span><span class="s1">Server</span><span class="s4">, </span><span class="s1">params</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">))</span>
+    <span class="s3">except </span><span class="s1">pythoncom</span><span class="s4">.</span><span class="s1">com_error </span><span class="s3">as </span><span class="s1">details</span><span class="s4">:</span>
+        <span class="s1">rc </span><span class="s4">= </span><span class="s1">_GetWin32ErrorCode</span><span class="s4">(</span><span class="s1">details</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">rc </span><span class="s4">!= </span><span class="s1">winerror</span><span class="s4">.</span><span class="s1">ERROR_PATH_NOT_FOUND</span><span class="s4">:</span>
+            <span class="s3">raise</span>
+        <span class="s1">log</span><span class="s4">(</span><span class="s5">2</span><span class="s4">, </span><span class="s6">&quot;VirtualDirectory '%s' did not exist&quot; </span><span class="s4">% </span><span class="s1">params</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">)</span>
+        <span class="s1">directory </span><span class="s4">= </span><span class="s3">None</span>
+    <span class="s3">if </span><span class="s1">directory </span><span class="s3">is not None</span><span class="s4">:</span>
+        <span class="s2"># Be robust should IIS get upset about unloading.</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s1">directory</span><span class="s4">.</span><span class="s1">AppUnLoad</span><span class="s4">()</span>
+        <span class="s3">except</span><span class="s4">:</span>
+            <span class="s1">exc_val </span><span class="s4">= </span><span class="s1">sys</span><span class="s4">.</span><span class="s1">exc_info</span><span class="s4">()[</span><span class="s5">1</span><span class="s4">]</span>
+            <span class="s1">log</span><span class="s4">(</span><span class="s5">2</span><span class="s4">, </span><span class="s6">&quot;AppUnLoad() for %s failed: %s&quot; </span><span class="s4">% (</span><span class="s1">params</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">, </span><span class="s1">exc_val</span><span class="s4">))</span>
+        <span class="s2"># Continue trying to delete it.</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s1">parent </span><span class="s4">= </span><span class="s1">GetObject</span><span class="s4">(</span><span class="s1">directory</span><span class="s4">.</span><span class="s1">Parent</span><span class="s4">)</span>
+            <span class="s1">parent</span><span class="s4">.</span><span class="s1">Delete</span><span class="s4">(</span><span class="s1">directory</span><span class="s4">.</span><span class="s1">Class</span><span class="s4">, </span><span class="s1">directory</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">)</span>
+            <span class="s1">log</span><span class="s4">(</span><span class="s5">1</span><span class="s4">, </span><span class="s6">&quot;Deleted Virtual Directory: %s&quot; </span><span class="s4">% (</span><span class="s1">params</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">,))</span>
+        <span class="s3">except</span><span class="s4">:</span>
+            <span class="s1">exc_val </span><span class="s4">= </span><span class="s1">sys</span><span class="s4">.</span><span class="s1">exc_info</span><span class="s4">()[</span><span class="s5">1</span><span class="s4">]</span>
+            <span class="s1">log</span><span class="s4">(</span><span class="s5">1</span><span class="s4">, </span><span class="s6">&quot;Failed to remove directory %s: %s&quot; </span><span class="s4">% (</span><span class="s1">params</span><span class="s4">.</span><span class="s1">Name</span><span class="s4">, </span><span class="s1">exc_val</span><span class="s4">))</span>
+
+
+<span class="s3">def </span><span class="s1">RemoveScriptMaps</span><span class="s4">(</span><span class="s1">vd_params</span><span class="s4">, </span><span class="s1">options</span><span class="s4">):</span>
+    <span class="s0">&quot;Remove script maps from the already installed virtual directory&quot;</span>
+    <span class="s1">parent</span><span class="s4">, </span><span class="s1">name </span><span class="s4">= </span><span class="s1">vd_params</span><span class="s4">.</span><span class="s1">split_path</span><span class="s4">()</span>
+    <span class="s1">target_dir </span><span class="s4">= </span><span class="s1">GetObject</span><span class="s4">(</span><span class="s1">FindPath</span><span class="s4">(</span><span class="s1">options</span><span class="s4">, </span><span class="s1">vd_params</span><span class="s4">.</span><span class="s1">Server</span><span class="s4">, </span><span class="s1">parent</span><span class="s4">))</span>
+    <span class="s1">installed_maps </span><span class="s4">= </span><span class="s1">list</span><span class="s4">(</span><span class="s1">target_dir</span><span class="s4">.</span><span class="s1">ScriptMaps</span><span class="s4">)</span>
+    <span class="s3">for </span><span class="s1">_map </span><span class="s3">in </span><span class="s1">map</span><span class="s4">(</span><span class="s1">str</span><span class="s4">, </span><span class="s1">vd_params</span><span class="s4">.</span><span class="s1">ScriptMaps</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">_map </span><span class="s3">in </span><span class="s1">installed_maps</span><span class="s4">:</span>
+            <span class="s1">installed_maps</span><span class="s4">.</span><span class="s1">remove</span><span class="s4">(</span><span class="s1">_map</span><span class="s4">)</span>
+    <span class="s1">target_dir</span><span class="s4">.</span><span class="s1">ScriptMaps </span><span class="s4">= </span><span class="s1">installed_maps</span>
+    <span class="s1">target_dir</span><span class="s4">.</span><span class="s1">SetInfo</span><span class="s4">()</span>
+
+
+<span class="s3">def </span><span class="s1">Uninstall</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s1">options</span><span class="s4">):</span>
+    <span class="s1">_CallHook</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s6">&quot;PreRemove&quot;</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+
+    <span class="s1">DeleteExtensionFileRecords</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+
+    <span class="s3">for </span><span class="s1">vd </span><span class="s3">in </span><span class="s1">params</span><span class="s4">.</span><span class="s1">VirtualDirs</span><span class="s4">:</span>
+        <span class="s1">_CallHook</span><span class="s4">(</span><span class="s1">vd</span><span class="s4">, </span><span class="s6">&quot;PreRemove&quot;</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+
+        <span class="s1">RemoveDirectory</span><span class="s4">(</span><span class="s1">vd</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">vd</span><span class="s4">.</span><span class="s1">is_root</span><span class="s4">():</span>
+            <span class="s2"># if this is installed to the root virtual directory, we can't delete it</span>
+            <span class="s2">#  so remove the script maps.</span>
+            <span class="s1">RemoveScriptMaps</span><span class="s4">(</span><span class="s1">vd</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+
+        <span class="s1">_CallHook</span><span class="s4">(</span><span class="s1">vd</span><span class="s4">, </span><span class="s6">&quot;PostRemove&quot;</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+
+    <span class="s3">for </span><span class="s1">filter_def </span><span class="s3">in </span><span class="s1">params</span><span class="s4">.</span><span class="s1">Filters</span><span class="s4">:</span>
+        <span class="s1">DeleteISAPIFilter</span><span class="s4">(</span><span class="s1">filter_def</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+    <span class="s1">_CallHook</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s6">&quot;PostRemove&quot;</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+
+
+<span class="s2"># Patch up any missing module names in the params, replacing them with</span>
+<span class="s2"># the DLL name that hosts this extension/filter.</span>
+<span class="s3">def </span><span class="s1">_PatchParamsModule</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s1">dll_name</span><span class="s4">, </span><span class="s1">file_must_exist</span><span class="s4">=</span><span class="s3">True</span><span class="s4">):</span>
+    <span class="s3">if </span><span class="s1">file_must_exist</span><span class="s4">:</span>
+        <span class="s3">if not </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">isfile</span><span class="s4">(</span><span class="s1">dll_name</span><span class="s4">):</span>
+            <span class="s3">raise </span><span class="s1">ConfigurationError</span><span class="s4">(</span><span class="s6">&quot;%s does not exist&quot; </span><span class="s4">% (</span><span class="s1">dll_name</span><span class="s4">,))</span>
+
+    <span class="s2"># Patch up all references to the DLL.</span>
+    <span class="s3">for </span><span class="s1">f </span><span class="s3">in </span><span class="s1">params</span><span class="s4">.</span><span class="s1">Filters</span><span class="s4">:</span>
+        <span class="s3">if </span><span class="s1">f</span><span class="s4">.</span><span class="s1">Path </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s1">f</span><span class="s4">.</span><span class="s1">Path </span><span class="s4">= </span><span class="s1">dll_name</span>
+    <span class="s3">for </span><span class="s1">d </span><span class="s3">in </span><span class="s1">params</span><span class="s4">.</span><span class="s1">VirtualDirs</span><span class="s4">:</span>
+        <span class="s3">for </span><span class="s1">sm </span><span class="s3">in </span><span class="s1">d</span><span class="s4">.</span><span class="s1">ScriptMaps</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">sm</span><span class="s4">.</span><span class="s1">Module </span><span class="s3">is None</span><span class="s4">:</span>
+                <span class="s1">sm</span><span class="s4">.</span><span class="s1">Module </span><span class="s4">= </span><span class="s1">dll_name</span>
+
+
+<span class="s3">def </span><span class="s1">GetLoaderModuleName</span><span class="s4">(</span><span class="s1">mod_name</span><span class="s4">, </span><span class="s1">check_module</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+    <span class="s2"># find the name of the DLL hosting us.</span>
+    <span class="s2"># By default, this is &quot;_{module_base_name}.dll&quot;</span>
+    <span class="s3">if </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">sys</span><span class="s4">, </span><span class="s6">&quot;frozen&quot;</span><span class="s4">):</span>
+        <span class="s2"># What to do?  The .dll knows its name, but this is likely to be</span>
+        <span class="s2"># executed via a .exe, which does not know.</span>
+        <span class="s1">base</span><span class="s4">, </span><span class="s1">ext </span><span class="s4">= </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">splitext</span><span class="s4">(</span><span class="s1">mod_name</span><span class="s4">)</span>
+        <span class="s1">path</span><span class="s4">, </span><span class="s1">base </span><span class="s4">= </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">split</span><span class="s4">(</span><span class="s1">base</span><span class="s4">)</span>
+        <span class="s2"># handle the common case of 'foo.exe'/'foow.exe'</span>
+        <span class="s3">if </span><span class="s1">base</span><span class="s4">.</span><span class="s1">endswith</span><span class="s4">(</span><span class="s6">&quot;w&quot;</span><span class="s4">):</span>
+            <span class="s1">base </span><span class="s4">= </span><span class="s1">base</span><span class="s4">[:-</span><span class="s5">1</span><span class="s4">]</span>
+        <span class="s2"># For py2exe, we have '_foo.dll' as the standard pyisapi loader - but</span>
+        <span class="s2"># 'foo.dll' is what we use (it just delegates).</span>
+        <span class="s2"># So no leading '_' on the installed name.</span>
+        <span class="s1">dll_name </span><span class="s4">= </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">abspath</span><span class="s4">(</span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">path</span><span class="s4">, </span><span class="s1">base </span><span class="s4">+ </span><span class="s6">&quot;.dll&quot;</span><span class="s4">))</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s1">base</span><span class="s4">, </span><span class="s1">ext </span><span class="s4">= </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">splitext</span><span class="s4">(</span><span class="s1">mod_name</span><span class="s4">)</span>
+        <span class="s1">path</span><span class="s4">, </span><span class="s1">base </span><span class="s4">= </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">split</span><span class="s4">(</span><span class="s1">base</span><span class="s4">)</span>
+        <span class="s1">dll_name </span><span class="s4">= </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">abspath</span><span class="s4">(</span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">path</span><span class="s4">, </span><span class="s6">&quot;_&quot; </span><span class="s4">+ </span><span class="s1">base </span><span class="s4">+ </span><span class="s6">&quot;.dll&quot;</span><span class="s4">))</span>
+    <span class="s2"># Check we actually have it.</span>
+    <span class="s3">if </span><span class="s1">check_module </span><span class="s3">is None</span><span class="s4">:</span>
+        <span class="s1">check_module </span><span class="s4">= </span><span class="s3">not </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">sys</span><span class="s4">, </span><span class="s6">&quot;frozen&quot;</span><span class="s4">)</span>
+    <span class="s3">if </span><span class="s1">check_module</span><span class="s4">:</span>
+        <span class="s1">CheckLoaderModule</span><span class="s4">(</span><span class="s1">dll_name</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">dll_name</span>
+
+
+<span class="s2"># Note the 'log' params to these 'builtin' args - old versions of pywin32</span>
+<span class="s2"># didn't log at all in this function (by intent; anyone calling this was</span>
+<span class="s2"># responsible). So existing code that calls this function with the old</span>
+<span class="s2"># signature (ie, without a 'log' param) still gets the same behaviour as</span>
+<span class="s2"># before...</span>
+
+
+<span class="s3">def </span><span class="s1">InstallModule</span><span class="s4">(</span><span class="s1">conf_module_name</span><span class="s4">, </span><span class="s1">params</span><span class="s4">, </span><span class="s1">options</span><span class="s4">, </span><span class="s1">log</span><span class="s4">=</span><span class="s3">lambda </span><span class="s4">*</span><span class="s1">args</span><span class="s4">: </span><span class="s3">None</span><span class="s4">):</span>
+    <span class="s0">&quot;Install the extension&quot;</span>
+    <span class="s3">if not </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">sys</span><span class="s4">, </span><span class="s6">&quot;frozen&quot;</span><span class="s4">):</span>
+        <span class="s1">conf_module_name </span><span class="s4">= </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">abspath</span><span class="s4">(</span><span class="s1">conf_module_name</span><span class="s4">)</span>
+        <span class="s3">if not </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">isfile</span><span class="s4">(</span><span class="s1">conf_module_name</span><span class="s4">):</span>
+            <span class="s3">raise </span><span class="s1">ConfigurationError</span><span class="s4">(</span><span class="s6">&quot;%s does not exist&quot; </span><span class="s4">% (</span><span class="s1">conf_module_name</span><span class="s4">,))</span>
+
+    <span class="s1">loader_dll </span><span class="s4">= </span><span class="s1">GetLoaderModuleName</span><span class="s4">(</span><span class="s1">conf_module_name</span><span class="s4">)</span>
+    <span class="s1">_PatchParamsModule</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s1">loader_dll</span><span class="s4">)</span>
+    <span class="s1">Install</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+    <span class="s1">log</span><span class="s4">(</span><span class="s5">1</span><span class="s4">, </span><span class="s6">&quot;Installation complete.&quot;</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">UninstallModule</span><span class="s4">(</span><span class="s1">conf_module_name</span><span class="s4">, </span><span class="s1">params</span><span class="s4">, </span><span class="s1">options</span><span class="s4">, </span><span class="s1">log</span><span class="s4">=</span><span class="s3">lambda </span><span class="s4">*</span><span class="s1">args</span><span class="s4">: </span><span class="s3">None</span><span class="s4">):</span>
+    <span class="s0">&quot;Remove the extension&quot;</span>
+    <span class="s1">loader_dll </span><span class="s4">= </span><span class="s1">GetLoaderModuleName</span><span class="s4">(</span><span class="s1">conf_module_name</span><span class="s4">, </span><span class="s3">False</span><span class="s4">)</span>
+    <span class="s1">_PatchParamsModule</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s1">loader_dll</span><span class="s4">, </span><span class="s3">False</span><span class="s4">)</span>
+    <span class="s1">Uninstall</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s1">options</span><span class="s4">)</span>
+    <span class="s1">log</span><span class="s4">(</span><span class="s5">1</span><span class="s4">, </span><span class="s6">&quot;Uninstallation complete.&quot;</span><span class="s4">)</span>
+
+
+<span class="s1">standard_arguments </span><span class="s4">= {</span>
+    <span class="s6">&quot;install&quot;</span><span class="s4">: </span><span class="s1">InstallModule</span><span class="s4">,</span>
+    <span class="s6">&quot;remove&quot;</span><span class="s4">: </span><span class="s1">UninstallModule</span><span class="s4">,</span>
+<span class="s4">}</span>
+
+
+<span class="s3">def </span><span class="s1">build_usage</span><span class="s4">(</span><span class="s1">handler_map</span><span class="s4">):</span>
+    <span class="s1">docstrings </span><span class="s4">= [</span><span class="s1">handler</span><span class="s4">.</span><span class="s1">__doc__ </span><span class="s3">for </span><span class="s1">handler </span><span class="s3">in </span><span class="s1">handler_map</span><span class="s4">.</span><span class="s1">values</span><span class="s4">()]</span>
+    <span class="s1">all_args </span><span class="s4">= </span><span class="s1">dict</span><span class="s4">(</span><span class="s1">zip</span><span class="s4">(</span><span class="s1">iter</span><span class="s4">(</span><span class="s1">handler_map</span><span class="s4">.</span><span class="s1">keys</span><span class="s4">()), </span><span class="s1">docstrings</span><span class="s4">))</span>
+    <span class="s1">arg_names </span><span class="s4">= </span><span class="s6">&quot;|&quot;</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">iter</span><span class="s4">(</span><span class="s1">all_args</span><span class="s4">.</span><span class="s1">keys</span><span class="s4">()))</span>
+    <span class="s1">usage_string </span><span class="s4">= </span><span class="s6">&quot;%prog [options] [&quot; </span><span class="s4">+ </span><span class="s1">arg_names </span><span class="s4">+ </span><span class="s6">&quot;]</span><span class="s3">\n</span><span class="s6">&quot;</span>
+    <span class="s1">usage_string </span><span class="s4">+= </span><span class="s6">&quot;commands:</span><span class="s3">\n</span><span class="s6">&quot;</span>
+    <span class="s3">for </span><span class="s1">arg</span><span class="s4">, </span><span class="s1">desc </span><span class="s3">in </span><span class="s1">all_args</span><span class="s4">.</span><span class="s1">items</span><span class="s4">():</span>
+        <span class="s1">usage_string </span><span class="s4">+= </span><span class="s6">&quot; %-10s: %s&quot; </span><span class="s4">% (</span><span class="s1">arg</span><span class="s4">, </span><span class="s1">desc</span><span class="s4">) + </span><span class="s6">&quot;</span><span class="s3">\n</span><span class="s6">&quot;</span>
+    <span class="s3">return </span><span class="s1">usage_string</span><span class="s4">[:-</span><span class="s5">1</span><span class="s4">]</span>
+
+
+<span class="s3">def </span><span class="s1">MergeStandardOptions</span><span class="s4">(</span><span class="s1">options</span><span class="s4">, </span><span class="s1">params</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Take an options object generated by the command line and merge 
+    the values into the IISParameters object. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">pass</span>
+
+
+<span class="s2"># We support 2 ways of extending our command-line/install support.</span>
+<span class="s2"># * Many of the installation items allow you to specify &quot;PreInstall&quot;,</span>
+<span class="s2">#   &quot;PostInstall&quot;, &quot;PreRemove&quot; and &quot;PostRemove&quot; hooks</span>
+<span class="s2">#   All hooks are called with the 'params' object being operated on, and</span>
+<span class="s2">#   the 'optparser' options for this session (ie, the command-line options)</span>
+<span class="s2">#   PostInstall for VirtualDirectories and Filters both have an additional</span>
+<span class="s2">#   param - the ADSI object just created.</span>
+<span class="s2"># * You can pass your own option parser for us to use, and/or define a map</span>
+<span class="s2">#   with your own custom arg handlers.  It is a map of 'arg'-&gt;function.</span>
+<span class="s2">#   The function is called with (options, log_fn, arg).  The function's</span>
+<span class="s2">#   docstring is used in the usage output.</span>
+<span class="s3">def </span><span class="s1">HandleCommandLine</span><span class="s4">(</span>
+    <span class="s1">params</span><span class="s4">,</span>
+    <span class="s1">argv</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s1">conf_module_name</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s1">default_arg</span><span class="s4">=</span><span class="s6">&quot;install&quot;</span><span class="s4">,</span>
+    <span class="s1">opt_parser</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s1">custom_arg_handlers</span><span class="s4">={},</span>
+<span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Perform installation or removal of an ISAPI filter or extension. 
+ 
+    This module handles standard command-line options and configuration 
+    information, and installs, removes or updates the configuration of an 
+    ISAPI filter or extension. 
+ 
+    You must pass your configuration information in params - all other 
+    arguments are optional, and allow you to configure the installation 
+    process. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">global </span><span class="s1">verbose</span>
+    <span class="s3">from </span><span class="s1">optparse </span><span class="s3">import </span><span class="s1">OptionParser</span>
+
+    <span class="s1">argv </span><span class="s4">= </span><span class="s1">argv </span><span class="s3">or </span><span class="s1">sys</span><span class="s4">.</span><span class="s1">argv</span>
+    <span class="s3">if not </span><span class="s1">conf_module_name</span><span class="s4">:</span>
+        <span class="s1">conf_module_name </span><span class="s4">= </span><span class="s1">sys</span><span class="s4">.</span><span class="s1">argv</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+        <span class="s2"># convert to a long name so that if we were somehow registered with</span>
+        <span class="s2"># the &quot;short&quot; version but unregistered with the &quot;long&quot; version we</span>
+        <span class="s2"># still work (that will depend on exactly how the installer was</span>
+        <span class="s2"># started)</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s1">conf_module_name </span><span class="s4">= </span><span class="s1">win32api</span><span class="s4">.</span><span class="s1">GetLongPathName</span><span class="s4">(</span><span class="s1">conf_module_name</span><span class="s4">)</span>
+        <span class="s3">except </span><span class="s1">win32api</span><span class="s4">.</span><span class="s1">error </span><span class="s3">as </span><span class="s1">exc</span><span class="s4">:</span>
+            <span class="s1">log</span><span class="s4">(</span>
+                <span class="s5">2</span><span class="s4">,</span>
+                <span class="s6">&quot;Couldn't determine the long name for %r: %s&quot; </span><span class="s4">% (</span><span class="s1">conf_module_name</span><span class="s4">, </span><span class="s1">exc</span><span class="s4">),</span>
+            <span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">opt_parser </span><span class="s3">is None</span><span class="s4">:</span>
+        <span class="s2"># Build our own parser.</span>
+        <span class="s1">parser </span><span class="s4">= </span><span class="s1">OptionParser</span><span class="s4">(</span><span class="s1">usage</span><span class="s4">=</span><span class="s6">&quot;&quot;</span><span class="s4">)</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s2"># The caller is providing their own filter, presumably with their</span>
+        <span class="s2"># own options all setup.</span>
+        <span class="s1">parser </span><span class="s4">= </span><span class="s1">opt_parser</span>
+
+    <span class="s2"># build a usage string if we don't have one.</span>
+    <span class="s3">if not </span><span class="s1">parser</span><span class="s4">.</span><span class="s1">get_usage</span><span class="s4">():</span>
+        <span class="s1">all_handlers </span><span class="s4">= </span><span class="s1">standard_arguments</span><span class="s4">.</span><span class="s1">copy</span><span class="s4">()</span>
+        <span class="s1">all_handlers</span><span class="s4">.</span><span class="s1">update</span><span class="s4">(</span><span class="s1">custom_arg_handlers</span><span class="s4">)</span>
+        <span class="s1">parser</span><span class="s4">.</span><span class="s1">set_usage</span><span class="s4">(</span><span class="s1">build_usage</span><span class="s4">(</span><span class="s1">all_handlers</span><span class="s4">))</span>
+
+    <span class="s2"># allow the user to use uninstall as a synonym for remove if it wasn't</span>
+    <span class="s2">#  defined by the custom arg handlers.</span>
+    <span class="s1">all_handlers</span><span class="s4">.</span><span class="s1">setdefault</span><span class="s4">(</span><span class="s6">&quot;uninstall&quot;</span><span class="s4">, </span><span class="s1">all_handlers</span><span class="s4">[</span><span class="s6">&quot;remove&quot;</span><span class="s4">])</span>
+
+    <span class="s1">parser</span><span class="s4">.</span><span class="s1">add_option</span><span class="s4">(</span>
+        <span class="s6">&quot;-q&quot;</span><span class="s4">,</span>
+        <span class="s6">&quot;--quiet&quot;</span><span class="s4">,</span>
+        <span class="s1">action</span><span class="s4">=</span><span class="s6">&quot;store_false&quot;</span><span class="s4">,</span>
+        <span class="s1">dest</span><span class="s4">=</span><span class="s6">&quot;verbose&quot;</span><span class="s4">,</span>
+        <span class="s1">default</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+        <span class="s1">help</span><span class="s4">=</span><span class="s6">&quot;don't print status messages to stdout&quot;</span><span class="s4">,</span>
+    <span class="s4">)</span>
+    <span class="s1">parser</span><span class="s4">.</span><span class="s1">add_option</span><span class="s4">(</span>
+        <span class="s6">&quot;-v&quot;</span><span class="s4">,</span>
+        <span class="s6">&quot;--verbosity&quot;</span><span class="s4">,</span>
+        <span class="s1">action</span><span class="s4">=</span><span class="s6">&quot;count&quot;</span><span class="s4">,</span>
+        <span class="s1">dest</span><span class="s4">=</span><span class="s6">&quot;verbose&quot;</span><span class="s4">,</span>
+        <span class="s1">default</span><span class="s4">=</span><span class="s5">1</span><span class="s4">,</span>
+        <span class="s1">help</span><span class="s4">=</span><span class="s6">&quot;increase the verbosity of status messages&quot;</span><span class="s4">,</span>
+    <span class="s4">)</span>
+    <span class="s1">parser</span><span class="s4">.</span><span class="s1">add_option</span><span class="s4">(</span>
+        <span class="s6">&quot;&quot;</span><span class="s4">,</span>
+        <span class="s6">&quot;--server&quot;</span><span class="s4">,</span>
+        <span class="s1">action</span><span class="s4">=</span><span class="s6">&quot;store&quot;</span><span class="s4">,</span>
+        <span class="s1">help</span><span class="s4">=</span><span class="s6">&quot;Specifies the IIS server to install/uninstall on.&quot;</span>
+        <span class="s6">&quot; Default is '%s/1'&quot; </span><span class="s4">% (</span><span class="s1">_IIS_OBJECT</span><span class="s4">,),</span>
+    <span class="s4">)</span>
+
+    <span class="s4">(</span><span class="s1">options</span><span class="s4">, </span><span class="s1">args</span><span class="s4">) = </span><span class="s1">parser</span><span class="s4">.</span><span class="s1">parse_args</span><span class="s4">(</span><span class="s1">argv</span><span class="s4">[</span><span class="s5">1</span><span class="s4">:])</span>
+    <span class="s1">MergeStandardOptions</span><span class="s4">(</span><span class="s1">options</span><span class="s4">, </span><span class="s1">params</span><span class="s4">)</span>
+    <span class="s1">verbose </span><span class="s4">= </span><span class="s1">options</span><span class="s4">.</span><span class="s1">verbose</span>
+    <span class="s3">if not </span><span class="s1">args</span><span class="s4">:</span>
+        <span class="s1">args </span><span class="s4">= [</span><span class="s1">default_arg</span><span class="s4">]</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s3">for </span><span class="s1">arg </span><span class="s3">in </span><span class="s1">args</span><span class="s4">:</span>
+            <span class="s1">handler </span><span class="s4">= </span><span class="s1">all_handlers</span><span class="s4">[</span><span class="s1">arg</span><span class="s4">]</span>
+            <span class="s1">handler</span><span class="s4">(</span><span class="s1">conf_module_name</span><span class="s4">, </span><span class="s1">params</span><span class="s4">, </span><span class="s1">options</span><span class="s4">, </span><span class="s1">log</span><span class="s4">)</span>
+    <span class="s3">except </span><span class="s4">(</span><span class="s1">ItemNotFound</span><span class="s4">, </span><span class="s1">InstallationError</span><span class="s4">) </span><span class="s3">as </span><span class="s1">details</span><span class="s4">:</span>
+        <span class="s3">if </span><span class="s1">options</span><span class="s4">.</span><span class="s1">verbose </span><span class="s4">&gt; </span><span class="s5">1</span><span class="s4">:</span>
+            <span class="s1">traceback</span><span class="s4">.</span><span class="s1">print_exc</span><span class="s4">()</span>
+        <span class="s1">print</span><span class="s4">(</span><span class="s6">&quot;%s: %s&quot; </span><span class="s4">% (</span><span class="s1">details</span><span class="s4">.</span><span class="s1">__class__</span><span class="s4">.</span><span class="s1">__name__</span><span class="s4">, </span><span class="s1">details</span><span class="s4">))</span>
+    <span class="s3">except </span><span class="s1">KeyError</span><span class="s4">:</span>
+        <span class="s1">parser</span><span class="s4">.</span><span class="s1">error</span><span class="s4">(</span><span class="s6">&quot;Invalid arg '%s'&quot; </span><span class="s4">% </span><span class="s1">arg</span><span class="s4">)</span>
+</pre>
+</body>
+</html>

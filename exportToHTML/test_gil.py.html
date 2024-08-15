@@ -1,0 +1,205 @@
+<html>
+<head>
+<title>test_gil.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #7a7e85;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+.s6 { color: #5f826b; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_gil.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">ctypes</span>
+<span class="s0">import </span><span class="s1">ctypes</span><span class="s2">.</span><span class="s1">util</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">sys</span>
+<span class="s0">import </span><span class="s1">threading</span>
+<span class="s0">import </span><span class="s1">warnings</span>
+
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+
+<span class="s0">import </span><span class="s1">unittest</span>
+<span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">jit</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">errors</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">tests</span><span class="s2">.</span><span class="s1">support </span><span class="s0">import </span><span class="s1">TestCase</span><span class="s2">, </span><span class="s1">tag</span>
+
+
+<span class="s3"># This CPython API function is a portable way to get the current thread id.</span>
+<span class="s1">PyThread_get_thread_ident </span><span class="s2">= </span><span class="s1">ctypes</span><span class="s2">.</span><span class="s1">pythonapi</span><span class="s2">.</span><span class="s1">PyThread_get_thread_ident</span>
+<span class="s1">PyThread_get_thread_ident</span><span class="s2">.</span><span class="s1">restype </span><span class="s2">= </span><span class="s1">ctypes</span><span class="s2">.</span><span class="s1">c_long</span>
+<span class="s1">PyThread_get_thread_ident</span><span class="s2">.</span><span class="s1">argtypes </span><span class="s2">= []</span>
+
+<span class="s3"># A way of sleeping from nopython code</span>
+<span class="s0">if </span><span class="s1">os</span><span class="s2">.</span><span class="s1">name </span><span class="s2">== </span><span class="s4">'nt'</span><span class="s2">:</span>
+    <span class="s1">sleep </span><span class="s2">= </span><span class="s1">ctypes</span><span class="s2">.</span><span class="s1">windll</span><span class="s2">.</span><span class="s1">kernel32</span><span class="s2">.</span><span class="s1">Sleep</span>
+    <span class="s1">sleep</span><span class="s2">.</span><span class="s1">argtypes </span><span class="s2">= [</span><span class="s1">ctypes</span><span class="s2">.</span><span class="s1">c_uint</span><span class="s2">]</span>
+    <span class="s1">sleep</span><span class="s2">.</span><span class="s1">restype </span><span class="s2">= </span><span class="s0">None</span>
+    <span class="s1">sleep_factor </span><span class="s2">= </span><span class="s5">1  </span><span class="s3"># milliseconds</span>
+<span class="s0">else</span><span class="s2">:</span>
+    <span class="s1">sleep </span><span class="s2">= </span><span class="s1">ctypes</span><span class="s2">.</span><span class="s1">CDLL</span><span class="s2">(</span><span class="s1">ctypes</span><span class="s2">.</span><span class="s1">util</span><span class="s2">.</span><span class="s1">find_library</span><span class="s2">(</span><span class="s4">&quot;c&quot;</span><span class="s2">)).</span><span class="s1">usleep</span>
+    <span class="s1">sleep</span><span class="s2">.</span><span class="s1">argtypes </span><span class="s2">= [</span><span class="s1">ctypes</span><span class="s2">.</span><span class="s1">c_uint</span><span class="s2">]</span>
+    <span class="s1">sleep</span><span class="s2">.</span><span class="s1">restype </span><span class="s2">= </span><span class="s1">ctypes</span><span class="s2">.</span><span class="s1">c_int</span>
+    <span class="s1">sleep_factor </span><span class="s2">= </span><span class="s5">1000  </span><span class="s3"># microseconds</span>
+
+
+<span class="s0">def </span><span class="s1">f</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">indices</span><span class="s2">):</span>
+    <span class="s3"># If run from one thread at a time, the function will always fill the</span>
+    <span class="s3"># array with identical values.</span>
+    <span class="s3"># If run from several threads at a time, the function will probably</span>
+    <span class="s3"># fill the array with differing values.</span>
+    <span class="s0">for </span><span class="s1">idx </span><span class="s0">in </span><span class="s1">indices</span><span class="s2">:</span>
+        <span class="s3"># Let another thread run</span>
+        <span class="s1">sleep</span><span class="s2">(</span><span class="s5">10 </span><span class="s2">* </span><span class="s1">sleep_factor</span><span class="s2">)</span>
+        <span class="s1">a</span><span class="s2">[</span><span class="s1">idx</span><span class="s2">] = </span><span class="s1">PyThread_get_thread_ident</span><span class="s2">()</span>
+
+<span class="s1">f_sig </span><span class="s2">= </span><span class="s4">&quot;void(int64[:], intp[:])&quot;</span>
+
+<span class="s0">def </span><span class="s1">lifted_f</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">indices</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    Same as f(), but inside a lifted loop 
+    &quot;&quot;&quot;</span>
+    <span class="s1">object</span><span class="s2">()   </span><span class="s3"># Force object mode</span>
+    <span class="s0">for </span><span class="s1">idx </span><span class="s0">in </span><span class="s1">indices</span><span class="s2">:</span>
+        <span class="s3"># Let another thread run</span>
+        <span class="s1">sleep</span><span class="s2">(</span><span class="s5">10 </span><span class="s2">* </span><span class="s1">sleep_factor</span><span class="s2">)</span>
+        <span class="s1">a</span><span class="s2">[</span><span class="s1">idx</span><span class="s2">] = </span><span class="s1">PyThread_get_thread_ident</span><span class="s2">()</span>
+
+<span class="s0">def </span><span class="s1">object_f</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">indices</span><span class="s2">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    Same as f(), but in object mode 
+    &quot;&quot;&quot;</span>
+    <span class="s0">for </span><span class="s1">idx </span><span class="s0">in </span><span class="s1">indices</span><span class="s2">:</span>
+        <span class="s3"># Let another thread run</span>
+        <span class="s1">sleep</span><span class="s2">(</span><span class="s5">10 </span><span class="s2">* </span><span class="s1">sleep_factor</span><span class="s2">)</span>
+        <span class="s1">object</span><span class="s2">()   </span><span class="s3"># Force object mode</span>
+        <span class="s1">a</span><span class="s2">[</span><span class="s1">idx</span><span class="s2">] = </span><span class="s1">PyThread_get_thread_ident</span><span class="s2">()</span>
+
+
+<span class="s0">class </span><span class="s1">TestGILRelease</span><span class="s2">(</span><span class="s1">TestCase</span><span class="s2">):</span>
+
+    <span class="s0">def </span><span class="s1">make_test_array</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">n_members</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s1">n_members</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">run_in_threads</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">n_threads</span><span class="s2">):</span>
+        <span class="s3"># Run the function in parallel over an array and collect results.</span>
+        <span class="s1">threads </span><span class="s2">= []</span>
+        <span class="s3"># Warm up compilation, since we don't want that to interfere with</span>
+        <span class="s3"># the test proper.</span>
+        <span class="s1">func</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">make_test_array</span><span class="s2">(</span><span class="s5">1</span><span class="s2">), </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s5">1</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">))</span>
+        <span class="s1">arr </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">make_test_array</span><span class="s2">(</span><span class="s5">50</span><span class="s2">)</span>
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">n_threads</span><span class="s2">):</span>
+            <span class="s3"># Ensure different threads write into the array in different</span>
+            <span class="s3"># orders.</span>
+            <span class="s1">indices </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s1">arr</span><span class="s2">.</span><span class="s1">size</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">)</span>
+            <span class="s1">np</span><span class="s2">.</span><span class="s1">random</span><span class="s2">.</span><span class="s1">shuffle</span><span class="s2">(</span><span class="s1">indices</span><span class="s2">)</span>
+            <span class="s1">t </span><span class="s2">= </span><span class="s1">threading</span><span class="s2">.</span><span class="s1">Thread</span><span class="s2">(</span><span class="s1">target</span><span class="s2">=</span><span class="s1">func</span><span class="s2">, </span><span class="s1">args</span><span class="s2">=(</span><span class="s1">arr</span><span class="s2">, </span><span class="s1">indices</span><span class="s2">))</span>
+            <span class="s1">threads</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">t</span><span class="s2">)</span>
+        <span class="s0">for </span><span class="s1">t </span><span class="s0">in </span><span class="s1">threads</span><span class="s2">:</span>
+            <span class="s1">t</span><span class="s2">.</span><span class="s1">start</span><span class="s2">()</span>
+        <span class="s0">for </span><span class="s1">t </span><span class="s0">in </span><span class="s1">threads</span><span class="s2">:</span>
+            <span class="s1">t</span><span class="s2">.</span><span class="s1">join</span><span class="s2">()</span>
+        <span class="s0">return </span><span class="s1">arr</span>
+
+    <span class="s0">def </span><span class="s1">check_gil_held</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func</span><span class="s2">):</span>
+        <span class="s1">arr </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">run_in_threads</span><span class="s2">(</span><span class="s1">func</span><span class="s2">, </span><span class="s1">n_threads</span><span class="s2">=</span><span class="s5">4</span><span class="s2">)</span>
+        <span class="s1">distinct </span><span class="s2">= </span><span class="s1">set</span><span class="s2">(</span><span class="s1">arr</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">distinct</span><span class="s2">), </span><span class="s5">1</span><span class="s2">, </span><span class="s1">distinct</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">check_gil_released</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func</span><span class="s2">):</span>
+        <span class="s0">for </span><span class="s1">n_threads </span><span class="s0">in </span><span class="s2">(</span><span class="s5">4</span><span class="s2">, </span><span class="s5">12</span><span class="s2">, </span><span class="s5">32</span><span class="s2">):</span>
+            <span class="s3"># Try harder each time. On an empty machine 4 threads seems</span>
+            <span class="s3"># sufficient, but in some contexts (e.g. Travis CI) we need more.</span>
+            <span class="s1">arr </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">run_in_threads</span><span class="s2">(</span><span class="s1">func</span><span class="s2">, </span><span class="s1">n_threads</span><span class="s2">)</span>
+            <span class="s1">distinct </span><span class="s2">= </span><span class="s1">set</span><span class="s2">(</span><span class="s1">arr</span><span class="s2">)</span>
+            <span class="s0">try</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">assertGreater</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">distinct</span><span class="s2">), </span><span class="s5">1</span><span class="s2">, </span><span class="s1">distinct</span><span class="s2">)</span>
+            <span class="s0">except </span><span class="s1">AssertionError </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+                <span class="s1">failure </span><span class="s2">= </span><span class="s1">e</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s0">return</span>
+        <span class="s0">raise </span><span class="s1">failure</span>
+
+    <span class="s0">def </span><span class="s1">test_gil_held</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Test the GIL is held by default, by checking serialized runs 
+        produce deterministic results. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">cfunc </span><span class="s2">= </span><span class="s1">jit</span><span class="s2">(</span><span class="s1">f_sig</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">f</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_gil_held</span><span class="s2">(</span><span class="s1">cfunc</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_gil_released</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Test releasing the GIL, by checking parallel runs produce 
+        unpredictable results. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">cfunc </span><span class="s2">= </span><span class="s1">jit</span><span class="s2">(</span><span class="s1">f_sig</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s0">True</span><span class="s2">, </span><span class="s1">nogil</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">f</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_gil_released</span><span class="s2">(</span><span class="s1">cfunc</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_gil_released_inside_lifted_loop</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Test the GIL can by released by a lifted loop even though the 
+        surrounding code uses object mode. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">cfunc </span><span class="s2">= </span><span class="s1">jit</span><span class="s2">(</span><span class="s1">f_sig</span><span class="s2">, </span><span class="s1">forceobj</span><span class="s2">=</span><span class="s0">True</span><span class="s2">, </span><span class="s1">nogil</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">lifted_f</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_gil_released</span><span class="s2">(</span><span class="s1">cfunc</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_gil_released_by_caller</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Releasing the GIL in the caller is sufficient to have it 
+        released in a callee. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">compiled_f </span><span class="s2">= </span><span class="s1">jit</span><span class="s2">(</span><span class="s1">f_sig</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">f</span><span class="s2">)</span>
+        <span class="s2">@</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">f_sig</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s0">True</span><span class="s2">, </span><span class="s1">nogil</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">caller</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">i</span><span class="s2">):</span>
+            <span class="s1">compiled_f</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">i</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_gil_released</span><span class="s2">(</span><span class="s1">caller</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_gil_released_by_caller_and_callee</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Same, but with both caller and callee asking to release the GIL. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">compiled_f </span><span class="s2">= </span><span class="s1">jit</span><span class="s2">(</span><span class="s1">f_sig</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s0">True</span><span class="s2">, </span><span class="s1">nogil</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">f</span><span class="s2">)</span>
+        <span class="s2">@</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">f_sig</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s0">True</span><span class="s2">, </span><span class="s1">nogil</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">caller</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">i</span><span class="s2">):</span>
+            <span class="s1">compiled_f</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">i</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_gil_released</span><span class="s2">(</span><span class="s1">caller</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_gil_ignored_by_callee</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        When only the callee asks to release the GIL, it gets ignored. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">compiled_f </span><span class="s2">= </span><span class="s1">jit</span><span class="s2">(</span><span class="s1">f_sig</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s0">True</span><span class="s2">, </span><span class="s1">nogil</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">f</span><span class="s2">)</span>
+        <span class="s2">@</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">f_sig</span><span class="s2">, </span><span class="s1">nopython</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">caller</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">i</span><span class="s2">):</span>
+            <span class="s1">compiled_f</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">i</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">check_gil_held</span><span class="s2">(</span><span class="s1">caller</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_object_mode</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        When the function is compiled in object mode, a warning is 
+        printed out. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">with </span><span class="s1">warnings</span><span class="s2">.</span><span class="s1">catch_warnings</span><span class="s2">(</span><span class="s1">record</span><span class="s2">=</span><span class="s0">True</span><span class="s2">) </span><span class="s0">as </span><span class="s1">wlist</span><span class="s2">:</span>
+            <span class="s1">warnings</span><span class="s2">.</span><span class="s1">simplefilter</span><span class="s2">(</span><span class="s4">'always'</span><span class="s2">, </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">NumbaWarning</span><span class="s2">)</span>
+            <span class="s1">cfunc </span><span class="s2">= </span><span class="s1">jit</span><span class="s2">(</span><span class="s1">f_sig</span><span class="s2">, </span><span class="s1">forceobj</span><span class="s2">=</span><span class="s0">True</span><span class="s2">, </span><span class="s1">nogil</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)(</span><span class="s1">object_f</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">any</span><span class="s2">(</span><span class="s1">w</span><span class="s2">.</span><span class="s1">category </span><span class="s0">is </span><span class="s1">errors</span><span class="s2">.</span><span class="s1">NumbaWarning</span>
+                            <span class="s0">and </span><span class="s4">&quot;Code running in object mode won't allow parallel execution&quot; </span><span class="s0">in </span><span class="s1">str</span><span class="s2">(</span><span class="s1">w</span><span class="s2">.</span><span class="s1">message</span><span class="s2">)</span>
+                            <span class="s0">for </span><span class="s1">w </span><span class="s0">in </span><span class="s1">wlist</span><span class="s2">), </span><span class="s1">wlist</span><span class="s2">)</span>
+        <span class="s3"># Just check it doesn't crash.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">run_in_threads</span><span class="s2">(</span><span class="s1">cfunc</span><span class="s2">, </span><span class="s5">2</span><span class="s2">)</span>
+
+
+<span class="s0">if </span><span class="s1">__name__ </span><span class="s2">== </span><span class="s4">'__main__'</span><span class="s2">:</span>
+    <span class="s1">unittest</span><span class="s2">.</span><span class="s1">main</span><span class="s2">()</span>
+</pre>
+</body>
+</html>

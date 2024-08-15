@@ -1,0 +1,995 @@
+<html>
+<head>
+<title>controlflow.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #7a7e85;}
+.s4 { color: #6aab73;}
+.s5 { color: #5f826b; font-style: italic;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+controlflow.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">collections</span>
+<span class="s0">import </span><span class="s1">functools</span>
+<span class="s0">import </span><span class="s1">sys</span>
+
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">ir </span><span class="s0">import </span><span class="s1">Loc</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">errors </span><span class="s0">import </span><span class="s1">UnsupportedError</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">utils </span><span class="s0">import </span><span class="s1">PYVERSION</span>
+
+<span class="s3"># List of bytecodes creating a new block in the control flow graph</span>
+<span class="s3"># (in addition to explicit jump labels).</span>
+<span class="s1">NEW_BLOCKERS </span><span class="s2">= </span><span class="s1">frozenset</span><span class="s2">([</span>
+    <span class="s4">'SETUP_LOOP'</span><span class="s2">, </span><span class="s4">'FOR_ITER'</span><span class="s2">, </span><span class="s4">'SETUP_WITH'</span><span class="s2">, </span><span class="s4">'BEFORE_WITH'</span>
+<span class="s2">])</span>
+
+
+<span class="s0">class </span><span class="s1">CFBlock</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">offset</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">offset </span><span class="s2">= </span><span class="s1">offset</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">body </span><span class="s2">= []</span>
+        <span class="s3"># A map of jumps to outgoing blocks (successors):</span>
+        <span class="s3">#   { offset of outgoing block -&gt; number of stack pops }</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">outgoing_jumps </span><span class="s2">= {}</span>
+        <span class="s3"># A map of jumps to incoming blocks (predecessors):</span>
+        <span class="s3">#   { offset of incoming block -&gt; number of stack pops }</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">incoming_jumps </span><span class="s2">= {}</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">terminating </span><span class="s2">= </span><span class="s0">False</span>
+
+    <span class="s0">def </span><span class="s1">__repr__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">args </span><span class="s2">= (</span><span class="s1">self</span><span class="s2">.</span><span class="s1">offset</span><span class="s2">,</span>
+                <span class="s1">sorted</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">outgoing_jumps</span><span class="s2">),</span>
+                <span class="s1">sorted</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">incoming_jumps</span><span class="s2">))</span>
+        <span class="s0">return </span><span class="s4">&quot;block(offset:%d, outgoing: %s, incoming: %s)&quot; </span><span class="s2">% </span><span class="s1">args</span>
+
+    <span class="s0">def </span><span class="s1">__iter__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">iter</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">body</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">Loop</span><span class="s2">(</span><span class="s1">collections</span><span class="s2">.</span><span class="s1">namedtuple</span><span class="s2">(</span><span class="s4">&quot;Loop&quot;</span><span class="s2">,</span>
+                                  <span class="s2">(</span><span class="s4">&quot;entries&quot;</span><span class="s2">, </span><span class="s4">&quot;exits&quot;</span><span class="s2">, </span><span class="s4">&quot;header&quot;</span><span class="s2">, </span><span class="s4">&quot;body&quot;</span><span class="s2">))):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    A control flow loop, as detected by a CFGraph object. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">__slots__ </span><span class="s2">= ()</span>
+
+    <span class="s3"># The loop header is enough to detect that two loops are really</span>
+    <span class="s3"># the same, assuming they belong to the same graph.</span>
+    <span class="s3"># (note: in practice, only one loop instance is created per graph</span>
+    <span class="s3">#  loop, so identity would be fine)</span>
+
+    <span class="s0">def </span><span class="s1">__eq__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">other</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">other</span><span class="s2">, </span><span class="s1">Loop</span><span class="s2">) </span><span class="s0">and </span><span class="s1">other</span><span class="s2">.</span><span class="s1">header </span><span class="s2">== </span><span class="s1">self</span><span class="s2">.</span><span class="s1">header</span>
+
+    <span class="s0">def </span><span class="s1">__hash__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">hash</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">header</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">_DictOfContainers</span><span class="s2">(</span><span class="s1">collections</span><span class="s2">.</span><span class="s1">defaultdict</span><span class="s2">):</span>
+    <span class="s5">&quot;&quot;&quot;A defaultdict with customized equality checks that ignore empty values. 
+ 
+    Non-empty value is checked by: `bool(value_item) == True`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__eq__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">other</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">other</span><span class="s2">, </span><span class="s1">_DictOfContainers</span><span class="s2">):</span>
+            <span class="s1">mine </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_non_empty_items</span><span class="s2">()</span>
+            <span class="s1">theirs </span><span class="s2">= </span><span class="s1">other</span><span class="s2">.</span><span class="s1">_non_empty_items</span><span class="s2">()</span>
+            <span class="s0">return </span><span class="s1">mine </span><span class="s2">== </span><span class="s1">theirs</span>
+
+        <span class="s0">return </span><span class="s1">NotImplemented</span>
+
+    <span class="s0">def </span><span class="s1">__ne__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">other</span><span class="s2">):</span>
+        <span class="s1">ret </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">__eq__</span><span class="s2">(</span><span class="s1">other</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">ret </span><span class="s0">is </span><span class="s1">NotImplemented</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">ret</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s0">return not </span><span class="s1">ret</span>
+
+    <span class="s0">def </span><span class="s1">_non_empty_items</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s2">[(</span><span class="s1">k</span><span class="s2">, </span><span class="s1">vs</span><span class="s2">) </span><span class="s0">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">vs </span><span class="s0">in </span><span class="s1">sorted</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">items</span><span class="s2">()) </span><span class="s0">if </span><span class="s1">vs</span><span class="s2">]</span>
+
+
+<span class="s0">class </span><span class="s1">CFGraph</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Generic (almost) implementation of a Control Flow Graph. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_nodes </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_preds </span><span class="s2">= </span><span class="s1">_DictOfContainers</span><span class="s2">(</span><span class="s1">set</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_succs </span><span class="s2">= </span><span class="s1">_DictOfContainers</span><span class="s2">(</span><span class="s1">set</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_edge_data </span><span class="s2">= {}</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_entry_point </span><span class="s2">= </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">add_node</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">node</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Add *node* to the graph.  This is necessary before adding any 
+        edges from/to the node.  *node* can be any hashable object. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_nodes</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">node</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">add_edge</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">src</span><span class="s2">, </span><span class="s1">dest</span><span class="s2">, </span><span class="s1">data</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Add an edge from node *src* to node *dest*, with optional 
+        per-edge *data*. 
+        If such an edge already exists, it is replaced (duplicate edges 
+        are not possible). 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">src </span><span class="s0">not in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_nodes</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s4">&quot;Cannot add edge as src node %s not in nodes %s&quot; </span><span class="s2">%</span>
+                             <span class="s2">(</span><span class="s1">src</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_nodes</span><span class="s2">))</span>
+        <span class="s0">if </span><span class="s1">dest </span><span class="s0">not in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_nodes</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s4">&quot;Cannot add edge as dest node %s not in nodes %s&quot; </span><span class="s2">%</span>
+                             <span class="s2">(</span><span class="s1">dest</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_nodes</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_add_edge</span><span class="s2">(</span><span class="s1">src</span><span class="s2">, </span><span class="s1">dest</span><span class="s2">, </span><span class="s1">data</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">successors</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">src</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Yield (node, data) pairs representing the successors of node *src*. 
+        (*data* will be None if no data was specified when adding the edge) 
+        &quot;&quot;&quot;</span>
+        <span class="s0">for </span><span class="s1">dest </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_succs</span><span class="s2">[</span><span class="s1">src</span><span class="s2">]:</span>
+            <span class="s0">yield </span><span class="s1">dest</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_edge_data</span><span class="s2">[</span><span class="s1">src</span><span class="s2">, </span><span class="s1">dest</span><span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">predecessors</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">dest</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Yield (node, data) pairs representing the predecessors of node *dest*. 
+        (*data* will be None if no data was specified when adding the edge) 
+        &quot;&quot;&quot;</span>
+        <span class="s0">for </span><span class="s1">src </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_preds</span><span class="s2">[</span><span class="s1">dest</span><span class="s2">]:</span>
+            <span class="s0">yield </span><span class="s1">src</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_edge_data</span><span class="s2">[</span><span class="s1">src</span><span class="s2">, </span><span class="s1">dest</span><span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">set_entry_point</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">node</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Set the entry point of the graph to *node*. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">assert </span><span class="s1">node </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_nodes</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_entry_point </span><span class="s2">= </span><span class="s1">node</span>
+
+    <span class="s0">def </span><span class="s1">process</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Compute essential properties of the control flow graph.  The graph 
+        must have been fully populated, and its entry point specified. Other 
+        graph properties are computed on-demand. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_entry_point </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">RuntimeError</span><span class="s2">(</span><span class="s4">&quot;no entry point defined!&quot;</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_eliminate_dead_blocks</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">dominators</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Return a dictionary of {node -&gt; set(nodes)} mapping each node to 
+        the nodes dominating it. 
+ 
+        A node D dominates a node N when any path leading to N must go through D 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_doms</span>
+
+    <span class="s0">def </span><span class="s1">post_dominators</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Return a dictionary of {node -&gt; set(nodes)} mapping each node to 
+        the nodes post-dominating it. 
+ 
+        A node P post-dominates a node N when any path starting from N must go 
+        through P. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_post_doms</span>
+
+    <span class="s0">def </span><span class="s1">immediate_dominators</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Return a dictionary of {node -&gt; node} mapping each node to its 
+        immediate dominator (idom). 
+ 
+        The idom(B) is the closest strict dominator of V 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_idom</span>
+
+    <span class="s0">def </span><span class="s1">dominance_frontier</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Return a dictionary of {node -&gt; set(nodes)} mapping each node to 
+        the nodes in its dominance frontier. 
+ 
+        The dominance frontier _df(N) is the set of all nodes that are 
+        immediate successors to blocks dominated by N but which aren't 
+        strictly dominated by N 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_df</span>
+
+    <span class="s0">def </span><span class="s1">dominator_tree</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        return a dictionary of {node -&gt; set(nodes)} mapping each node to 
+        the set of nodes it immediately dominates 
+ 
+        The domtree(B) is the closest strict set of nodes that B dominates 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_domtree</span>
+
+    <span class="s2">@</span><span class="s1">functools</span><span class="s2">.</span><span class="s1">cached_property</span>
+    <span class="s0">def </span><span class="s1">_exit_points</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_find_exit_points</span><span class="s2">()</span>
+
+    <span class="s2">@</span><span class="s1">functools</span><span class="s2">.</span><span class="s1">cached_property</span>
+    <span class="s0">def </span><span class="s1">_doms</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_find_dominators</span><span class="s2">()</span>
+
+    <span class="s2">@</span><span class="s1">functools</span><span class="s2">.</span><span class="s1">cached_property</span>
+    <span class="s0">def </span><span class="s1">_back_edges</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_find_back_edges</span><span class="s2">()</span>
+
+    <span class="s2">@</span><span class="s1">functools</span><span class="s2">.</span><span class="s1">cached_property</span>
+    <span class="s0">def </span><span class="s1">_topo_order</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_find_topo_order</span><span class="s2">()</span>
+
+    <span class="s2">@</span><span class="s1">functools</span><span class="s2">.</span><span class="s1">cached_property</span>
+    <span class="s0">def </span><span class="s1">_descs</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_find_descendents</span><span class="s2">()</span>
+
+    <span class="s2">@</span><span class="s1">functools</span><span class="s2">.</span><span class="s1">cached_property</span>
+    <span class="s0">def </span><span class="s1">_loops</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_find_loops</span><span class="s2">()</span>
+
+    <span class="s2">@</span><span class="s1">functools</span><span class="s2">.</span><span class="s1">cached_property</span>
+    <span class="s0">def </span><span class="s1">_in_loops</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_find_in_loops</span><span class="s2">()</span>
+
+    <span class="s2">@</span><span class="s1">functools</span><span class="s2">.</span><span class="s1">cached_property</span>
+    <span class="s0">def </span><span class="s1">_post_doms</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_find_post_dominators</span><span class="s2">()</span>
+
+    <span class="s2">@</span><span class="s1">functools</span><span class="s2">.</span><span class="s1">cached_property</span>
+    <span class="s0">def </span><span class="s1">_idom</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_find_immediate_dominators</span><span class="s2">()</span>
+
+    <span class="s2">@</span><span class="s1">functools</span><span class="s2">.</span><span class="s1">cached_property</span>
+    <span class="s0">def </span><span class="s1">_df</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_find_dominance_frontier</span><span class="s2">()</span>
+
+    <span class="s2">@</span><span class="s1">functools</span><span class="s2">.</span><span class="s1">cached_property</span>
+    <span class="s0">def </span><span class="s1">_domtree</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_find_dominator_tree</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">descendents</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">node</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Return the set of descendents of the given *node*, in topological 
+        order (ignoring back edges). 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_descs</span><span class="s2">[</span><span class="s1">node</span><span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">entry_point</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Return the entry point node. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">assert </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_entry_point </span><span class="s0">is not None</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_entry_point</span>
+
+    <span class="s0">def </span><span class="s1">exit_points</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Return the computed set of exit nodes (may be empty). 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_exit_points</span>
+
+    <span class="s0">def </span><span class="s1">backbone</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Return the set of nodes constituting the graph's backbone. 
+        (i.e. the nodes that every path starting from the entry point 
+         must go through).  By construction, it is non-empty: it contains 
+         at least the entry point. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_post_doms</span><span class="s2">[</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_entry_point</span><span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">loops</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Return a dictionary of {node -&gt; loop} mapping each loop header 
+        to the loop (a Loop instance) starting with it. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_loops</span>
+
+    <span class="s0">def </span><span class="s1">in_loops</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">node</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Return the list of Loop objects the *node* belongs to, 
+        from innermost to outermost. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s2">[</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_loops</span><span class="s2">[</span><span class="s1">x</span><span class="s2">] </span><span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_in_loops</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">node</span><span class="s2">, ())]</span>
+
+    <span class="s0">def </span><span class="s1">dead_nodes</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Return the set of dead nodes (eliminated from the graph). 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_dead_nodes</span>
+
+    <span class="s0">def </span><span class="s1">nodes</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Return the set of live nodes. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_nodes</span>
+
+    <span class="s0">def </span><span class="s1">topo_order</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Return the sequence of nodes in topological order (ignoring back 
+        edges). 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_topo_order</span>
+
+    <span class="s0">def </span><span class="s1">topo_sort</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">nodes</span><span class="s2">, </span><span class="s1">reverse</span><span class="s2">=</span><span class="s0">False</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Iterate over the *nodes* in topological order (ignoring back edges). 
+        The sort isn't guaranteed to be stable. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">nodes </span><span class="s2">= </span><span class="s1">set</span><span class="s2">(</span><span class="s1">nodes</span><span class="s2">)</span>
+        <span class="s1">it </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_topo_order</span>
+        <span class="s0">if </span><span class="s1">reverse</span><span class="s2">:</span>
+            <span class="s1">it </span><span class="s2">= </span><span class="s1">reversed</span><span class="s2">(</span><span class="s1">it</span><span class="s2">)</span>
+        <span class="s0">for </span><span class="s1">n </span><span class="s0">in </span><span class="s1">it</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">n </span><span class="s0">in </span><span class="s1">nodes</span><span class="s2">:</span>
+                <span class="s0">yield </span><span class="s1">n</span>
+
+    <span class="s0">def </span><span class="s1">dump</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">file</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Dump extensive debug information. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">import </span><span class="s1">pprint</span>
+        <span class="s1">file </span><span class="s2">= </span><span class="s1">file </span><span class="s0">or </span><span class="s1">sys</span><span class="s2">.</span><span class="s1">stdout</span>
+        <span class="s0">if </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s1">print</span><span class="s2">(</span><span class="s4">&quot;CFG adjacency lists:&quot;</span><span class="s2">, </span><span class="s1">file</span><span class="s2">=</span><span class="s1">file</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_dump_adj_lists</span><span class="s2">(</span><span class="s1">file</span><span class="s2">)</span>
+        <span class="s1">print</span><span class="s2">(</span><span class="s4">&quot;CFG dominators:&quot;</span><span class="s2">, </span><span class="s1">file</span><span class="s2">=</span><span class="s1">file</span><span class="s2">)</span>
+        <span class="s1">pprint</span><span class="s2">.</span><span class="s1">pprint</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_doms</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">file</span><span class="s2">)</span>
+        <span class="s1">print</span><span class="s2">(</span><span class="s4">&quot;CFG post-dominators:&quot;</span><span class="s2">, </span><span class="s1">file</span><span class="s2">=</span><span class="s1">file</span><span class="s2">)</span>
+        <span class="s1">pprint</span><span class="s2">.</span><span class="s1">pprint</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_post_doms</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">file</span><span class="s2">)</span>
+        <span class="s1">print</span><span class="s2">(</span><span class="s4">&quot;CFG back edges:&quot;</span><span class="s2">, </span><span class="s1">sorted</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_back_edges</span><span class="s2">), </span><span class="s1">file</span><span class="s2">=</span><span class="s1">file</span><span class="s2">)</span>
+        <span class="s1">print</span><span class="s2">(</span><span class="s4">&quot;CFG loops:&quot;</span><span class="s2">, </span><span class="s1">file</span><span class="s2">=</span><span class="s1">file</span><span class="s2">)</span>
+        <span class="s1">pprint</span><span class="s2">.</span><span class="s1">pprint</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_loops</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">file</span><span class="s2">)</span>
+        <span class="s1">print</span><span class="s2">(</span><span class="s4">&quot;CFG node-to-loops:&quot;</span><span class="s2">, </span><span class="s1">file</span><span class="s2">=</span><span class="s1">file</span><span class="s2">)</span>
+        <span class="s1">pprint</span><span class="s2">.</span><span class="s1">pprint</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_in_loops</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">file</span><span class="s2">)</span>
+        <span class="s1">print</span><span class="s2">(</span><span class="s4">&quot;CFG backbone:&quot;</span><span class="s2">, </span><span class="s1">file</span><span class="s2">=</span><span class="s1">file</span><span class="s2">)</span>
+        <span class="s1">pprint</span><span class="s2">.</span><span class="s1">pprint</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">backbone</span><span class="s2">(), </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">file</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">render_dot</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">=</span><span class="s4">&quot;numba_cfg.dot&quot;</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot;Render the controlflow graph with GraphViz DOT via the 
+        ``graphviz`` python binding. 
+ 
+        Returns 
+        ------- 
+        g : graphviz.Digraph 
+            Use `g.view()` to open the graph in the default PDF application. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s0">import </span><span class="s1">graphviz </span><span class="s0">as </span><span class="s1">gv</span>
+        <span class="s0">except </span><span class="s1">ImportError</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ImportError</span><span class="s2">(</span>
+                <span class="s4">&quot;The feature requires `graphviz` but it is not available. &quot;</span>
+                <span class="s4">&quot;Please install with `pip install graphviz`&quot;</span>
+            <span class="s2">)</span>
+        <span class="s1">g </span><span class="s2">= </span><span class="s1">gv</span><span class="s2">.</span><span class="s1">Digraph</span><span class="s2">(</span><span class="s1">filename</span><span class="s2">=</span><span class="s1">filename</span><span class="s2">)</span>
+        <span class="s3"># Populate the nodes</span>
+        <span class="s0">for </span><span class="s1">n </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_nodes</span><span class="s2">:</span>
+            <span class="s1">g</span><span class="s2">.</span><span class="s1">node</span><span class="s2">(</span><span class="s1">str</span><span class="s2">(</span><span class="s1">n</span><span class="s2">))</span>
+        <span class="s3"># Populate the edges</span>
+        <span class="s0">for </span><span class="s1">n </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_nodes</span><span class="s2">:</span>
+            <span class="s0">for </span><span class="s1">edge </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_succs</span><span class="s2">[</span><span class="s1">n</span><span class="s2">]:</span>
+                <span class="s1">g</span><span class="s2">.</span><span class="s1">edge</span><span class="s2">(</span><span class="s1">str</span><span class="s2">(</span><span class="s1">n</span><span class="s2">), </span><span class="s1">str</span><span class="s2">(</span><span class="s1">edge</span><span class="s2">))</span>
+        <span class="s0">return </span><span class="s1">g</span>
+
+    <span class="s3"># Internal APIs</span>
+
+    <span class="s0">def </span><span class="s1">_add_edge</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">from_</span><span class="s2">, </span><span class="s1">to</span><span class="s2">, </span><span class="s1">data</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s3"># This internal version allows adding edges to/from unregistered</span>
+        <span class="s3"># (ghost) nodes.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_preds</span><span class="s2">[</span><span class="s1">to</span><span class="s2">].</span><span class="s1">add</span><span class="s2">(</span><span class="s1">from_</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_succs</span><span class="s2">[</span><span class="s1">from_</span><span class="s2">].</span><span class="s1">add</span><span class="s2">(</span><span class="s1">to</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_edge_data</span><span class="s2">[</span><span class="s1">from_</span><span class="s2">, </span><span class="s1">to</span><span class="s2">] = </span><span class="s1">data</span>
+
+    <span class="s0">def </span><span class="s1">_remove_node_edges</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">node</span><span class="s2">):</span>
+        <span class="s0">for </span><span class="s1">succ </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_succs</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s1">node</span><span class="s2">, ()):</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_preds</span><span class="s2">[</span><span class="s1">succ</span><span class="s2">].</span><span class="s1">remove</span><span class="s2">(</span><span class="s1">node</span><span class="s2">)</span>
+            <span class="s0">del </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_edge_data</span><span class="s2">[</span><span class="s1">node</span><span class="s2">, </span><span class="s1">succ</span><span class="s2">]</span>
+        <span class="s0">for </span><span class="s1">pred </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_preds</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s1">node</span><span class="s2">, ()):</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_succs</span><span class="s2">[</span><span class="s1">pred</span><span class="s2">].</span><span class="s1">remove</span><span class="s2">(</span><span class="s1">node</span><span class="s2">)</span>
+            <span class="s0">del </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_edge_data</span><span class="s2">[</span><span class="s1">pred</span><span class="s2">, </span><span class="s1">node</span><span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">_dfs</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">entries</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">entries </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s1">entries </span><span class="s2">= (</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_entry_point</span><span class="s2">,)</span>
+        <span class="s1">seen </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+        <span class="s1">stack </span><span class="s2">= </span><span class="s1">list</span><span class="s2">(</span><span class="s1">entries</span><span class="s2">)</span>
+        <span class="s0">while </span><span class="s1">stack</span><span class="s2">:</span>
+            <span class="s1">node </span><span class="s2">= </span><span class="s1">stack</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">()</span>
+            <span class="s0">if </span><span class="s1">node </span><span class="s0">not in </span><span class="s1">seen</span><span class="s2">:</span>
+                <span class="s0">yield </span><span class="s1">node</span>
+                <span class="s1">seen</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">node</span><span class="s2">)</span>
+                <span class="s0">for </span><span class="s1">succ </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_succs</span><span class="s2">[</span><span class="s1">node</span><span class="s2">]:</span>
+                    <span class="s1">stack</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">succ</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">_eliminate_dead_blocks</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Eliminate all blocks not reachable from the entry point, and 
+        stash them into self._dead_nodes. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">live </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+        <span class="s0">for </span><span class="s1">node </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_dfs</span><span class="s2">():</span>
+            <span class="s1">live</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">node</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_dead_nodes </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_nodes </span><span class="s2">- </span><span class="s1">live</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_nodes </span><span class="s2">= </span><span class="s1">live</span>
+        <span class="s3"># Remove all edges leading from dead nodes</span>
+        <span class="s0">for </span><span class="s1">dead </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_dead_nodes</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_remove_node_edges</span><span class="s2">(</span><span class="s1">dead</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">_find_exit_points</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Compute the graph's exit points. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">exit_points </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+        <span class="s0">for </span><span class="s1">n </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_nodes</span><span class="s2">:</span>
+            <span class="s0">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_succs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">n</span><span class="s2">):</span>
+                <span class="s1">exit_points</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">n</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">exit_points</span>
+
+    <span class="s0">def </span><span class="s1">_find_postorder</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">succs </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_succs</span>
+        <span class="s1">back_edges </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_back_edges</span>
+        <span class="s1">post_order </span><span class="s2">= []</span>
+        <span class="s1">seen </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+
+        <span class="s1">post_order </span><span class="s2">= []</span>
+
+        <span class="s3"># DFS</span>
+        <span class="s0">def </span><span class="s1">dfs_rec</span><span class="s2">(</span><span class="s1">node</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s1">node </span><span class="s0">not in </span><span class="s1">seen</span><span class="s2">:</span>
+                <span class="s1">seen</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">node</span><span class="s2">)</span>
+                <span class="s1">stack</span><span class="s2">.</span><span class="s1">append</span><span class="s2">((</span><span class="s1">post_order</span><span class="s2">.</span><span class="s1">append</span><span class="s2">, </span><span class="s1">node</span><span class="s2">))</span>
+                <span class="s0">for </span><span class="s1">dest </span><span class="s0">in </span><span class="s1">succs</span><span class="s2">[</span><span class="s1">node</span><span class="s2">]:</span>
+                    <span class="s0">if </span><span class="s2">(</span><span class="s1">node</span><span class="s2">, </span><span class="s1">dest</span><span class="s2">) </span><span class="s0">not in </span><span class="s1">back_edges</span><span class="s2">:</span>
+                        <span class="s1">stack</span><span class="s2">.</span><span class="s1">append</span><span class="s2">((</span><span class="s1">dfs_rec</span><span class="s2">, </span><span class="s1">dest</span><span class="s2">))</span>
+
+        <span class="s1">stack </span><span class="s2">= [(</span><span class="s1">dfs_rec</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_entry_point</span><span class="s2">)]</span>
+        <span class="s0">while </span><span class="s1">stack</span><span class="s2">:</span>
+            <span class="s1">cb</span><span class="s2">, </span><span class="s1">data </span><span class="s2">= </span><span class="s1">stack</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">()</span>
+            <span class="s1">cb</span><span class="s2">(</span><span class="s1">data</span><span class="s2">)</span>
+
+        <span class="s0">return </span><span class="s1">post_order</span>
+
+    <span class="s0">def </span><span class="s1">_find_immediate_dominators</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># The algorithm implemented computes the immediate dominator</span>
+        <span class="s3"># for each node in the CFG which is equivalent to build a dominator tree</span>
+        <span class="s3"># Based on the implementation from NetworkX</span>
+        <span class="s3"># library - nx.immediate_dominators</span>
+        <span class="s3"># https://github.com/networkx/networkx/blob/858e7cb183541a78969fed0cbcd02346f5866c02/networkx/algorithms/dominance.py    # noqa: E501</span>
+        <span class="s3"># References:</span>
+        <span class="s3">#   Keith D. Cooper, Timothy J. Harvey, and Ken Kennedy</span>
+        <span class="s3">#   A Simple, Fast Dominance Algorithm</span>
+        <span class="s3">#   https://www.cs.rice.edu/~keith/EMBED/dom.pdf</span>
+        <span class="s0">def </span><span class="s1">intersect</span><span class="s2">(</span><span class="s1">u</span><span class="s2">, </span><span class="s1">v</span><span class="s2">):</span>
+            <span class="s0">while </span><span class="s1">u </span><span class="s2">!= </span><span class="s1">v</span><span class="s2">:</span>
+                <span class="s0">while </span><span class="s1">idx</span><span class="s2">[</span><span class="s1">u</span><span class="s2">] &lt; </span><span class="s1">idx</span><span class="s2">[</span><span class="s1">v</span><span class="s2">]:</span>
+                    <span class="s1">u </span><span class="s2">= </span><span class="s1">idom</span><span class="s2">[</span><span class="s1">u</span><span class="s2">]</span>
+                <span class="s0">while </span><span class="s1">idx</span><span class="s2">[</span><span class="s1">u</span><span class="s2">] &gt; </span><span class="s1">idx</span><span class="s2">[</span><span class="s1">v</span><span class="s2">]:</span>
+                    <span class="s1">v </span><span class="s2">= </span><span class="s1">idom</span><span class="s2">[</span><span class="s1">v</span><span class="s2">]</span>
+            <span class="s0">return </span><span class="s1">u</span>
+
+        <span class="s1">entry </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_entry_point</span>
+        <span class="s1">preds_table </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_preds</span>
+
+        <span class="s1">order </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_find_postorder</span><span class="s2">()</span>
+        <span class="s1">idx </span><span class="s2">= {</span><span class="s1">e</span><span class="s2">: </span><span class="s1">i </span><span class="s0">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">e </span><span class="s0">in </span><span class="s1">enumerate</span><span class="s2">(</span><span class="s1">order</span><span class="s2">)} </span><span class="s3"># index of each node</span>
+        <span class="s1">idom </span><span class="s2">= {</span><span class="s1">entry </span><span class="s2">: </span><span class="s1">entry</span><span class="s2">}</span>
+        <span class="s1">order</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">()</span>
+        <span class="s1">order</span><span class="s2">.</span><span class="s1">reverse</span><span class="s2">()</span>
+
+        <span class="s1">changed </span><span class="s2">= </span><span class="s0">True</span>
+        <span class="s0">while </span><span class="s1">changed</span><span class="s2">:</span>
+            <span class="s1">changed </span><span class="s2">= </span><span class="s0">False</span>
+            <span class="s0">for </span><span class="s1">u </span><span class="s0">in </span><span class="s1">order</span><span class="s2">:</span>
+                <span class="s1">new_idom </span><span class="s2">= </span><span class="s1">functools</span><span class="s2">.</span><span class="s1">reduce</span><span class="s2">(</span><span class="s1">intersect</span><span class="s2">,</span>
+                                            <span class="s2">(</span><span class="s1">v </span><span class="s0">for </span><span class="s1">v </span><span class="s0">in </span><span class="s1">preds_table</span><span class="s2">[</span><span class="s1">u</span><span class="s2">]</span>
+                                             <span class="s0">if </span><span class="s1">v </span><span class="s0">in </span><span class="s1">idom</span><span class="s2">))</span>
+                <span class="s0">if </span><span class="s1">u </span><span class="s0">not in </span><span class="s1">idom </span><span class="s0">or </span><span class="s1">idom</span><span class="s2">[</span><span class="s1">u</span><span class="s2">] != </span><span class="s1">new_idom</span><span class="s2">:</span>
+                    <span class="s1">idom</span><span class="s2">[</span><span class="s1">u</span><span class="s2">] = </span><span class="s1">new_idom</span>
+                    <span class="s1">changed </span><span class="s2">= </span><span class="s0">True</span>
+
+        <span class="s0">return </span><span class="s1">idom</span>
+
+    <span class="s0">def </span><span class="s1">_find_dominator_tree</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">idom </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_idom</span>
+        <span class="s1">domtree </span><span class="s2">= </span><span class="s1">_DictOfContainers</span><span class="s2">(</span><span class="s1">set</span><span class="s2">)</span>
+
+        <span class="s0">for </span><span class="s1">u</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">idom</span><span class="s2">.</span><span class="s1">items</span><span class="s2">():</span>
+            <span class="s3"># v dominates u</span>
+            <span class="s0">if </span><span class="s1">u </span><span class="s0">not in </span><span class="s1">domtree</span><span class="s2">:</span>
+                <span class="s1">domtree</span><span class="s2">[</span><span class="s1">u</span><span class="s2">] = </span><span class="s1">set</span><span class="s2">()</span>
+            <span class="s0">if </span><span class="s1">u </span><span class="s2">!= </span><span class="s1">v</span><span class="s2">:</span>
+                <span class="s1">domtree</span><span class="s2">[</span><span class="s1">v</span><span class="s2">].</span><span class="s1">add</span><span class="s2">(</span><span class="s1">u</span><span class="s2">)</span>
+
+        <span class="s0">return </span><span class="s1">domtree</span>
+
+    <span class="s0">def </span><span class="s1">_find_dominance_frontier</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">idom </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_idom</span>
+        <span class="s1">preds_table </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_preds</span>
+        <span class="s1">df </span><span class="s2">= {</span><span class="s1">u</span><span class="s2">: </span><span class="s1">set</span><span class="s2">() </span><span class="s0">for </span><span class="s1">u </span><span class="s0">in </span><span class="s1">idom</span><span class="s2">}</span>
+
+        <span class="s0">for </span><span class="s1">u </span><span class="s0">in </span><span class="s1">idom</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">preds_table</span><span class="s2">[</span><span class="s1">u</span><span class="s2">]) &lt; </span><span class="s6">2</span><span class="s2">:</span>
+                <span class="s0">continue</span>
+            <span class="s0">for </span><span class="s1">v </span><span class="s0">in </span><span class="s1">preds_table</span><span class="s2">[</span><span class="s1">u</span><span class="s2">]:</span>
+                <span class="s0">while </span><span class="s1">v </span><span class="s2">!= </span><span class="s1">idom</span><span class="s2">[</span><span class="s1">u</span><span class="s2">]:</span>
+                    <span class="s1">df</span><span class="s2">[</span><span class="s1">v</span><span class="s2">].</span><span class="s1">add</span><span class="s2">(</span><span class="s1">u</span><span class="s2">)</span>
+                    <span class="s1">v </span><span class="s2">= </span><span class="s1">idom</span><span class="s2">[</span><span class="s1">v</span><span class="s2">]</span>
+
+        <span class="s0">return </span><span class="s1">df</span>
+
+    <span class="s0">def </span><span class="s1">_find_dominators_internal</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">post</span><span class="s2">=</span><span class="s0">False</span><span class="s2">):</span>
+        <span class="s3"># See theoretical description in</span>
+        <span class="s3"># http://en.wikipedia.org/wiki/Dominator_%28graph_theory%29</span>
+        <span class="s3"># The algorithm implemented here uses a todo-list as described</span>
+        <span class="s3"># in http://pages.cs.wisc.edu/~fischer/cs701.f08/finding.loops.html</span>
+        <span class="s0">if </span><span class="s1">post</span><span class="s2">:</span>
+            <span class="s1">entries </span><span class="s2">= </span><span class="s1">set</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_exit_points</span><span class="s2">)</span>
+            <span class="s1">preds_table </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_succs</span>
+            <span class="s1">succs_table </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_preds</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">entries </span><span class="s2">= </span><span class="s1">set</span><span class="s2">([</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_entry_point</span><span class="s2">])</span>
+            <span class="s1">preds_table </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_preds</span>
+            <span class="s1">succs_table </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_succs</span>
+
+        <span class="s0">if not </span><span class="s1">entries</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">RuntimeError</span><span class="s2">(</span><span class="s4">&quot;no entry points: dominator algorithm &quot;</span>
+                               <span class="s4">&quot;cannot be seeded&quot;</span><span class="s2">)</span>
+
+        <span class="s1">doms </span><span class="s2">= {}</span>
+        <span class="s0">for </span><span class="s1">e </span><span class="s0">in </span><span class="s1">entries</span><span class="s2">:</span>
+            <span class="s1">doms</span><span class="s2">[</span><span class="s1">e</span><span class="s2">] = </span><span class="s1">set</span><span class="s2">([</span><span class="s1">e</span><span class="s2">])</span>
+
+        <span class="s1">todo </span><span class="s2">= []</span>
+        <span class="s0">for </span><span class="s1">n </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_nodes</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">n </span><span class="s0">not in </span><span class="s1">entries</span><span class="s2">:</span>
+                <span class="s1">doms</span><span class="s2">[</span><span class="s1">n</span><span class="s2">] = </span><span class="s1">set</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_nodes</span><span class="s2">)</span>
+                <span class="s1">todo</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">n</span><span class="s2">)</span>
+
+        <span class="s0">while </span><span class="s1">todo</span><span class="s2">:</span>
+            <span class="s1">n </span><span class="s2">= </span><span class="s1">todo</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">()</span>
+            <span class="s0">if </span><span class="s1">n </span><span class="s0">in </span><span class="s1">entries</span><span class="s2">:</span>
+                <span class="s0">continue</span>
+            <span class="s1">new_doms </span><span class="s2">= </span><span class="s1">set</span><span class="s2">([</span><span class="s1">n</span><span class="s2">])</span>
+            <span class="s1">preds </span><span class="s2">= </span><span class="s1">preds_table</span><span class="s2">[</span><span class="s1">n</span><span class="s2">]</span>
+            <span class="s0">if </span><span class="s1">preds</span><span class="s2">:</span>
+                <span class="s1">new_doms </span><span class="s2">|= </span><span class="s1">functools</span><span class="s2">.</span><span class="s1">reduce</span><span class="s2">(</span><span class="s1">set</span><span class="s2">.</span><span class="s1">intersection</span><span class="s2">,</span>
+                                             <span class="s2">[</span><span class="s1">doms</span><span class="s2">[</span><span class="s1">p</span><span class="s2">] </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">preds</span><span class="s2">])</span>
+            <span class="s0">if </span><span class="s1">new_doms </span><span class="s2">!= </span><span class="s1">doms</span><span class="s2">[</span><span class="s1">n</span><span class="s2">]:</span>
+                <span class="s0">assert </span><span class="s1">len</span><span class="s2">(</span><span class="s1">new_doms</span><span class="s2">) &lt; </span><span class="s1">len</span><span class="s2">(</span><span class="s1">doms</span><span class="s2">[</span><span class="s1">n</span><span class="s2">])</span>
+                <span class="s1">doms</span><span class="s2">[</span><span class="s1">n</span><span class="s2">] = </span><span class="s1">new_doms</span>
+                <span class="s1">todo</span><span class="s2">.</span><span class="s1">extend</span><span class="s2">(</span><span class="s1">succs_table</span><span class="s2">[</span><span class="s1">n</span><span class="s2">])</span>
+        <span class="s0">return </span><span class="s1">doms</span>
+
+    <span class="s0">def </span><span class="s1">_find_dominators</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_find_dominators_internal</span><span class="s2">(</span><span class="s1">post</span><span class="s2">=</span><span class="s0">False</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">_find_post_dominators</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># To handle infinite loops correctly, we need to add a dummy</span>
+        <span class="s3"># exit point, and link members of infinite loops to it.</span>
+        <span class="s1">dummy_exit </span><span class="s2">= </span><span class="s1">object</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_exit_points</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">dummy_exit</span><span class="s2">)</span>
+        <span class="s0">for </span><span class="s1">loop </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_loops</span><span class="s2">.</span><span class="s1">values</span><span class="s2">():</span>
+            <span class="s0">if not </span><span class="s1">loop</span><span class="s2">.</span><span class="s1">exits</span><span class="s2">:</span>
+                <span class="s0">for </span><span class="s1">b </span><span class="s0">in </span><span class="s1">loop</span><span class="s2">.</span><span class="s1">body</span><span class="s2">:</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">_add_edge</span><span class="s2">(</span><span class="s1">b</span><span class="s2">, </span><span class="s1">dummy_exit</span><span class="s2">)</span>
+        <span class="s1">pdoms </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_find_dominators_internal</span><span class="s2">(</span><span class="s1">post</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+        <span class="s3"># Fix the _post_doms table to make no reference to the dummy exit</span>
+        <span class="s0">del </span><span class="s1">pdoms</span><span class="s2">[</span><span class="s1">dummy_exit</span><span class="s2">]</span>
+        <span class="s0">for </span><span class="s1">doms </span><span class="s0">in </span><span class="s1">pdoms</span><span class="s2">.</span><span class="s1">values</span><span class="s2">():</span>
+            <span class="s1">doms</span><span class="s2">.</span><span class="s1">discard</span><span class="s2">(</span><span class="s1">dummy_exit</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_remove_node_edges</span><span class="s2">(</span><span class="s1">dummy_exit</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_exit_points</span><span class="s2">.</span><span class="s1">remove</span><span class="s2">(</span><span class="s1">dummy_exit</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">pdoms</span>
+
+    <span class="s3"># Finding loops and back edges: see</span>
+    <span class="s3"># http://pages.cs.wisc.edu/~fischer/cs701.f08/finding.loops.html</span>
+
+    <span class="s0">def </span><span class="s1">_find_back_edges</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">stats</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Find back edges.  An edge (src, dest) is a back edge if and 
+        only if *dest* dominates *src*. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># Prepare stats to capture execution information</span>
+        <span class="s0">if </span><span class="s1">stats </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s0">if not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">stats</span><span class="s2">, </span><span class="s1">dict</span><span class="s2">):</span>
+                <span class="s0">raise </span><span class="s1">TypeError</span><span class="s2">(</span><span class="s4">f&quot;*stats* must be a dict; got </span><span class="s0">{</span><span class="s1">type</span><span class="s2">(</span><span class="s1">stats</span><span class="s2">)</span><span class="s0">}</span><span class="s4">&quot;</span><span class="s2">)</span>
+            <span class="s1">stats</span><span class="s2">.</span><span class="s1">setdefault</span><span class="s2">(</span><span class="s4">'iteration_count'</span><span class="s2">, </span><span class="s6">0</span><span class="s2">)</span>
+
+        <span class="s3"># Uses a simple DFS to find back-edges.</span>
+        <span class="s3"># The new algorithm is faster than the the previous dominator based</span>
+        <span class="s3"># algorithm.</span>
+        <span class="s1">back_edges </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+        <span class="s3"># stack: keeps track of the traversal path</span>
+        <span class="s1">stack </span><span class="s2">= []</span>
+        <span class="s3"># succs_state: keep track of unvisited successors of a node</span>
+        <span class="s1">succs_state </span><span class="s2">= {}</span>
+        <span class="s1">entry_point </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">entry_point</span><span class="s2">()</span>
+
+        <span class="s1">checked </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+
+        <span class="s0">def </span><span class="s1">push_state</span><span class="s2">(</span><span class="s1">node</span><span class="s2">):</span>
+            <span class="s1">stack</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">node</span><span class="s2">)</span>
+            <span class="s1">succs_state</span><span class="s2">[</span><span class="s1">node</span><span class="s2">] = [</span><span class="s1">dest </span><span class="s0">for </span><span class="s1">dest </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_succs</span><span class="s2">[</span><span class="s1">node</span><span class="s2">]]</span>
+
+        <span class="s1">push_state</span><span class="s2">(</span><span class="s1">entry_point</span><span class="s2">)</span>
+
+        <span class="s3"># Keep track for iteration count for debugging</span>
+        <span class="s1">iter_ct </span><span class="s2">= </span><span class="s6">0</span>
+        <span class="s0">while </span><span class="s1">stack</span><span class="s2">:</span>
+            <span class="s1">iter_ct </span><span class="s2">+= </span><span class="s6">1</span>
+            <span class="s1">tos </span><span class="s2">= </span><span class="s1">stack</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">]</span>
+            <span class="s1">tos_succs </span><span class="s2">= </span><span class="s1">succs_state</span><span class="s2">[</span><span class="s1">tos</span><span class="s2">]</span>
+            <span class="s3"># Are there successors not checked?</span>
+            <span class="s0">if </span><span class="s1">tos_succs</span><span class="s2">:</span>
+                <span class="s3"># Check the next successor</span>
+                <span class="s1">cur_node </span><span class="s2">= </span><span class="s1">tos_succs</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">()</span>
+                <span class="s3"># Is it in our traversal path?</span>
+                <span class="s0">if </span><span class="s1">cur_node </span><span class="s0">in </span><span class="s1">stack</span><span class="s2">:</span>
+                    <span class="s3"># Yes, it's a backedge</span>
+                    <span class="s1">back_edges</span><span class="s2">.</span><span class="s1">add</span><span class="s2">((</span><span class="s1">tos</span><span class="s2">, </span><span class="s1">cur_node</span><span class="s2">))</span>
+                <span class="s0">elif </span><span class="s1">cur_node </span><span class="s0">not in </span><span class="s1">checked</span><span class="s2">:</span>
+                    <span class="s3"># Push</span>
+                    <span class="s1">push_state</span><span class="s2">(</span><span class="s1">cur_node</span><span class="s2">)</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s3"># Checked all successors. Pop</span>
+                <span class="s1">stack</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">()</span>
+                <span class="s1">checked</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">tos</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">stats </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s1">stats</span><span class="s2">[</span><span class="s4">'iteration_count'</span><span class="s2">] += </span><span class="s1">iter_ct</span>
+        <span class="s0">return </span><span class="s1">back_edges</span>
+
+    <span class="s0">def </span><span class="s1">_find_topo_order</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">succs </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_succs</span>
+        <span class="s1">back_edges </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_back_edges</span>
+        <span class="s1">post_order </span><span class="s2">= []</span>
+        <span class="s1">seen </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+
+        <span class="s0">def </span><span class="s1">_dfs_rec</span><span class="s2">(</span><span class="s1">node</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s1">node </span><span class="s0">not in </span><span class="s1">seen</span><span class="s2">:</span>
+                <span class="s1">seen</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">node</span><span class="s2">)</span>
+                <span class="s0">for </span><span class="s1">dest </span><span class="s0">in </span><span class="s1">succs</span><span class="s2">[</span><span class="s1">node</span><span class="s2">]:</span>
+                    <span class="s0">if </span><span class="s2">(</span><span class="s1">node</span><span class="s2">, </span><span class="s1">dest</span><span class="s2">) </span><span class="s0">not in </span><span class="s1">back_edges</span><span class="s2">:</span>
+                        <span class="s1">_dfs_rec</span><span class="s2">(</span><span class="s1">dest</span><span class="s2">)</span>
+                <span class="s1">post_order</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">node</span><span class="s2">)</span>
+
+        <span class="s1">_dfs_rec</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_entry_point</span><span class="s2">)</span>
+        <span class="s1">post_order</span><span class="s2">.</span><span class="s1">reverse</span><span class="s2">()</span>
+        <span class="s0">return </span><span class="s1">post_order</span>
+
+    <span class="s0">def </span><span class="s1">_find_descendents</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">descs </span><span class="s2">= {}</span>
+        <span class="s0">for </span><span class="s1">node </span><span class="s0">in </span><span class="s1">reversed</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_topo_order</span><span class="s2">):</span>
+            <span class="s1">descs</span><span class="s2">[</span><span class="s1">node</span><span class="s2">] = </span><span class="s1">node_descs </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+            <span class="s0">for </span><span class="s1">succ </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_succs</span><span class="s2">[</span><span class="s1">node</span><span class="s2">]:</span>
+                <span class="s0">if </span><span class="s2">(</span><span class="s1">node</span><span class="s2">, </span><span class="s1">succ</span><span class="s2">) </span><span class="s0">not in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_back_edges</span><span class="s2">:</span>
+                    <span class="s1">node_descs</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">succ</span><span class="s2">)</span>
+                    <span class="s1">node_descs</span><span class="s2">.</span><span class="s1">update</span><span class="s2">(</span><span class="s1">descs</span><span class="s2">[</span><span class="s1">succ</span><span class="s2">])</span>
+        <span class="s0">return </span><span class="s1">descs</span>
+
+    <span class="s0">def </span><span class="s1">_find_loops</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Find the loops defined by the graph's back edges. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">bodies </span><span class="s2">= {}</span>
+        <span class="s0">for </span><span class="s1">src</span><span class="s2">, </span><span class="s1">dest </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_back_edges</span><span class="s2">:</span>
+            <span class="s3"># The destination of the back edge is the loop header</span>
+            <span class="s1">header </span><span class="s2">= </span><span class="s1">dest</span>
+            <span class="s3"># Build up the loop body from the back edge's source node,</span>
+            <span class="s3"># up to the source header.</span>
+            <span class="s1">body </span><span class="s2">= </span><span class="s1">set</span><span class="s2">([</span><span class="s1">header</span><span class="s2">])</span>
+            <span class="s1">queue </span><span class="s2">= [</span><span class="s1">src</span><span class="s2">]</span>
+            <span class="s0">while </span><span class="s1">queue</span><span class="s2">:</span>
+                <span class="s1">n </span><span class="s2">= </span><span class="s1">queue</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">()</span>
+                <span class="s0">if </span><span class="s1">n </span><span class="s0">not in </span><span class="s1">body</span><span class="s2">:</span>
+                    <span class="s1">body</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">n</span><span class="s2">)</span>
+                    <span class="s1">queue</span><span class="s2">.</span><span class="s1">extend</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_preds</span><span class="s2">[</span><span class="s1">n</span><span class="s2">])</span>
+            <span class="s3"># There can be several back edges to a given loop header;</span>
+            <span class="s3"># if so, merge the resulting body fragments.</span>
+            <span class="s0">if </span><span class="s1">header </span><span class="s0">in </span><span class="s1">bodies</span><span class="s2">:</span>
+                <span class="s1">bodies</span><span class="s2">[</span><span class="s1">header</span><span class="s2">].</span><span class="s1">update</span><span class="s2">(</span><span class="s1">body</span><span class="s2">)</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s1">bodies</span><span class="s2">[</span><span class="s1">header</span><span class="s2">] = </span><span class="s1">body</span>
+
+        <span class="s3"># Create a Loop object for each header.</span>
+        <span class="s1">loops </span><span class="s2">= {}</span>
+        <span class="s0">for </span><span class="s1">header</span><span class="s2">, </span><span class="s1">body </span><span class="s0">in </span><span class="s1">bodies</span><span class="s2">.</span><span class="s1">items</span><span class="s2">():</span>
+            <span class="s1">entries </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+            <span class="s1">exits </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+            <span class="s0">for </span><span class="s1">n </span><span class="s0">in </span><span class="s1">body</span><span class="s2">:</span>
+                <span class="s1">entries</span><span class="s2">.</span><span class="s1">update</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_preds</span><span class="s2">[</span><span class="s1">n</span><span class="s2">] - </span><span class="s1">body</span><span class="s2">)</span>
+                <span class="s1">exits</span><span class="s2">.</span><span class="s1">update</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_succs</span><span class="s2">[</span><span class="s1">n</span><span class="s2">] - </span><span class="s1">body</span><span class="s2">)</span>
+            <span class="s1">loop </span><span class="s2">= </span><span class="s1">Loop</span><span class="s2">(</span><span class="s1">header</span><span class="s2">=</span><span class="s1">header</span><span class="s2">, </span><span class="s1">body</span><span class="s2">=</span><span class="s1">body</span><span class="s2">, </span><span class="s1">entries</span><span class="s2">=</span><span class="s1">entries</span><span class="s2">, </span><span class="s1">exits</span><span class="s2">=</span><span class="s1">exits</span><span class="s2">)</span>
+            <span class="s1">loops</span><span class="s2">[</span><span class="s1">header</span><span class="s2">] = </span><span class="s1">loop</span>
+        <span class="s0">return </span><span class="s1">loops</span>
+
+    <span class="s0">def </span><span class="s1">_find_in_loops</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">loops </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_loops</span>
+        <span class="s3"># Compute the loops to which each node belongs.</span>
+        <span class="s1">in_loops </span><span class="s2">= </span><span class="s1">dict</span><span class="s2">((</span><span class="s1">n</span><span class="s2">, []) </span><span class="s0">for </span><span class="s1">n </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_nodes</span><span class="s2">)</span>
+        <span class="s3"># Sort loops from longest to shortest</span>
+        <span class="s3"># This ensures that outer loops will come before inner loops</span>
+        <span class="s0">for </span><span class="s1">loop </span><span class="s0">in </span><span class="s1">sorted</span><span class="s2">(</span><span class="s1">loops</span><span class="s2">.</span><span class="s1">values</span><span class="s2">(), </span><span class="s1">key</span><span class="s2">=</span><span class="s0">lambda </span><span class="s1">loop</span><span class="s2">: </span><span class="s1">len</span><span class="s2">(</span><span class="s1">loop</span><span class="s2">.</span><span class="s1">body</span><span class="s2">)):</span>
+            <span class="s0">for </span><span class="s1">n </span><span class="s0">in </span><span class="s1">loop</span><span class="s2">.</span><span class="s1">body</span><span class="s2">:</span>
+                <span class="s1">in_loops</span><span class="s2">[</span><span class="s1">n</span><span class="s2">].</span><span class="s1">append</span><span class="s2">(</span><span class="s1">loop</span><span class="s2">.</span><span class="s1">header</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">in_loops</span>
+
+    <span class="s0">def </span><span class="s1">_dump_adj_lists</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">file</span><span class="s2">):</span>
+        <span class="s1">adj_lists </span><span class="s2">= </span><span class="s1">dict</span><span class="s2">((</span><span class="s1">src</span><span class="s2">, </span><span class="s1">sorted</span><span class="s2">(</span><span class="s1">list</span><span class="s2">(</span><span class="s1">dests</span><span class="s2">)))</span>
+                         <span class="s0">for </span><span class="s1">src</span><span class="s2">, </span><span class="s1">dests </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_succs</span><span class="s2">.</span><span class="s1">items</span><span class="s2">())</span>
+        <span class="s0">import </span><span class="s1">pprint</span>
+        <span class="s1">pprint</span><span class="s2">.</span><span class="s1">pprint</span><span class="s2">(</span><span class="s1">adj_lists</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">file</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__eq__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">other</span><span class="s2">):</span>
+        <span class="s0">if not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">other</span><span class="s2">, </span><span class="s1">CFGraph</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">NotImplemented</span>
+
+        <span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s2">[</span><span class="s4">'_nodes'</span><span class="s2">, </span><span class="s4">'_edge_data'</span><span class="s2">, </span><span class="s4">'_entry_point'</span><span class="s2">, </span><span class="s4">'_preds'</span><span class="s2">, </span><span class="s4">'_succs'</span><span class="s2">]:</span>
+            <span class="s1">this </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+            <span class="s1">that </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">other</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">this </span><span class="s2">!= </span><span class="s1">that</span><span class="s2">:</span>
+                <span class="s0">return False</span>
+        <span class="s0">return True</span>
+
+    <span class="s0">def </span><span class="s1">__ne__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">other</span><span class="s2">):</span>
+        <span class="s0">return not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">__eq__</span><span class="s2">(</span><span class="s1">other</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">ControlFlowAnalysis</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Attributes 
+    ---------- 
+    - bytecode 
+ 
+    - blocks 
+ 
+    - blockseq 
+ 
+    - doms: dict of set 
+        Dominators 
+ 
+    - backbone: set of block offsets 
+        The set of block that is common to all possible code path. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">bytecode</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">bytecode </span><span class="s2">= </span><span class="s1">bytecode</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">blocks </span><span class="s2">= {}</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">liveblocks </span><span class="s2">= {}</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">blockseq </span><span class="s2">= []</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">doms </span><span class="s2">= </span><span class="s0">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">backbone </span><span class="s2">= </span><span class="s0">None</span>
+        <span class="s3"># Internal temp states</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_force_new_block </span><span class="s2">= </span><span class="s0">True</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_curblock </span><span class="s2">= </span><span class="s0">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_blockstack </span><span class="s2">= []</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_loops </span><span class="s2">= []</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_withs </span><span class="s2">= []</span>
+
+    <span class="s0">def </span><span class="s1">iterblocks</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Return all blocks in sequence of occurrence 
+        &quot;&quot;&quot;</span>
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">blockseq</span><span class="s2">:</span>
+            <span class="s0">yield </span><span class="s1">self</span><span class="s2">.</span><span class="s1">blocks</span><span class="s2">[</span><span class="s1">i</span><span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">iterliveblocks</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Return all live blocks in sequence of occurrence 
+        &quot;&quot;&quot;</span>
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">blockseq</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">i </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">liveblocks</span><span class="s2">:</span>
+                <span class="s0">yield </span><span class="s1">self</span><span class="s2">.</span><span class="s1">blocks</span><span class="s2">[</span><span class="s1">i</span><span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">incoming_blocks</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">block</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Yield (incoming block, number of stack pops) pairs for *block*. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">pops </span><span class="s0">in </span><span class="s1">block</span><span class="s2">.</span><span class="s1">incoming_jumps</span><span class="s2">.</span><span class="s1">items</span><span class="s2">():</span>
+            <span class="s0">if </span><span class="s1">i </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">liveblocks</span><span class="s2">:</span>
+                <span class="s0">yield </span><span class="s1">self</span><span class="s2">.</span><span class="s1">blocks</span><span class="s2">[</span><span class="s1">i</span><span class="s2">], </span><span class="s1">pops</span>
+
+    <span class="s0">def </span><span class="s1">dump</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">file</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">graph</span><span class="s2">.</span><span class="s1">dump</span><span class="s2">(</span><span class="s1">file</span><span class="s2">=</span><span class="s0">None</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">run</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">for </span><span class="s1">inst </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_iter_inst</span><span class="s2">():</span>
+            <span class="s1">fname </span><span class="s2">= </span><span class="s4">&quot;op_%s&quot; </span><span class="s2">% </span><span class="s1">inst</span><span class="s2">.</span><span class="s1">opname</span>
+            <span class="s1">fn </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">fn </span><span class="s0">is not None</span><span class="s2">:</span>
+                <span class="s1">fn</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">)</span>
+            <span class="s0">elif </span><span class="s1">inst</span><span class="s2">.</span><span class="s1">is_jump</span><span class="s2">:</span>
+                <span class="s3"># this catches e.g. try... except</span>
+                <span class="s1">l </span><span class="s2">= </span><span class="s1">Loc</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">bytecode</span><span class="s2">.</span><span class="s1">func_id</span><span class="s2">.</span><span class="s1">filename</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">.</span><span class="s1">lineno</span><span class="s2">)</span>
+                <span class="s0">if </span><span class="s1">inst</span><span class="s2">.</span><span class="s1">opname </span><span class="s0">in </span><span class="s2">{</span><span class="s4">&quot;SETUP_FINALLY&quot;</span><span class="s2">}:</span>
+                    <span class="s1">msg </span><span class="s2">= </span><span class="s4">&quot;'try' block not supported until python3.7 or later&quot;</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s1">msg </span><span class="s2">= </span><span class="s4">&quot;Use of unsupported opcode (%s) found&quot; </span><span class="s2">% </span><span class="s1">inst</span><span class="s2">.</span><span class="s1">opname</span>
+                <span class="s0">raise </span><span class="s1">UnsupportedError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">, </span><span class="s1">loc</span><span class="s2">=</span><span class="s1">l</span><span class="s2">)</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s3"># Non-jump instructions are ignored</span>
+                <span class="s0">pass  </span><span class="s3"># intentionally</span>
+
+        <span class="s3"># Close all blocks</span>
+        <span class="s0">for </span><span class="s1">cur</span><span class="s2">, </span><span class="s1">nxt </span><span class="s0">in </span><span class="s1">zip</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">blockseq</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">blockseq</span><span class="s2">[</span><span class="s6">1</span><span class="s2">:]):</span>
+            <span class="s1">blk </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">blocks</span><span class="s2">[</span><span class="s1">cur</span><span class="s2">]</span>
+            <span class="s0">if not </span><span class="s1">blk</span><span class="s2">.</span><span class="s1">outgoing_jumps </span><span class="s0">and not </span><span class="s1">blk</span><span class="s2">.</span><span class="s1">terminating</span><span class="s2">:</span>
+                <span class="s1">blk</span><span class="s2">.</span><span class="s1">outgoing_jumps</span><span class="s2">[</span><span class="s1">nxt</span><span class="s2">] = </span><span class="s6">0</span>
+
+        <span class="s1">graph </span><span class="s2">= </span><span class="s1">CFGraph</span><span class="s2">()</span>
+        <span class="s0">for </span><span class="s1">b </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">blocks</span><span class="s2">:</span>
+            <span class="s1">graph</span><span class="s2">.</span><span class="s1">add_node</span><span class="s2">(</span><span class="s1">b</span><span class="s2">)</span>
+        <span class="s0">for </span><span class="s1">b </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">blocks</span><span class="s2">.</span><span class="s1">values</span><span class="s2">():</span>
+            <span class="s0">for </span><span class="s1">out</span><span class="s2">, </span><span class="s1">pops </span><span class="s0">in </span><span class="s1">b</span><span class="s2">.</span><span class="s1">outgoing_jumps</span><span class="s2">.</span><span class="s1">items</span><span class="s2">():</span>
+                <span class="s1">graph</span><span class="s2">.</span><span class="s1">add_edge</span><span class="s2">(</span><span class="s1">b</span><span class="s2">.</span><span class="s1">offset</span><span class="s2">, </span><span class="s1">out</span><span class="s2">, </span><span class="s1">pops</span><span class="s2">)</span>
+        <span class="s1">graph</span><span class="s2">.</span><span class="s1">set_entry_point</span><span class="s2">(</span><span class="s1">min</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">blocks</span><span class="s2">))</span>
+        <span class="s1">graph</span><span class="s2">.</span><span class="s1">process</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">graph </span><span class="s2">= </span><span class="s1">graph</span>
+
+        <span class="s3"># Fill incoming</span>
+        <span class="s0">for </span><span class="s1">b </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">blocks</span><span class="s2">.</span><span class="s1">values</span><span class="s2">():</span>
+            <span class="s0">for </span><span class="s1">out</span><span class="s2">, </span><span class="s1">pops </span><span class="s0">in </span><span class="s1">b</span><span class="s2">.</span><span class="s1">outgoing_jumps</span><span class="s2">.</span><span class="s1">items</span><span class="s2">():</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">blocks</span><span class="s2">[</span><span class="s1">out</span><span class="s2">].</span><span class="s1">incoming_jumps</span><span class="s2">[</span><span class="s1">b</span><span class="s2">.</span><span class="s1">offset</span><span class="s2">] = </span><span class="s1">pops</span>
+
+        <span class="s3"># Find liveblocks</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">liveblocks </span><span class="s2">= </span><span class="s1">dict</span><span class="s2">((</span><span class="s1">i</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">blocks</span><span class="s2">[</span><span class="s1">i</span><span class="s2">])</span>
+                               <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">graph</span><span class="s2">.</span><span class="s1">nodes</span><span class="s2">())</span>
+
+        <span class="s0">for </span><span class="s1">lastblk </span><span class="s0">in </span><span class="s1">reversed</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">blockseq</span><span class="s2">):</span>
+            <span class="s0">if </span><span class="s1">lastblk </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">liveblocks</span><span class="s2">:</span>
+                <span class="s0">break</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">AssertionError</span><span class="s2">(</span><span class="s4">&quot;No live block that exits!?&quot;</span><span class="s2">)</span>
+
+        <span class="s3"># Find backbone</span>
+        <span class="s1">backbone </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">graph</span><span class="s2">.</span><span class="s1">backbone</span><span class="s2">()</span>
+        <span class="s3"># Filter out in loop blocks (Assuming no other cyclic control blocks)</span>
+        <span class="s3"># This is to unavoid variable defined in loops to be considered as</span>
+        <span class="s3"># function scope.</span>
+        <span class="s1">inloopblocks </span><span class="s2">= </span><span class="s1">set</span><span class="s2">()</span>
+
+        <span class="s0">for </span><span class="s1">b </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">blocks</span><span class="s2">.</span><span class="s1">keys</span><span class="s2">():</span>
+            <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">graph</span><span class="s2">.</span><span class="s1">in_loops</span><span class="s2">(</span><span class="s1">b</span><span class="s2">):</span>
+                <span class="s1">inloopblocks</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">b</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">backbone </span><span class="s2">= </span><span class="s1">backbone </span><span class="s2">- </span><span class="s1">inloopblocks</span>
+
+    <span class="s0">def </span><span class="s1">jump</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">target</span><span class="s2">, </span><span class="s1">pops</span><span class="s2">=</span><span class="s6">0</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Register a jump (conditional or not) to *target* offset. 
+        *pops* is the number of stack pops implied by the jump (default 0). 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_curblock</span><span class="s2">.</span><span class="s1">outgoing_jumps</span><span class="s2">[</span><span class="s1">target</span><span class="s2">] = </span><span class="s1">pops</span>
+
+    <span class="s0">def </span><span class="s1">_iter_inst</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">for </span><span class="s1">inst </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bytecode</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_use_new_block</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">):</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_guard_with_as</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_start_new_block</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_curblock</span><span class="s2">.</span><span class="s1">body</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">offset</span><span class="s2">)</span>
+            <span class="s0">yield </span><span class="s1">inst</span>
+
+    <span class="s0">def </span><span class="s1">_use_new_block</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">inst</span><span class="s2">.</span><span class="s1">offset </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bytecode</span><span class="s2">.</span><span class="s1">labels</span><span class="s2">:</span>
+            <span class="s1">res </span><span class="s2">= </span><span class="s0">True</span>
+        <span class="s0">elif </span><span class="s1">inst</span><span class="s2">.</span><span class="s1">opname </span><span class="s0">in </span><span class="s1">NEW_BLOCKERS</span><span class="s2">:</span>
+            <span class="s1">res </span><span class="s2">= </span><span class="s0">True</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">res </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_force_new_block</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_force_new_block </span><span class="s2">= </span><span class="s0">False</span>
+        <span class="s0">return </span><span class="s1">res</span>
+
+    <span class="s0">def </span><span class="s1">_start_new_block</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_curblock </span><span class="s2">= </span><span class="s1">CFBlock</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">offset</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">blocks</span><span class="s2">[</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">offset</span><span class="s2">] = </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_curblock</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">blockseq</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">offset</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">_guard_with_as</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">current_inst</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot;Checks if the next instruction after a SETUP_WITH is something other 
+        than a POP_TOP, if it is something else it'll be some sort of store 
+        which is not supported (this corresponds to `with CTXMGR as VAR(S)`).&quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">current_inst</span><span class="s2">.</span><span class="s1">opname </span><span class="s2">== </span><span class="s4">&quot;SETUP_WITH&quot;</span><span class="s2">:</span>
+            <span class="s1">next_op </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">bytecode</span><span class="s2">[</span><span class="s1">current_inst</span><span class="s2">.</span><span class="s1">next</span><span class="s2">].</span><span class="s1">opname</span>
+            <span class="s0">if </span><span class="s1">next_op </span><span class="s2">!= </span><span class="s4">&quot;POP_TOP&quot;</span><span class="s2">:</span>
+                <span class="s1">msg </span><span class="s2">= (</span><span class="s4">&quot;The 'with (context manager) as &quot;</span>
+                       <span class="s4">&quot;(variable):' construct is not &quot;</span>
+                       <span class="s4">&quot;supported.&quot;</span><span class="s2">)</span>
+                <span class="s0">raise </span><span class="s1">UnsupportedError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">op_SETUP_LOOP</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">):</span>
+        <span class="s1">end </span><span class="s2">= </span><span class="s1">inst</span><span class="s2">.</span><span class="s1">get_jump_target</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_blockstack</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">end</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_loops</span><span class="s2">.</span><span class="s1">append</span><span class="s2">((</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">offset</span><span class="s2">, </span><span class="s1">end</span><span class="s2">))</span>
+        <span class="s3"># TODO: Looplifting requires the loop entry be its own block.</span>
+        <span class="s3">#       Forcing a new block here is the simplest solution for now.</span>
+        <span class="s3">#       But, we should consider other less ad-hoc ways.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">jump</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">next</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_force_new_block </span><span class="s2">= </span><span class="s0">True</span>
+
+    <span class="s0">def </span><span class="s1">op_SETUP_WITH</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">):</span>
+        <span class="s1">end </span><span class="s2">= </span><span class="s1">inst</span><span class="s2">.</span><span class="s1">get_jump_target</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_blockstack</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">end</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_withs</span><span class="s2">.</span><span class="s1">append</span><span class="s2">((</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">offset</span><span class="s2">, </span><span class="s1">end</span><span class="s2">))</span>
+        <span class="s3"># TODO: WithLifting requires the loop entry be its own block.</span>
+        <span class="s3">#       Forcing a new block here is the simplest solution for now.</span>
+        <span class="s3">#       But, we should consider other less ad-hoc ways.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">jump</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">next</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_force_new_block </span><span class="s2">= </span><span class="s0">True</span>
+
+    <span class="s0">def </span><span class="s1">op_POP_BLOCK</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_blockstack</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">op_FOR_ITER</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">jump</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">get_jump_target</span><span class="s2">())</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">jump</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">next</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_force_new_block </span><span class="s2">= </span><span class="s0">True</span>
+
+    <span class="s0">def </span><span class="s1">_op_ABSOLUTE_JUMP_IF</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">jump</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">get_jump_target</span><span class="s2">())</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">jump</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">next</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_force_new_block </span><span class="s2">= </span><span class="s0">True</span>
+
+    <span class="s1">op_POP_JUMP_IF_FALSE </span><span class="s2">= </span><span class="s1">_op_ABSOLUTE_JUMP_IF</span>
+    <span class="s1">op_POP_JUMP_IF_TRUE </span><span class="s2">= </span><span class="s1">_op_ABSOLUTE_JUMP_IF</span>
+    <span class="s1">op_JUMP_IF_FALSE </span><span class="s2">= </span><span class="s1">_op_ABSOLUTE_JUMP_IF</span>
+    <span class="s1">op_JUMP_IF_TRUE </span><span class="s2">= </span><span class="s1">_op_ABSOLUTE_JUMP_IF</span>
+
+    <span class="s1">op_POP_JUMP_FORWARD_IF_FALSE </span><span class="s2">= </span><span class="s1">_op_ABSOLUTE_JUMP_IF</span>
+    <span class="s1">op_POP_JUMP_BACKWARD_IF_FALSE </span><span class="s2">= </span><span class="s1">_op_ABSOLUTE_JUMP_IF</span>
+    <span class="s1">op_POP_JUMP_FORWARD_IF_TRUE </span><span class="s2">= </span><span class="s1">_op_ABSOLUTE_JUMP_IF</span>
+    <span class="s1">op_POP_JUMP_BACKWARD_IF_TRUE </span><span class="s2">= </span><span class="s1">_op_ABSOLUTE_JUMP_IF</span>
+
+    <span class="s0">def </span><span class="s1">_op_ABSOLUTE_JUMP_OR_POP</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">jump</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">get_jump_target</span><span class="s2">())</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">jump</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">next</span><span class="s2">, </span><span class="s1">pops</span><span class="s2">=</span><span class="s6">1</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_force_new_block </span><span class="s2">= </span><span class="s0">True</span>
+
+    <span class="s1">op_JUMP_IF_FALSE_OR_POP </span><span class="s2">= </span><span class="s1">_op_ABSOLUTE_JUMP_OR_POP</span>
+    <span class="s1">op_JUMP_IF_TRUE_OR_POP </span><span class="s2">= </span><span class="s1">_op_ABSOLUTE_JUMP_OR_POP</span>
+
+    <span class="s0">def </span><span class="s1">op_JUMP_ABSOLUTE</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">jump</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">get_jump_target</span><span class="s2">())</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_force_new_block </span><span class="s2">= </span><span class="s0">True</span>
+
+    <span class="s0">def </span><span class="s1">op_JUMP_FORWARD</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">jump</span><span class="s2">(</span><span class="s1">inst</span><span class="s2">.</span><span class="s1">get_jump_target</span><span class="s2">())</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_force_new_block </span><span class="s2">= </span><span class="s0">True</span>
+
+    <span class="s1">op_JUMP_BACKWARD </span><span class="s2">= </span><span class="s1">op_JUMP_FORWARD</span>
+
+    <span class="s0">def </span><span class="s1">op_RETURN_VALUE</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_curblock</span><span class="s2">.</span><span class="s1">terminating </span><span class="s2">= </span><span class="s0">True</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_force_new_block </span><span class="s2">= </span><span class="s0">True</span>
+
+    <span class="s0">if </span><span class="s1">PYVERSION </span><span class="s0">in </span><span class="s2">((</span><span class="s6">3</span><span class="s2">, </span><span class="s6">12</span><span class="s2">), ):</span>
+        <span class="s0">def </span><span class="s1">op_RETURN_CONST</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">):</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_curblock</span><span class="s2">.</span><span class="s1">terminating </span><span class="s2">= </span><span class="s0">True</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_force_new_block </span><span class="s2">= </span><span class="s0">True</span>
+    <span class="s0">elif </span><span class="s1">PYVERSION </span><span class="s0">in </span><span class="s2">((</span><span class="s6">3</span><span class="s2">, </span><span class="s6">9</span><span class="s2">), (</span><span class="s6">3</span><span class="s2">, </span><span class="s6">10</span><span class="s2">), (</span><span class="s6">3</span><span class="s2">, </span><span class="s6">11</span><span class="s2">)):</span>
+        <span class="s0">pass</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span><span class="s2">(</span><span class="s1">PYVERSION</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">op_RAISE_VARARGS</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_curblock</span><span class="s2">.</span><span class="s1">terminating </span><span class="s2">= </span><span class="s0">True</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_force_new_block </span><span class="s2">= </span><span class="s0">True</span>
+
+    <span class="s0">def </span><span class="s1">op_BREAK_LOOP</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">inst</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">jump</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_blockstack</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">])</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_force_new_block </span><span class="s2">= </span><span class="s0">True</span>
+</pre>
+</body>
+</html>

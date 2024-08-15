@@ -1,0 +1,79 @@
+<html>
+<head>
+<title>compiler_lock.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #7a7e85;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+.s6 { color: #5f826b; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+compiler_lock.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">threading</span>
+<span class="s0">import </span><span class="s1">functools</span>
+<span class="s0">import </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">event </span><span class="s0">as </span><span class="s1">ev</span>
+
+
+<span class="s3"># Lock for the preventing multiple compiler execution</span>
+<span class="s0">class </span><span class="s1">_CompilerLock</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_lock </span><span class="s2">= </span><span class="s1">threading</span><span class="s2">.</span><span class="s1">RLock</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">acquire</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">ev</span><span class="s2">.</span><span class="s1">start_event</span><span class="s2">(</span><span class="s4">&quot;numba:compiler_lock&quot;</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_lock</span><span class="s2">.</span><span class="s1">acquire</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">release</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_lock</span><span class="s2">.</span><span class="s1">release</span><span class="s2">()</span>
+        <span class="s1">ev</span><span class="s2">.</span><span class="s1">end_event</span><span class="s2">(</span><span class="s4">&quot;numba:compiler_lock&quot;</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__enter__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">acquire</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">__exit__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">exc_val</span><span class="s2">, </span><span class="s1">exc_type</span><span class="s2">, </span><span class="s1">traceback</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">release</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">is_locked</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">is_owned </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_lock</span><span class="s2">, </span><span class="s4">'_is_owned'</span><span class="s2">)</span>
+        <span class="s0">if not </span><span class="s1">callable</span><span class="s2">(</span><span class="s1">is_owned</span><span class="s2">):</span>
+            <span class="s1">is_owned </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_is_owned</span>
+        <span class="s0">return </span><span class="s1">is_owned</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">__call__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func</span><span class="s2">):</span>
+        <span class="s2">@</span><span class="s1">functools</span><span class="s2">.</span><span class="s1">wraps</span><span class="s2">(</span><span class="s1">func</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">_acquire_compile_lock</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+            <span class="s0">with </span><span class="s1">self</span><span class="s2">:</span>
+                <span class="s0">return </span><span class="s1">func</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">_acquire_compile_lock</span>
+
+    <span class="s0">def </span><span class="s1">_is_owned</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3"># This method is borrowed from threading.Condition.</span>
+        <span class="s3"># Return True if lock is owned by current_thread.</span>
+        <span class="s3"># This method is called only if _lock doesn't have _is_owned().</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_lock</span><span class="s2">.</span><span class="s1">acquire</span><span class="s2">(</span><span class="s5">0</span><span class="s2">):</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_lock</span><span class="s2">.</span><span class="s1">release</span><span class="s2">()</span>
+            <span class="s0">return False</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s0">return True</span>
+
+
+<span class="s1">global_compiler_lock </span><span class="s2">= </span><span class="s1">_CompilerLock</span><span class="s2">()</span>
+
+
+<span class="s0">def </span><span class="s1">require_global_compiler_lock</span><span class="s2">():</span>
+    <span class="s6">&quot;&quot;&quot;Sentry that checks the global_compiler_lock is acquired. 
+    &quot;&quot;&quot;</span>
+    <span class="s3"># Use assert to allow turning off this check</span>
+    <span class="s0">assert </span><span class="s1">global_compiler_lock</span><span class="s2">.</span><span class="s1">is_locked</span><span class="s2">()</span>
+</pre>
+</body>
+</html>

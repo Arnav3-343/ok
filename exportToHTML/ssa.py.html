@@ -1,0 +1,513 @@
+<html>
+<head>
+<title>ssa.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ssa.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Implement Dominance-Fronter-based SSA by Choi et al described in Inria SSA book 
+ 
+References: 
+ 
+- Static Single Assignment Book by Inria 
+  http://ssabook.gforge.inria.fr/latest/book.pdf 
+- Choi et al. Incremental computation of static single assignment form. 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">operator</span>
+<span class="s2">import </span><span class="s1">warnings</span>
+<span class="s2">from </span><span class="s1">functools </span><span class="s2">import </span><span class="s1">reduce</span>
+<span class="s2">from </span><span class="s1">copy </span><span class="s2">import </span><span class="s1">copy</span>
+<span class="s2">from </span><span class="s1">pprint </span><span class="s2">import </span><span class="s1">pformat</span>
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">defaultdict</span>
+
+<span class="s2">from </span><span class="s1">numba </span><span class="s2">import </span><span class="s1">config</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">ir</span><span class="s3">, </span><span class="s1">ir_utils</span><span class="s3">, </span><span class="s1">errors</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">utils </span><span class="s2">import </span><span class="s1">OrderedSet</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">analysis </span><span class="s2">import </span><span class="s1">compute_cfg_from_blocks</span>
+
+
+<span class="s1">_logger </span><span class="s3">= </span><span class="s1">logging</span><span class="s3">.</span><span class="s1">getLogger</span><span class="s3">(</span><span class="s1">__name__</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">reconstruct_ssa</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Apply SSA reconstruction algorithm on the given IR. 
+ 
+    Produces minimal SSA using Choi et al algorithm. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks </span><span class="s3">= </span><span class="s1">_run_ssa</span><span class="s3">(</span><span class="s1">func_ir</span><span class="s3">.</span><span class="s1">blocks</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">func_ir</span>
+
+
+<span class="s2">class </span><span class="s1">_CacheListVars</span><span class="s3">:</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_saved </span><span class="s3">= {}</span>
+
+    <span class="s2">def </span><span class="s1">get</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">inst</span><span class="s3">):</span>
+        <span class="s1">got </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_saved</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">got </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_saved</span><span class="s3">[</span><span class="s1">inst</span><span class="s3">] = </span><span class="s1">got </span><span class="s3">= </span><span class="s1">inst</span><span class="s3">.</span><span class="s1">list_vars</span><span class="s3">()</span>
+        <span class="s2">return </span><span class="s1">got</span>
+
+
+<span class="s2">def </span><span class="s1">_run_ssa</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Run SSA reconstruction on IR blocks of a function. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if not </span><span class="s1">blocks</span><span class="s3">:</span>
+        <span class="s4"># Empty blocks?</span>
+        <span class="s2">return </span><span class="s3">{}</span>
+    <span class="s4"># Run CFG on the blocks</span>
+    <span class="s1">cfg </span><span class="s3">= </span><span class="s1">compute_cfg_from_blocks</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">)</span>
+    <span class="s1">df_plus </span><span class="s3">= </span><span class="s1">_iterated_domfronts</span><span class="s3">(</span><span class="s1">cfg</span><span class="s3">)</span>
+    <span class="s4"># Find SSA violators</span>
+    <span class="s1">violators </span><span class="s3">= </span><span class="s1">_find_defs_violators</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">cfg</span><span class="s3">)</span>
+    <span class="s4"># Make cache for .list_vars()</span>
+    <span class="s1">cache_list_vars </span><span class="s3">= </span><span class="s1">_CacheListVars</span><span class="s3">()</span>
+
+    <span class="s4"># Process one SSA-violating variable at a time</span>
+    <span class="s2">for </span><span class="s1">varname </span><span class="s2">in </span><span class="s1">violators</span><span class="s3">:</span>
+        <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span>
+            <span class="s5">&quot;Fix SSA violator on var %s&quot;</span><span class="s3">, </span><span class="s1">varname</span><span class="s3">,</span>
+        <span class="s3">)</span>
+        <span class="s4"># Fix up the LHS</span>
+        <span class="s4"># Put fresh variables for all assignments to the variable</span>
+        <span class="s1">blocks</span><span class="s3">, </span><span class="s1">defmap </span><span class="s3">= </span><span class="s1">_fresh_vars</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">varname</span><span class="s3">)</span>
+        <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;Replaced assignments: %s&quot;</span><span class="s3">, </span><span class="s1">pformat</span><span class="s3">(</span><span class="s1">defmap</span><span class="s3">))</span>
+        <span class="s4"># Fix up the RHS</span>
+        <span class="s4"># Re-associate the variable uses with the reaching definition</span>
+        <span class="s1">blocks </span><span class="s3">= </span><span class="s1">_fix_ssa_vars</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">varname</span><span class="s3">, </span><span class="s1">defmap</span><span class="s3">, </span><span class="s1">cfg</span><span class="s3">, </span><span class="s1">df_plus</span><span class="s3">,</span>
+                               <span class="s1">cache_list_vars</span><span class="s3">)</span>
+
+    <span class="s4"># Post-condition checks.</span>
+    <span class="s4"># CFG invariant</span>
+    <span class="s1">cfg_post </span><span class="s3">= </span><span class="s1">compute_cfg_from_blocks</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">cfg_post </span><span class="s3">!= </span><span class="s1">cfg</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">errors</span><span class="s3">.</span><span class="s1">CompilerError</span><span class="s3">(</span><span class="s5">&quot;CFG mutated in SSA pass&quot;</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">blocks</span>
+
+
+<span class="s2">def </span><span class="s1">_fix_ssa_vars</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">varname</span><span class="s3">, </span><span class="s1">defmap</span><span class="s3">, </span><span class="s1">cfg</span><span class="s3">, </span><span class="s1">df_plus</span><span class="s3">, </span><span class="s1">cache_list_vars</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Rewrite all uses to ``varname`` given the definition map 
+    &quot;&quot;&quot;</span>
+    <span class="s1">states </span><span class="s3">= </span><span class="s1">_make_states</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">)</span>
+    <span class="s1">states</span><span class="s3">[</span><span class="s5">'varname'</span><span class="s3">] = </span><span class="s1">varname</span>
+    <span class="s1">states</span><span class="s3">[</span><span class="s5">'defmap'</span><span class="s3">] = </span><span class="s1">defmap</span>
+    <span class="s1">states</span><span class="s3">[</span><span class="s5">'phimap'</span><span class="s3">] = </span><span class="s1">phimap </span><span class="s3">= </span><span class="s1">defaultdict</span><span class="s3">(</span><span class="s1">list</span><span class="s3">)</span>
+    <span class="s1">states</span><span class="s3">[</span><span class="s5">'cfg'</span><span class="s3">] = </span><span class="s1">cfg</span>
+    <span class="s1">states</span><span class="s3">[</span><span class="s5">'phi_locations'</span><span class="s3">] = </span><span class="s1">_compute_phi_locations</span><span class="s3">(</span><span class="s1">df_plus</span><span class="s3">, </span><span class="s1">defmap</span><span class="s3">)</span>
+    <span class="s1">newblocks </span><span class="s3">= </span><span class="s1">_run_block_rewrite</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">states</span><span class="s3">, </span><span class="s1">_FixSSAVars</span><span class="s3">(</span><span class="s1">cache_list_vars</span><span class="s3">))</span>
+    <span class="s4"># insert phi nodes</span>
+    <span class="s2">for </span><span class="s1">label</span><span class="s3">, </span><span class="s1">philist </span><span class="s2">in </span><span class="s1">phimap</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+        <span class="s1">curblk </span><span class="s3">= </span><span class="s1">newblocks</span><span class="s3">[</span><span class="s1">label</span><span class="s3">]</span>
+        <span class="s4"># Prepend PHI nodes to the block</span>
+        <span class="s1">curblk</span><span class="s3">.</span><span class="s1">body </span><span class="s3">= </span><span class="s1">philist </span><span class="s3">+ </span><span class="s1">curblk</span><span class="s3">.</span><span class="s1">body</span>
+    <span class="s2">return </span><span class="s1">newblocks</span>
+
+
+<span class="s2">def </span><span class="s1">_iterated_domfronts</span><span class="s3">(</span><span class="s1">cfg</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Compute the iterated dominance frontiers (DF+ in literatures). 
+ 
+    Returns a dictionary which maps block label to the set of labels of its 
+    iterated dominance frontiers. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">domfronts </span><span class="s3">= {</span><span class="s1">k</span><span class="s3">: </span><span class="s1">set</span><span class="s3">(</span><span class="s1">vs</span><span class="s3">) </span><span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">vs </span><span class="s2">in </span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">dominance_frontier</span><span class="s3">().</span><span class="s1">items</span><span class="s3">()}</span>
+    <span class="s1">keep_going </span><span class="s3">= </span><span class="s2">True</span>
+    <span class="s2">while </span><span class="s1">keep_going</span><span class="s3">:</span>
+        <span class="s1">keep_going </span><span class="s3">= </span><span class="s2">False</span>
+        <span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">vs </span><span class="s2">in </span><span class="s1">domfronts</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+            <span class="s1">inner </span><span class="s3">= </span><span class="s1">reduce</span><span class="s3">(</span><span class="s1">operator</span><span class="s3">.</span><span class="s1">or_</span><span class="s3">, [</span><span class="s1">domfronts</span><span class="s3">[</span><span class="s1">v</span><span class="s3">] </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">vs</span><span class="s3">], </span><span class="s1">set</span><span class="s3">())</span>
+            <span class="s2">if </span><span class="s1">inner</span><span class="s3">.</span><span class="s1">difference</span><span class="s3">(</span><span class="s1">vs</span><span class="s3">):</span>
+                <span class="s1">vs </span><span class="s3">|= </span><span class="s1">inner</span>
+                <span class="s1">keep_going </span><span class="s3">= </span><span class="s2">True</span>
+    <span class="s2">return </span><span class="s1">domfronts</span>
+
+
+<span class="s2">def </span><span class="s1">_compute_phi_locations</span><span class="s3">(</span><span class="s1">iterated_df</span><span class="s3">, </span><span class="s1">defmap</span><span class="s3">):</span>
+    <span class="s4"># See basic algorithm in Ch 4.1 in Inria SSA Book</span>
+    <span class="s4"># Compute DF+(defs)</span>
+    <span class="s4"># DF of all DFs is the union of all DFs</span>
+    <span class="s1">phi_locations </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+    <span class="s2">for </span><span class="s1">deflabel</span><span class="s3">, </span><span class="s1">defstmts </span><span class="s2">in </span><span class="s1">defmap</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+        <span class="s2">if </span><span class="s1">defstmts</span><span class="s3">:</span>
+            <span class="s1">phi_locations </span><span class="s3">|= </span><span class="s1">iterated_df</span><span class="s3">[</span><span class="s1">deflabel</span><span class="s3">]</span>
+    <span class="s2">return </span><span class="s1">phi_locations</span>
+
+
+<span class="s2">def </span><span class="s1">_fresh_vars</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">varname</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Rewrite to put fresh variable names 
+    &quot;&quot;&quot;</span>
+    <span class="s1">states </span><span class="s3">= </span><span class="s1">_make_states</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">)</span>
+    <span class="s1">states</span><span class="s3">[</span><span class="s5">'varname'</span><span class="s3">] = </span><span class="s1">varname</span>
+    <span class="s1">states</span><span class="s3">[</span><span class="s5">'defmap'</span><span class="s3">] = </span><span class="s1">defmap </span><span class="s3">= </span><span class="s1">defaultdict</span><span class="s3">(</span><span class="s1">list</span><span class="s3">)</span>
+    <span class="s1">newblocks </span><span class="s3">= </span><span class="s1">_run_block_rewrite</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">states</span><span class="s3">, </span><span class="s1">_FreshVarHandler</span><span class="s3">())</span>
+    <span class="s2">return </span><span class="s1">newblocks</span><span class="s3">, </span><span class="s1">defmap</span>
+
+
+<span class="s2">def </span><span class="s1">_get_scope</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">):</span>
+    <span class="s1">first</span><span class="s3">, *</span><span class="s1">_ </span><span class="s3">= </span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">values</span><span class="s3">()</span>
+    <span class="s2">return </span><span class="s1">first</span><span class="s3">.</span><span class="s1">scope</span>
+
+
+<span class="s2">def </span><span class="s1">_find_defs_violators</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">cfg</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Returns 
+    ------- 
+    res : Set[str] 
+        The SSA violators in a dictionary of variable names. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">defs </span><span class="s3">= </span><span class="s1">defaultdict</span><span class="s3">(</span><span class="s1">list</span><span class="s3">)</span>
+    <span class="s1">uses </span><span class="s3">= </span><span class="s1">defaultdict</span><span class="s3">(</span><span class="s1">set</span><span class="s3">)</span>
+    <span class="s1">states </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">defs</span><span class="s3">=</span><span class="s1">defs</span><span class="s3">, </span><span class="s1">uses</span><span class="s3">=</span><span class="s1">uses</span><span class="s3">)</span>
+    <span class="s1">_run_block_analysis</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">states</span><span class="s3">, </span><span class="s1">_GatherDefsHandler</span><span class="s3">())</span>
+    <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;defs %s&quot;</span><span class="s3">, </span><span class="s1">pformat</span><span class="s3">(</span><span class="s1">defs</span><span class="s3">))</span>
+    <span class="s4"># Gather violators by number of definitions.</span>
+    <span class="s4"># The violators are added by the order that they are seen and the algorithm</span>
+    <span class="s4"># scan from the first to the last basic-block as they occur in bytecode.</span>
+    <span class="s1">violators </span><span class="s3">= </span><span class="s1">OrderedSet</span><span class="s3">([</span><span class="s1">k </span><span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">vs </span><span class="s2">in </span><span class="s1">defs</span><span class="s3">.</span><span class="s1">items</span><span class="s3">() </span><span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">vs</span><span class="s3">) &gt; </span><span class="s6">1</span><span class="s3">])</span>
+    <span class="s4"># Gather violators by uses not dominated by the one def</span>
+    <span class="s1">doms </span><span class="s3">= </span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">dominators</span><span class="s3">()</span>
+    <span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">use_blocks </span><span class="s2">in </span><span class="s1">uses</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+        <span class="s2">if </span><span class="s1">k </span><span class="s2">not in </span><span class="s1">violators</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">label </span><span class="s2">in </span><span class="s1">use_blocks</span><span class="s3">:</span>
+                <span class="s1">dom </span><span class="s3">= </span><span class="s1">doms</span><span class="s3">[</span><span class="s1">label</span><span class="s3">]</span>
+                <span class="s1">def_labels </span><span class="s3">= {</span><span class="s1">label </span><span class="s2">for </span><span class="s1">_assign</span><span class="s3">, </span><span class="s1">label </span><span class="s2">in </span><span class="s1">defs</span><span class="s3">[</span><span class="s1">k</span><span class="s3">] }</span>
+                <span class="s2">if not </span><span class="s1">def_labels</span><span class="s3">.</span><span class="s1">intersection</span><span class="s3">(</span><span class="s1">dom</span><span class="s3">):</span>
+                    <span class="s1">violators</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">k</span><span class="s3">)</span>
+                    <span class="s2">break</span>
+    <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;SSA violators %s&quot;</span><span class="s3">, </span><span class="s1">pformat</span><span class="s3">(</span><span class="s1">violators</span><span class="s3">))</span>
+    <span class="s2">return </span><span class="s1">violators</span>
+
+
+<span class="s2">def </span><span class="s1">_run_block_analysis</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">states</span><span class="s3">, </span><span class="s1">handler</span><span class="s3">):</span>
+    <span class="s2">for </span><span class="s1">label</span><span class="s3">, </span><span class="s1">blk </span><span class="s2">in </span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+        <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;==== SSA block analysis pass on %s&quot;</span><span class="s3">, </span><span class="s1">label</span><span class="s3">)</span>
+        <span class="s1">states</span><span class="s3">[</span><span class="s5">'label'</span><span class="s3">] = </span><span class="s1">label</span>
+        <span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">_run_ssa_block_pass</span><span class="s3">(</span><span class="s1">states</span><span class="s3">, </span><span class="s1">blk</span><span class="s3">, </span><span class="s1">handler</span><span class="s3">):</span>
+            <span class="s2">pass</span>
+
+
+<span class="s2">def </span><span class="s1">_run_block_rewrite</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">states</span><span class="s3">, </span><span class="s1">handler</span><span class="s3">):</span>
+    <span class="s1">newblocks </span><span class="s3">= {}</span>
+    <span class="s2">for </span><span class="s1">label</span><span class="s3">, </span><span class="s1">blk </span><span class="s2">in </span><span class="s1">blocks</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+        <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;==== SSA block rewrite pass on %s&quot;</span><span class="s3">, </span><span class="s1">label</span><span class="s3">)</span>
+        <span class="s1">newblk </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Block</span><span class="s3">(</span><span class="s1">scope</span><span class="s3">=</span><span class="s1">blk</span><span class="s3">.</span><span class="s1">scope</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">blk</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">)</span>
+
+        <span class="s1">newbody </span><span class="s3">= []</span>
+        <span class="s1">states</span><span class="s3">[</span><span class="s5">'label'</span><span class="s3">] = </span><span class="s1">label</span>
+        <span class="s1">states</span><span class="s3">[</span><span class="s5">'block'</span><span class="s3">] = </span><span class="s1">blk</span>
+        <span class="s2">for </span><span class="s1">stmt </span><span class="s2">in </span><span class="s1">_run_ssa_block_pass</span><span class="s3">(</span><span class="s1">states</span><span class="s3">, </span><span class="s1">blk</span><span class="s3">, </span><span class="s1">handler</span><span class="s3">):</span>
+            <span class="s2">assert </span><span class="s1">stmt </span><span class="s2">is not None</span>
+            <span class="s1">newbody</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">)</span>
+        <span class="s1">newblk</span><span class="s3">.</span><span class="s1">body </span><span class="s3">= </span><span class="s1">newbody</span>
+        <span class="s1">newblocks</span><span class="s3">[</span><span class="s1">label</span><span class="s3">] = </span><span class="s1">newblk</span>
+    <span class="s2">return </span><span class="s1">newblocks</span>
+
+
+<span class="s2">def </span><span class="s1">_make_states</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">dict</span><span class="s3">(</span>
+        <span class="s1">scope</span><span class="s3">=</span><span class="s1">_get_scope</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">),</span>
+    <span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_run_ssa_block_pass</span><span class="s3">(</span><span class="s1">states</span><span class="s3">, </span><span class="s1">blk</span><span class="s3">, </span><span class="s1">handler</span><span class="s3">):</span>
+    <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;Running %s&quot;</span><span class="s3">, </span><span class="s1">handler</span><span class="s3">)</span>
+    <span class="s2">for </span><span class="s1">stmt </span><span class="s2">in </span><span class="s1">blk</span><span class="s3">.</span><span class="s1">body</span><span class="s3">:</span>
+        <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;on stmt: %s&quot;</span><span class="s3">, </span><span class="s1">stmt</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Assign</span><span class="s3">):</span>
+            <span class="s1">ret </span><span class="s3">= </span><span class="s1">handler</span><span class="s3">.</span><span class="s1">on_assign</span><span class="s3">(</span><span class="s1">states</span><span class="s3">, </span><span class="s1">stmt</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">ret </span><span class="s3">= </span><span class="s1">handler</span><span class="s3">.</span><span class="s1">on_other</span><span class="s3">(</span><span class="s1">states</span><span class="s3">, </span><span class="s1">stmt</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">ret </span><span class="s2">is not </span><span class="s1">stmt </span><span class="s2">and </span><span class="s1">ret </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;replaced with: %s&quot;</span><span class="s3">, </span><span class="s1">ret</span><span class="s3">)</span>
+        <span class="s2">yield </span><span class="s1">ret</span>
+
+
+<span class="s2">class </span><span class="s1">_BaseHandler</span><span class="s3">:</span>
+    <span class="s0">&quot;&quot;&quot;A base handler for all the passes used here for the SSA algorithm. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">on_assign</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">states</span><span class="s3">, </span><span class="s1">assign</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Called when the pass sees an ``ir.Assign``. 
+ 
+        Subclasses should override this for custom behavior 
+ 
+        Parameters 
+        ----------- 
+        states : dict 
+        assign : numba.ir.Assign 
+ 
+        Returns 
+        ------- 
+        stmt : numba.ir.Assign or None 
+            For rewrite passes, the return value is used as the replacement 
+            for the given statement. 
+        &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">on_other</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">states</span><span class="s3">, </span><span class="s1">stmt</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Called when the pass sees an ``ir.Stmt`` that's not an assignment. 
+ 
+        Subclasses should override this for custom behavior 
+ 
+        Parameters 
+        ----------- 
+        states : dict 
+        assign : numba.ir.Stmt 
+ 
+        Returns 
+        ------- 
+        stmt : numba.ir.Stmt or None 
+            For rewrite passes, the return value is used as the replacement 
+            for the given statement. 
+        &quot;&quot;&quot;</span>
+
+
+<span class="s2">class </span><span class="s1">_GatherDefsHandler</span><span class="s3">(</span><span class="s1">_BaseHandler</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Find all defs and uses of variable in each block 
+ 
+    ``states[&quot;label&quot;]`` is a int; label of the current block 
+    ``states[&quot;defs&quot;]`` is a Mapping[str, List[Tuple[ir.Assign, int]]]: 
+        - a mapping of the name of the assignee variable to the assignment 
+          IR node and the block label. 
+    ``states[&quot;uses&quot;]`` is a Mapping[Set[int]] 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">on_assign</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">states</span><span class="s3">, </span><span class="s1">assign</span><span class="s3">):</span>
+        <span class="s4"># keep track of assignment and the block</span>
+        <span class="s1">states</span><span class="s3">[</span><span class="s5">&quot;defs&quot;</span><span class="s3">][</span><span class="s1">assign</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name</span><span class="s3">].</span><span class="s1">append</span><span class="s3">((</span><span class="s1">assign</span><span class="s3">, </span><span class="s1">states</span><span class="s3">[</span><span class="s5">&quot;label&quot;</span><span class="s3">]))</span>
+        <span class="s4"># keep track of uses</span>
+        <span class="s2">for </span><span class="s1">var </span><span class="s2">in </span><span class="s1">assign</span><span class="s3">.</span><span class="s1">list_vars</span><span class="s3">():</span>
+            <span class="s1">k </span><span class="s3">= </span><span class="s1">var</span><span class="s3">.</span><span class="s1">name</span>
+            <span class="s2">if </span><span class="s1">k </span><span class="s3">!= </span><span class="s1">assign</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name</span><span class="s3">:</span>
+                <span class="s1">states</span><span class="s3">[</span><span class="s5">&quot;uses&quot;</span><span class="s3">][</span><span class="s1">k</span><span class="s3">].</span><span class="s1">add</span><span class="s3">(</span><span class="s1">states</span><span class="s3">[</span><span class="s5">&quot;label&quot;</span><span class="s3">])</span>
+
+    <span class="s2">def </span><span class="s1">on_other</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">states</span><span class="s3">, </span><span class="s1">stmt</span><span class="s3">):</span>
+        <span class="s4"># keep track of uses</span>
+        <span class="s2">for </span><span class="s1">var </span><span class="s2">in </span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">list_vars</span><span class="s3">():</span>
+            <span class="s1">k </span><span class="s3">= </span><span class="s1">var</span><span class="s3">.</span><span class="s1">name</span>
+            <span class="s1">states</span><span class="s3">[</span><span class="s5">&quot;uses&quot;</span><span class="s3">][</span><span class="s1">k</span><span class="s3">].</span><span class="s1">add</span><span class="s3">(</span><span class="s1">states</span><span class="s3">[</span><span class="s5">&quot;label&quot;</span><span class="s3">])</span>
+
+
+<span class="s2">class </span><span class="s1">UndefinedVariable</span><span class="s3">:</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">raise </span><span class="s1">NotImplementedError</span><span class="s3">(</span><span class="s5">&quot;Not intended for instantiation&quot;</span><span class="s3">)</span>
+
+    <span class="s1">target </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">UNDEFINED</span>
+
+
+<span class="s2">class </span><span class="s1">_FreshVarHandler</span><span class="s3">(</span><span class="s1">_BaseHandler</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Replaces assignment target with new fresh variables. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">on_assign</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">states</span><span class="s3">, </span><span class="s1">assign</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">assign</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name </span><span class="s3">== </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'varname'</span><span class="s3">]:</span>
+            <span class="s1">scope </span><span class="s3">= </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'scope'</span><span class="s3">]</span>
+            <span class="s1">defmap </span><span class="s3">= </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'defmap'</span><span class="s3">]</span>
+            <span class="s4"># Allow first assignment to retain the name</span>
+            <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">defmap</span><span class="s3">) == </span><span class="s6">0</span><span class="s3">:</span>
+                <span class="s1">newtarget </span><span class="s3">= </span><span class="s1">assign</span><span class="s3">.</span><span class="s1">target</span>
+                <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;first assign: %s&quot;</span><span class="s3">, </span><span class="s1">newtarget</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">newtarget</span><span class="s3">.</span><span class="s1">name </span><span class="s2">not in </span><span class="s1">scope</span><span class="s3">.</span><span class="s1">localvars</span><span class="s3">:</span>
+                    <span class="s1">wmsg </span><span class="s3">= </span><span class="s5">f&quot;variable </span><span class="s2">{</span><span class="s1">newtarget</span><span class="s3">.</span><span class="s1">name</span><span class="s2">!r} </span><span class="s5">is not in scope.&quot;</span>
+                    <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span><span class="s1">errors</span><span class="s3">.</span><span class="s1">NumbaIRAssumptionWarning</span><span class="s3">(</span><span class="s1">wmsg</span><span class="s3">,</span>
+                                  <span class="s1">loc</span><span class="s3">=</span><span class="s1">assign</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">))</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">newtarget </span><span class="s3">= </span><span class="s1">scope</span><span class="s3">.</span><span class="s1">redefine</span><span class="s3">(</span><span class="s1">assign</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">assign</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">)</span>
+            <span class="s1">assign </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Assign</span><span class="s3">(</span>
+                <span class="s1">target</span><span class="s3">=</span><span class="s1">newtarget</span><span class="s3">,</span>
+                <span class="s1">value</span><span class="s3">=</span><span class="s1">assign</span><span class="s3">.</span><span class="s1">value</span><span class="s3">,</span>
+                <span class="s1">loc</span><span class="s3">=</span><span class="s1">assign</span><span class="s3">.</span><span class="s1">loc</span>
+            <span class="s3">)</span>
+            <span class="s1">defmap</span><span class="s3">[</span><span class="s1">states</span><span class="s3">[</span><span class="s5">'label'</span><span class="s3">]].</span><span class="s1">append</span><span class="s3">(</span><span class="s1">assign</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">assign</span>
+
+    <span class="s2">def </span><span class="s1">on_other</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">states</span><span class="s3">, </span><span class="s1">stmt</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">stmt</span>
+
+
+<span class="s2">class </span><span class="s1">_FixSSAVars</span><span class="s3">(</span><span class="s1">_BaseHandler</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Replace variable uses in IR nodes to the correct reaching variable 
+    and introduce Phi nodes if necessary. This class contains the core of 
+    the SSA reconstruction algorithm. 
+ 
+    See Ch 5 of the Inria SSA book for reference. The method names used here 
+    are similar to the names used in the pseudocode in the book. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">cache_list_vars</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_list_vars </span><span class="s3">= </span><span class="s1">cache_list_vars</span>
+
+    <span class="s2">def </span><span class="s1">on_assign</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">states</span><span class="s3">, </span><span class="s1">assign</span><span class="s3">):</span>
+        <span class="s1">rhs </span><span class="s3">= </span><span class="s1">assign</span><span class="s3">.</span><span class="s1">value</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">rhs</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Inst</span><span class="s3">):</span>
+            <span class="s1">newdef </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fix_var</span><span class="s3">(</span>
+                <span class="s1">states</span><span class="s3">, </span><span class="s1">assign</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_list_vars</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">assign</span><span class="s3">.</span><span class="s1">value</span><span class="s3">),</span>
+            <span class="s3">)</span>
+            <span class="s4"># Has a replacement that is not the current variable</span>
+            <span class="s2">if </span><span class="s1">newdef </span><span class="s2">is not None and </span><span class="s1">newdef</span><span class="s3">.</span><span class="s1">target </span><span class="s2">is not </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">UNDEFINED</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'varname'</span><span class="s3">] != </span><span class="s1">newdef</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name</span><span class="s3">:</span>
+                    <span class="s1">replmap </span><span class="s3">= {</span><span class="s1">states</span><span class="s3">[</span><span class="s5">'varname'</span><span class="s3">]: </span><span class="s1">newdef</span><span class="s3">.</span><span class="s1">target</span><span class="s3">}</span>
+                    <span class="s1">rhs </span><span class="s3">= </span><span class="s1">copy</span><span class="s3">(</span><span class="s1">rhs</span><span class="s3">)</span>
+
+                    <span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">replace_vars_inner</span><span class="s3">(</span><span class="s1">rhs</span><span class="s3">, </span><span class="s1">replmap</span><span class="s3">)</span>
+                    <span class="s2">return </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Assign</span><span class="s3">(</span>
+                        <span class="s1">target</span><span class="s3">=</span><span class="s1">assign</span><span class="s3">.</span><span class="s1">target</span><span class="s3">,</span>
+                        <span class="s1">value</span><span class="s3">=</span><span class="s1">rhs</span><span class="s3">,</span>
+                        <span class="s1">loc</span><span class="s3">=</span><span class="s1">assign</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">,</span>
+                    <span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">rhs</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Var</span><span class="s3">):</span>
+            <span class="s1">newdef </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fix_var</span><span class="s3">(</span><span class="s1">states</span><span class="s3">, </span><span class="s1">assign</span><span class="s3">, [</span><span class="s1">rhs</span><span class="s3">])</span>
+            <span class="s4"># Has a replacement that is not the current variable</span>
+            <span class="s2">if </span><span class="s1">newdef </span><span class="s2">is not None and </span><span class="s1">newdef</span><span class="s3">.</span><span class="s1">target </span><span class="s2">is not </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">UNDEFINED</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'varname'</span><span class="s3">] != </span><span class="s1">newdef</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name</span><span class="s3">:</span>
+                    <span class="s2">return </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Assign</span><span class="s3">(</span>
+                        <span class="s1">target</span><span class="s3">=</span><span class="s1">assign</span><span class="s3">.</span><span class="s1">target</span><span class="s3">,</span>
+                        <span class="s1">value</span><span class="s3">=</span><span class="s1">newdef</span><span class="s3">.</span><span class="s1">target</span><span class="s3">,</span>
+                        <span class="s1">loc</span><span class="s3">=</span><span class="s1">assign</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">,</span>
+                    <span class="s3">)</span>
+
+        <span class="s2">return </span><span class="s1">assign</span>
+
+    <span class="s2">def </span><span class="s1">on_other</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">states</span><span class="s3">, </span><span class="s1">stmt</span><span class="s3">):</span>
+        <span class="s1">newdef </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fix_var</span><span class="s3">(</span>
+            <span class="s1">states</span><span class="s3">, </span><span class="s1">stmt</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cache_list_vars</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">),</span>
+        <span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">newdef </span><span class="s2">is not None and </span><span class="s1">newdef</span><span class="s3">.</span><span class="s1">target </span><span class="s2">is not </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">UNDEFINED</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'varname'</span><span class="s3">] != </span><span class="s1">newdef</span><span class="s3">.</span><span class="s1">target</span><span class="s3">.</span><span class="s1">name</span><span class="s3">:</span>
+                <span class="s1">replmap </span><span class="s3">= {</span><span class="s1">states</span><span class="s3">[</span><span class="s5">'varname'</span><span class="s3">]: </span><span class="s1">newdef</span><span class="s3">.</span><span class="s1">target</span><span class="s3">}</span>
+                <span class="s1">stmt </span><span class="s3">= </span><span class="s1">copy</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">)</span>
+                <span class="s1">ir_utils</span><span class="s3">.</span><span class="s1">replace_vars_stmt</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">, </span><span class="s1">replmap</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">stmt</span>
+
+    <span class="s2">def </span><span class="s1">_fix_var</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">states</span><span class="s3">, </span><span class="s1">stmt</span><span class="s3">, </span><span class="s1">used_vars</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Fix all variable uses in ``used_vars``. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">varnames </span><span class="s3">= [</span><span class="s1">k</span><span class="s3">.</span><span class="s1">name </span><span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">used_vars</span><span class="s3">]</span>
+        <span class="s1">phivar </span><span class="s3">= </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'varname'</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">phivar </span><span class="s2">in </span><span class="s1">varnames</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_find_def</span><span class="s3">(</span><span class="s1">states</span><span class="s3">, </span><span class="s1">stmt</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_find_def</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">states</span><span class="s3">, </span><span class="s1">stmt</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Find definition of ``stmt`` for the statement ``stmt`` 
+        &quot;&quot;&quot;</span>
+        <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;find_def var=%r stmt=%s&quot;</span><span class="s3">, </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'varname'</span><span class="s3">], </span><span class="s1">stmt</span><span class="s3">)</span>
+        <span class="s1">selected_def </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s1">label </span><span class="s3">= </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'label'</span><span class="s3">]</span>
+        <span class="s1">local_defs </span><span class="s3">= </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'defmap'</span><span class="s3">][</span><span class="s1">label</span><span class="s3">]</span>
+        <span class="s1">local_phis </span><span class="s3">= </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'phimap'</span><span class="s3">][</span><span class="s1">label</span><span class="s3">]</span>
+        <span class="s1">block </span><span class="s3">= </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'block'</span><span class="s3">]</span>
+
+        <span class="s1">cur_pos </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_stmt_index</span><span class="s3">(</span><span class="s1">stmt</span><span class="s3">, </span><span class="s1">block</span><span class="s3">)</span>
+        <span class="s2">for </span><span class="s1">defstmt </span><span class="s2">in </span><span class="s1">reversed</span><span class="s3">(</span><span class="s1">local_defs</span><span class="s3">):</span>
+            <span class="s4"># Phi nodes have no index</span>
+            <span class="s1">def_pos </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_stmt_index</span><span class="s3">(</span><span class="s1">defstmt</span><span class="s3">, </span><span class="s1">block</span><span class="s3">, </span><span class="s1">stop</span><span class="s3">=</span><span class="s1">cur_pos</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">def_pos </span><span class="s3">&lt; </span><span class="s1">cur_pos</span><span class="s3">:</span>
+                <span class="s1">selected_def </span><span class="s3">= </span><span class="s1">defstmt</span>
+                <span class="s2">break</span>
+            <span class="s4"># Maybe it's a PHI</span>
+            <span class="s2">elif </span><span class="s1">defstmt </span><span class="s2">in </span><span class="s1">local_phis</span><span class="s3">:</span>
+                <span class="s1">selected_def </span><span class="s3">= </span><span class="s1">local_phis</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">]</span>
+                <span class="s2">break</span>
+
+        <span class="s2">if </span><span class="s1">selected_def </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">selected_def </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_find_def_from_top</span><span class="s3">(</span>
+                <span class="s1">states</span><span class="s3">, </span><span class="s1">label</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">stmt</span><span class="s3">.</span><span class="s1">loc</span><span class="s3">,</span>
+            <span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">selected_def</span>
+
+    <span class="s2">def </span><span class="s1">_find_def_from_top</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">states</span><span class="s3">, </span><span class="s1">label</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Find definition reaching block of ``label``. 
+ 
+        This method would look at all dominance frontiers. 
+        Insert phi node if necessary. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;find_def_from_top label %r&quot;</span><span class="s3">, </span><span class="s1">label</span><span class="s3">)</span>
+        <span class="s1">cfg </span><span class="s3">= </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'cfg'</span><span class="s3">]</span>
+        <span class="s1">defmap </span><span class="s3">= </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'defmap'</span><span class="s3">]</span>
+        <span class="s1">phimap </span><span class="s3">= </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'phimap'</span><span class="s3">]</span>
+        <span class="s1">phi_locations </span><span class="s3">= </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'phi_locations'</span><span class="s3">]</span>
+
+        <span class="s2">if </span><span class="s1">label </span><span class="s2">in </span><span class="s1">phi_locations</span><span class="s3">:</span>
+            <span class="s1">scope </span><span class="s3">= </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'scope'</span><span class="s3">]</span>
+            <span class="s1">loc </span><span class="s3">= </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'block'</span><span class="s3">].</span><span class="s1">loc</span>
+            <span class="s4"># fresh variable</span>
+            <span class="s1">freshvar </span><span class="s3">= </span><span class="s1">scope</span><span class="s3">.</span><span class="s1">redefine</span><span class="s3">(</span><span class="s1">states</span><span class="s3">[</span><span class="s5">'varname'</span><span class="s3">], </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">)</span>
+            <span class="s4"># insert phi</span>
+            <span class="s1">phinode </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Assign</span><span class="s3">(</span>
+                <span class="s1">target</span><span class="s3">=</span><span class="s1">freshvar</span><span class="s3">,</span>
+                <span class="s1">value</span><span class="s3">=</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Expr</span><span class="s3">.</span><span class="s1">phi</span><span class="s3">(</span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">),</span>
+                <span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">,</span>
+            <span class="s3">)</span>
+            <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;insert phi node %s at %s&quot;</span><span class="s3">, </span><span class="s1">phinode</span><span class="s3">, </span><span class="s1">label</span><span class="s3">)</span>
+            <span class="s1">defmap</span><span class="s3">[</span><span class="s1">label</span><span class="s3">].</span><span class="s1">insert</span><span class="s3">(</span><span class="s6">0</span><span class="s3">, </span><span class="s1">phinode</span><span class="s3">)</span>
+            <span class="s1">phimap</span><span class="s3">[</span><span class="s1">label</span><span class="s3">].</span><span class="s1">append</span><span class="s3">(</span><span class="s1">phinode</span><span class="s3">)</span>
+            <span class="s4"># Find incoming values for the Phi node</span>
+            <span class="s2">for </span><span class="s1">pred</span><span class="s3">, </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">predecessors</span><span class="s3">(</span><span class="s1">label</span><span class="s3">):</span>
+                <span class="s1">incoming_def </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_find_def_from_bottom</span><span class="s3">(</span>
+                    <span class="s1">states</span><span class="s3">, </span><span class="s1">pred</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">,</span>
+                <span class="s3">)</span>
+                <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;incoming_def %s&quot;</span><span class="s3">, </span><span class="s1">incoming_def</span><span class="s3">)</span>
+                <span class="s1">phinode</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">incoming_values</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">incoming_def</span><span class="s3">.</span><span class="s1">target</span><span class="s3">)</span>
+                <span class="s1">phinode</span><span class="s3">.</span><span class="s1">value</span><span class="s3">.</span><span class="s1">incoming_blocks</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">pred</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">phinode</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">idom </span><span class="s3">= </span><span class="s1">cfg</span><span class="s3">.</span><span class="s1">immediate_dominators</span><span class="s3">()[</span><span class="s1">label</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">idom </span><span class="s3">== </span><span class="s1">label</span><span class="s3">:</span>
+                <span class="s4"># We have searched to the top of the idom tree.</span>
+                <span class="s4"># Since we still cannot find a definition,</span>
+                <span class="s4"># we will warn.</span>
+                <span class="s1">_warn_about_uninitialized_variable</span><span class="s3">(</span><span class="s1">states</span><span class="s3">[</span><span class="s5">'varname'</span><span class="s3">], </span><span class="s1">loc</span><span class="s3">)</span>
+                <span class="s2">return </span><span class="s1">UndefinedVariable</span>
+            <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;idom %s from label %s&quot;</span><span class="s3">, </span><span class="s1">idom</span><span class="s3">, </span><span class="s1">label</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_find_def_from_bottom</span><span class="s3">(</span><span class="s1">states</span><span class="s3">, </span><span class="s1">idom</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_find_def_from_bottom</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">states</span><span class="s3">, </span><span class="s1">label</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Find definition from within the block at ``label``. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">_logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">&quot;find_def_from_bottom label %r&quot;</span><span class="s3">, </span><span class="s1">label</span><span class="s3">)</span>
+        <span class="s1">defmap </span><span class="s3">= </span><span class="s1">states</span><span class="s3">[</span><span class="s5">'defmap'</span><span class="s3">]</span>
+        <span class="s1">defs </span><span class="s3">= </span><span class="s1">defmap</span><span class="s3">[</span><span class="s1">label</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">defs</span><span class="s3">:</span>
+            <span class="s1">lastdef </span><span class="s3">= </span><span class="s1">defs</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">]</span>
+            <span class="s2">return </span><span class="s1">lastdef</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_find_def_from_top</span><span class="s3">(</span><span class="s1">states</span><span class="s3">, </span><span class="s1">label</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_stmt_index</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">defstmt</span><span class="s3">, </span><span class="s1">block</span><span class="s3">, </span><span class="s1">stop</span><span class="s3">=-</span><span class="s6">1</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Find the positional index of the statement at ``block``. 
+ 
+        Assumptions: 
+        - no two statements can point to the same object. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># Compare using id() as IR node equality is for semantic equivalence</span>
+        <span class="s4"># opposed to direct equality (the location and scope are not considered</span>
+        <span class="s4"># as part of the equality measure, this is important here).</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">))[:</span><span class="s1">stop</span><span class="s3">]:</span>
+            <span class="s2">if </span><span class="s1">block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] </span><span class="s2">is </span><span class="s1">defstmt</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">i</span>
+        <span class="s2">return </span><span class="s1">len</span><span class="s3">(</span><span class="s1">block</span><span class="s3">.</span><span class="s1">body</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_warn_about_uninitialized_variable</span><span class="s3">(</span><span class="s1">varname</span><span class="s3">, </span><span class="s1">loc</span><span class="s3">):</span>
+    <span class="s2">if </span><span class="s1">config</span><span class="s3">.</span><span class="s1">ALWAYS_WARN_UNINIT_VAR</span><span class="s3">:</span>
+        <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span>
+            <span class="s1">errors</span><span class="s3">.</span><span class="s1">NumbaWarning</span><span class="s3">(</span>
+                <span class="s5">f&quot;Detected uninitialized variable </span><span class="s2">{</span><span class="s1">varname</span><span class="s2">}</span><span class="s5">&quot;</span><span class="s3">,</span>
+                <span class="s1">loc</span><span class="s3">=</span><span class="s1">loc</span><span class="s3">),</span>
+        <span class="s3">)</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,257 @@
+<html>
+<head>
+<title>test_cuda_driver.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #2aacb8;}
+.s5 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_cuda_driver.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">ctypes </span><span class="s0">import </span><span class="s1">byref</span><span class="s2">, </span><span class="s1">c_int</span><span class="s2">, </span><span class="s1">c_void_p</span><span class="s2">, </span><span class="s1">sizeof</span>
+
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">cudadrv</span><span class="s2">.</span><span class="s1">driver </span><span class="s0">import </span><span class="s2">(</span><span class="s1">host_to_device</span><span class="s2">, </span><span class="s1">device_to_host</span><span class="s2">, </span><span class="s1">driver</span><span class="s2">,</span>
+                                       <span class="s1">launch_kernel</span><span class="s2">)</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">cudadrv </span><span class="s0">import </span><span class="s1">devices</span><span class="s2">, </span><span class="s1">drvapi</span><span class="s2">, </span><span class="s1">driver </span><span class="s0">as </span><span class="s1">_driver</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">testing </span><span class="s0">import </span><span class="s1">unittest</span><span class="s2">, </span><span class="s1">CUDATestCase</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">testing </span><span class="s0">import </span><span class="s1">skip_on_cudasim</span>
+
+
+<span class="s1">ptx1 </span><span class="s2">= </span><span class="s3">''' 
+    .version 1.4 
+    .target sm_10, map_f64_to_f32 
+ 
+    .entry _Z10helloworldPi ( 
+    .param .u64 __cudaparm__Z10helloworldPi_A) 
+    { 
+    .reg .u32 %r&lt;3&gt;; 
+    .reg .u64 %rd&lt;6&gt;; 
+    .loc    14  4   0 
+$LDWbegin__Z10helloworldPi: 
+    .loc    14  6   0 
+    cvt.s32.u16     %r1, %tid.x; 
+    ld.param.u64    %rd1, [__cudaparm__Z10helloworldPi_A]; 
+    cvt.u64.u16     %rd2, %tid.x; 
+    mul.lo.u64  %rd3, %rd2, 4; 
+    add.u64     %rd4, %rd1, %rd3; 
+    st.global.s32   [%rd4+0], %r1; 
+    .loc    14  7   0 
+    exit; 
+$LDWend__Z10helloworldPi: 
+    } // _Z10helloworldPi 
+'''</span>
+
+<span class="s1">ptx2 </span><span class="s2">= </span><span class="s3">''' 
+.version 3.0 
+.target sm_20 
+.address_size 64 
+ 
+    .file   1 &quot;/tmp/tmpxft_000012c7_00000000-9_testcuda.cpp3.i&quot; 
+    .file   2 &quot;testcuda.cu&quot; 
+ 
+.entry _Z10helloworldPi( 
+    .param .u64 _Z10helloworldPi_param_0 
+) 
+{ 
+    .reg .s32   %r&lt;3&gt;; 
+    .reg .s64   %rl&lt;5&gt;; 
+ 
+ 
+    ld.param.u64    %rl1, [_Z10helloworldPi_param_0]; 
+    cvta.to.global.u64  %rl2, %rl1; 
+    .loc 2 6 1 
+    mov.u32     %r1, %tid.x; 
+    mul.wide.u32    %rl3, %r1, 4; 
+    add.s64     %rl4, %rl2, %rl3; 
+    st.global.u32   [%rl4], %r1; 
+    .loc 2 7 2 
+    ret; 
+} 
+'''</span>
+
+
+<span class="s2">@</span><span class="s1">skip_on_cudasim</span><span class="s2">(</span><span class="s3">'CUDA Driver API unsupported in the simulator'</span><span class="s2">)</span>
+<span class="s0">class </span><span class="s1">TestCudaDriver</span><span class="s2">(</span><span class="s1">CUDATestCase</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">setUp</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">setUp</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">devices</span><span class="s2">.</span><span class="s1">gpus</span><span class="s2">) &gt; </span><span class="s4">0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">context </span><span class="s2">= </span><span class="s1">devices</span><span class="s2">.</span><span class="s1">get_context</span><span class="s2">()</span>
+        <span class="s1">device </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">device</span>
+        <span class="s1">ccmajor</span><span class="s2">, </span><span class="s1">_ </span><span class="s2">= </span><span class="s1">device</span><span class="s2">.</span><span class="s1">compute_capability</span>
+        <span class="s0">if </span><span class="s1">ccmajor </span><span class="s2">&gt;= </span><span class="s4">2</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">ptx </span><span class="s2">= </span><span class="s1">ptx2</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">ptx </span><span class="s2">= </span><span class="s1">ptx1</span>
+
+    <span class="s0">def </span><span class="s1">tearDown</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">tearDown</span><span class="s2">()</span>
+        <span class="s0">del </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span>
+
+    <span class="s0">def </span><span class="s1">test_cuda_driver_basic</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">module </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">create_module_ptx</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">ptx</span><span class="s2">)</span>
+        <span class="s1">function </span><span class="s2">= </span><span class="s1">module</span><span class="s2">.</span><span class="s1">get_function</span><span class="s2">(</span><span class="s3">'_Z10helloworldPi'</span><span class="s2">)</span>
+
+        <span class="s1">array </span><span class="s2">= (</span><span class="s1">c_int </span><span class="s2">* </span><span class="s4">100</span><span class="s2">)()</span>
+
+        <span class="s1">memory </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">memalloc</span><span class="s2">(</span><span class="s1">sizeof</span><span class="s2">(</span><span class="s1">array</span><span class="s2">))</span>
+        <span class="s1">host_to_device</span><span class="s2">(</span><span class="s1">memory</span><span class="s2">, </span><span class="s1">array</span><span class="s2">, </span><span class="s1">sizeof</span><span class="s2">(</span><span class="s1">array</span><span class="s2">))</span>
+
+        <span class="s1">ptr </span><span class="s2">= </span><span class="s1">memory</span><span class="s2">.</span><span class="s1">device_ctypes_pointer</span>
+        <span class="s1">stream </span><span class="s2">= </span><span class="s4">0</span>
+
+        <span class="s0">if </span><span class="s1">_driver</span><span class="s2">.</span><span class="s1">USE_NV_BINDING</span><span class="s2">:</span>
+            <span class="s1">ptr </span><span class="s2">= </span><span class="s1">c_void_p</span><span class="s2">(</span><span class="s1">int</span><span class="s2">(</span><span class="s1">ptr</span><span class="s2">))</span>
+            <span class="s1">stream </span><span class="s2">= </span><span class="s1">_driver</span><span class="s2">.</span><span class="s1">binding</span><span class="s2">.</span><span class="s1">CUstream</span><span class="s2">(</span><span class="s1">stream</span><span class="s2">)</span>
+
+        <span class="s1">launch_kernel</span><span class="s2">(</span><span class="s1">function</span><span class="s2">.</span><span class="s1">handle</span><span class="s2">,  </span><span class="s5"># Kernel</span>
+                      <span class="s4">1</span><span class="s2">,   </span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s2">,        </span><span class="s5"># gx, gy, gz</span>
+                      <span class="s4">100</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s2">,        </span><span class="s5"># bx, by, bz</span>
+                      <span class="s4">0</span><span class="s2">,                </span><span class="s5"># dynamic shared mem</span>
+                      <span class="s1">stream</span><span class="s2">,           </span><span class="s5"># stream</span>
+                      <span class="s2">[</span><span class="s1">ptr</span><span class="s2">])            </span><span class="s5"># arguments</span>
+
+        <span class="s1">device_to_host</span><span class="s2">(</span><span class="s1">array</span><span class="s2">, </span><span class="s1">memory</span><span class="s2">, </span><span class="s1">sizeof</span><span class="s2">(</span><span class="s1">array</span><span class="s2">))</span>
+        <span class="s0">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">enumerate</span><span class="s2">(</span><span class="s1">array</span><span class="s2">):</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">i</span><span class="s2">, </span><span class="s1">v</span><span class="s2">)</span>
+
+        <span class="s1">module</span><span class="s2">.</span><span class="s1">unload</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">test_cuda_driver_stream_operations</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">module </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">create_module_ptx</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">ptx</span><span class="s2">)</span>
+        <span class="s1">function </span><span class="s2">= </span><span class="s1">module</span><span class="s2">.</span><span class="s1">get_function</span><span class="s2">(</span><span class="s3">'_Z10helloworldPi'</span><span class="s2">)</span>
+
+        <span class="s1">array </span><span class="s2">= (</span><span class="s1">c_int </span><span class="s2">* </span><span class="s4">100</span><span class="s2">)()</span>
+
+        <span class="s1">stream </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">create_stream</span><span class="s2">()</span>
+
+        <span class="s0">with </span><span class="s1">stream</span><span class="s2">.</span><span class="s1">auto_synchronize</span><span class="s2">():</span>
+            <span class="s1">memory </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">memalloc</span><span class="s2">(</span><span class="s1">sizeof</span><span class="s2">(</span><span class="s1">array</span><span class="s2">))</span>
+            <span class="s1">host_to_device</span><span class="s2">(</span><span class="s1">memory</span><span class="s2">, </span><span class="s1">array</span><span class="s2">, </span><span class="s1">sizeof</span><span class="s2">(</span><span class="s1">array</span><span class="s2">), </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">stream</span><span class="s2">)</span>
+
+            <span class="s1">ptr </span><span class="s2">= </span><span class="s1">memory</span><span class="s2">.</span><span class="s1">device_ctypes_pointer</span>
+            <span class="s0">if </span><span class="s1">_driver</span><span class="s2">.</span><span class="s1">USE_NV_BINDING</span><span class="s2">:</span>
+                <span class="s1">ptr </span><span class="s2">= </span><span class="s1">c_void_p</span><span class="s2">(</span><span class="s1">int</span><span class="s2">(</span><span class="s1">ptr</span><span class="s2">))</span>
+
+            <span class="s1">launch_kernel</span><span class="s2">(</span><span class="s1">function</span><span class="s2">.</span><span class="s1">handle</span><span class="s2">,  </span><span class="s5"># Kernel</span>
+                          <span class="s4">1</span><span class="s2">,   </span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s2">,        </span><span class="s5"># gx, gy, gz</span>
+                          <span class="s4">100</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s2">,        </span><span class="s5"># bx, by, bz</span>
+                          <span class="s4">0</span><span class="s2">,                </span><span class="s5"># dynamic shared mem</span>
+                          <span class="s1">stream</span><span class="s2">.</span><span class="s1">handle</span><span class="s2">,    </span><span class="s5"># stream</span>
+                          <span class="s2">[</span><span class="s1">ptr</span><span class="s2">])            </span><span class="s5"># arguments</span>
+
+        <span class="s1">device_to_host</span><span class="s2">(</span><span class="s1">array</span><span class="s2">, </span><span class="s1">memory</span><span class="s2">, </span><span class="s1">sizeof</span><span class="s2">(</span><span class="s1">array</span><span class="s2">), </span><span class="s1">stream</span><span class="s2">=</span><span class="s1">stream</span><span class="s2">)</span>
+
+        <span class="s0">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">enumerate</span><span class="s2">(</span><span class="s1">array</span><span class="s2">):</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">i</span><span class="s2">, </span><span class="s1">v</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_cuda_driver_default_stream</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Test properties of the default stream</span>
+        <span class="s1">ds </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_default_stream</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s3">&quot;Default CUDA stream&quot;</span><span class="s2">, </span><span class="s1">repr</span><span class="s2">(</span><span class="s1">ds</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s4">0</span><span class="s2">, </span><span class="s1">int</span><span class="s2">(</span><span class="s1">ds</span><span class="s2">))</span>
+        <span class="s5"># bool(stream) is the check that is done in memcpy to decide if async</span>
+        <span class="s5"># version should be used. So the default (0) stream should be true-ish</span>
+        <span class="s5"># even though 0 is usually false-ish in Python.</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">ds</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertFalse</span><span class="s2">(</span><span class="s1">ds</span><span class="s2">.</span><span class="s1">external</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_cuda_driver_legacy_default_stream</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Test properties of the legacy default stream</span>
+        <span class="s1">ds </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_legacy_default_stream</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s3">&quot;Legacy default CUDA stream&quot;</span><span class="s2">, </span><span class="s1">repr</span><span class="s2">(</span><span class="s1">ds</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s4">1</span><span class="s2">, </span><span class="s1">int</span><span class="s2">(</span><span class="s1">ds</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">ds</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertFalse</span><span class="s2">(</span><span class="s1">ds</span><span class="s2">.</span><span class="s1">external</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_cuda_driver_per_thread_default_stream</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Test properties of the per-thread default stream</span>
+        <span class="s1">ds </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_per_thread_default_stream</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s3">&quot;Per-thread default CUDA stream&quot;</span><span class="s2">, </span><span class="s1">repr</span><span class="s2">(</span><span class="s1">ds</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s4">2</span><span class="s2">, </span><span class="s1">int</span><span class="s2">(</span><span class="s1">ds</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">ds</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertFalse</span><span class="s2">(</span><span class="s1">ds</span><span class="s2">.</span><span class="s1">external</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_cuda_driver_stream</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Test properties of non-default streams</span>
+        <span class="s1">s </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">create_stream</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s3">&quot;CUDA stream&quot;</span><span class="s2">, </span><span class="s1">repr</span><span class="s2">(</span><span class="s1">s</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertNotIn</span><span class="s2">(</span><span class="s3">&quot;Default&quot;</span><span class="s2">, </span><span class="s1">repr</span><span class="s2">(</span><span class="s1">s</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertNotIn</span><span class="s2">(</span><span class="s3">&quot;External&quot;</span><span class="s2">, </span><span class="s1">repr</span><span class="s2">(</span><span class="s1">s</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertNotEqual</span><span class="s2">(</span><span class="s4">0</span><span class="s2">, </span><span class="s1">int</span><span class="s2">(</span><span class="s1">s</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">s</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertFalse</span><span class="s2">(</span><span class="s1">s</span><span class="s2">.</span><span class="s1">external</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_cuda_driver_external_stream</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># Test properties of a stream created from an external stream object.</span>
+        <span class="s5"># We use the driver API directly to create a stream, to emulate an</span>
+        <span class="s5"># external library creating a stream</span>
+        <span class="s0">if </span><span class="s1">_driver</span><span class="s2">.</span><span class="s1">USE_NV_BINDING</span><span class="s2">:</span>
+            <span class="s1">handle </span><span class="s2">= </span><span class="s1">driver</span><span class="s2">.</span><span class="s1">cuStreamCreate</span><span class="s2">(</span><span class="s4">0</span><span class="s2">)</span>
+            <span class="s1">ptr </span><span class="s2">= </span><span class="s1">int</span><span class="s2">(</span><span class="s1">handle</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">handle </span><span class="s2">= </span><span class="s1">drvapi</span><span class="s2">.</span><span class="s1">cu_stream</span><span class="s2">()</span>
+            <span class="s1">driver</span><span class="s2">.</span><span class="s1">cuStreamCreate</span><span class="s2">(</span><span class="s1">byref</span><span class="s2">(</span><span class="s1">handle</span><span class="s2">), </span><span class="s4">0</span><span class="s2">)</span>
+            <span class="s1">ptr </span><span class="s2">= </span><span class="s1">handle</span><span class="s2">.</span><span class="s1">value</span>
+        <span class="s1">s </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">create_external_stream</span><span class="s2">(</span><span class="s1">ptr</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertIn</span><span class="s2">(</span><span class="s3">&quot;External CUDA stream&quot;</span><span class="s2">, </span><span class="s1">repr</span><span class="s2">(</span><span class="s1">s</span><span class="s2">))</span>
+        <span class="s5"># Ensure neither &quot;Default&quot; nor &quot;default&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertNotIn</span><span class="s2">(</span><span class="s3">&quot;efault&quot;</span><span class="s2">, </span><span class="s1">repr</span><span class="s2">(</span><span class="s1">s</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertEqual</span><span class="s2">(</span><span class="s1">ptr</span><span class="s2">, </span><span class="s1">int</span><span class="s2">(</span><span class="s1">s</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">s</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">s</span><span class="s2">.</span><span class="s1">external</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">test_cuda_driver_occupancy</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">module </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">create_module_ptx</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">ptx</span><span class="s2">)</span>
+        <span class="s1">function </span><span class="s2">= </span><span class="s1">module</span><span class="s2">.</span><span class="s1">get_function</span><span class="s2">(</span><span class="s3">'_Z10helloworldPi'</span><span class="s2">)</span>
+
+        <span class="s1">value </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_active_blocks_per_multiprocessor</span><span class="s2">(</span><span class="s1">function</span><span class="s2">,</span>
+                                                                  <span class="s4">128</span><span class="s2">, </span><span class="s4">128</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">value </span><span class="s2">&gt; </span><span class="s4">0</span><span class="s2">)</span>
+
+        <span class="s0">def </span><span class="s1">b2d</span><span class="s2">(</span><span class="s1">bs</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">bs</span>
+
+        <span class="s1">grid</span><span class="s2">, </span><span class="s1">block </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">context</span><span class="s2">.</span><span class="s1">get_max_potential_block_size</span><span class="s2">(</span><span class="s1">function</span><span class="s2">, </span><span class="s1">b2d</span><span class="s2">,</span>
+                                                                <span class="s4">128</span><span class="s2">, </span><span class="s4">128</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">grid </span><span class="s2">&gt; </span><span class="s4">0</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">block </span><span class="s2">&gt; </span><span class="s4">0</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">TestDevice</span><span class="s2">(</span><span class="s1">CUDATestCase</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">test_device_get_uuid</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s5"># A device UUID looks like:</span>
+        <span class="s5">#</span>
+        <span class="s5">#     GPU-e6489c45-5b68-3b03-bab7-0e7c8e809643</span>
+        <span class="s5">#</span>
+        <span class="s5"># To test, we construct an RE that matches this form and verify that</span>
+        <span class="s5"># the returned UUID matches.</span>
+        <span class="s5">#</span>
+        <span class="s5"># Device UUIDs may not conform to parts of the UUID specification (RFC</span>
+        <span class="s5"># 4122) pertaining to versions and variants, so we do not extract and</span>
+        <span class="s5"># validate the values of these bits.</span>
+
+        <span class="s1">h </span><span class="s2">= </span><span class="s3">'[0-9a-f]{%d}'</span>
+        <span class="s1">h4 </span><span class="s2">= </span><span class="s1">h </span><span class="s2">% </span><span class="s4">4</span>
+        <span class="s1">h8 </span><span class="s2">= </span><span class="s1">h </span><span class="s2">% </span><span class="s4">8</span>
+        <span class="s1">h12 </span><span class="s2">= </span><span class="s1">h </span><span class="s2">% </span><span class="s4">12</span>
+        <span class="s1">uuid_format </span><span class="s2">= </span><span class="s3">f'^GPU-</span><span class="s0">{</span><span class="s1">h8</span><span class="s0">}</span><span class="s3">-</span><span class="s0">{</span><span class="s1">h4</span><span class="s0">}</span><span class="s3">-</span><span class="s0">{</span><span class="s1">h4</span><span class="s0">}</span><span class="s3">-</span><span class="s0">{</span><span class="s1">h4</span><span class="s0">}</span><span class="s3">-</span><span class="s0">{</span><span class="s1">h12</span><span class="s0">}</span><span class="s3">$'</span>
+
+        <span class="s1">dev </span><span class="s2">= </span><span class="s1">devices</span><span class="s2">.</span><span class="s1">get_context</span><span class="s2">().</span><span class="s1">device</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertRegex</span><span class="s2">(</span><span class="s1">dev</span><span class="s2">.</span><span class="s1">uuid</span><span class="s2">, </span><span class="s1">uuid_format</span><span class="s2">)</span>
+
+
+<span class="s0">if </span><span class="s1">__name__ </span><span class="s2">== </span><span class="s3">'__main__'</span><span class="s2">:</span>
+    <span class="s1">unittest</span><span class="s2">.</span><span class="s1">main</span><span class="s2">()</span>
+</pre>
+</body>
+</html>

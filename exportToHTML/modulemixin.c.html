@@ -1,0 +1,224 @@
+<html>
+<head>
+<title>modulemixin.c</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #6aab73;}
+.s4 { color: #2aacb8;}
+.s5 { color: #0da19e;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+modulemixin.c</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * This C file is compiled and linked into pycc-generated shared objects. 
+ * It provides the Numba helper functions for runtime use in pycc-compiled 
+ * functions. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;../_numba_common.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;../_pymodule.h&quot;</span>
+
+<span class="s0">/* Define all runtime-required symbols in this C module, but do not 
+   export them outside the shared library if possible. */</span>
+
+<span class="s2">#define </span><span class="s1">NUMBA_EXPORT_FUNC(_rettype) VISIBILITY_HIDDEN _rettype</span>
+<span class="s2">#define </span><span class="s1">NUMBA_EXPORT_DATA(_vartype) VISIBILITY_HIDDEN _vartype</span>
+
+<span class="s2">#define </span><span class="s1">PYCC_COMPILING</span>
+
+<span class="s2">#include </span><span class="s3">&quot;../_helperlib.c&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;../_dynfunc.c&quot;</span>
+
+<span class="s2">#if </span><span class="s1">PYCC_USE_NRT</span>
+<span class="s2">#include </span><span class="s3">&quot;../core/runtime/_nrt_python.c&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;../core/runtime/nrt.h&quot;</span>
+<span class="s2">#endif</span>
+
+<span class="s0">/* Defines hashsecret variables (see issue #6386) */</span>
+<span class="s1">int64_t _numba_hashsecret_siphash_k0;</span>
+<span class="s1">int64_t _numba_hashsecret_siphash_k1;</span>
+<span class="s1">int64_t _numba_hashsecret_djbx33a_suffix;</span>
+
+<span class="s0">/* NOTE: import_array() is macro, not a function.  It returns NULL on 
+   failure */</span>
+<span class="s2">static void </span><span class="s1">*</span>
+<span class="s1">wrap_import_array(</span><span class="s2">void</span><span class="s1">) {</span>
+    <span class="s1">import_array();</span>
+    <span class="s2">return </span><span class="s1">(</span><span class="s2">void </span><span class="s1">*) </span><span class="s4">1</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+
+<span class="s2">static int</span>
+<span class="s1">init_numpy(</span><span class="s2">void</span><span class="s1">) {</span>
+    <span class="s2">return </span><span class="s1">wrap_import_array() != NULL;</span>
+<span class="s1">}</span>
+
+
+<span class="s2">#ifndef </span><span class="s1">PYCC_MODULE_NAME</span>
+<span class="s2">#error </span><span class="s1">PYCC_MODULE_NAME must be defined</span>
+<span class="s2">#endif</span>
+
+<span class="s0">/* Preprocessor trick: need to use two levels of macros otherwise 
+   PYCC_MODULE_NAME would not get expanded */</span>
+<span class="s2">#define </span><span class="s1">__PYCC(prefix, modname) prefix ## modname</span>
+<span class="s2">#define </span><span class="s1">_PYCC(prefix, modname) __PYCC(prefix, modname)</span>
+<span class="s2">#define </span><span class="s1">PYCC(prefix) _PYCC(prefix, PYCC_MODULE_NAME)</span>
+
+<span class="s0">/* Silence warnings about unused functions */</span>
+<span class="s1">VISIBILITY_HIDDEN </span><span class="s2">void </span><span class="s1">**PYCC(_unused_) = {</span>
+    <span class="s1">(</span><span class="s2">void </span><span class="s1">*) Numba_make_generator,</span>
+<span class="s1">};</span>
+
+<span class="s0">/* The structure type constructed by PythonAPI.serialize_uncached() */</span>
+<span class="s2">typedef struct </span><span class="s1">{</span>
+    <span class="s2">const char </span><span class="s1">*data;</span>
+    <span class="s2">int </span><span class="s1">len;</span>
+    <span class="s2">const char </span><span class="s1">*hashbuf;</span>
+    <span class="s2">const char </span><span class="s1">*func_ptr;  </span><span class="s0">// pointer to unwrap dyn args function</span>
+    <span class="s2">int </span><span class="s1">alloc_flag;</span>
+<span class="s1">} env_def_t;</span>
+
+<span class="s0">/* Environment GlobalVariable address type */</span>
+<span class="s2">typedef void </span><span class="s1">**env_gv_t;</span>
+
+<span class="s0">/* 
+ * Recreate an environment object from a env_def_t structure. 
+ */</span>
+<span class="s2">static </span><span class="s1">EnvironmentObject *</span>
+<span class="s1">recreate_environment(PyObject *module, env_def_t env)</span>
+<span class="s1">{</span>
+    <span class="s1">EnvironmentObject *envobj;</span>
+    <span class="s1">PyObject *env_consts;</span>
+
+    <span class="s1">env_consts = numba_unpickle(env.data, env.len, env.hashbuf);</span>
+    <span class="s2">if </span><span class="s1">(env_consts == NULL)</span>
+        <span class="s2">return </span><span class="s1">NULL;</span>
+    <span class="s2">if </span><span class="s1">(!PyList_Check(env_consts)) {</span>
+        <span class="s1">PyErr_Format(PyExc_TypeError,</span>
+                     <span class="s3">&quot;environment constants should be a list, got '%s'&quot;</span><span class="s1">,</span>
+                     <span class="s1">Py_TYPE(env_consts)</span><span class="s5">-&gt;</span><span class="s1">tp_name);</span>
+        <span class="s1">Py_DECREF(env_consts);</span>
+        <span class="s2">return </span><span class="s1">NULL;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">envobj = env_new_empty(&amp;EnvironmentType);</span>
+    <span class="s2">if </span><span class="s1">(envobj == NULL) {</span>
+        <span class="s1">Py_DECREF(env_consts);</span>
+        <span class="s2">return </span><span class="s1">NULL;</span>
+    <span class="s1">}</span>
+    <span class="s1">envobj</span><span class="s5">-&gt;</span><span class="s1">consts = env_consts;</span>
+    <span class="s1">envobj</span><span class="s5">-&gt;</span><span class="s1">globals = PyModule_GetDict(module);</span>
+    <span class="s2">if </span><span class="s1">(envobj</span><span class="s5">-&gt;</span><span class="s1">globals == NULL) {</span>
+        <span class="s1">Py_DECREF(envobj);</span>
+        <span class="s2">return </span><span class="s1">NULL;</span>
+    <span class="s1">}</span>
+    <span class="s1">Py_INCREF(envobj</span><span class="s5">-&gt;</span><span class="s1">globals);</span>
+    <span class="s2">return </span><span class="s1">envobj;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Subroutine to initialize all resources required for running the 
+ * pycc-compiled functions. 
+ */</span>
+
+<span class="s2">int</span>
+<span class="s1">PYCC(pycc_init_) (PyObject *module, PyMethodDef *defs,</span>
+                                    <span class="s1">env_def_t *envs,</span>
+                                    <span class="s1">env_gv_t *envgvs)</span>
+<span class="s1">{</span>
+    <span class="s0">/* Aligns hashsecret with values in current python process so that 
+     * hashes computed inside the pycc module are correct if imported 
+     * by the current process. Imports in a new process get the right 
+     * hash secret through: 
+     * `numba.cpython.hashing._load_hashsecret`. 
+     */</span>
+    <span class="s1">_numba_hashsecret_siphash_k0 = _Py_HashSecret.siphash.k0;</span>
+    <span class="s1">_numba_hashsecret_siphash_k1 = _Py_HashSecret.siphash.k1;</span>
+    <span class="s1">_numba_hashsecret_djbx33a_suffix = _Py_HashSecret.djbx33a.suffix;</span>
+
+    <span class="s1">PyMethodDef *fdef;</span>
+    <span class="s1">PyObject *modname = NULL;</span>
+    <span class="s1">PyObject *docobj = NULL;</span>
+    <span class="s2">int </span><span class="s1">i;</span>
+
+    <span class="s2">if </span><span class="s1">(!init_numpy()) {</span>
+        <span class="s2">goto </span><span class="s1">error;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(init_dynfunc_module(module)) {</span>
+        <span class="s2">goto </span><span class="s1">error;</span>
+    <span class="s1">}</span>
+    <span class="s0">/* Initialize random generation. */</span>
+    <span class="s1">numba_rnd_ensure_global_init();</span>
+
+<span class="s2">#if </span><span class="s1">PYCC_USE_NRT</span>
+    <span class="s1">NRT_MemSys_init();</span>
+    <span class="s2">if </span><span class="s1">(init_nrt_python_module(module)) {</span>
+        <span class="s2">goto </span><span class="s1">error;</span>
+    <span class="s1">}</span>
+<span class="s2">#endif</span>
+
+    <span class="s1">modname = PyObject_GetAttrString(module, </span><span class="s3">&quot;__name__&quot;</span><span class="s1">);</span>
+    <span class="s2">if </span><span class="s1">(modname == NULL) {</span>
+        <span class="s2">goto </span><span class="s1">error;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/* Empty docstring for all compiled functions */</span>
+    <span class="s1">docobj = PyString_FromString(</span><span class="s3">&quot;&quot;</span><span class="s1">);</span>
+    <span class="s2">if </span><span class="s1">(docobj == NULL) {</span>
+        <span class="s2">goto </span><span class="s1">error;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/* Overwrite C method objects with our own Closure objects, in order 
+     * to make their environments available to the compiled functions. 
+     */</span>
+    <span class="s2">for </span><span class="s1">(i = </span><span class="s4">0</span><span class="s1">, fdef = defs; fdef</span><span class="s5">-&gt;</span><span class="s1">ml_name != NULL; i++, fdef++) {</span>
+        <span class="s1">PyObject *func;</span>
+        <span class="s1">PyObject *nameobj;</span>
+        <span class="s1">EnvironmentObject *envobj;</span>
+
+        <span class="s1">envobj = recreate_environment(module, envs[i]);</span>
+        <span class="s2">if </span><span class="s1">(envobj == NULL) {</span>
+            <span class="s2">goto </span><span class="s1">error;</span>
+        <span class="s1">}</span>
+        <span class="s1">nameobj = PyString_FromString(fdef</span><span class="s5">-&gt;</span><span class="s1">ml_name);</span>
+        <span class="s2">if </span><span class="s1">(nameobj == NULL) {</span>
+            <span class="s1">Py_DECREF(envobj);</span>
+            <span class="s2">goto </span><span class="s1">error;</span>
+        <span class="s1">}</span>
+        <span class="s0">// Store the environment pointer into the global</span>
+        <span class="s1">*envgvs[i] = envobj;</span>
+
+        <span class="s1">func = pycfunction_new(module, nameobj, docobj,</span>
+                               <span class="s1">fdef</span><span class="s5">-&gt;</span><span class="s1">ml_meth, envobj, NULL);</span>
+        <span class="s1">Py_DECREF(envobj);</span>
+        <span class="s1">Py_DECREF(nameobj);</span>
+
+        <span class="s2">if </span><span class="s1">(func == NULL) {</span>
+            <span class="s2">goto </span><span class="s1">error;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(PyObject_SetAttrString(module, fdef</span><span class="s5">-&gt;</span><span class="s1">ml_name, func)) {</span>
+            <span class="s1">Py_DECREF(func);</span>
+            <span class="s2">goto </span><span class="s1">error;</span>
+        <span class="s1">}</span>
+        <span class="s1">Py_DECREF(func);</span>
+    <span class="s1">}</span>
+    <span class="s1">Py_DECREF(docobj);</span>
+    <span class="s1">Py_DECREF(modname);</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+
+<span class="s1">error:</span>
+    <span class="s1">Py_XDECREF(docobj);</span>
+    <span class="s1">Py_XDECREF(modname);</span>
+    <span class="s2">return </span><span class="s1">-</span><span class="s4">1</span><span class="s1">;</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

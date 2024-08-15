@@ -1,0 +1,1287 @@
+<html>
+<head>
+<title>dictobject.c</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #2aacb8;}
+.s4 { color: #6aab73;}
+.s5 { color: #0da19e;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+dictobject.c</font>
+</center></td></tr></table>
+<pre><span class="s0">/* The following is adapted from CPython3.7. 
+The exact commit is: 
+ 
+- https://github.com/python/cpython/blob/44467e8ea4cea390b0718702291b4cfe8ddd67ed/Objects/dictobject.c 
+ 
+ 
+*/</span>
+
+<span class="s0">/* Dictionary object implementation using a hash table */</span>
+
+<span class="s0">/* The distribution includes a separate file, Objects/dictnotes.txt, 
+   describing explorations into dictionary design and optimization. 
+   It covers typical dictionary use patterns, the parameters for 
+   tuning dictionaries, and several ideas for possible optimizations. 
+*/</span>
+
+<span class="s0">/* PyDictKeysObject 
+ 
+This implements the dictionary's hashtable. 
+ 
+As of Python 3.6, this is compact and ordered. Basic idea is described here: 
+* https://mail.python.org/pipermail/python-dev/2012-December/123028.html 
+* https://morepypy.blogspot.com/2015/01/faster-more-memory-efficient-and-more.html 
+ 
+layout: 
+ 
++---------------+ 
+| dk_refcnt     | 
+| dk_size       | 
+| dk_lookup     | 
+| dk_usable     | 
+| dk_nentries   | 
++---------------+ 
+| dk_indices    | 
+|               | 
++---------------+ 
+| dk_entries    | 
+|               | 
++---------------+ 
+ 
+dk_indices is actual hashtable.  It holds index in entries, or DKIX_EMPTY(-1) 
+or DKIX_DUMMY(-2). 
+Size of indices is dk_size.  Type of each index in indices is vary on dk_size: 
+ 
+* int8  for          dk_size &lt;= 128 
+* int16 for 256   &lt;= dk_size &lt;= 2**15 
+* int32 for 2**16 &lt;= dk_size &lt;= 2**31 
+* int64 for 2**32 &lt;= dk_size 
+ 
+dk_entries is array of PyDictKeyEntry.  It's size is USABLE_FRACTION(dk_size). 
+DK_ENTRIES(dk) can be used to get pointer to entries. 
+ 
+NOTE: Since negative value is used for DKIX_EMPTY and DKIX_DUMMY, type of 
+dk_indices entry is signed integer and int16 is used for table which 
+dk_size == 256. 
+*/</span>
+
+
+<span class="s0">/* 
+The DictObject can be in one of two forms. 
+ 
+Either: 
+  A combined table: 
+    ma_values == NULL, dk_refcnt == 1. 
+    Values are stored in the me_value field of the PyDictKeysObject. 
+Or: 
+ 
+  (Numba dev notes: split table logic is removed) 
+ 
+  A split table: 
+    ma_values != NULL, dk_refcnt &gt;= 1 
+    Values are stored in the ma_values array. 
+    Only string (unicode) keys are allowed. 
+    All dicts sharing same key must have same insertion order. 
+ 
+There are four kinds of slots in the table (slot is index, and 
+DK_ENTRIES(keys)[index] if index &gt;= 0): 
+ 
+1. Unused.  index == DKIX_EMPTY 
+   Does not hold an active (key, value) pair now and never did.  Unused can 
+   transition to Active upon key insertion.  This is each slot's initial state. 
+ 
+2. Active.  index &gt;= 0, me_key != NULL and me_value != NULL 
+   Holds an active (key, value) pair.  Active can transition to Dummy or 
+   Pending upon key deletion (for combined and split tables respectively). 
+   This is the only case in which me_value != NULL. 
+ 
+3. Dummy.  index == DKIX_DUMMY  (combined only) 
+   Previously held an active (key, value) pair, but that was deleted and an 
+   active pair has not yet overwritten the slot.  Dummy can transition to 
+   Active upon key insertion.  Dummy slots cannot be made Unused again 
+   else the probe sequence in case of collision would have no way to know 
+   they were once active. 
+ 
+4. Pending. index &gt;= 0, key != NULL, and value == NULL  (split only) 
+   Not yet inserted in split-table. 
+*/</span>
+
+<span class="s0">/* 
+Preserving insertion order 
+ 
+It's simple for combined table.  Since dk_entries is mostly append only, we can 
+get insertion order by just iterating dk_entries. 
+ 
+One exception is .popitem().  It removes last item in dk_entries and decrement 
+dk_nentries to achieve amortized O(1).  Since there are DKIX_DUMMY remains in 
+dk_indices, we can't increment dk_usable even though dk_nentries is 
+decremented. 
+ 
+In split table, inserting into pending entry is allowed only for dk_entries[ix] 
+where ix == mp-&gt;ma_used. Inserting into other index and deleting item cause 
+converting the dict to the combined table. 
+*/</span>
+
+
+<span class="s0">/* D_MINSIZE (adapted from PyDict_MINSIZE) 
+ * is the starting size for any new dict. 
+ * 8 allows dicts with no more than 5 active entries; experiments suggested 
+ * this suffices for the majority of dicts (consisting mostly of usually-small 
+ * dicts created to pass keyword arguments). 
+ * Making this 8, rather than 4 reduces the number of resizes for most 
+ * dictionaries, without any significant extra memory use. 
+ */</span>
+<span class="s2">#define </span><span class="s1">D_MINSIZE </span><span class="s3">8</span>
+
+<span class="s2">#include </span><span class="s4">&quot;dictobject.h&quot;</span>
+
+
+<span class="s2">#if </span><span class="s1">defined(_MSC_VER)</span>
+<span class="s1">#   </span><span class="s2">if </span><span class="s1">_MSC_VER &lt;= </span><span class="s3">1900  </span><span class="s0">/* Visual Studio 2014 */</span>
+        <span class="s2">typedef </span><span class="s1">__int8 int8_t;</span>
+        <span class="s2">typedef </span><span class="s1">__int16 int16_t;</span>
+        <span class="s2">typedef </span><span class="s1">__int32 int32_t;</span>
+        <span class="s2">typedef </span><span class="s1">__int64 int64_t;</span>
+<span class="s1">#   endif</span>
+    <span class="s0">/* Use _alloca() to dynamically allocate on the stack on MSVC */</span>
+    <span class="s2">#define </span><span class="s1">STACK_ALLOC(Type, Name, Size) Type * </span><span class="s2">const </span><span class="s1">Name = _alloca(Size);</span>
+<span class="s2">#else</span>
+    <span class="s2">#define </span><span class="s1">STACK_ALLOC(Type, Name, Size) Type Name[Size];</span>
+<span class="s2">#endif</span>
+
+
+<span class="s0">/*[clinic input] 
+class dict &quot;PyDictObject *&quot; &quot;&amp;PyDict_Type&quot; 
+[clinic start generated code]*/</span>
+<span class="s0">/*[clinic end generated code: output=da39a3ee5e6b4b0d input=f157a5a0ce9589d6]*/</span>
+
+
+<span class="s0">/* 
+To ensure the lookup algorithm terminates, there must be at least one Unused 
+slot (NULL key) in the table. 
+To avoid slowing down lookups on a near-full table, we resize the table when 
+it's USABLE_FRACTION (currently two-thirds) full. 
+*/</span>
+
+<span class="s2">#define </span><span class="s1">PERTURB_SHIFT </span><span class="s3">5</span>
+
+<span class="s0">/* 
+Major subtleties ahead:  Most hash schemes depend on having a &quot;good&quot; hash 
+function, in the sense of simulating randomness.  Python doesn't:  its most 
+important hash functions (for ints) are very regular in common 
+cases: 
+ 
+  &gt;&gt;&gt;[hash(i) for i in range(4)] 
+  [0, 1, 2, 3] 
+ 
+This isn't necessarily bad!  To the contrary, in a table of size 2**i, taking 
+the low-order i bits as the initial table index is extremely fast, and there 
+are no collisions at all for dicts indexed by a contiguous range of ints. So 
+this gives better-than-random behavior in common cases, and that's very 
+desirable. 
+ 
+OTOH, when collisions occur, the tendency to fill contiguous slices of the 
+hash table makes a good collision resolution strategy crucial.  Taking only 
+the last i bits of the hash code is also vulnerable:  for example, consider 
+the list [i &lt;&lt; 16 for i in range(20000)] as a set of keys.  Since ints are 
+their own hash codes, and this fits in a dict of size 2**15, the last 15 bits 
+ of every hash code are all 0:  they *all* map to the same table index. 
+ 
+But catering to unusual cases should not slow the usual ones, so we just take 
+the last i bits anyway.  It's up to collision resolution to do the rest.  If 
+we *usually* find the key we're looking for on the first try (and, it turns 
+out, we usually do -- the table load factor is kept under 2/3, so the odds 
+are solidly in our favor), then it makes best sense to keep the initial index 
+computation dirt cheap. 
+ 
+The first half of collision resolution is to visit table indices via this 
+recurrence: 
+ 
+    j = ((5*j) + 1) mod 2**i 
+ 
+For any initial j in range(2**i), repeating that 2**i times generates each 
+int in range(2**i) exactly once (see any text on random-number generation for 
+proof).  By itself, this doesn't help much:  like linear probing (setting 
+j += 1, or j -= 1, on each loop trip), it scans the table entries in a fixed 
+order.  This would be bad, except that's not the only thing we do, and it's 
+actually *good* in the common cases where hash keys are consecutive.  In an 
+example that's really too small to make this entirely clear, for a table of 
+size 2**3 the order of indices is: 
+ 
+    0 -&gt; 1 -&gt; 6 -&gt; 7 -&gt; 4 -&gt; 5 -&gt; 2 -&gt; 3 -&gt; 0 [and here it's repeating] 
+ 
+If two things come in at index 5, the first place we look after is index 2, 
+not 6, so if another comes in at index 6 the collision at 5 didn't hurt it. 
+Linear probing is deadly in this case because there the fixed probe order 
+is the *same* as the order consecutive keys are likely to arrive.  But it's 
+extremely unlikely hash codes will follow a 5*j+1 recurrence by accident, 
+and certain that consecutive hash codes do not. 
+ 
+The other half of the strategy is to get the other bits of the hash code 
+into play.  This is done by initializing a (unsigned) vrbl &quot;perturb&quot; to the 
+full hash code, and changing the recurrence to: 
+ 
+    perturb &gt;&gt;= PERTURB_SHIFT; 
+    j = (5*j) + 1 + perturb; 
+    use j % 2**i as the next table index; 
+ 
+Now the probe sequence depends (eventually) on every bit in the hash code, 
+and the pseudo-scrambling property of recurring on 5*j+1 is more valuable, 
+because it quickly magnifies small differences in the bits that didn't affect 
+the initial index.  Note that because perturb is unsigned, if the recurrence 
+is executed often enough perturb eventually becomes and remains 0.  At that 
+point (very rarely reached) the recurrence is on (just) 5*j+1 again, and 
+that's certain to find an empty slot eventually (since it generates every int 
+in range(2**i), and we make sure there's always at least one empty slot). 
+ 
+Selecting a good value for PERTURB_SHIFT is a balancing act.  You want it 
+small so that the high bits of the hash code continue to affect the probe 
+sequence across iterations; but you want it large so that in really bad cases 
+the high-order hash bits have an effect on early iterations.  5 was &quot;the 
+best&quot; in minimizing total collisions across experiments Tim Peters ran (on 
+both normal and pathological cases), but 4 and 6 weren't significantly worse. 
+ 
+Historical: Reimer Behrends contributed the idea of using a polynomial-based 
+approach, using repeated multiplication by x in GF(2**n) where an irreducible 
+polynomial for each table size was chosen such that x was a primitive root. 
+Christian Tismer later extended that to use division by x instead, as an 
+efficient way to get the high bits of the hash code into play.  This scheme 
+also gave excellent collision statistics, but was more expensive:  two 
+if-tests were required inside the loop; computing &quot;the next&quot; index took about 
+the same number of operations but without as much potential parallelism 
+(e.g., computing 5*j can go on at the same time as computing 1+perturb in the 
+above, and then shifting perturb can be done while the table index is being 
+masked); and the PyDictObject struct required a member to hold the table's 
+polynomial.  In Tim's experiments the current scheme ran faster, produced 
+equally good collision statistics, needed less code &amp; used less memory. 
+ 
+*/</span>
+
+<span class="s2">#define </span><span class="s1">DKIX_EMPTY (-</span><span class="s3">1</span><span class="s1">)</span>
+<span class="s2">#define </span><span class="s1">DKIX_DUMMY (-</span><span class="s3">2</span><span class="s1">)  </span><span class="s0">/* Used internally */</span>
+<span class="s2">#define </span><span class="s1">DKIX_ERROR (-</span><span class="s3">3</span><span class="s1">)</span>
+
+<span class="s2">typedef enum </span><span class="s1">{</span>
+    <span class="s1">OK = </span><span class="s3">0</span><span class="s1">,</span>
+    <span class="s1">OK_REPLACED = </span><span class="s3">1</span><span class="s1">,</span>
+    <span class="s1">ERR_NO_MEMORY = -</span><span class="s3">1</span><span class="s1">,</span>
+    <span class="s1">ERR_DICT_MUTATED = -</span><span class="s3">2</span><span class="s1">,</span>
+    <span class="s1">ERR_ITER_EXHAUSTED = -</span><span class="s3">3</span><span class="s1">,</span>
+    <span class="s1">ERR_DICT_EMPTY = -</span><span class="s3">4</span><span class="s1">,</span>
+    <span class="s1">ERR_CMP_FAILED = -</span><span class="s3">5</span><span class="s1">,</span>
+<span class="s1">} Status;</span>
+
+
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+<span class="s2">static</span>
+<span class="s2">int </span><span class="s1">mem_cmp_zeros(</span><span class="s2">void </span><span class="s1">*obj, size_t n){</span>
+    <span class="s2">int </span><span class="s1">diff = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s2">char </span><span class="s1">*mem = obj;</span>
+    <span class="s2">char </span><span class="s1">*it;</span>
+    <span class="s2">for </span><span class="s1">(it = mem; it &lt; mem + n; ++it) {</span>
+        <span class="s2">if </span><span class="s1">(*it != </span><span class="s3">0</span><span class="s1">) diff += </span><span class="s3">1</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">diff;</span>
+<span class="s1">}</span>
+<span class="s2">#endif</span>
+
+<span class="s2">#define </span><span class="s1">D_MASK(dk) ((dk)</span><span class="s5">-&gt;</span><span class="s1">size-1)</span>
+<span class="s2">#define </span><span class="s1">D_GROWTH_RATE(d) ((d)</span><span class="s5">-&gt;</span><span class="s1">used*</span><span class="s3">3</span><span class="s1">)</span>
+
+<span class="s2">static int</span>
+<span class="s1">ix_size(Py_ssize_t size) {</span>
+    <span class="s2">if </span><span class="s1">( size &lt; </span><span class="s3">0xff </span><span class="s1">) </span><span class="s2">return </span><span class="s3">1</span><span class="s1">;</span>
+    <span class="s2">if </span><span class="s1">( size &lt; </span><span class="s3">0xffff </span><span class="s1">) </span><span class="s2">return </span><span class="s3">2</span><span class="s1">;</span>
+    <span class="s2">if </span><span class="s1">( size &lt; </span><span class="s3">0xffffffff </span><span class="s1">) </span><span class="s2">return </span><span class="s3">4</span><span class="s1">;</span>
+    <span class="s2">return sizeof</span><span class="s1">(int64_t);</span>
+<span class="s1">}</span>
+
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+<span class="s0">/* NOTE: This function is only used in assert()s */</span>
+<span class="s0">/* Align pointer *ptr* to pointer size */</span>
+<span class="s2">static void</span><span class="s1">*</span>
+<span class="s1">aligned_pointer(</span><span class="s2">void </span><span class="s1">*ptr) {</span>
+    <span class="s2">return </span><span class="s1">(</span><span class="s2">void</span><span class="s1">*)aligned_size((size_t)ptr);</span>
+<span class="s1">}</span>
+<span class="s2">#endif</span>
+
+<span class="s0">/* lookup indices.  returns DKIX_EMPTY, DKIX_DUMMY, or ix &gt;=0 */</span>
+<span class="s2">static </span><span class="s1">Py_ssize_t</span>
+<span class="s1">get_index(NB_DictKeys *dk, Py_ssize_t i)</span>
+<span class="s1">{</span>
+    <span class="s1">Py_ssize_t s = dk</span><span class="s5">-&gt;</span><span class="s1">size;</span>
+    <span class="s1">Py_ssize_t ix;</span>
+
+    <span class="s2">if </span><span class="s1">(s &lt;= </span><span class="s3">0xff</span><span class="s1">) {</span>
+        <span class="s1">int8_t *indices = (int8_t*)(dk</span><span class="s5">-&gt;</span><span class="s1">indices);</span>
+        <span class="s1">assert (i &lt; dk</span><span class="s5">-&gt;</span><span class="s1">size);</span>
+        <span class="s1">ix = indices[i];</span>
+    <span class="s1">}</span>
+    <span class="s2">else if </span><span class="s1">(s &lt;= </span><span class="s3">0xffff</span><span class="s1">) {</span>
+        <span class="s1">int16_t *indices = (int16_t*)(dk</span><span class="s5">-&gt;</span><span class="s1">indices);</span>
+        <span class="s1">ix = indices[i];</span>
+    <span class="s1">}</span>
+<span class="s2">#if </span><span class="s1">SIZEOF_VOID_P &gt; </span><span class="s3">4</span>
+    <span class="s2">else if </span><span class="s1">(s &gt; </span><span class="s3">0xffffffff</span><span class="s1">) {</span>
+        <span class="s1">int64_t *indices = (int64_t*)(dk</span><span class="s5">-&gt;</span><span class="s1">indices);</span>
+        <span class="s1">ix = indices[i];</span>
+    <span class="s1">}</span>
+<span class="s2">#endif</span>
+    <span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">int32_t *indices = (int32_t*)(dk</span><span class="s5">-&gt;</span><span class="s1">indices);</span>
+        <span class="s1">ix = indices[i];</span>
+    <span class="s1">}</span>
+    <span class="s1">assert(ix &gt;= DKIX_DUMMY);</span>
+    <span class="s2">return </span><span class="s1">ix;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* write to indices. */</span>
+<span class="s2">static void</span>
+<span class="s1">set_index(NB_DictKeys *dk, Py_ssize_t i, Py_ssize_t ix)</span>
+<span class="s1">{</span>
+    <span class="s1">Py_ssize_t s = dk</span><span class="s5">-&gt;</span><span class="s1">size;</span>
+
+    <span class="s1">assert(ix &gt;= DKIX_DUMMY);</span>
+
+    <span class="s2">if </span><span class="s1">(s &lt;= </span><span class="s3">0xff</span><span class="s1">) {</span>
+        <span class="s1">int8_t *indices = (int8_t*)(dk</span><span class="s5">-&gt;</span><span class="s1">indices);</span>
+        <span class="s1">assert(ix &lt;= </span><span class="s3">0x7f</span><span class="s1">);</span>
+        <span class="s1">indices[i] = (</span><span class="s2">char</span><span class="s1">)ix;</span>
+    <span class="s1">}</span>
+    <span class="s2">else if </span><span class="s1">(s &lt;= </span><span class="s3">0xffff</span><span class="s1">) {</span>
+        <span class="s1">int16_t *indices = (int16_t*)(dk</span><span class="s5">-&gt;</span><span class="s1">indices);</span>
+        <span class="s1">assert(ix &lt;= </span><span class="s3">0x7fff</span><span class="s1">);</span>
+        <span class="s1">indices[i] = (int16_t)ix;</span>
+    <span class="s1">}</span>
+<span class="s2">#if </span><span class="s1">SIZEOF_VOID_P &gt; </span><span class="s3">4</span>
+    <span class="s2">else if </span><span class="s1">(s &gt; </span><span class="s3">0xffffffff</span><span class="s1">) {</span>
+        <span class="s1">int64_t *indices = (int64_t*)(dk</span><span class="s5">-&gt;</span><span class="s1">indices);</span>
+        <span class="s1">indices[i] = ix;</span>
+    <span class="s1">}</span>
+<span class="s2">#endif</span>
+    <span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">int32_t *indices = (int32_t*)(dk</span><span class="s5">-&gt;</span><span class="s1">indices);</span>
+        <span class="s1">assert(ix &lt;= </span><span class="s3">0x7fffffff</span><span class="s1">);</span>
+        <span class="s1">indices[i] = (int32_t)ix;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* USABLE_FRACTION is the maximum dictionary load. 
+ * Increasing this ratio makes dictionaries more dense resulting in more 
+ * collisions.  Decreasing it improves sparseness at the expense of spreading 
+ * indices over more cache lines and at the cost of total memory consumed. 
+ * 
+ * USABLE_FRACTION must obey the following: 
+ *     (0 &lt; USABLE_FRACTION(n) &lt; n) for all n &gt;= 2 
+ * 
+ * USABLE_FRACTION should be quick to calculate. 
+ * Fractions around 1/2 to 2/3 seem to work well in practice. 
+ */</span>
+
+<span class="s2">#define </span><span class="s1">USABLE_FRACTION(n) (((n) &lt;&lt; </span><span class="s3">1</span><span class="s1">)/</span><span class="s3">3</span><span class="s1">)  </span><span class="s0">// ratio: 2/3</span>
+
+<span class="s0">/* Alternative fraction that is otherwise close enough to 2n/3 to make 
+ * little difference. 8 * 2/3 == 8 * 5/8 == 5. 16 * 2/3 == 16 * 5/8 == 10. 
+ * 32 * 2/3 = 21, 32 * 5/8 = 20. 
+ * Its advantage is that it is faster to compute on machines with slow division. 
+ * #define USABLE_FRACTION(n) (((n) &gt;&gt; 1) + ((n) &gt;&gt; 2) - ((n) &gt;&gt; 3))  // ratio: 5/8 
+ */</span>
+
+
+<span class="s0">/* INV_USABLE_FRACTION gives the inverse of USABLE_FRACTION. 
+ * Used for sizing a new dictionary to a specified number of keys. 
+ *  
+ * NOTE: If the denominator of the USABLE_FRACTION ratio is not a power 
+ * of 2, must add 1 to the result of the inverse for correct sizing. 
+ *  
+ * For example, when USABLE_FRACTION ratio = 5/8 (8 is a power of 2): 
+ * #define INV_USABLE_FRACTION(n) (((n) &lt;&lt; 3)/5)  // inv_ratio: 8/5 
+ *  
+ * When USABLE_FRACTION ratio = 5/7 (7 is not a power of 2): 
+ * #define INV_USABLE_FRACTION(n) ((7*(n))/5 + 1)  // inv_ratio: 7/5 
+ */</span>
+
+<span class="s2">#define </span><span class="s1">INV_USABLE_FRACTION(n) ((n) + ((n) &gt;&gt; </span><span class="s3">1</span><span class="s1">) + </span><span class="s3">1</span><span class="s1">)  </span><span class="s0">// inv_ratio: 3/2</span>
+
+
+<span class="s0">/* GROWTH_RATE. Growth rate upon hitting maximum load. 
+ * Currently set to used*3. 
+ * This means that dicts double in size when growing without deletions, 
+ * but have more head room when the number of deletions is on a par with the 
+ * number of insertions.  See also bpo-17563 and bpo-33205. 
+ * 
+ * GROWTH_RATE was set to used*4 up to version 3.2. 
+ * GROWTH_RATE was set to used*2 in version 3.3.0 
+ * GROWTH_RATE was set to used*2 + capacity/2 in 3.4.0-3.6.0. 
+ */</span>
+<span class="s2">#define </span><span class="s1">GROWTH_RATE(d) ((d)</span><span class="s5">-&gt;</span><span class="s1">ma_used*</span><span class="s3">3</span><span class="s1">)</span>
+
+
+<span class="s2">static </span><span class="s1">NB_DictEntry*</span>
+<span class="s1">get_entry(NB_DictKeys *dk, Py_ssize_t idx) {</span>
+    <span class="s1">Py_ssize_t offset;</span>
+    <span class="s2">char </span><span class="s1">*ptr;</span>
+
+    <span class="s1">assert (idx &lt; dk</span><span class="s5">-&gt;</span><span class="s1">size);</span>
+    <span class="s1">offset = idx * dk</span><span class="s5">-&gt;</span><span class="s1">entry_size;</span>
+    <span class="s1">ptr = dk</span><span class="s5">-&gt;</span><span class="s1">indices + dk</span><span class="s5">-&gt;</span><span class="s1">entry_offset + offset;</span>
+    <span class="s2">return </span><span class="s1">(NB_DictEntry*)ptr;</span>
+<span class="s1">}</span>
+
+<span class="s2">static void</span>
+<span class="s1">zero_key(NB_DictKeys *dk, </span><span class="s2">char </span><span class="s1">*data){</span>
+    <span class="s1">memset(data, </span><span class="s3">0</span><span class="s1">, dk</span><span class="s5">-&gt;</span><span class="s1">key_size);</span>
+<span class="s1">}</span>
+
+<span class="s2">static void</span>
+<span class="s1">zero_val(NB_DictKeys *dk, </span><span class="s2">char </span><span class="s1">*data){</span>
+    <span class="s1">memset(data, </span><span class="s3">0</span><span class="s1">, dk</span><span class="s5">-&gt;</span><span class="s1">val_size);</span>
+<span class="s1">}</span>
+
+<span class="s2">static void</span>
+<span class="s1">copy_key(NB_DictKeys *dk, </span><span class="s2">char </span><span class="s1">*dst, </span><span class="s2">const char </span><span class="s1">*src){</span>
+    <span class="s1">memcpy(dst, src, dk</span><span class="s5">-&gt;</span><span class="s1">key_size);</span>
+<span class="s1">}</span>
+
+<span class="s2">static void</span>
+<span class="s1">copy_val(NB_DictKeys *dk, </span><span class="s2">char </span><span class="s1">*dst, </span><span class="s2">const char </span><span class="s1">*src){</span>
+    <span class="s1">memcpy(dst, src, dk</span><span class="s5">-&gt;</span><span class="s1">val_size);</span>
+<span class="s1">}</span>
+
+<span class="s0">/* Returns -1 for error; 0 for not equal; 1 for equal */</span>
+<span class="s2">static int</span>
+<span class="s1">key_equal(NB_DictKeys *dk, </span><span class="s2">const char </span><span class="s1">*lhs, </span><span class="s2">const char </span><span class="s1">*rhs) {</span>
+    <span class="s2">if </span><span class="s1">( dk</span><span class="s5">-&gt;</span><span class="s1">methods.key_equal ) {</span>
+        <span class="s2">return </span><span class="s1">dk</span><span class="s5">-&gt;</span><span class="s1">methods.key_equal(lhs, rhs);</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s2">return </span><span class="s1">memcmp(lhs, rhs, dk</span><span class="s5">-&gt;</span><span class="s1">key_size) == </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">static char </span><span class="s1">*</span>
+<span class="s1">entry_get_key(NB_DictKeys *dk, NB_DictEntry* entry) {</span>
+    <span class="s2">char </span><span class="s1">* out = entry</span><span class="s5">-&gt;</span><span class="s1">keyvalue;</span>
+    <span class="s1">assert (out == aligned_pointer(out));</span>
+    <span class="s2">return </span><span class="s1">out;</span>
+<span class="s1">}</span>
+
+<span class="s2">static char </span><span class="s1">*</span>
+<span class="s1">entry_get_val(NB_DictKeys *dk, NB_DictEntry* entry) {</span>
+    <span class="s2">char </span><span class="s1">* out = entry_get_key(dk, entry) + aligned_size(dk</span><span class="s5">-&gt;</span><span class="s1">key_size);</span>
+    <span class="s1">assert (out == aligned_pointer(out));</span>
+    <span class="s2">return </span><span class="s1">out;</span>
+<span class="s1">}</span>
+
+<span class="s2">static void</span>
+<span class="s1">dk_incref_key(NB_DictKeys *dk, </span><span class="s2">const char </span><span class="s1">*key) {</span>
+    <span class="s2">if </span><span class="s1">( dk</span><span class="s5">-&gt;</span><span class="s1">methods.key_incref ) {</span>
+        <span class="s1">dk</span><span class="s5">-&gt;</span><span class="s1">methods.key_incref(key);</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">static void</span>
+<span class="s1">dk_decref_key(NB_DictKeys *dk, </span><span class="s2">const char </span><span class="s1">*key) {</span>
+    <span class="s2">if </span><span class="s1">( dk</span><span class="s5">-&gt;</span><span class="s1">methods.key_decref ) {</span>
+        <span class="s1">dk</span><span class="s5">-&gt;</span><span class="s1">methods.key_decref(key);</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">static void</span>
+<span class="s1">dk_incref_val(NB_DictKeys *dk, </span><span class="s2">const char </span><span class="s1">*val) {</span>
+    <span class="s2">if </span><span class="s1">( dk</span><span class="s5">-&gt;</span><span class="s1">methods.value_incref ) {</span>
+        <span class="s1">dk</span><span class="s5">-&gt;</span><span class="s1">methods.value_incref(val);</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">static void</span>
+<span class="s1">dk_decref_val(NB_DictKeys *dk, </span><span class="s2">const char </span><span class="s1">*val) {</span>
+    <span class="s2">if </span><span class="s1">( dk</span><span class="s5">-&gt;</span><span class="s1">methods.value_decref ) {</span>
+        <span class="s1">dk</span><span class="s5">-&gt;</span><span class="s1">methods.value_decref(val);</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+
+<span class="s2">void</span>
+<span class="s1">numba_dictkeys_free(NB_DictKeys *dk) {</span>
+    <span class="s0">/* Clear all references from the entries */</span>
+    <span class="s1">Py_ssize_t i;</span>
+    <span class="s1">NB_DictEntry *ep;</span>
+
+    <span class="s2">for </span><span class="s1">(i = </span><span class="s3">0</span><span class="s1">; i &lt; dk</span><span class="s5">-&gt;</span><span class="s1">nentries; i++) {</span>
+        <span class="s1">ep = get_entry(dk, i);</span>
+        <span class="s2">if </span><span class="s1">(ep</span><span class="s5">-&gt;</span><span class="s1">hash != DKIX_EMPTY) {</span>
+            <span class="s1">dk_decref_key(dk, entry_get_key(dk, ep));</span>
+            <span class="s1">dk_decref_val(dk, entry_get_val(dk, ep));</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s0">/* Deallocate */</span>
+    <span class="s1">free(dk);</span>
+<span class="s1">}</span>
+
+<span class="s2">void</span>
+<span class="s1">numba_dict_free(NB_Dict *d) {</span>
+    <span class="s1">numba_dictkeys_free(d</span><span class="s5">-&gt;</span><span class="s1">keys);</span>
+    <span class="s1">free(d);</span>
+<span class="s1">}</span>
+
+<span class="s1">Py_ssize_t</span>
+<span class="s1">numba_dict_length(NB_Dict *d) {</span>
+    <span class="s2">return </span><span class="s1">d</span><span class="s5">-&gt;</span><span class="s1">used;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* Allocate new dictionary keys 
+ 
+Adapted from CPython's new_keys_object(). 
+*/</span>
+<span class="s2">int</span>
+<span class="s1">numba_dictkeys_new(NB_DictKeys **out, Py_ssize_t size, Py_ssize_t key_size, Py_ssize_t val_size) {</span>
+    <span class="s1">Py_ssize_t usable = USABLE_FRACTION(size);</span>
+    <span class="s1">Py_ssize_t index_size = ix_size(size);</span>
+    <span class="s1">Py_ssize_t entry_size = aligned_size(</span><span class="s2">sizeof</span><span class="s1">(NB_DictEntry) + aligned_size(key_size) + aligned_size(val_size));</span>
+    <span class="s1">Py_ssize_t entry_offset = aligned_size(index_size * size);</span>
+    <span class="s1">Py_ssize_t alloc_size = </span><span class="s2">sizeof</span><span class="s1">(NB_DictKeys) + entry_offset + entry_size * usable;</span>
+
+    <span class="s1">NB_DictKeys *dk = malloc(aligned_size(alloc_size));</span>
+    <span class="s2">if </span><span class="s1">(!dk) </span><span class="s2">return </span><span class="s1">ERR_NO_MEMORY;</span>
+
+    <span class="s1">assert ( size &gt;= D_MINSIZE );</span>
+
+    <span class="s1">dk</span><span class="s5">-&gt;</span><span class="s1">size = size;</span>
+    <span class="s1">dk</span><span class="s5">-&gt;</span><span class="s1">usable = usable;</span>
+    <span class="s1">dk</span><span class="s5">-&gt;</span><span class="s1">nentries = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">dk</span><span class="s5">-&gt;</span><span class="s1">key_size = key_size;</span>
+    <span class="s1">dk</span><span class="s5">-&gt;</span><span class="s1">val_size = val_size;</span>
+    <span class="s1">dk</span><span class="s5">-&gt;</span><span class="s1">entry_offset = entry_offset;</span>
+    <span class="s1">dk</span><span class="s5">-&gt;</span><span class="s1">entry_size = entry_size;</span>
+
+    <span class="s1">assert (aligned_pointer(dk</span><span class="s5">-&gt;</span><span class="s1">indices) == dk</span><span class="s5">-&gt;</span><span class="s1">indices );</span>
+    <span class="s0">/* Ensure that the method table is all nulls */</span>
+    <span class="s1">memset(&amp;dk</span><span class="s5">-&gt;</span><span class="s1">methods, </span><span class="s3">0x00</span><span class="s1">, </span><span class="s2">sizeof</span><span class="s1">(type_based_methods_table));</span>
+    <span class="s0">/* Ensure hash is (-1) for empty entry */</span>
+    <span class="s1">memset(dk</span><span class="s5">-&gt;</span><span class="s1">indices, </span><span class="s3">0xff</span><span class="s1">, entry_offset + entry_size * usable);</span>
+
+    <span class="s1">*out = dk;</span>
+    <span class="s2">return </span><span class="s1">OK;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* Allocate new dictionary */</span>
+<span class="s2">int</span>
+<span class="s1">numba_dict_new(NB_Dict **out, Py_ssize_t size, Py_ssize_t key_size, Py_ssize_t val_size) {</span>
+    <span class="s1">NB_DictKeys *dk;</span>
+    <span class="s1">NB_Dict *d;</span>
+    <span class="s2">int </span><span class="s1">status = numba_dictkeys_new(&amp;dk, size, key_size, val_size);</span>
+    <span class="s2">if </span><span class="s1">(status != OK) </span><span class="s2">return </span><span class="s1">status;</span>
+
+    <span class="s1">d = malloc(</span><span class="s2">sizeof</span><span class="s1">(NB_Dict));</span>
+    <span class="s2">if </span><span class="s1">(!d) {</span>
+        <span class="s1">numba_dictkeys_free(dk);</span>
+        <span class="s2">return </span><span class="s1">ERR_NO_MEMORY;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">d</span><span class="s5">-&gt;</span><span class="s1">used = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">d</span><span class="s5">-&gt;</span><span class="s1">keys = dk;</span>
+    <span class="s1">*out = d;</span>
+    <span class="s2">return </span><span class="s1">OK;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* 
+Adapted from CPython lookdict_index(). 
+ 
+Search index of hash table from offset of entry table 
+*/</span>
+<span class="s2">static </span><span class="s1">Py_ssize_t</span>
+<span class="s1">lookdict_index(NB_DictKeys *dk, Py_hash_t hash, Py_ssize_t index)</span>
+<span class="s1">{</span>
+    <span class="s1">size_t mask = D_MASK(dk);</span>
+    <span class="s1">size_t perturb = (size_t)hash;</span>
+    <span class="s1">size_t i = (size_t)hash &amp; mask;</span>
+
+    <span class="s2">for </span><span class="s1">(;;) {</span>
+        <span class="s1">Py_ssize_t ix = get_index(dk, i);</span>
+        <span class="s2">if </span><span class="s1">(ix == index) {</span>
+            <span class="s2">return </span><span class="s1">i;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(ix == DKIX_EMPTY) {</span>
+            <span class="s2">return </span><span class="s1">DKIX_EMPTY;</span>
+        <span class="s1">}</span>
+        <span class="s1">perturb &gt;&gt;= PERTURB_SHIFT;</span>
+        <span class="s1">i = mask &amp; (i*</span><span class="s3">5 </span><span class="s1">+ perturb + </span><span class="s3">1</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s1">assert(</span><span class="s3">0 </span><span class="s1">&amp;&amp; </span><span class="s4">&quot;unreachable&quot;</span><span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ 
+Adapted from the CPython3.7 lookdict(). 
+ 
+The basic lookup function used by all operations. 
+This is based on Algorithm D from Knuth Vol. 3, Sec. 6.4. 
+Open addressing is preferred over chaining since the link overhead for 
+chaining would be substantial (100% with typical malloc overhead). 
+ 
+The initial probe index is computed as hash mod the table size. Subsequent 
+probe indices are computed as explained earlier. 
+ 
+All arithmetic on hash should ignore overflow. 
+ 
+The details in this version are due to Tim Peters, building on many past 
+contributions by Reimer Behrends, Jyrki Alakuijala, Vladimir Marangozov and 
+Christian Tismer. 
+ 
+lookdict() is general-purpose, and may return DKIX_ERROR if (and only if) a 
+comparison raises an exception. 
+lookdict_unicode() below is specialized to string keys, comparison of which can 
+never raise an exception; that function can never return DKIX_ERROR when key 
+is string.  Otherwise, it falls back to lookdict(). 
+lookdict_unicode_nodummy is further specialized for string keys that cannot be 
+the &lt;dummy&gt; value. 
+For both, when the key isn't found a DKIX_EMPTY is returned. 
+*/</span>
+<span class="s1">Py_ssize_t</span>
+<span class="s1">numba_dict_lookup(NB_Dict *d, </span><span class="s2">const char </span><span class="s1">*key_bytes, Py_hash_t hash, </span><span class="s2">char </span><span class="s1">*oldval_bytes)</span>
+<span class="s1">{</span>
+    <span class="s1">NB_DictKeys *dk = d</span><span class="s5">-&gt;</span><span class="s1">keys;</span>
+    <span class="s1">size_t mask = D_MASK(dk);</span>
+    <span class="s1">size_t perturb = hash;</span>
+    <span class="s1">size_t i = (size_t)hash &amp; mask;</span>
+
+    <span class="s2">for </span><span class="s1">(;;) {</span>
+        <span class="s1">Py_ssize_t ix = get_index(dk, i);</span>
+        <span class="s2">if </span><span class="s1">(ix == DKIX_EMPTY) {</span>
+            <span class="s1">zero_val(dk, oldval_bytes);</span>
+            <span class="s2">return </span><span class="s1">ix;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(ix &gt;= </span><span class="s3">0</span><span class="s1">) {</span>
+            <span class="s1">NB_DictEntry *ep = get_entry(dk, ix);</span>
+            <span class="s2">const char </span><span class="s1">*startkey = NULL;</span>
+            <span class="s2">if </span><span class="s1">(ep</span><span class="s5">-&gt;</span><span class="s1">hash == hash) {</span>
+                <span class="s2">int </span><span class="s1">cmp;</span>
+
+                <span class="s1">startkey = entry_get_key(dk, ep);</span>
+                <span class="s1">cmp = key_equal(dk, startkey, key_bytes);</span>
+                <span class="s2">if </span><span class="s1">(cmp &lt; </span><span class="s3">0</span><span class="s1">) {</span>
+                    <span class="s0">// error'ed in comparison</span>
+                    <span class="s1">memset(oldval_bytes, </span><span class="s3">0</span><span class="s1">, dk</span><span class="s5">-&gt;</span><span class="s1">val_size);</span>
+                    <span class="s2">return </span><span class="s1">DKIX_ERROR;</span>
+                <span class="s1">}</span>
+                <span class="s2">if </span><span class="s1">(cmp &gt; </span><span class="s3">0</span><span class="s1">) {</span>
+                    <span class="s0">// key is equal; retrieve the value.</span>
+                    <span class="s1">copy_val(dk, oldval_bytes, entry_get_val(dk, ep));</span>
+                    <span class="s2">return </span><span class="s1">ix;</span>
+                <span class="s1">}</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+        <span class="s1">perturb &gt;&gt;= PERTURB_SHIFT;</span>
+        <span class="s1">i = (i*</span><span class="s3">5 </span><span class="s1">+ perturb + </span><span class="s3">1</span><span class="s1">) &amp; mask;</span>
+    <span class="s1">}</span>
+    <span class="s1">assert(</span><span class="s3">0 </span><span class="s1">&amp;&amp; </span><span class="s4">&quot;unreachable&quot;</span><span class="s1">);</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* Internal function to find slot for an item from its hash 
+   when it is known that the key is not present in the dict. 
+ 
+   The dict must be combined. */</span>
+<span class="s2">static </span><span class="s1">Py_ssize_t</span>
+<span class="s1">find_empty_slot(NB_DictKeys *dk, Py_hash_t hash){</span>
+    <span class="s1">size_t mask;</span>
+    <span class="s1">size_t i;</span>
+    <span class="s1">Py_ssize_t ix;</span>
+    <span class="s1">size_t perturb;</span>
+
+    <span class="s1">assert(dk != NULL);</span>
+
+    <span class="s1">mask = D_MASK(dk);</span>
+    <span class="s1">i = hash &amp; mask;</span>
+    <span class="s1">ix = get_index(dk, i);</span>
+    <span class="s2">for </span><span class="s1">(perturb = hash; ix &gt;= </span><span class="s3">0</span><span class="s1">;) {</span>
+        <span class="s1">perturb &gt;&gt;= PERTURB_SHIFT;</span>
+        <span class="s1">i = (i*</span><span class="s3">5 </span><span class="s1">+ perturb + </span><span class="s3">1</span><span class="s1">) &amp; mask;</span>
+        <span class="s1">ix = get_index(dk, i);</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">i;</span>
+<span class="s1">}</span>
+
+<span class="s2">static int</span>
+<span class="s1">insertion_resize(NB_Dict *d)</span>
+<span class="s1">{</span>
+    <span class="s2">return </span><span class="s1">numba_dict_resize(d, D_GROWTH_RATE(d));</span>
+<span class="s1">}</span>
+
+<span class="s2">int</span>
+<span class="s1">numba_dict_insert(</span>
+    <span class="s1">NB_Dict    *d,</span>
+    <span class="s2">const char </span><span class="s1">*key_bytes,</span>
+    <span class="s1">Py_hash_t   hash,</span>
+    <span class="s2">const char </span><span class="s1">*val_bytes,</span>
+    <span class="s2">char       </span><span class="s1">*oldval_bytes</span>
+    <span class="s1">)</span>
+<span class="s1">{</span>
+
+    <span class="s1">NB_DictKeys *dk = d</span><span class="s5">-&gt;</span><span class="s1">keys;</span>
+
+    <span class="s1">Py_ssize_t ix = numba_dict_lookup(d, key_bytes, hash, oldval_bytes);</span>
+    <span class="s2">if </span><span class="s1">(ix == DKIX_ERROR) {</span>
+        <span class="s0">// exception in key comparison in lookup.</span>
+        <span class="s2">return </span><span class="s1">ERR_CMP_FAILED;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">if </span><span class="s1">(ix == DKIX_EMPTY) {</span>
+        <span class="s0">/* Insert into new slot */</span>
+        <span class="s1">Py_ssize_t hashpos;</span>
+        <span class="s1">NB_DictEntry *ep;</span>
+
+        <span class="s2">if </span><span class="s1">(dk</span><span class="s5">-&gt;</span><span class="s1">usable &lt;= </span><span class="s3">0</span><span class="s1">) {</span>
+            <span class="s0">/* Need to resize */</span>
+            <span class="s2">if </span><span class="s1">(insertion_resize(d) != OK)</span>
+                <span class="s2">return </span><span class="s1">ERR_NO_MEMORY;</span>
+            <span class="s2">else</span>
+                <span class="s1">dk = d</span><span class="s5">-&gt;</span><span class="s1">keys;     </span><span class="s0">// reload</span>
+        <span class="s1">}</span>
+        <span class="s1">hashpos = find_empty_slot(dk, hash);</span>
+        <span class="s1">ep = get_entry(dk, dk</span><span class="s5">-&gt;</span><span class="s1">nentries);</span>
+        <span class="s1">set_index(dk, hashpos, dk</span><span class="s5">-&gt;</span><span class="s1">nentries);</span>
+        <span class="s1">copy_key(dk, entry_get_key(dk, ep), key_bytes);</span>
+        <span class="s1">assert ( hash != -</span><span class="s3">1 </span><span class="s1">);</span>
+        <span class="s1">ep</span><span class="s5">-&gt;</span><span class="s1">hash = hash;</span>
+        <span class="s1">copy_val(dk, entry_get_val(dk, ep), val_bytes);</span>
+
+        <span class="s0">/* incref */</span>
+        <span class="s1">dk_incref_key(dk, key_bytes);</span>
+        <span class="s1">dk_incref_val(dk, val_bytes);</span>
+
+        <span class="s1">d</span><span class="s5">-&gt;</span><span class="s1">used += </span><span class="s3">1</span><span class="s1">;</span>
+        <span class="s1">dk</span><span class="s5">-&gt;</span><span class="s1">usable -= </span><span class="s3">1</span><span class="s1">;</span>
+        <span class="s1">dk</span><span class="s5">-&gt;</span><span class="s1">nentries += </span><span class="s3">1</span><span class="s1">;</span>
+        <span class="s1">assert (dk</span><span class="s5">-&gt;</span><span class="s1">usable &gt;= </span><span class="s3">0</span><span class="s1">);</span>
+        <span class="s2">return </span><span class="s1">OK;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s0">/* Replace existing value in the slot at ix */</span>
+        <span class="s0">/* decref old value */</span>
+        <span class="s1">dk_decref_val(dk, oldval_bytes);</span>
+        <span class="s0">// Replace the previous value</span>
+        <span class="s1">copy_val(dk, entry_get_val(dk, get_entry(dk, ix)), val_bytes);</span>
+
+        <span class="s0">/* incref */</span>
+        <span class="s1">dk_incref_val(dk, val_bytes);</span>
+        <span class="s2">return </span><span class="s1">OK_REPLACED;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+Adapted from build_indices(). 
+Internal routine used by dictresize() to build a hashtable of entries. 
+*/</span>
+<span class="s2">void</span>
+<span class="s1">build_indices(NB_DictKeys *keys, Py_ssize_t n) {</span>
+    <span class="s1">size_t mask = (size_t)D_MASK(keys);</span>
+    <span class="s1">Py_ssize_t ix;</span>
+    <span class="s2">for </span><span class="s1">(ix = </span><span class="s3">0</span><span class="s1">; ix != n; ix++) {</span>
+        <span class="s1">size_t perturb;</span>
+        <span class="s1">Py_hash_t hash = get_entry(keys, ix)</span><span class="s5">-&gt;</span><span class="s1">hash;</span>
+        <span class="s1">size_t i = hash &amp; mask;</span>
+        <span class="s2">for </span><span class="s1">(perturb = hash; get_index(keys, i) != DKIX_EMPTY;) {</span>
+            <span class="s1">perturb &gt;&gt;= PERTURB_SHIFT;</span>
+            <span class="s1">i = mask &amp; (i*</span><span class="s3">5 </span><span class="s1">+ perturb + </span><span class="s3">1</span><span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s1">set_index(keys, i, ix);</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ 
+Adapted from CPython dictresize(). 
+ 
+Restructure the table by allocating a new table and reinserting all 
+items again.  When entries have been deleted, the new table may 
+actually be smaller than the old one. 
+If a table is split (its keys and hashes are shared, its values are not), 
+then the values are temporarily copied into the table, it is resized as 
+a combined table, then the me_value slots in the old table are NULLed out. 
+After resizing a table is always combined, 
+but can be resplit by make_keys_shared(). 
+*/</span>
+<span class="s2">int</span>
+<span class="s1">numba_dict_resize(NB_Dict *d, Py_ssize_t minsize) {</span>
+    <span class="s1">Py_ssize_t newsize, numentries;</span>
+    <span class="s1">NB_DictKeys *oldkeys;</span>
+    <span class="s2">int </span><span class="s1">status;</span>
+
+    <span class="s0">/* Find the smallest table size &gt; minused. */</span>
+    <span class="s2">for </span><span class="s1">(newsize = D_MINSIZE;</span>
+         <span class="s1">newsize &lt; minsize &amp;&amp; newsize &gt; </span><span class="s3">0</span><span class="s1">;</span>
+         <span class="s1">newsize &lt;&lt;= </span><span class="s3">1</span><span class="s1">)</span>
+        <span class="s1">;</span>
+    <span class="s2">if </span><span class="s1">(newsize &lt;= </span><span class="s3">0</span><span class="s1">) {</span>
+        <span class="s2">return </span><span class="s1">ERR_NO_MEMORY;</span>
+    <span class="s1">}</span>
+    <span class="s1">oldkeys = d</span><span class="s5">-&gt;</span><span class="s1">keys;</span>
+
+    <span class="s0">/* NOTE: Current odict checks mp-&gt;ma_keys to detect resize happen. 
+     * So we can't reuse oldkeys even if oldkeys-&gt;dk_size == newsize. 
+     * TODO: Try reusing oldkeys when reimplement odict. 
+     */</span>
+
+    <span class="s0">/* Allocate a new table. */</span>
+    <span class="s1">status = numba_dictkeys_new(</span>
+        <span class="s1">&amp;d</span><span class="s5">-&gt;</span><span class="s1">keys, newsize, oldkeys</span><span class="s5">-&gt;</span><span class="s1">key_size, oldkeys</span><span class="s5">-&gt;</span><span class="s1">val_size</span>
+    <span class="s1">);</span>
+    <span class="s2">if </span><span class="s1">(status != OK) {</span>
+        <span class="s1">d</span><span class="s5">-&gt;</span><span class="s1">keys = oldkeys;</span>
+        <span class="s2">return </span><span class="s1">status;</span>
+    <span class="s1">}</span>
+    <span class="s0">// New table must be large enough.</span>
+    <span class="s1">assert(d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">usable &gt;= d</span><span class="s5">-&gt;</span><span class="s1">used);</span>
+    <span class="s0">// Copy method table</span>
+    <span class="s1">memcpy(&amp;d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">methods, &amp;oldkeys</span><span class="s5">-&gt;</span><span class="s1">methods, </span><span class="s2">sizeof</span><span class="s1">(type_based_methods_table));</span>
+
+    <span class="s1">numentries = d</span><span class="s5">-&gt;</span><span class="s1">used;</span>
+
+    <span class="s2">if </span><span class="s1">(oldkeys</span><span class="s5">-&gt;</span><span class="s1">nentries == numentries) {</span>
+        <span class="s1">NB_DictEntry *oldentries, *newentries;</span>
+
+        <span class="s1">oldentries = get_entry(oldkeys, </span><span class="s3">0</span><span class="s1">);</span>
+        <span class="s1">newentries = get_entry(d</span><span class="s5">-&gt;</span><span class="s1">keys, </span><span class="s3">0</span><span class="s1">);</span>
+        <span class="s1">memcpy(newentries, oldentries, numentries * oldkeys</span><span class="s5">-&gt;</span><span class="s1">entry_size);</span>
+        <span class="s0">// to avoid decref</span>
+        <span class="s1">memset(oldentries, </span><span class="s3">0xff</span><span class="s1">, numentries * oldkeys</span><span class="s5">-&gt;</span><span class="s1">entry_size);</span>
+    <span class="s1">}</span>
+    <span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">Py_ssize_t i;</span>
+        <span class="s1">size_t epi = </span><span class="s3">0</span><span class="s1">;</span>
+        <span class="s2">for </span><span class="s1">(i=</span><span class="s3">0</span><span class="s1">; i&lt;numentries; ++i) {</span>
+            <span class="s0">/* 
+                ep-&gt;hash == (-1) hash means it is empty 
+ 
+                Here, we skip until a non empty entry is encountered. 
+            */</span>
+            <span class="s2">while</span><span class="s1">( get_entry(oldkeys, epi)</span><span class="s5">-&gt;</span><span class="s1">hash == DKIX_EMPTY ) {</span>
+                <span class="s1">assert( mem_cmp_zeros(entry_get_val(oldkeys, get_entry(oldkeys, epi)), oldkeys</span><span class="s5">-&gt;</span><span class="s1">val_size) == </span><span class="s3">0 </span><span class="s1">);</span>
+                <span class="s1">epi += </span><span class="s3">1</span><span class="s1">;</span>
+            <span class="s1">}</span>
+            <span class="s1">memcpy(</span>
+                <span class="s1">get_entry(d</span><span class="s5">-&gt;</span><span class="s1">keys, i),</span>
+                <span class="s1">get_entry(oldkeys, epi),</span>
+                <span class="s1">oldkeys</span><span class="s5">-&gt;</span><span class="s1">entry_size</span>
+            <span class="s1">);</span>
+            <span class="s1">get_entry(oldkeys, epi)</span><span class="s5">-&gt;</span><span class="s1">hash = DKIX_EMPTY;  </span><span class="s0">// to avoid decref</span>
+            <span class="s1">epi += </span><span class="s3">1</span><span class="s1">;</span>
+
+        <span class="s1">}</span>
+
+    <span class="s1">}</span>
+    <span class="s1">numba_dictkeys_free(oldkeys);</span>
+
+    <span class="s1">build_indices(d</span><span class="s5">-&gt;</span><span class="s1">keys, numentries);</span>
+    <span class="s1">d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">usable -= numentries;</span>
+    <span class="s1">d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">nentries = numentries;</span>
+    <span class="s2">return </span><span class="s1">OK;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+    Adapted from CPython delitem_common 
+ */</span>
+<span class="s2">int</span>
+<span class="s1">numba_dict_delitem(NB_Dict *d, Py_hash_t hash, Py_ssize_t ix)</span>
+<span class="s1">{</span>
+    <span class="s1">Py_ssize_t hashpos;</span>
+    <span class="s1">NB_DictEntry *ep;</span>
+    <span class="s1">NB_DictKeys *dk = d</span><span class="s5">-&gt;</span><span class="s1">keys;</span>
+
+    <span class="s1">hashpos = lookdict_index(dk, hash, ix);</span>
+    <span class="s1">assert(hashpos &gt;= </span><span class="s3">0</span><span class="s1">);</span>
+
+    <span class="s1">d</span><span class="s5">-&gt;</span><span class="s1">used -= </span><span class="s3">1</span><span class="s1">;</span>
+    <span class="s1">ep = get_entry(dk, ix);</span>
+    <span class="s1">set_index(dk, hashpos, DKIX_DUMMY);</span>
+
+    <span class="s0">/* decref */</span>
+    <span class="s1">dk_decref_key(dk, entry_get_key(dk, ep));</span>
+    <span class="s1">dk_decref_val(dk, entry_get_val(dk, ep));</span>
+
+    <span class="s0">/* zero the entries */</span>
+    <span class="s1">zero_key(dk, entry_get_key(dk, ep));</span>
+    <span class="s1">zero_val(dk, entry_get_val(dk, ep));</span>
+    <span class="s1">ep</span><span class="s5">-&gt;</span><span class="s1">hash = DKIX_EMPTY; </span><span class="s0">// to mark it as empty;</span>
+
+    <span class="s2">return </span><span class="s1">OK;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/** 
+ * Adapted from dict_popitem 
+ * 
+ */</span>
+<span class="s2">int</span>
+<span class="s1">numba_dict_popitem(NB_Dict *d, </span><span class="s2">char </span><span class="s1">*key_bytes, </span><span class="s2">char </span><span class="s1">*val_bytes)</span>
+<span class="s1">{</span>
+    <span class="s1">Py_ssize_t i, j;</span>
+    <span class="s2">char </span><span class="s1">*key_ptr, *val_ptr;</span>
+    <span class="s1">NB_DictEntry *ep = NULL;</span>
+
+    <span class="s2">if </span><span class="s1">(d</span><span class="s5">-&gt;</span><span class="s1">used == </span><span class="s3">0</span><span class="s1">) {</span>
+        <span class="s2">return </span><span class="s1">ERR_DICT_EMPTY;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/* Pop last item */</span>
+    <span class="s1">i = d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">nentries - </span><span class="s3">1</span><span class="s1">;</span>
+    <span class="s2">while </span><span class="s1">(i &gt;= </span><span class="s3">0 </span><span class="s1">&amp;&amp; (ep = get_entry(d</span><span class="s5">-&gt;</span><span class="s1">keys, i))</span><span class="s5">-&gt;</span><span class="s1">hash == DKIX_EMPTY ) {</span>
+        <span class="s1">i--;</span>
+    <span class="s1">}</span>
+    <span class="s1">assert(i &gt;= </span><span class="s3">0</span><span class="s1">);</span>
+
+    <span class="s1">j = lookdict_index(d</span><span class="s5">-&gt;</span><span class="s1">keys, ep</span><span class="s5">-&gt;</span><span class="s1">hash, i);</span>
+    <span class="s1">assert(j &gt;= </span><span class="s3">0</span><span class="s1">);</span>
+    <span class="s1">assert(get_index(d</span><span class="s5">-&gt;</span><span class="s1">keys, j) == i);</span>
+    <span class="s1">set_index(d</span><span class="s5">-&gt;</span><span class="s1">keys, j, DKIX_DUMMY);</span>
+
+    <span class="s1">key_ptr = entry_get_key(d</span><span class="s5">-&gt;</span><span class="s1">keys, ep);</span>
+    <span class="s1">val_ptr = entry_get_val(d</span><span class="s5">-&gt;</span><span class="s1">keys, ep);</span>
+
+    <span class="s1">copy_key(d</span><span class="s5">-&gt;</span><span class="s1">keys, key_bytes, key_ptr);</span>
+    <span class="s1">copy_val(d</span><span class="s5">-&gt;</span><span class="s1">keys, val_bytes, val_ptr);</span>
+
+    <span class="s1">zero_key(d</span><span class="s5">-&gt;</span><span class="s1">keys, key_ptr);</span>
+    <span class="s1">zero_val(d</span><span class="s5">-&gt;</span><span class="s1">keys, val_ptr);</span>
+
+    <span class="s0">/* We can't dk_usable++ since there is DKIX_DUMMY in indices */</span>
+    <span class="s1">d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">nentries = i;</span>
+    <span class="s1">d</span><span class="s5">-&gt;</span><span class="s1">used--;</span>
+
+    <span class="s2">return </span><span class="s1">OK;</span>
+<span class="s1">}</span>
+
+<span class="s2">void</span>
+<span class="s1">numba_dict_dump(NB_Dict *d) {</span>
+    <span class="s2">long long </span><span class="s1">i, j, k;</span>
+    <span class="s2">long long </span><span class="s1">size, n;</span>
+    <span class="s2">char </span><span class="s1">*cp;</span>
+    <span class="s1">NB_DictEntry *ep;</span>
+    <span class="s1">NB_DictKeys *dk = d</span><span class="s5">-&gt;</span><span class="s1">keys;</span>
+
+    <span class="s1">n = d</span><span class="s5">-&gt;</span><span class="s1">used;</span>
+    <span class="s1">size = dk</span><span class="s5">-&gt;</span><span class="s1">nentries;</span>
+
+    <span class="s1">printf(</span><span class="s4">&quot;Dict dump</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s1">);</span>
+    <span class="s1">printf(</span><span class="s4">&quot;   key_size = %lld</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s1">, (</span><span class="s2">long long</span><span class="s1">)d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">key_size);</span>
+    <span class="s1">printf(</span><span class="s4">&quot;   val_size = %lld</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s1">, (</span><span class="s2">long long</span><span class="s1">)d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">val_size);</span>
+
+    <span class="s2">for </span><span class="s1">(i = </span><span class="s3">0</span><span class="s1">, j = </span><span class="s3">0</span><span class="s1">; i &lt; size; i++) {</span>
+        <span class="s1">ep = get_entry(dk, i);</span>
+        <span class="s2">if </span><span class="s1">(ep</span><span class="s5">-&gt;</span><span class="s1">hash != DKIX_EMPTY) {</span>
+            <span class="s2">long long </span><span class="s1">hash = ep</span><span class="s5">-&gt;</span><span class="s1">hash;</span>
+            <span class="s1">printf(</span><span class="s4">&quot;  key=&quot;</span><span class="s1">);</span>
+            <span class="s2">for </span><span class="s1">(cp=entry_get_key(dk, ep), k=</span><span class="s3">0</span><span class="s1">; k &lt; d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">key_size; ++k, ++cp){</span>
+                <span class="s1">printf(</span><span class="s4">&quot;%02x &quot;</span><span class="s1">, ((</span><span class="s2">int</span><span class="s1">)*cp) &amp; </span><span class="s3">0xff</span><span class="s1">);</span>
+            <span class="s1">}</span>
+            <span class="s1">printf(</span><span class="s4">&quot; hash=%llu value=&quot;</span><span class="s1">, hash);</span>
+            <span class="s2">for </span><span class="s1">(cp=entry_get_val(dk, ep), k=</span><span class="s3">0</span><span class="s1">; k &lt; d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">val_size; ++k, ++cp){</span>
+                <span class="s1">printf(</span><span class="s4">&quot;%02x &quot;</span><span class="s1">, ((</span><span class="s2">int</span><span class="s1">)*cp) &amp; </span><span class="s3">0xff</span><span class="s1">);</span>
+            <span class="s1">}</span>
+            <span class="s1">printf(</span><span class="s4">&quot;</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s1">);</span>
+            <span class="s1">j++;</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">printf(</span><span class="s4">&quot;j = %lld; n = %lld</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s1">, j, n);</span>
+    <span class="s1">assert(j == n);</span>
+<span class="s1">}</span>
+
+<span class="s1">size_t</span>
+<span class="s1">numba_dict_iter_sizeof() {</span>
+    <span class="s2">return sizeof</span><span class="s1">(NB_DictIter);</span>
+<span class="s1">}</span>
+
+<span class="s2">void</span>
+<span class="s1">numba_dict_iter(NB_DictIter *it, NB_Dict *d) {</span>
+    <span class="s1">it</span><span class="s5">-&gt;</span><span class="s1">parent = d;</span>
+    <span class="s1">it</span><span class="s5">-&gt;</span><span class="s1">parent_keys = d</span><span class="s5">-&gt;</span><span class="s1">keys;</span>
+    <span class="s1">it</span><span class="s5">-&gt;</span><span class="s1">size = d</span><span class="s5">-&gt;</span><span class="s1">used;</span>
+    <span class="s1">it</span><span class="s5">-&gt;</span><span class="s1">pos = </span><span class="s3">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s2">int</span>
+<span class="s1">numba_dict_iter_next(NB_DictIter *it, </span><span class="s2">const char </span><span class="s1">**key_ptr, </span><span class="s2">const char </span><span class="s1">**val_ptr) {</span>
+    <span class="s0">/* Detect dictionary mutation during iteration */</span>
+    <span class="s1">NB_DictKeys *dk;</span>
+    <span class="s2">if </span><span class="s1">(it</span><span class="s5">-&gt;</span><span class="s1">parent</span><span class="s5">-&gt;</span><span class="s1">keys != it</span><span class="s5">-&gt;</span><span class="s1">parent_keys ||</span>
+        <span class="s1">it</span><span class="s5">-&gt;</span><span class="s1">parent</span><span class="s5">-&gt;</span><span class="s1">used != it</span><span class="s5">-&gt;</span><span class="s1">size) {</span>
+        <span class="s2">return </span><span class="s1">ERR_DICT_MUTATED;</span>
+    <span class="s1">}</span>
+    <span class="s1">dk = it</span><span class="s5">-&gt;</span><span class="s1">parent_keys;</span>
+    <span class="s2">while </span><span class="s1">( it</span><span class="s5">-&gt;</span><span class="s1">pos &lt; dk</span><span class="s5">-&gt;</span><span class="s1">nentries ) {</span>
+        <span class="s1">NB_DictEntry *ep = get_entry(dk, it</span><span class="s5">-&gt;</span><span class="s1">pos++);</span>
+        <span class="s2">if </span><span class="s1">( ep</span><span class="s5">-&gt;</span><span class="s1">hash != DKIX_EMPTY ) {</span>
+            <span class="s1">*key_ptr = entry_get_key(dk, ep);</span>
+            <span class="s1">*val_ptr = entry_get_val(dk, ep);</span>
+            <span class="s2">return </span><span class="s1">OK;</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">ERR_ITER_EXHAUSTED;</span>
+<span class="s1">}</span>
+
+<span class="s2">int</span>
+<span class="s1">numba_dict_insert_ez(</span>
+    <span class="s1">NB_Dict    *d,</span>
+    <span class="s2">const char </span><span class="s1">*key_bytes,</span>
+    <span class="s1">Py_hash_t   hash,</span>
+    <span class="s2">const char </span><span class="s1">*val_bytes</span>
+    <span class="s1">)</span>
+<span class="s1">{</span>
+    <span class="s1">STACK_ALLOC(</span><span class="s2">char</span><span class="s1">, old, d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">val_size);</span>
+    <span class="s2">return </span><span class="s1">numba_dict_insert(d, key_bytes, hash, val_bytes, old);</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* Allocate a new dictionary with enough space to hold n_keys without resizes */</span>
+<span class="s2">int</span>
+<span class="s1">numba_dict_new_sized(NB_Dict **out, Py_ssize_t n_keys, Py_ssize_t key_size, Py_ssize_t val_size) {</span>
+
+    <span class="s0">/* Respect D_MINSIZE */</span>
+    <span class="s2">if </span><span class="s1">(n_keys &lt;= USABLE_FRACTION(D_MINSIZE)) {</span>
+        <span class="s2">return </span><span class="s1">numba_dict_new(out, D_MINSIZE, key_size, val_size);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/*  Adjust for load factor */</span>
+    <span class="s1">Py_ssize_t size = INV_USABLE_FRACTION(n_keys) - </span><span class="s3">1</span><span class="s1">;</span>
+
+    <span class="s0">/* Round up size to the nearest power of 2. */</span>
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">unsigned int </span><span class="s1">shift = </span><span class="s3">1</span><span class="s1">; shift &lt; </span><span class="s2">sizeof</span><span class="s1">(Py_ssize_t) * CHAR_BIT; shift &lt;&lt;= </span><span class="s3">1</span><span class="s1">) {</span>
+        <span class="s1">size |= (size &gt;&gt; shift);</span>
+    <span class="s1">}</span>
+    <span class="s1">size++;</span>
+
+    <span class="s0">/* Handle overflows */</span>
+    <span class="s2">if </span><span class="s1">(size &lt;= </span><span class="s3">0</span><span class="s1">) {</span>
+        <span class="s2">return </span><span class="s1">ERR_NO_MEMORY;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">return </span><span class="s1">numba_dict_new(out, size, key_size, val_size);</span>
+<span class="s1">}</span>
+
+
+<span class="s2">void</span>
+<span class="s1">numba_dict_set_method_table(NB_Dict *d, type_based_methods_table *methods)</span>
+<span class="s1">{</span>
+    <span class="s1">memcpy(&amp;d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">methods, methods, </span><span class="s2">sizeof</span><span class="s1">(type_based_methods_table));</span>
+<span class="s1">}</span>
+
+
+<span class="s2">#define </span><span class="s1">CHECK(CASE) {                                                   \</span>
+    <span class="s2">if </span><span class="s1">( !(CASE) ) {                                                    \</span>
+        <span class="s1">printf(</span><span class="s4">&quot;'%s' failed file %s:%d</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s1">, #CASE, __FILE__, __LINE__);   \</span>
+        <span class="s2">return </span><span class="s3">1</span><span class="s1">;                                                       \</span>
+    <span class="s1">}                                                                   \</span>
+<span class="s1">}</span>
+
+<span class="s2">int</span>
+<span class="s1">numba_test_dict(</span><span class="s2">void</span><span class="s1">) {</span>
+    <span class="s1">NB_Dict *d;</span>
+    <span class="s2">int </span><span class="s1">status;</span>
+    <span class="s1">Py_ssize_t ix;</span>
+    <span class="s1">Py_ssize_t usable;</span>
+    <span class="s1">Py_ssize_t it_count;</span>
+    <span class="s2">const char </span><span class="s1">*it_key, *it_val;</span>
+    <span class="s1">NB_DictIter iter;</span>
+
+<span class="s2">#if </span><span class="s1">defined(_MSC_VER)</span>
+    <span class="s0">/* So that VS2008 compiler is happy */</span>
+    <span class="s2">char </span><span class="s1">*got_key, *got_value;</span>
+    <span class="s1">got_key = _alloca(</span><span class="s3">4</span><span class="s1">);</span>
+    <span class="s1">got_value = _alloca(</span><span class="s3">8</span><span class="s1">);</span>
+<span class="s2">#else</span>
+    <span class="s2">char </span><span class="s1">got_key[</span><span class="s3">4</span><span class="s1">];</span>
+    <span class="s2">char </span><span class="s1">got_value[</span><span class="s3">8</span><span class="s1">];</span>
+<span class="s2">#endif</span>
+    <span class="s1">puts(</span><span class="s4">&quot;test_dict&quot;</span><span class="s1">);</span>
+
+    <span class="s1">status = numba_dict_new(&amp;d, D_MINSIZE, </span><span class="s3">4</span><span class="s1">, </span><span class="s3">8</span><span class="s1">);</span>
+    <span class="s1">CHECK(status == OK);</span>
+    <span class="s1">CHECK(d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">size == D_MINSIZE);</span>
+    <span class="s1">CHECK(d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">key_size == </span><span class="s3">4</span><span class="s1">);</span>
+    <span class="s1">CHECK(d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">val_size == </span><span class="s3">8</span><span class="s1">);</span>
+    <span class="s1">CHECK(ix_size(d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">size) == </span><span class="s3">1</span><span class="s1">);</span>
+    <span class="s1">printf(</span><span class="s4">&quot;aligned_size(index_size * size) = %d</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s1">, (</span><span class="s2">int</span><span class="s1">)(aligned_size(ix_size(d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">size) * d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">size)));</span>
+
+    <span class="s1">printf(</span><span class="s4">&quot;d %p</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s1">, d);</span>
+    <span class="s1">printf(</span><span class="s4">&quot;d-&gt;usable = %u</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s1">, (</span><span class="s2">int</span><span class="s1">)d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">usable);</span>
+    <span class="s1">usable = d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">usable;</span>
+    <span class="s1">printf(</span><span class="s4">&quot;d[0] %d</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s1">, (</span><span class="s2">int</span><span class="s1">)((</span><span class="s2">char</span><span class="s1">*)get_entry(d</span><span class="s5">-&gt;</span><span class="s1">keys, </span><span class="s3">0</span><span class="s1">) - (</span><span class="s2">char</span><span class="s1">*)d</span><span class="s5">-&gt;</span><span class="s1">keys));</span>
+    <span class="s1">CHECK ((</span><span class="s2">char</span><span class="s1">*)get_entry(d</span><span class="s5">-&gt;</span><span class="s1">keys, </span><span class="s3">0</span><span class="s1">) - (</span><span class="s2">char</span><span class="s1">*)d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">indices == d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">entry_offset);</span>
+    <span class="s1">printf(</span><span class="s4">&quot;d[1] %d</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s1">, (</span><span class="s2">int</span><span class="s1">)((</span><span class="s2">char</span><span class="s1">*)get_entry(d</span><span class="s5">-&gt;</span><span class="s1">keys, </span><span class="s3">1</span><span class="s1">) - (</span><span class="s2">char</span><span class="s1">*)d</span><span class="s5">-&gt;</span><span class="s1">keys));</span>
+    <span class="s1">CHECK ((</span><span class="s2">char</span><span class="s1">*)get_entry(d</span><span class="s5">-&gt;</span><span class="s1">keys, </span><span class="s3">1</span><span class="s1">) - (</span><span class="s2">char</span><span class="s1">*)d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">indices == d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">entry_offset + d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">entry_size);</span>
+
+    <span class="s1">ix = numba_dict_lookup(d, </span><span class="s4">&quot;bef&quot;</span><span class="s1">, </span><span class="s3">0xbeef</span><span class="s1">, got_value);</span>
+    <span class="s1">printf(</span><span class="s4">&quot;ix = %d</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s1">, (</span><span class="s2">int</span><span class="s1">)ix);</span>
+    <span class="s1">CHECK (ix == DKIX_EMPTY);</span>
+
+    <span class="s0">// insert 1st key</span>
+    <span class="s1">status = numba_dict_insert(d, </span><span class="s4">&quot;bef&quot;</span><span class="s1">, </span><span class="s3">0xbeef</span><span class="s1">, </span><span class="s4">&quot;1234567&quot;</span><span class="s1">, got_value);</span>
+    <span class="s1">CHECK (status == OK);</span>
+    <span class="s1">CHECK (d</span><span class="s5">-&gt;</span><span class="s1">used == </span><span class="s3">1</span><span class="s1">);</span>
+    <span class="s1">CHECK (d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">usable == usable - d</span><span class="s5">-&gt;</span><span class="s1">used);</span>
+
+    <span class="s0">// insert same key</span>
+    <span class="s1">status = numba_dict_insert(d, </span><span class="s4">&quot;bef&quot;</span><span class="s1">, </span><span class="s3">0xbeef</span><span class="s1">, </span><span class="s4">&quot;1234567&quot;</span><span class="s1">, got_value);</span>
+    <span class="s1">CHECK (status == OK_REPLACED);</span>
+    <span class="s1">printf(</span><span class="s4">&quot;got_value %s</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s1">, got_value);</span>
+    <span class="s1">CHECK (d</span><span class="s5">-&gt;</span><span class="s1">used == </span><span class="s3">1</span><span class="s1">);</span>
+    <span class="s1">CHECK (d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">usable == usable - d</span><span class="s5">-&gt;</span><span class="s1">used);</span>
+
+    <span class="s0">// insert 2nd key</span>
+    <span class="s1">status = numba_dict_insert(d, </span><span class="s4">&quot;beg&quot;</span><span class="s1">, </span><span class="s3">0xbeef</span><span class="s1">, </span><span class="s4">&quot;1234568&quot;</span><span class="s1">, got_value);</span>
+    <span class="s1">CHECK (status == OK);</span>
+    <span class="s1">CHECK (d</span><span class="s5">-&gt;</span><span class="s1">used == </span><span class="s3">2</span><span class="s1">);</span>
+    <span class="s1">CHECK (d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">usable == usable - d</span><span class="s5">-&gt;</span><span class="s1">used);</span>
+
+    <span class="s0">// insert 3rd key</span>
+    <span class="s1">status = numba_dict_insert(d, </span><span class="s4">&quot;beh&quot;</span><span class="s1">, </span><span class="s3">0xcafe</span><span class="s1">, </span><span class="s4">&quot;1234569&quot;</span><span class="s1">, got_value);</span>
+    <span class="s1">CHECK (status == OK);</span>
+    <span class="s1">CHECK (d</span><span class="s5">-&gt;</span><span class="s1">used == </span><span class="s3">3</span><span class="s1">);</span>
+    <span class="s1">CHECK (d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">usable == usable - d</span><span class="s5">-&gt;</span><span class="s1">used);</span>
+
+    <span class="s0">// replace key &quot;bef&quot;'s value</span>
+    <span class="s1">status = numba_dict_insert(d, </span><span class="s4">&quot;bef&quot;</span><span class="s1">, </span><span class="s3">0xbeef</span><span class="s1">, </span><span class="s4">&quot;7654321&quot;</span><span class="s1">, got_value);</span>
+    <span class="s1">CHECK (status == OK_REPLACED);</span>
+    <span class="s1">CHECK (d</span><span class="s5">-&gt;</span><span class="s1">used == </span><span class="s3">3</span><span class="s1">);</span>
+    <span class="s1">CHECK (d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">usable == usable - d</span><span class="s5">-&gt;</span><span class="s1">used);</span>
+
+    <span class="s0">// insert 4th key</span>
+    <span class="s1">status = numba_dict_insert(d, </span><span class="s4">&quot;bei&quot;</span><span class="s1">, </span><span class="s3">0xcafe</span><span class="s1">, </span><span class="s4">&quot;0_0_0_1&quot;</span><span class="s1">, got_value);</span>
+    <span class="s1">CHECK (status == OK);</span>
+    <span class="s1">CHECK (d</span><span class="s5">-&gt;</span><span class="s1">used == </span><span class="s3">4</span><span class="s1">);</span>
+    <span class="s1">CHECK (d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">usable == usable - d</span><span class="s5">-&gt;</span><span class="s1">used);</span>
+
+    <span class="s0">// insert 5th key</span>
+    <span class="s1">status = numba_dict_insert(d, </span><span class="s4">&quot;bej&quot;</span><span class="s1">, </span><span class="s3">0xcafe</span><span class="s1">, </span><span class="s4">&quot;0_0_0_2&quot;</span><span class="s1">, got_value);</span>
+    <span class="s1">CHECK (status == OK);</span>
+    <span class="s1">CHECK (d</span><span class="s5">-&gt;</span><span class="s1">used == </span><span class="s3">5</span><span class="s1">);</span>
+    <span class="s1">CHECK (d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">usable == usable - d</span><span class="s5">-&gt;</span><span class="s1">used);</span>
+
+    <span class="s0">// insert 6th key &amp; triggers resize</span>
+    <span class="s1">status = numba_dict_insert(d, </span><span class="s4">&quot;bek&quot;</span><span class="s1">, </span><span class="s3">0xcafe</span><span class="s1">, </span><span class="s4">&quot;0_0_0_3&quot;</span><span class="s1">, got_value);</span>
+    <span class="s1">CHECK (status == OK);</span>
+    <span class="s1">CHECK (d</span><span class="s5">-&gt;</span><span class="s1">used == </span><span class="s3">6</span><span class="s1">);</span>
+    <span class="s1">CHECK (d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">usable == USABLE_FRACTION(d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">size) - d</span><span class="s5">-&gt;</span><span class="s1">used);</span>
+
+    <span class="s0">// Dump</span>
+    <span class="s1">numba_dict_dump(d);</span>
+
+    <span class="s0">// Make sure everything are still in there</span>
+    <span class="s1">ix = numba_dict_lookup(d, </span><span class="s4">&quot;bef&quot;</span><span class="s1">, </span><span class="s3">0xbeef</span><span class="s1">, got_value);</span>
+    <span class="s1">CHECK (ix &gt;= </span><span class="s3">0</span><span class="s1">);</span>
+    <span class="s1">CHECK (memcpy(got_value, </span><span class="s4">&quot;7654321&quot;</span><span class="s1">, d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">val_size));</span>
+
+    <span class="s1">ix = numba_dict_lookup(d, </span><span class="s4">&quot;beg&quot;</span><span class="s1">, </span><span class="s3">0xbeef</span><span class="s1">, got_value);</span>
+    <span class="s1">CHECK (ix &gt;= </span><span class="s3">0</span><span class="s1">);</span>
+    <span class="s1">CHECK (memcpy(got_value, </span><span class="s4">&quot;1234567&quot;</span><span class="s1">, d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">val_size));</span>
+
+    <span class="s1">ix = numba_dict_lookup(d, </span><span class="s4">&quot;beh&quot;</span><span class="s1">, </span><span class="s3">0xcafe</span><span class="s1">, got_value);</span>
+    <span class="s1">printf(</span><span class="s4">&quot;ix = %d</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s1">, (</span><span class="s2">int</span><span class="s1">)ix);</span>
+    <span class="s1">CHECK (ix &gt;= </span><span class="s3">0</span><span class="s1">);</span>
+    <span class="s1">CHECK (memcpy(got_value, </span><span class="s4">&quot;1234569&quot;</span><span class="s1">, d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">val_size));</span>
+
+    <span class="s1">ix = numba_dict_lookup(d, </span><span class="s4">&quot;bei&quot;</span><span class="s1">, </span><span class="s3">0xcafe</span><span class="s1">, got_value);</span>
+    <span class="s1">CHECK (ix &gt;= </span><span class="s3">0</span><span class="s1">);</span>
+    <span class="s1">CHECK (memcpy(got_value, </span><span class="s4">&quot;0_0_0_1&quot;</span><span class="s1">, d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">val_size));</span>
+
+    <span class="s1">ix = numba_dict_lookup(d, </span><span class="s4">&quot;bej&quot;</span><span class="s1">, </span><span class="s3">0xcafe</span><span class="s1">, got_value);</span>
+    <span class="s1">CHECK (ix &gt;= </span><span class="s3">0</span><span class="s1">);</span>
+    <span class="s1">CHECK (memcpy(got_value, </span><span class="s4">&quot;0_0_0_2&quot;</span><span class="s1">, d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">val_size));</span>
+
+    <span class="s1">ix = numba_dict_lookup(d, </span><span class="s4">&quot;bek&quot;</span><span class="s1">, </span><span class="s3">0xcafe</span><span class="s1">, got_value);</span>
+    <span class="s1">CHECK (ix &gt;= </span><span class="s3">0</span><span class="s1">);</span>
+    <span class="s1">CHECK (memcpy(got_value, </span><span class="s4">&quot;0_0_0_3&quot;</span><span class="s1">, d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">val_size));</span>
+
+    <span class="s0">// Test delete</span>
+    <span class="s1">ix = numba_dict_lookup(d, </span><span class="s4">&quot;beg&quot;</span><span class="s1">, </span><span class="s3">0xbeef</span><span class="s1">, got_value);</span>
+    <span class="s1">status = numba_dict_delitem(d, </span><span class="s3">0xbeef</span><span class="s1">, ix);</span>
+    <span class="s1">CHECK (status == OK);</span>
+
+    <span class="s1">ix = numba_dict_lookup(d, </span><span class="s4">&quot;beg&quot;</span><span class="s1">, </span><span class="s3">0xbeef</span><span class="s1">, got_value);</span>
+    <span class="s1">CHECK (ix == DKIX_EMPTY); </span><span class="s0">// not found</span>
+
+    <span class="s1">ix = numba_dict_lookup(d, </span><span class="s4">&quot;bef&quot;</span><span class="s1">, </span><span class="s3">0xbeef</span><span class="s1">, got_value);</span>
+    <span class="s1">CHECK (ix &gt;= </span><span class="s3">0</span><span class="s1">);</span>
+    <span class="s1">ix = numba_dict_lookup(d, </span><span class="s4">&quot;beh&quot;</span><span class="s1">, </span><span class="s3">0xcafe</span><span class="s1">, got_value);</span>
+    <span class="s1">CHECK (ix &gt;= </span><span class="s3">0</span><span class="s1">);</span>
+
+
+    <span class="s0">// Test popitem</span>
+    <span class="s0">// They are always the last item</span>
+    <span class="s1">status = numba_dict_popitem(d, got_key, got_value);</span>
+    <span class="s1">CHECK(status == OK);</span>
+    <span class="s1">CHECK(memcmp(</span><span class="s4">&quot;bek&quot;</span><span class="s1">, got_key, d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">key_size) == </span><span class="s3">0</span><span class="s1">);</span>
+    <span class="s1">CHECK(memcmp(</span><span class="s4">&quot;0_0_0_3&quot;</span><span class="s1">, got_value, d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">val_size) == </span><span class="s3">0</span><span class="s1">);</span>
+
+    <span class="s1">status = numba_dict_popitem(d, got_key, got_value);</span>
+    <span class="s1">CHECK(status == OK);</span>
+    <span class="s1">CHECK(memcmp(</span><span class="s4">&quot;bej&quot;</span><span class="s1">, got_key, d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">key_size) == </span><span class="s3">0</span><span class="s1">);</span>
+    <span class="s1">CHECK(memcmp(</span><span class="s4">&quot;0_0_0_2&quot;</span><span class="s1">, got_value, d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">val_size) == </span><span class="s3">0</span><span class="s1">);</span>
+
+    <span class="s0">// Test iterator</span>
+    <span class="s1">CHECK( d</span><span class="s5">-&gt;</span><span class="s1">used &gt; </span><span class="s3">0 </span><span class="s1">);</span>
+    <span class="s1">numba_dict_iter(&amp;iter, d);</span>
+    <span class="s1">it_count = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s2">while </span><span class="s1">( (status = numba_dict_iter_next(&amp;iter, &amp;it_key, &amp;it_val)) == OK) {</span>
+        <span class="s1">it_count += </span><span class="s3">1</span><span class="s1">;  </span><span class="s0">// valid items</span>
+        <span class="s1">CHECK(it_key != NULL);</span>
+        <span class="s1">CHECK(it_val != NULL);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">CHECK(status == ERR_ITER_EXHAUSTED);</span>
+    <span class="s1">CHECK(d</span><span class="s5">-&gt;</span><span class="s1">used == it_count);</span>
+
+    <span class="s1">numba_dict_free(d);</span>
+
+    <span class="s0">/* numba_dict_new_sized() */</span>
+
+    <span class="s1">Py_ssize_t target_size;</span>
+    <span class="s1">Py_ssize_t n_keys;</span>
+
+    <span class="s0">// Test if minsize dict returned with n_keys=0</span>
+    <span class="s1">target_size = D_MINSIZE;</span>
+    <span class="s1">n_keys = </span><span class="s3">0</span><span class="s1">;</span>
+
+    <span class="s1">numba_dict_new_sized(&amp;d, n_keys, </span><span class="s3">1</span><span class="s1">, </span><span class="s3">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">size == target_size);</span>
+    <span class="s1">CHECK(d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">usable == USABLE_FRACTION(target_size));</span>
+    <span class="s1">numba_dict_free(d);</span>
+
+    <span class="s0">// Test sizing at power of 2 boundary</span>
+    <span class="s1">target_size = D_MINSIZE * </span><span class="s3">2</span><span class="s1">;</span>
+    <span class="s1">n_keys = USABLE_FRACTION(target_size);</span>
+
+    <span class="s1">numba_dict_new_sized(&amp;d, n_keys, </span><span class="s3">1</span><span class="s1">, </span><span class="s3">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">size == target_size);</span>
+    <span class="s1">CHECK(d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">usable == n_keys);</span>
+    <span class="s1">numba_dict_free(d);</span>
+
+    <span class="s1">target_size *= </span><span class="s3">2</span><span class="s1">;</span>
+    <span class="s1">n_keys++;</span>
+
+    <span class="s1">numba_dict_new_sized(&amp;d, n_keys, </span><span class="s3">1</span><span class="s1">, </span><span class="s3">1</span><span class="s1">);</span>
+    <span class="s1">CHECK(d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">size == target_size);</span>
+    <span class="s1">CHECK(d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">usable &gt; n_keys);</span>
+    <span class="s1">CHECK(d</span><span class="s5">-&gt;</span><span class="s1">keys</span><span class="s5">-&gt;</span><span class="s1">usable == USABLE_FRACTION(target_size));</span>
+    <span class="s1">numba_dict_free(d);</span>
+
+    <span class="s2">return </span><span class="s3">0</span><span class="s1">;</span>
+
+<span class="s1">}</span>
+
+<span class="s2">#undef </span><span class="s1">CHECK</span>
+</pre>
+</body>
+</html>

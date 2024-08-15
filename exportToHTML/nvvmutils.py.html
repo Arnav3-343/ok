@@ -1,0 +1,258 @@
+<html>
+<head>
+<title>nvvmutils.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #2aacb8;}
+.s5 { color: #a5c261;}
+.s6 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+nvvmutils.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">itertools</span>
+<span class="s0">from </span><span class="s1">llvmlite </span><span class="s0">import </span><span class="s1">ir</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">core </span><span class="s0">import </span><span class="s1">cgutils</span><span class="s2">, </span><span class="s1">targetconfig</span>
+<span class="s0">from </span><span class="s2">.</span><span class="s1">cudadrv </span><span class="s0">import </span><span class="s1">nvvm</span>
+
+
+<span class="s0">def </span><span class="s1">declare_atomic_cas_int</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">isize</span><span class="s2">):</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s3">'___numba_atomic_i' </span><span class="s2">+ </span><span class="s1">str</span><span class="s2">(</span><span class="s1">isize</span><span class="s2">) + </span><span class="s3">'_cas_hack'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s1">isize</span><span class="s2">),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s1">isize</span><span class="s2">)),</span>
+                            <span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s1">isize</span><span class="s2">),</span>
+                            <span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s1">isize</span><span class="s2">)))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">atomic_cmpxchg</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">isize</span><span class="s2">, </span><span class="s1">ptr</span><span class="s2">, </span><span class="s1">cmp</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+    <span class="s1">out </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">cmpxchg</span><span class="s2">(</span><span class="s1">ptr</span><span class="s2">, </span><span class="s1">cmp</span><span class="s2">, </span><span class="s1">val</span><span class="s2">, </span><span class="s3">'monotonic'</span><span class="s2">, </span><span class="s3">'monotonic'</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">extract_value</span><span class="s2">(</span><span class="s1">out</span><span class="s2">, </span><span class="s4">0</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_atomic_add_float32</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s3">'llvm.nvvm.atomic.load.add.f32.p0f32'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">(),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">(), </span><span class="s4">0</span><span class="s2">), </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">()))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_atomic_add_float64</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">flags </span><span class="s2">= </span><span class="s1">targetconfig</span><span class="s2">.</span><span class="s1">ConfigStack</span><span class="s2">().</span><span class="s1">top</span><span class="s2">()</span>
+    <span class="s0">if </span><span class="s1">flags</span><span class="s2">.</span><span class="s1">compute_capability </span><span class="s2">&gt;= (</span><span class="s4">6</span><span class="s2">, </span><span class="s4">0</span><span class="s2">):</span>
+        <span class="s1">fname </span><span class="s2">= </span><span class="s3">'llvm.nvvm.atomic.load.add.f64.p0f64'</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s1">fname </span><span class="s2">= </span><span class="s3">'___numba_atomic_double_add'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">(),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">()), </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">()))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_atomic_sub_float32</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s3">'___numba_atomic_float_sub'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">(),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">()), </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">()))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_atomic_sub_float64</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s3">'___numba_atomic_double_sub'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">(),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">()), </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">()))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_atomic_inc_int32</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s3">'llvm.nvvm.atomic.load.inc.32.p0i32'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">32</span><span class="s2">),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">32</span><span class="s2">)), </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">32</span><span class="s2">)))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_atomic_inc_int64</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s3">'___numba_atomic_u64_inc'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">64</span><span class="s2">),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">64</span><span class="s2">)), </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">64</span><span class="s2">)))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_atomic_dec_int32</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s3">'llvm.nvvm.atomic.load.dec.32.p0i32'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">32</span><span class="s2">),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">32</span><span class="s2">)), </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">32</span><span class="s2">)))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_atomic_dec_int64</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s3">'___numba_atomic_u64_dec'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">64</span><span class="s2">),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">64</span><span class="s2">)), </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">64</span><span class="s2">)))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_atomic_max_float32</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s3">'___numba_atomic_float_max'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">(),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">()), </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">()))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_atomic_max_float64</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s3">'___numba_atomic_double_max'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">(),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">()), </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">()))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_atomic_min_float32</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s3">'___numba_atomic_float_min'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">(),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">()), </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">()))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_atomic_min_float64</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s3">'___numba_atomic_double_min'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">(),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">()), </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">()))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_atomic_nanmax_float32</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s3">'___numba_atomic_float_nanmax'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">(),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">()), </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">()))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_atomic_nanmax_float64</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s3">'___numba_atomic_double_nanmax'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">(),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">()), </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">()))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_atomic_nanmin_float32</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s3">'___numba_atomic_float_nanmin'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">(),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">()), </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FloatType</span><span class="s2">()))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_atomic_nanmin_float64</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s3">'___numba_atomic_double_nanmin'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">(),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">()), </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">DoubleType</span><span class="s2">()))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_cudaCGGetIntrinsicHandle</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s3">'cudaCGGetIntrinsicHandle'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">64</span><span class="s2">),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">32</span><span class="s2">),))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_cudaCGSynchronize</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">fname </span><span class="s2">= </span><span class="s3">'cudaCGSynchronize'</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">32</span><span class="s2">),</span>
+                           <span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">64</span><span class="s2">), </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">32</span><span class="s2">)))</span>
+    <span class="s0">return </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_string</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">value</span><span class="s2">):</span>
+    <span class="s1">lmod </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">basic_block</span><span class="s2">.</span><span class="s1">function</span><span class="s2">.</span><span class="s1">module</span>
+    <span class="s1">cval </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">make_bytearray</span><span class="s2">(</span><span class="s1">value</span><span class="s2">.</span><span class="s1">encode</span><span class="s2">(</span><span class="s3">&quot;utf-8&quot;</span><span class="s2">) + </span><span class="s5">b&quot;</span><span class="s0">\x00</span><span class="s5">&quot;</span><span class="s2">)</span>
+    <span class="s1">gl </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">add_global_variable</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">cval</span><span class="s2">.</span><span class="s1">type</span><span class="s2">, </span><span class="s1">name</span><span class="s2">=</span><span class="s3">&quot;_str&quot;</span><span class="s2">,</span>
+                                     <span class="s1">addrspace</span><span class="s2">=</span><span class="s1">nvvm</span><span class="s2">.</span><span class="s1">ADDRSPACE_CONSTANT</span><span class="s2">)</span>
+    <span class="s1">gl</span><span class="s2">.</span><span class="s1">linkage </span><span class="s2">= </span><span class="s3">'internal'</span>
+    <span class="s1">gl</span><span class="s2">.</span><span class="s1">global_constant </span><span class="s2">= </span><span class="s0">True</span>
+    <span class="s1">gl</span><span class="s2">.</span><span class="s1">initializer </span><span class="s2">= </span><span class="s1">cval</span>
+
+    <span class="s0">return </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">addrspacecast</span><span class="s2">(</span><span class="s1">gl</span><span class="s2">, </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">8</span><span class="s2">)), </span><span class="s3">'generic'</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">declare_vprint</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">):</span>
+    <span class="s1">voidptrty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">PointerType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">8</span><span class="s2">))</span>
+    <span class="s6"># NOTE: the second argument to vprintf() points to the variable-length</span>
+    <span class="s6"># array of arguments (after the format)</span>
+    <span class="s1">vprintfty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">32</span><span class="s2">), [</span><span class="s1">voidptrty</span><span class="s2">, </span><span class="s1">voidptrty</span><span class="s2">])</span>
+    <span class="s1">vprintf </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">lmod</span><span class="s2">, </span><span class="s1">vprintfty</span><span class="s2">, </span><span class="s3">&quot;vprintf&quot;</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">vprintf</span>
+
+
+<span class="s6"># -----------------------------------------------------------------------------</span>
+
+<span class="s1">SREG_MAPPING </span><span class="s2">= {</span>
+    <span class="s3">'tid.x'</span><span class="s2">: </span><span class="s3">'llvm.nvvm.read.ptx.sreg.tid.x'</span><span class="s2">,</span>
+    <span class="s3">'tid.y'</span><span class="s2">: </span><span class="s3">'llvm.nvvm.read.ptx.sreg.tid.y'</span><span class="s2">,</span>
+    <span class="s3">'tid.z'</span><span class="s2">: </span><span class="s3">'llvm.nvvm.read.ptx.sreg.tid.z'</span><span class="s2">,</span>
+
+    <span class="s3">'ntid.x'</span><span class="s2">: </span><span class="s3">'llvm.nvvm.read.ptx.sreg.ntid.x'</span><span class="s2">,</span>
+    <span class="s3">'ntid.y'</span><span class="s2">: </span><span class="s3">'llvm.nvvm.read.ptx.sreg.ntid.y'</span><span class="s2">,</span>
+    <span class="s3">'ntid.z'</span><span class="s2">: </span><span class="s3">'llvm.nvvm.read.ptx.sreg.ntid.z'</span><span class="s2">,</span>
+
+    <span class="s3">'ctaid.x'</span><span class="s2">: </span><span class="s3">'llvm.nvvm.read.ptx.sreg.ctaid.x'</span><span class="s2">,</span>
+    <span class="s3">'ctaid.y'</span><span class="s2">: </span><span class="s3">'llvm.nvvm.read.ptx.sreg.ctaid.y'</span><span class="s2">,</span>
+    <span class="s3">'ctaid.z'</span><span class="s2">: </span><span class="s3">'llvm.nvvm.read.ptx.sreg.ctaid.z'</span><span class="s2">,</span>
+
+    <span class="s3">'nctaid.x'</span><span class="s2">: </span><span class="s3">'llvm.nvvm.read.ptx.sreg.nctaid.x'</span><span class="s2">,</span>
+    <span class="s3">'nctaid.y'</span><span class="s2">: </span><span class="s3">'llvm.nvvm.read.ptx.sreg.nctaid.y'</span><span class="s2">,</span>
+    <span class="s3">'nctaid.z'</span><span class="s2">: </span><span class="s3">'llvm.nvvm.read.ptx.sreg.nctaid.z'</span><span class="s2">,</span>
+
+    <span class="s3">'warpsize'</span><span class="s2">: </span><span class="s3">'llvm.nvvm.read.ptx.sreg.warpsize'</span><span class="s2">,</span>
+    <span class="s3">'laneid'</span><span class="s2">: </span><span class="s3">'llvm.nvvm.read.ptx.sreg.laneid'</span><span class="s2">,</span>
+<span class="s2">}</span>
+
+
+<span class="s0">def </span><span class="s1">call_sreg</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">name</span><span class="s2">):</span>
+    <span class="s1">module </span><span class="s2">= </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">module</span>
+    <span class="s1">fnty </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">FunctionType</span><span class="s2">(</span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">32</span><span class="s2">), ())</span>
+    <span class="s1">fn </span><span class="s2">= </span><span class="s1">cgutils</span><span class="s2">.</span><span class="s1">get_or_insert_function</span><span class="s2">(</span><span class="s1">module</span><span class="s2">, </span><span class="s1">fnty</span><span class="s2">, </span><span class="s1">SREG_MAPPING</span><span class="s2">[</span><span class="s1">name</span><span class="s2">])</span>
+    <span class="s0">return </span><span class="s1">builder</span><span class="s2">.</span><span class="s1">call</span><span class="s2">(</span><span class="s1">fn</span><span class="s2">, ())</span>
+
+
+<span class="s0">class </span><span class="s1">SRegBuilder</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">builder</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">builder </span><span class="s2">= </span><span class="s1">builder</span>
+
+    <span class="s0">def </span><span class="s1">tid</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">xyz</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">call_sreg</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">, </span><span class="s3">'tid.%s' </span><span class="s2">% </span><span class="s1">xyz</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">ctaid</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">xyz</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">call_sreg</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">, </span><span class="s3">'ctaid.%s' </span><span class="s2">% </span><span class="s1">xyz</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">ntid</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">xyz</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">call_sreg</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">, </span><span class="s3">'ntid.%s' </span><span class="s2">% </span><span class="s1">xyz</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">nctaid</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">xyz</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">call_sreg</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">, </span><span class="s3">'nctaid.%s' </span><span class="s2">% </span><span class="s1">xyz</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">getdim</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">xyz</span><span class="s2">):</span>
+        <span class="s1">i64 </span><span class="s2">= </span><span class="s1">ir</span><span class="s2">.</span><span class="s1">IntType</span><span class="s2">(</span><span class="s4">64</span><span class="s2">)</span>
+        <span class="s1">tid </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">sext</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">tid</span><span class="s2">(</span><span class="s1">xyz</span><span class="s2">), </span><span class="s1">i64</span><span class="s2">)</span>
+        <span class="s1">ntid </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">sext</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">ntid</span><span class="s2">(</span><span class="s1">xyz</span><span class="s2">), </span><span class="s1">i64</span><span class="s2">)</span>
+        <span class="s1">nctaid </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">sext</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">ctaid</span><span class="s2">(</span><span class="s1">xyz</span><span class="s2">), </span><span class="s1">i64</span><span class="s2">)</span>
+        <span class="s1">res </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">add</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">builder</span><span class="s2">.</span><span class="s1">mul</span><span class="s2">(</span><span class="s1">ntid</span><span class="s2">, </span><span class="s1">nctaid</span><span class="s2">), </span><span class="s1">tid</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">res</span>
+
+
+<span class="s0">def </span><span class="s1">get_global_id</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">, </span><span class="s1">dim</span><span class="s2">):</span>
+    <span class="s1">sreg </span><span class="s2">= </span><span class="s1">SRegBuilder</span><span class="s2">(</span><span class="s1">builder</span><span class="s2">)</span>
+    <span class="s1">it </span><span class="s2">= (</span><span class="s1">sreg</span><span class="s2">.</span><span class="s1">getdim</span><span class="s2">(</span><span class="s1">xyz</span><span class="s2">) </span><span class="s0">for </span><span class="s1">xyz </span><span class="s0">in </span><span class="s3">'xyz'</span><span class="s2">)</span>
+    <span class="s1">seq </span><span class="s2">= </span><span class="s1">list</span><span class="s2">(</span><span class="s1">itertools</span><span class="s2">.</span><span class="s1">islice</span><span class="s2">(</span><span class="s1">it</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, </span><span class="s1">dim</span><span class="s2">))</span>
+    <span class="s0">if </span><span class="s1">dim </span><span class="s2">== </span><span class="s4">1</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">seq</span><span class="s2">[</span><span class="s4">0</span><span class="s2">]</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">seq</span>
+</pre>
+</body>
+</html>

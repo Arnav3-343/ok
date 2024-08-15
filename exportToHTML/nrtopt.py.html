@@ -1,0 +1,205 @@
+<html>
+<head>
+<title>nrtopt.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+nrtopt.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+NRT specific optimizations 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">re</span>
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">defaultdict</span><span class="s3">, </span><span class="s1">deque</span>
+<span class="s2">from </span><span class="s1">llvmlite </span><span class="s2">import </span><span class="s1">binding </span><span class="s2">as </span><span class="s1">ll</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">cgutils</span>
+
+<span class="s1">_regex_incref </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">compile</span><span class="s3">(</span><span class="s4">r'\s*(?:tail)?\s*call void @NRT_incref\((.*)\)'</span><span class="s3">)</span>
+<span class="s1">_regex_decref </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">compile</span><span class="s3">(</span><span class="s4">r'\s*(?:tail)?\s*call void @NRT_decref\((.*)\)'</span><span class="s3">)</span>
+<span class="s1">_regex_bb </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">compile</span><span class="s3">(</span>
+    <span class="s4">r'|'</span><span class="s3">.</span><span class="s1">join</span><span class="s3">([</span>
+        <span class="s5"># unnamed BB is just a plain number</span>
+        <span class="s4">r'[0-9]+:'</span><span class="s3">,</span>
+        <span class="s5"># with a proper identifier (see llvm langref)</span>
+        <span class="s4">r'[\'&quot;]?[-a-zA-Z$._0-9][-a-zA-Z$._0-9]*[\'&quot;]?:'</span><span class="s3">,</span>
+        <span class="s5"># is a start of a function definition</span>
+        <span class="s4">r'^define'</span><span class="s3">,</span>
+        <span class="s5"># no name</span>
+        <span class="s4">r'^;\s*&lt;label&gt;'</span><span class="s3">,</span>
+    <span class="s3">])</span>
+<span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_remove_redundant_nrt_refct</span><span class="s3">(</span><span class="s1">llvmir</span><span class="s3">):</span>
+    <span class="s5"># Note: As soon as we have better utility in analyzing materialized LLVM</span>
+    <span class="s5">#       module in llvmlite, we can redo this without so much string</span>
+    <span class="s5">#       processing.</span>
+    <span class="s2">def </span><span class="s1">_extract_functions</span><span class="s3">(</span><span class="s1">module</span><span class="s3">):</span>
+        <span class="s1">cur </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">str</span><span class="s3">(</span><span class="s1">module</span><span class="s3">).</span><span class="s1">splitlines</span><span class="s3">():</span>
+            <span class="s2">if </span><span class="s1">line</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s4">'define'</span><span class="s3">):</span>
+                <span class="s5"># start of function</span>
+                <span class="s2">assert not </span><span class="s1">cur</span>
+                <span class="s1">cur</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">line</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">line</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s4">'}'</span><span class="s3">):</span>
+                <span class="s5"># end of function</span>
+                <span class="s2">assert </span><span class="s1">cur</span>
+                <span class="s1">cur</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">line</span><span class="s3">)</span>
+                <span class="s2">yield True</span><span class="s3">, </span><span class="s1">cur</span>
+                <span class="s1">cur </span><span class="s3">= []</span>
+            <span class="s2">elif </span><span class="s1">cur</span><span class="s3">:</span>
+                <span class="s1">cur</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">line</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">yield False</span><span class="s3">, [</span><span class="s1">line</span><span class="s3">]</span>
+
+    <span class="s2">def </span><span class="s1">_process_function</span><span class="s3">(</span><span class="s1">func_lines</span><span class="s3">):</span>
+        <span class="s1">out </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">is_bb</span><span class="s3">, </span><span class="s1">bb_lines </span><span class="s2">in </span><span class="s1">_extract_basic_blocks</span><span class="s3">(</span><span class="s1">func_lines</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">is_bb </span><span class="s2">and </span><span class="s1">bb_lines</span><span class="s3">:</span>
+                <span class="s1">bb_lines </span><span class="s3">= </span><span class="s1">_process_basic_block</span><span class="s3">(</span><span class="s1">bb_lines</span><span class="s3">)</span>
+            <span class="s1">out </span><span class="s3">+= </span><span class="s1">bb_lines</span>
+        <span class="s2">return </span><span class="s1">out</span>
+
+    <span class="s2">def </span><span class="s1">_extract_basic_blocks</span><span class="s3">(</span><span class="s1">func_lines</span><span class="s3">):</span>
+        <span class="s2">assert </span><span class="s1">func_lines</span><span class="s3">[</span><span class="s6">0</span><span class="s3">].</span><span class="s1">startswith</span><span class="s3">(</span><span class="s4">'define'</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s1">func_lines</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">].</span><span class="s1">startswith</span><span class="s3">(</span><span class="s4">'}'</span><span class="s3">)</span>
+        <span class="s2">yield False</span><span class="s3">, [</span><span class="s1">func_lines</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]]</span>
+
+        <span class="s1">cur </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">ln </span><span class="s2">in </span><span class="s1">func_lines</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:-</span><span class="s6">1</span><span class="s3">]:</span>
+            <span class="s1">m </span><span class="s3">= </span><span class="s1">_regex_bb</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">ln</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">m </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s5"># line is a basic block separator</span>
+                <span class="s2">yield True</span><span class="s3">, </span><span class="s1">cur</span>
+                <span class="s1">cur </span><span class="s3">= []</span>
+                <span class="s2">yield False</span><span class="s3">, [</span><span class="s1">ln</span><span class="s3">]</span>
+            <span class="s2">elif </span><span class="s1">ln</span><span class="s3">:</span>
+                <span class="s1">cur</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">ln</span><span class="s3">)</span>
+
+        <span class="s2">yield True</span><span class="s3">, </span><span class="s1">cur</span>
+        <span class="s2">yield False</span><span class="s3">, [</span><span class="s1">func_lines</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">]]</span>
+
+    <span class="s2">def </span><span class="s1">_process_basic_block</span><span class="s3">(</span><span class="s1">bb_lines</span><span class="s3">):</span>
+        <span class="s1">bb_lines </span><span class="s3">= </span><span class="s1">_move_and_group_decref_after_all_increfs</span><span class="s3">(</span><span class="s1">bb_lines</span><span class="s3">)</span>
+        <span class="s1">bb_lines </span><span class="s3">= </span><span class="s1">_prune_redundant_refct_ops</span><span class="s3">(</span><span class="s1">bb_lines</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">bb_lines</span>
+
+    <span class="s2">def </span><span class="s1">_examine_refct_op</span><span class="s3">(</span><span class="s1">bb_lines</span><span class="s3">):</span>
+        <span class="s2">for </span><span class="s1">num</span><span class="s3">, </span><span class="s1">ln </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">bb_lines</span><span class="s3">):</span>
+            <span class="s1">m </span><span class="s3">= </span><span class="s1">_regex_incref</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">ln</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">m </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s2">yield </span><span class="s1">num</span><span class="s3">, </span><span class="s1">m</span><span class="s3">.</span><span class="s1">group</span><span class="s3">(</span><span class="s6">1</span><span class="s3">), </span><span class="s2">None</span>
+                <span class="s2">continue</span>
+
+            <span class="s1">m </span><span class="s3">= </span><span class="s1">_regex_decref</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">ln</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">m </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s2">yield </span><span class="s1">num</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s1">m</span><span class="s3">.</span><span class="s1">group</span><span class="s3">(</span><span class="s6">1</span><span class="s3">)</span>
+                <span class="s2">continue</span>
+
+            <span class="s2">yield </span><span class="s1">ln</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">_prune_redundant_refct_ops</span><span class="s3">(</span><span class="s1">bb_lines</span><span class="s3">):</span>
+        <span class="s1">incref_map </span><span class="s3">= </span><span class="s1">defaultdict</span><span class="s3">(</span><span class="s1">deque</span><span class="s3">)</span>
+        <span class="s1">decref_map </span><span class="s3">= </span><span class="s1">defaultdict</span><span class="s3">(</span><span class="s1">deque</span><span class="s3">)</span>
+        <span class="s1">to_remove </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+        <span class="s2">for </span><span class="s1">num</span><span class="s3">, </span><span class="s1">incref_var</span><span class="s3">, </span><span class="s1">decref_var </span><span class="s2">in </span><span class="s1">_examine_refct_op</span><span class="s3">(</span><span class="s1">bb_lines</span><span class="s3">):</span>
+            <span class="s2">assert not </span><span class="s3">(</span><span class="s1">incref_var </span><span class="s2">and </span><span class="s1">decref_var</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">incref_var</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">incref_var </span><span class="s3">== </span><span class="s4">'i8* null'</span><span class="s3">:</span>
+                    <span class="s1">to_remove</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">num</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">incref_map</span><span class="s3">[</span><span class="s1">incref_var</span><span class="s3">].</span><span class="s1">append</span><span class="s3">(</span><span class="s1">num</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">decref_var</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">decref_var </span><span class="s3">== </span><span class="s4">'i8* null'</span><span class="s3">:</span>
+                    <span class="s1">to_remove</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">num</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">decref_map</span><span class="s3">[</span><span class="s1">decref_var</span><span class="s3">].</span><span class="s1">append</span><span class="s3">(</span><span class="s1">num</span><span class="s3">)</span>
+
+        <span class="s2">for </span><span class="s1">var</span><span class="s3">, </span><span class="s1">decops </span><span class="s2">in </span><span class="s1">decref_map</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+            <span class="s1">incops </span><span class="s3">= </span><span class="s1">incref_map</span><span class="s3">[</span><span class="s1">var</span><span class="s3">]</span>
+            <span class="s1">ct </span><span class="s3">= </span><span class="s1">min</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">incops</span><span class="s3">), </span><span class="s1">len</span><span class="s3">(</span><span class="s1">decops</span><span class="s3">))</span>
+            <span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">ct</span><span class="s3">):</span>
+                <span class="s1">to_remove</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">incops</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">())</span>
+                <span class="s1">to_remove</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">decops</span><span class="s3">.</span><span class="s1">popleft</span><span class="s3">())</span>
+
+        <span class="s2">return </span><span class="s3">[</span><span class="s1">ln </span><span class="s2">for </span><span class="s1">num</span><span class="s3">, </span><span class="s1">ln </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">bb_lines</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">num </span><span class="s2">not in </span><span class="s1">to_remove</span><span class="s3">]</span>
+
+    <span class="s2">def </span><span class="s1">_move_and_group_decref_after_all_increfs</span><span class="s3">(</span><span class="s1">bb_lines</span><span class="s3">):</span>
+        <span class="s5"># find last incref</span>
+        <span class="s1">last_incref_pos </span><span class="s3">= </span><span class="s6">0</span>
+        <span class="s2">for </span><span class="s1">pos</span><span class="s3">, </span><span class="s1">ln </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">bb_lines</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">_regex_incref</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">ln</span><span class="s3">) </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">last_incref_pos </span><span class="s3">= </span><span class="s1">pos </span><span class="s3">+ </span><span class="s6">1</span>
+
+        <span class="s5"># find last decref</span>
+        <span class="s1">last_decref_pos </span><span class="s3">= </span><span class="s6">0</span>
+        <span class="s2">for </span><span class="s1">pos</span><span class="s3">, </span><span class="s1">ln </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">bb_lines</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">_regex_decref</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">ln</span><span class="s3">) </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">last_decref_pos </span><span class="s3">= </span><span class="s1">pos </span><span class="s3">+ </span><span class="s6">1</span>
+
+        <span class="s1">last_pos </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">last_incref_pos</span><span class="s3">, </span><span class="s1">last_decref_pos</span><span class="s3">)</span>
+
+        <span class="s5"># find decrefs before last_pos</span>
+        <span class="s1">decrefs </span><span class="s3">= []</span>
+        <span class="s1">head </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">ln </span><span class="s2">in </span><span class="s1">bb_lines</span><span class="s3">[:</span><span class="s1">last_pos</span><span class="s3">]:</span>
+            <span class="s2">if </span><span class="s1">_regex_decref</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">ln</span><span class="s3">) </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">decrefs</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">ln</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">head</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">ln</span><span class="s3">)</span>
+
+        <span class="s5"># insert decrefs at last_pos</span>
+        <span class="s2">return </span><span class="s1">head </span><span class="s3">+ </span><span class="s1">decrefs </span><span class="s3">+ </span><span class="s1">bb_lines</span><span class="s3">[</span><span class="s1">last_pos</span><span class="s3">:]</span>
+
+    <span class="s5"># Driver</span>
+    <span class="s1">processed </span><span class="s3">= []</span>
+
+    <span class="s2">for </span><span class="s1">is_func</span><span class="s3">, </span><span class="s1">lines </span><span class="s2">in </span><span class="s1">_extract_functions</span><span class="s3">(</span><span class="s1">llvmir</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">is_func</span><span class="s3">:</span>
+            <span class="s1">lines </span><span class="s3">= </span><span class="s1">_process_function</span><span class="s3">(</span><span class="s1">lines</span><span class="s3">)</span>
+
+        <span class="s1">processed </span><span class="s3">+= </span><span class="s1">lines</span>
+
+    <span class="s2">return </span><span class="s4">'</span><span class="s2">\n</span><span class="s4">'</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">processed</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">remove_redundant_nrt_refct</span><span class="s3">(</span><span class="s1">ll_module</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Remove redundant reference count operations from the 
+    `llvmlite.binding.ModuleRef`. This parses the ll_module as a string and 
+    line by line to remove the unnecessary nrt refct pairs within each block. 
+    Decref calls are moved after the last incref call in the block to avoid 
+    temporarily decref'ing to zero (which can happen due to hidden decref from 
+    alias). 
+ 
+    Note: non-threadsafe due to usage of global LLVMcontext 
+    &quot;&quot;&quot;</span>
+    <span class="s5"># Early escape if NRT_incref is not used</span>
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s1">ll_module</span><span class="s3">.</span><span class="s1">get_function</span><span class="s3">(</span><span class="s4">'NRT_incref'</span><span class="s3">)</span>
+    <span class="s2">except </span><span class="s1">NameError</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">ll_module</span>
+
+    <span class="s5"># the optimisation pass loses the name of module as it operates on</span>
+    <span class="s5"># strings, so back it up and reset it on completion</span>
+    <span class="s1">name </span><span class="s3">= </span><span class="s1">ll_module</span><span class="s3">.</span><span class="s1">name</span>
+    <span class="s1">newll </span><span class="s3">= </span><span class="s1">_remove_redundant_nrt_refct</span><span class="s3">(</span><span class="s1">str</span><span class="s3">(</span><span class="s1">ll_module</span><span class="s3">))</span>
+    <span class="s1">new_mod </span><span class="s3">= </span><span class="s1">ll</span><span class="s3">.</span><span class="s1">parse_assembly</span><span class="s3">(</span><span class="s1">newll</span><span class="s3">)</span>
+    <span class="s1">new_mod</span><span class="s3">.</span><span class="s1">name </span><span class="s3">= </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">normalize_ir_text</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">new_mod</span>
+</pre>
+</body>
+</html>

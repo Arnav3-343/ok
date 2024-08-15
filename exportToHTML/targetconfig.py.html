@@ -1,0 +1,345 @@
+<html>
+<head>
+<title>targetconfig.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+.s7 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+targetconfig.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+This module contains utils for manipulating target configurations such as 
+compiler flags. 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">re</span>
+<span class="s2">import </span><span class="s1">zlib</span>
+<span class="s2">import </span><span class="s1">base64</span>
+
+<span class="s2">from </span><span class="s1">types </span><span class="s2">import </span><span class="s1">MappingProxyType</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">utils</span>
+
+
+<span class="s2">class </span><span class="s1">Option</span><span class="s3">:</span>
+    <span class="s0">&quot;&quot;&quot;An option to be used in ``TargetConfig``. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">__slots__ </span><span class="s3">= </span><span class="s4">&quot;_type&quot;</span><span class="s3">, </span><span class="s4">&quot;_default&quot;</span><span class="s3">, </span><span class="s4">&quot;_doc&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">type</span><span class="s3">, *, </span><span class="s1">default</span><span class="s3">, </span><span class="s1">doc</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Parameters 
+        ---------- 
+        type : 
+            Type of the option value. It can be a callable. 
+            The setter always calls ``self._type(value)``. 
+        default : 
+            The default value for the option. 
+        doc : str 
+            Docstring for the option. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_type </span><span class="s3">= </span><span class="s1">type</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_default </span><span class="s3">= </span><span class="s1">default</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_doc </span><span class="s3">= </span><span class="s1">doc</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">type</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_type</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">default</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_default</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">doc</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_doc</span>
+
+
+<span class="s2">class </span><span class="s1">_FlagsStack</span><span class="s3">(</span><span class="s1">utils</span><span class="s3">.</span><span class="s1">ThreadLocalStack</span><span class="s3">, </span><span class="s1">stack_name</span><span class="s3">=</span><span class="s4">&quot;flags&quot;</span><span class="s3">):</span>
+    <span class="s2">pass</span>
+
+
+<span class="s2">class </span><span class="s1">ConfigStack</span><span class="s3">:</span>
+    <span class="s0">&quot;&quot;&quot;A stack for tracking target configurations in the compiler. 
+ 
+    It stores the stack in a thread-local class attribute. All instances in the 
+    same thread will see the same stack. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">top_or_none</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Get the TOS or return None if no config is set. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">:</span>
+            <span class="s1">flags </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">top</span><span class="s3">()</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s5"># Note: should this be the default flag for the target instead?</span>
+            <span class="s1">flags </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s2">return </span><span class="s1">flags</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_stk </span><span class="s3">= </span><span class="s1">_FlagsStack</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">top</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_stk</span><span class="s3">.</span><span class="s1">top</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">__len__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">len</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_stk</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">enter</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">flags</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Returns a contextmanager that performs ``push(flags)`` on enter and 
+        ``pop()`` on exit. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_stk</span><span class="s3">.</span><span class="s1">enter</span><span class="s3">(</span><span class="s1">flags</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">_MetaTargetConfig</span><span class="s3">(</span><span class="s1">type</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Metaclass for ``TargetConfig``. 
+ 
+    When a subclass of ``TargetConfig`` is created, all ``Option`` defined 
+    as class members will be parsed and corresponding getters, setters, and 
+    delters will be inserted. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">bases</span><span class="s3">, </span><span class="s1">dct</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Invoked when subclass is created. 
+ 
+        Insert properties for each ``Option`` that are class members. 
+        All the options will be grouped inside the ``.options`` class 
+        attribute. 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># Gather options from base classes and class dict</span>
+        <span class="s1">opts </span><span class="s3">= {}</span>
+        <span class="s5"># Reversed scan into the base classes to follow MRO ordering such that</span>
+        <span class="s5"># the closest base class is overriding</span>
+        <span class="s2">for </span><span class="s1">base_cls </span><span class="s2">in </span><span class="s1">reversed</span><span class="s3">(</span><span class="s1">bases</span><span class="s3">):</span>
+            <span class="s1">opts</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">base_cls</span><span class="s3">.</span><span class="s1">options</span><span class="s3">)</span>
+        <span class="s1">opts</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">.</span><span class="s1">find_options</span><span class="s3">(</span><span class="s1">dct</span><span class="s3">))</span>
+        <span class="s5"># Store the options into class attribute as a ready-only mapping.</span>
+        <span class="s1">cls</span><span class="s3">.</span><span class="s1">options </span><span class="s3">= </span><span class="s1">MappingProxyType</span><span class="s3">(</span><span class="s1">opts</span><span class="s3">)</span>
+
+        <span class="s5"># Make properties for each of the options</span>
+        <span class="s2">def </span><span class="s1">make_prop</span><span class="s3">(</span><span class="s1">name</span><span class="s3">, </span><span class="s1">option</span><span class="s3">):</span>
+            <span class="s2">def </span><span class="s1">getter</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+                <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_values</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">name</span><span class="s3">, </span><span class="s1">option</span><span class="s3">.</span><span class="s1">default</span><span class="s3">)</span>
+
+            <span class="s2">def </span><span class="s1">setter</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">val</span><span class="s3">):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_values</span><span class="s3">[</span><span class="s1">name</span><span class="s3">] = </span><span class="s1">option</span><span class="s3">.</span><span class="s1">type</span><span class="s3">(</span><span class="s1">val</span><span class="s3">)</span>
+
+            <span class="s2">def </span><span class="s1">delter</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+                <span class="s2">del </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_values</span><span class="s3">[</span><span class="s1">name</span><span class="s3">]</span>
+
+            <span class="s2">return </span><span class="s1">property</span><span class="s3">(</span><span class="s1">getter</span><span class="s3">, </span><span class="s1">setter</span><span class="s3">, </span><span class="s1">delter</span><span class="s3">, </span><span class="s1">option</span><span class="s3">.</span><span class="s1">doc</span><span class="s3">)</span>
+
+        <span class="s2">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">option </span><span class="s2">in </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">options</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+            <span class="s1">setattr</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">make_prop</span><span class="s3">(</span><span class="s1">name</span><span class="s3">, </span><span class="s1">option</span><span class="s3">))</span>
+
+    <span class="s2">def </span><span class="s1">find_options</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">dct</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Returns a new dict with all the items that are a mapping to an 
+        ``Option``. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s3">{</span><span class="s1">k</span><span class="s3">: </span><span class="s1">v </span><span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">dct</span><span class="s3">.</span><span class="s1">items</span><span class="s3">() </span><span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">v</span><span class="s3">, </span><span class="s1">Option</span><span class="s3">)}</span>
+
+
+<span class="s2">class </span><span class="s1">_NotSetType</span><span class="s3">:</span>
+    <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s4">&quot;&lt;NotSet&gt;&quot;</span>
+
+
+<span class="s1">_NotSet </span><span class="s3">= </span><span class="s1">_NotSetType</span><span class="s3">()</span>
+
+
+<span class="s2">class </span><span class="s1">TargetConfig</span><span class="s3">(</span><span class="s1">metaclass</span><span class="s3">=</span><span class="s1">_MetaTargetConfig</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Base class for ``TargetConfig``. 
+ 
+    Subclass should fill class members with ``Option``. For example: 
+ 
+    &gt;&gt;&gt; class MyTargetConfig(TargetConfig): 
+    &gt;&gt;&gt;     a_bool_option = Option(type=bool, default=False, doc=&quot;a bool&quot;) 
+    &gt;&gt;&gt;     an_int_option = Option(type=int, default=0, doc=&quot;an int&quot;) 
+ 
+    The metaclass will insert properties for each ``Option``. For example: 
+ 
+    &gt;&gt;&gt; tc = MyTargetConfig() 
+    &gt;&gt;&gt; tc.a_bool_option = True  # invokes the setter 
+    &gt;&gt;&gt; print(tc.an_int_option)  # print the default 
+    &quot;&quot;&quot;</span>
+
+    <span class="s5"># Used for compression in mangling.</span>
+    <span class="s5"># Set to -15 to disable the header and checksum for smallest output.</span>
+    <span class="s1">_ZLIB_CONFIG </span><span class="s3">= {</span><span class="s4">&quot;wbits&quot;</span><span class="s3">: -</span><span class="s6">15</span><span class="s3">}</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">copy_from</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Parameters 
+        ---------- 
+        copy_from : TargetConfig or None 
+            if None, creates an empty ``TargetConfig``. 
+            Otherwise, creates a copy. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_values </span><span class="s3">= {}</span>
+        <span class="s2">if </span><span class="s1">copy_from </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">copy_from</span><span class="s3">, </span><span class="s1">TargetConfig</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_values</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">copy_from</span><span class="s3">.</span><span class="s1">_values</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5"># NOTE: default options will be placed at the end and grouped inside</span>
+        <span class="s5">#       a square bracket; i.e. [optname=optval, ...]</span>
+        <span class="s1">args </span><span class="s3">= []</span>
+        <span class="s1">defs </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">options</span><span class="s3">:</span>
+            <span class="s1">msg </span><span class="s3">= </span><span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">k</span><span class="s2">}</span><span class="s4">=</span><span class="s2">{</span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">k</span><span class="s3">)</span><span class="s2">}</span><span class="s4">&quot;</span>
+            <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">is_set</span><span class="s3">(</span><span class="s1">k</span><span class="s3">):</span>
+                <span class="s1">defs</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">args</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+        <span class="s1">clsname </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span>
+        <span class="s2">return </span><span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">clsname</span><span class="s2">}</span><span class="s4">(</span><span class="s2">{</span><span class="s4">', '</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">args</span><span class="s3">)</span><span class="s2">}</span><span class="s4">, [</span><span class="s2">{</span><span class="s4">', '</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">defs</span><span class="s3">)</span><span class="s2">}</span><span class="s4">])&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__hash__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">hash</span><span class="s3">(</span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">values</span><span class="s3">())))</span>
+
+    <span class="s2">def </span><span class="s1">__eq__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">other</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">other</span><span class="s3">, </span><span class="s1">TargetConfig</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">values</span><span class="s3">() == </span><span class="s1">other</span><span class="s3">.</span><span class="s1">values</span><span class="s3">()</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">NotImplemented</span>
+
+    <span class="s2">def </span><span class="s1">values</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Returns a dict of all the values 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s3">{</span><span class="s1">k</span><span class="s3">: </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">k</span><span class="s3">) </span><span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">options</span><span class="s3">}</span>
+
+    <span class="s2">def </span><span class="s1">is_set</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Is the option set? 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_guard_option</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">name </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_values</span>
+
+    <span class="s2">def </span><span class="s1">discard</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Remove the option by name if it is defined. 
+ 
+        After this, the value for the option will be set to its default value. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_guard_option</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_values</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s1">name</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">inherit_if_not_set</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">default</span><span class="s3">=</span><span class="s1">_NotSet</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Inherit flag from ``ConfigStack``. 
+ 
+        Parameters 
+        ---------- 
+        name : str 
+            Option name. 
+        default : optional 
+            When given, it overrides the default value. 
+            It is only used when the flag is not defined locally and there is 
+            no entry in the ``ConfigStack``. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_guard_option</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">is_set</span><span class="s3">(</span><span class="s1">name</span><span class="s3">):</span>
+            <span class="s1">cstk </span><span class="s3">= </span><span class="s1">ConfigStack</span><span class="s3">()</span>
+            <span class="s2">if </span><span class="s1">cstk</span><span class="s3">:</span>
+                <span class="s5"># inherit</span>
+                <span class="s1">top </span><span class="s3">= </span><span class="s1">cstk</span><span class="s3">.</span><span class="s1">top</span><span class="s3">()</span>
+                <span class="s1">setattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">top</span><span class="s3">, </span><span class="s1">name</span><span class="s3">))</span>
+            <span class="s2">elif </span><span class="s1">default </span><span class="s2">is not </span><span class="s1">_NotSet</span><span class="s3">:</span>
+                <span class="s1">setattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">default</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">copy</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Clone this instance. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">type</span><span class="s3">(</span><span class="s1">self</span><span class="s3">)(</span><span class="s1">self</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">summary</span><span class="s3">(</span><span class="s1">self</span><span class="s3">) </span><span class="s1">-&gt; str</span><span class="s3">:</span>
+        <span class="s0">&quot;&quot;&quot;Returns a ``str`` that summarizes this instance. 
+ 
+        In contrast to ``__repr__``, only options that are explicitly set will 
+        be shown. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">args </span><span class="s3">= [</span><span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">k</span><span class="s2">}</span><span class="s4">=</span><span class="s2">{</span><span class="s1">v</span><span class="s2">}</span><span class="s4">&quot; </span><span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_summary_args</span><span class="s3">()]</span>
+        <span class="s1">clsname </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span>
+        <span class="s2">return </span><span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">clsname</span><span class="s2">}</span><span class="s4">(</span><span class="s2">{</span><span class="s4">', '</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">args</span><span class="s3">)</span><span class="s2">}</span><span class="s4">)&quot;</span>
+
+    <span class="s2">def </span><span class="s1">_guard_option</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">name </span><span class="s2">not in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">options</span><span class="s3">:</span>
+            <span class="s1">msg </span><span class="s3">= </span><span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">name</span><span class="s2">!r} </span><span class="s4">is not a valid option for </span><span class="s2">{</span><span class="s1">type</span><span class="s3">(</span><span class="s1">self</span><span class="s3">)</span><span class="s2">}</span><span class="s4">&quot;</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_summary_args</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;returns a sorted sequence of 2-tuple containing the 
+        ``(flag_name, flag_value)`` for flag that are set with a non-default 
+        value. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">args </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">options</span><span class="s3">):</span>
+            <span class="s1">opt </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">options</span><span class="s3">[</span><span class="s1">k</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">is_set</span><span class="s3">(</span><span class="s1">k</span><span class="s3">):</span>
+                <span class="s1">flagval </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">k</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">opt</span><span class="s3">.</span><span class="s1">default </span><span class="s3">!= </span><span class="s1">flagval</span><span class="s3">:</span>
+                    <span class="s1">v </span><span class="s3">= (</span><span class="s1">k</span><span class="s3">, </span><span class="s1">flagval</span><span class="s3">)</span>
+                    <span class="s1">args</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">v</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">args</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">_make_compression_dictionary</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">) </span><span class="s1">-&gt; bytes</span><span class="s3">:</span>
+        <span class="s0">&quot;&quot;&quot;Returns a ``bytes`` object suitable for use as a dictionary for 
+        compression. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">buf </span><span class="s3">= []</span>
+        <span class="s5"># include package name</span>
+        <span class="s1">buf</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s4">&quot;numba&quot;</span><span class="s3">)</span>
+        <span class="s5"># include class name</span>
+        <span class="s1">buf</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">)</span>
+        <span class="s5"># include common values</span>
+        <span class="s1">buf</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">([</span><span class="s4">&quot;True&quot;</span><span class="s3">, </span><span class="s4">&quot;False&quot;</span><span class="s3">])</span>
+        <span class="s5"># include all options name and their default value</span>
+        <span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">opt </span><span class="s2">in </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">options</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+            <span class="s1">buf</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">k</span><span class="s3">)</span>
+            <span class="s1">buf</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">str</span><span class="s3">(</span><span class="s1">opt</span><span class="s3">.</span><span class="s1">default</span><span class="s3">))</span>
+        <span class="s2">return </span><span class="s4">''</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">buf</span><span class="s3">).</span><span class="s1">encode</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">get_mangle_string</span><span class="s3">(</span><span class="s1">self</span><span class="s3">) </span><span class="s1">-&gt; str</span><span class="s3">:</span>
+        <span class="s0">&quot;&quot;&quot;Return a string suitable for symbol mangling. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">zdict </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_make_compression_dictionary</span><span class="s3">()</span>
+
+        <span class="s1">comp </span><span class="s3">= </span><span class="s1">zlib</span><span class="s3">.</span><span class="s1">compressobj</span><span class="s3">(</span><span class="s1">zdict</span><span class="s3">=</span><span class="s1">zdict</span><span class="s3">, </span><span class="s1">level</span><span class="s3">=</span><span class="s1">zlib</span><span class="s3">.</span><span class="s1">Z_BEST_COMPRESSION</span><span class="s3">,</span>
+                                <span class="s3">**</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_ZLIB_CONFIG</span><span class="s3">)</span>
+        <span class="s5"># The mangled string is a compressed and base64 encoded version of the</span>
+        <span class="s5"># summary</span>
+        <span class="s1">buf </span><span class="s3">= [</span><span class="s1">comp</span><span class="s3">.</span><span class="s1">compress</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">summary</span><span class="s3">().</span><span class="s1">encode</span><span class="s3">())]</span>
+        <span class="s1">buf</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">comp</span><span class="s3">.</span><span class="s1">flush</span><span class="s3">())</span>
+        <span class="s2">return </span><span class="s1">base64</span><span class="s3">.</span><span class="s1">b64encode</span><span class="s3">(</span><span class="s7">b''</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">buf</span><span class="s3">)).</span><span class="s1">decode</span><span class="s3">()</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">demangle</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">mangled</span><span class="s3">: </span><span class="s1">str</span><span class="s3">) </span><span class="s1">-&gt; str</span><span class="s3">:</span>
+        <span class="s0">&quot;&quot;&quot;Returns the demangled result from ``.get_mangle_string()`` 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># unescape _XX sequence</span>
+        <span class="s2">def </span><span class="s1">repl</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">chr</span><span class="s3">(</span><span class="s1">int</span><span class="s3">(</span><span class="s4">'0x' </span><span class="s3">+ </span><span class="s1">x</span><span class="s3">.</span><span class="s1">group</span><span class="s3">(</span><span class="s6">0</span><span class="s3">)[</span><span class="s6">1</span><span class="s3">:], </span><span class="s6">16</span><span class="s3">))</span>
+        <span class="s1">unescaped </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">sub</span><span class="s3">(</span><span class="s4">r&quot;_[a-zA-Z0-9][a-zA-Z0-9]&quot;</span><span class="s3">, </span><span class="s1">repl</span><span class="s3">, </span><span class="s1">mangled</span><span class="s3">)</span>
+        <span class="s5"># decode base64</span>
+        <span class="s1">raw </span><span class="s3">= </span><span class="s1">base64</span><span class="s3">.</span><span class="s1">b64decode</span><span class="s3">(</span><span class="s1">unescaped</span><span class="s3">)</span>
+        <span class="s5"># decompress</span>
+        <span class="s1">zdict </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_make_compression_dictionary</span><span class="s3">()</span>
+        <span class="s1">dc </span><span class="s3">= </span><span class="s1">zlib</span><span class="s3">.</span><span class="s1">decompressobj</span><span class="s3">(</span><span class="s1">zdict</span><span class="s3">=</span><span class="s1">zdict</span><span class="s3">, **</span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_ZLIB_CONFIG</span><span class="s3">)</span>
+        <span class="s1">buf </span><span class="s3">= []</span>
+        <span class="s2">while </span><span class="s1">raw</span><span class="s3">:</span>
+            <span class="s1">buf</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">dc</span><span class="s3">.</span><span class="s1">decompress</span><span class="s3">(</span><span class="s1">raw</span><span class="s3">))</span>
+            <span class="s1">raw </span><span class="s3">= </span><span class="s1">dc</span><span class="s3">.</span><span class="s1">unconsumed_tail</span>
+        <span class="s1">buf</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">dc</span><span class="s3">.</span><span class="s1">flush</span><span class="s3">())</span>
+        <span class="s2">return </span><span class="s7">b''</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">buf</span><span class="s3">).</span><span class="s1">decode</span><span class="s3">()</span>
+</pre>
+</body>
+</html>

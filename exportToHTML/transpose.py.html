@@ -1,0 +1,88 @@
+<html>
+<head>
+<title>transpose.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #5f826b; font-style: italic;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+transpose.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">cuda</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">cudadrv</span><span class="s2">.</span><span class="s1">driver </span><span class="s0">import </span><span class="s1">driver</span>
+<span class="s0">import </span><span class="s1">math</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">np </span><span class="s0">import </span><span class="s1">numpy_support </span><span class="s0">as </span><span class="s1">nps</span>
+
+
+<span class="s0">def </span><span class="s1">transpose</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Compute the transpose of 'a' and store it into 'b', if given, 
+    and return it. If 'b' is not given, allocate a new array 
+    and return that. 
+ 
+    This implements the algorithm documented in 
+    http://devblogs.nvidia.com/parallelforall/efficient-matrix-transpose-cuda-cc/ 
+ 
+    :param a: an `np.ndarray` or a `DeviceNDArrayBase` subclass. If already on 
+        the device its stream will be used to perform the transpose (and to copy 
+        `b` to the device if necessary). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s4"># prefer `a`'s stream if</span>
+    <span class="s1">stream </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s5">'stream'</span><span class="s2">, </span><span class="s6">0</span><span class="s2">)</span>
+
+    <span class="s0">if not </span><span class="s1">b</span><span class="s2">:</span>
+        <span class="s1">cols</span><span class="s2">, </span><span class="s1">rows </span><span class="s2">= </span><span class="s1">a</span><span class="s2">.</span><span class="s1">shape</span>
+        <span class="s1">strides </span><span class="s2">= </span><span class="s1">a</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">itemsize </span><span class="s2">* </span><span class="s1">cols</span><span class="s2">, </span><span class="s1">a</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">itemsize</span>
+        <span class="s1">b </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">cudadrv</span><span class="s2">.</span><span class="s1">devicearray</span><span class="s2">.</span><span class="s1">DeviceNDArray</span><span class="s2">(</span>
+            <span class="s2">(</span><span class="s1">rows</span><span class="s2">, </span><span class="s1">cols</span><span class="s2">),</span>
+            <span class="s1">strides</span><span class="s2">,</span>
+            <span class="s1">dtype</span><span class="s2">=</span><span class="s1">a</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">,</span>
+            <span class="s1">stream</span><span class="s2">=</span><span class="s1">stream</span><span class="s2">)</span>
+
+    <span class="s1">dt </span><span class="s2">= </span><span class="s1">nps</span><span class="s2">.</span><span class="s1">from_dtype</span><span class="s2">(</span><span class="s1">a</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+
+    <span class="s1">tpb </span><span class="s2">= </span><span class="s1">driver</span><span class="s2">.</span><span class="s1">get_device</span><span class="s2">().</span><span class="s1">MAX_THREADS_PER_BLOCK</span>
+    <span class="s4"># we need to factor available threads into x and y axis</span>
+    <span class="s1">tile_width </span><span class="s2">= </span><span class="s1">int</span><span class="s2">(</span><span class="s1">math</span><span class="s2">.</span><span class="s1">pow</span><span class="s2">(</span><span class="s6">2</span><span class="s2">, </span><span class="s1">math</span><span class="s2">.</span><span class="s1">log</span><span class="s2">(</span><span class="s1">tpb</span><span class="s2">, </span><span class="s6">2</span><span class="s2">) / </span><span class="s6">2</span><span class="s2">))</span>
+    <span class="s1">tile_height </span><span class="s2">= </span><span class="s1">int</span><span class="s2">(</span><span class="s1">tpb </span><span class="s2">/ </span><span class="s1">tile_width</span><span class="s2">)</span>
+
+    <span class="s1">tile_shape </span><span class="s2">= (</span><span class="s1">tile_height</span><span class="s2">, </span><span class="s1">tile_width </span><span class="s2">+ </span><span class="s6">1</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span>
+    <span class="s0">def </span><span class="s1">kernel</span><span class="s2">(</span><span class="s1">input</span><span class="s2">, </span><span class="s1">output</span><span class="s2">):</span>
+
+        <span class="s1">tile </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">shared</span><span class="s2">.</span><span class="s1">array</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">=</span><span class="s1">tile_shape</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">dt</span><span class="s2">)</span>
+
+        <span class="s1">tx </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">threadIdx</span><span class="s2">.</span><span class="s1">x</span>
+        <span class="s1">ty </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">threadIdx</span><span class="s2">.</span><span class="s1">y</span>
+        <span class="s1">bx </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">blockIdx</span><span class="s2">.</span><span class="s1">x </span><span class="s2">* </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">blockDim</span><span class="s2">.</span><span class="s1">x</span>
+        <span class="s1">by </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">blockIdx</span><span class="s2">.</span><span class="s1">y </span><span class="s2">* </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">blockDim</span><span class="s2">.</span><span class="s1">y</span>
+        <span class="s1">x </span><span class="s2">= </span><span class="s1">by </span><span class="s2">+ </span><span class="s1">tx</span>
+        <span class="s1">y </span><span class="s2">= </span><span class="s1">bx </span><span class="s2">+ </span><span class="s1">ty</span>
+
+        <span class="s0">if </span><span class="s1">by </span><span class="s2">+ </span><span class="s1">ty </span><span class="s2">&lt; </span><span class="s1">input</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s6">0</span><span class="s2">] </span><span class="s0">and </span><span class="s1">bx </span><span class="s2">+ </span><span class="s1">tx </span><span class="s2">&lt; </span><span class="s1">input</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s6">1</span><span class="s2">]:</span>
+            <span class="s1">tile</span><span class="s2">[</span><span class="s1">ty</span><span class="s2">, </span><span class="s1">tx</span><span class="s2">] = </span><span class="s1">input</span><span class="s2">[</span><span class="s1">by </span><span class="s2">+ </span><span class="s1">ty</span><span class="s2">, </span><span class="s1">bx </span><span class="s2">+ </span><span class="s1">tx</span><span class="s2">]</span>
+        <span class="s1">cuda</span><span class="s2">.</span><span class="s1">syncthreads</span><span class="s2">()</span>
+        <span class="s0">if </span><span class="s1">y </span><span class="s2">&lt; </span><span class="s1">output</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s6">0</span><span class="s2">] </span><span class="s0">and </span><span class="s1">x </span><span class="s2">&lt; </span><span class="s1">output</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s6">1</span><span class="s2">]:</span>
+            <span class="s1">output</span><span class="s2">[</span><span class="s1">y</span><span class="s2">, </span><span class="s1">x</span><span class="s2">] = </span><span class="s1">tile</span><span class="s2">[</span><span class="s1">tx</span><span class="s2">, </span><span class="s1">ty</span><span class="s2">]</span>
+
+    <span class="s4"># one block per tile, plus one for remainders</span>
+    <span class="s1">blocks </span><span class="s2">= </span><span class="s1">int</span><span class="s2">(</span><span class="s1">b</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s6">0</span><span class="s2">] / </span><span class="s1">tile_height </span><span class="s2">+ </span><span class="s6">1</span><span class="s2">), </span><span class="s1">int</span><span class="s2">(</span><span class="s1">b</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s6">1</span><span class="s2">] / </span><span class="s1">tile_width </span><span class="s2">+ </span><span class="s6">1</span><span class="s2">)</span>
+    <span class="s4"># one thread per tile element</span>
+    <span class="s1">threads </span><span class="s2">= </span><span class="s1">tile_height</span><span class="s2">, </span><span class="s1">tile_width</span>
+    <span class="s1">kernel</span><span class="s2">[</span><span class="s1">blocks</span><span class="s2">, </span><span class="s1">threads</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">](</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">)</span>
+
+    <span class="s0">return </span><span class="s1">b</span>
+</pre>
+</body>
+</html>

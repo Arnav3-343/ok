@@ -1,0 +1,508 @@
+<html>
+<head>
+<title>_nrt_python.c</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #6aab73;}
+.s4 { color: #2aacb8;}
+.s5 { color: #0da19e;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_nrt_python.c</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Definition of NRT functions for marshalling from / to Python objects. 
+ * This module is included by _nrt_pythonmod.c and by pycc-compiled modules. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;../../_pymodule.h&quot;</span>
+
+<span class="s2">#define </span><span class="s1">NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION</span>
+<span class="s2">#include </span><span class="s1">&lt;numpy/ndarrayobject.h&gt;</span>
+<span class="s2">#include </span><span class="s1">&lt;numpy/arrayscalars.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&quot;../../_arraystruct.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;../../_numba_common.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;nrt.h&quot;</span>
+
+
+<span class="s0">/* 
+ * Create a NRT MemInfo for data owned by a PyObject. 
+ */</span>
+
+<span class="s2">static void</span>
+<span class="s1">pyobject_dtor(</span><span class="s2">void </span><span class="s1">*ptr, size_t size, </span><span class="s2">void</span><span class="s1">* info) {</span>
+    <span class="s1">PyGILState_STATE gstate;</span>
+    <span class="s1">PyObject *ownerobj = info;</span>
+
+    <span class="s1">gstate = PyGILState_Ensure();   </span><span class="s0">/* ensure the GIL */</span>
+    <span class="s1">Py_DECREF(ownerobj);            </span><span class="s0">/* release the python object */</span>
+    <span class="s1">PyGILState_Release(gstate);     </span><span class="s0">/* release the GIL */</span>
+<span class="s1">}</span>
+
+<span class="s1">NUMBA_EXPORT_FUNC(NRT_MemInfo *)</span>
+<span class="s1">NRT_meminfo_new_from_pyobject(</span><span class="s2">void </span><span class="s1">*data, PyObject *ownerobj) {</span>
+    <span class="s1">size_t dummy_size = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">Py_INCREF(ownerobj);</span>
+    <span class="s2">return </span><span class="s1">NRT_MemInfo_new(data, dummy_size, pyobject_dtor, ownerobj);</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* 
+ * A Python object wrapping a NRT meminfo. 
+ */</span>
+
+<span class="s2">typedef struct </span><span class="s1">{</span>
+    <span class="s1">PyObject_HEAD</span>
+    <span class="s1">NRT_MemInfo *meminfo;</span>
+<span class="s1">} MemInfoObject;</span>
+
+
+<span class="s2">static</span>
+<span class="s2">int </span><span class="s1">MemInfo_init(MemInfoObject *self, PyObject *args, PyObject *kwds) {</span>
+    <span class="s2">static char </span><span class="s1">*keywords[] = {</span><span class="s3">&quot;ptr&quot;</span><span class="s1">, NULL};</span>
+    <span class="s1">PyObject *raw_ptr_obj;</span>
+    <span class="s2">void </span><span class="s1">*raw_ptr;</span>
+    <span class="s2">if </span><span class="s1">(!PyArg_ParseTupleAndKeywords(args, kwds, </span><span class="s3">&quot;O&quot;</span><span class="s1">, keywords, &amp;raw_ptr_obj)) {</span>
+        <span class="s2">return </span><span class="s1">-</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">raw_ptr = PyLong_AsVoidPtr(raw_ptr_obj);</span>
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;MemInfo_init self=%p raw_ptr=%p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, self, raw_ptr));</span>
+
+    <span class="s2">if</span><span class="s1">(PyErr_Occurred()) </span><span class="s2">return </span><span class="s1">-</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">self</span><span class="s5">-&gt;</span><span class="s1">meminfo = (NRT_MemInfo *)raw_ptr;</span>
+    <span class="s1">assert (NRT_MemInfo_refcount(self</span><span class="s5">-&gt;</span><span class="s1">meminfo) &gt; </span><span class="s4">0 </span><span class="s1">&amp;&amp; </span><span class="s3">&quot;0 refcount&quot;</span><span class="s1">);</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+
+<span class="s2">static int</span>
+<span class="s1">MemInfo_getbuffer(PyObject *exporter, Py_buffer *view, </span><span class="s2">int </span><span class="s1">flags) {</span>
+    <span class="s1">Py_ssize_t len;</span>
+    <span class="s2">void </span><span class="s1">*buf;</span>
+    <span class="s2">int </span><span class="s1">readonly = </span><span class="s4">0</span><span class="s1">;</span>
+
+    <span class="s1">MemInfoObject *miobj = (MemInfoObject*)exporter;</span>
+    <span class="s1">NRT_MemInfo *mi = miobj</span><span class="s5">-&gt;</span><span class="s1">meminfo;</span>
+
+    <span class="s1">buf = NRT_MemInfo_data(mi);</span>
+    <span class="s1">len = NRT_MemInfo_size(mi);</span>
+    <span class="s2">return </span><span class="s1">PyBuffer_FillInfo(view, exporter, buf, len, readonly, flags);</span>
+<span class="s1">}</span>
+
+<span class="s2">static </span><span class="s1">PyBufferProcs MemInfo_bufferProcs = {MemInfo_getbuffer, NULL};</span>
+
+<span class="s2">static</span>
+<span class="s1">PyObject*</span>
+<span class="s1">MemInfo_acquire(MemInfoObject *self) {</span>
+    <span class="s1">NRT_MemInfo_acquire(self</span><span class="s5">-&gt;</span><span class="s1">meminfo);</span>
+    <span class="s1">Py_RETURN_NONE;</span>
+<span class="s1">}</span>
+
+<span class="s2">static</span>
+<span class="s1">PyObject*</span>
+<span class="s1">MemInfo_release(MemInfoObject *self) {</span>
+    <span class="s1">NRT_MemInfo_release(self</span><span class="s5">-&gt;</span><span class="s1">meminfo);</span>
+    <span class="s1">Py_RETURN_NONE;</span>
+<span class="s1">}</span>
+
+<span class="s2">static</span>
+<span class="s1">PyObject*</span>
+<span class="s1">MemInfo_get_data(MemInfoObject *self, </span><span class="s2">void </span><span class="s1">*closure) {</span>
+    <span class="s2">return </span><span class="s1">PyLong_FromVoidPtr(NRT_MemInfo_data(self</span><span class="s5">-&gt;</span><span class="s1">meminfo));</span>
+<span class="s1">}</span>
+
+<span class="s2">static</span>
+<span class="s1">PyObject*</span>
+<span class="s1">MemInfo_get_refcount(MemInfoObject *self, </span><span class="s2">void </span><span class="s1">*closure) {</span>
+    <span class="s1">size_t refct = NRT_MemInfo_refcount(self</span><span class="s5">-&gt;</span><span class="s1">meminfo);</span>
+    <span class="s2">if </span><span class="s1">( refct == (size_t)-</span><span class="s4">1 </span><span class="s1">) {</span>
+        <span class="s1">PyErr_SetString(PyExc_ValueError, </span><span class="s3">&quot;invalid MemInfo&quot;</span><span class="s1">);</span>
+        <span class="s2">return </span><span class="s1">NULL;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">PyLong_FromSize_t(refct);</span>
+<span class="s1">}</span>
+
+<span class="s2">static</span>
+<span class="s1">PyObject*</span>
+<span class="s1">MemInfo_get_external_allocator(MemInfoObject *self, </span><span class="s2">void </span><span class="s1">*closure) {</span>
+    <span class="s2">void </span><span class="s1">*p = NRT_MemInfo_external_allocator(self</span><span class="s5">-&gt;</span><span class="s1">meminfo);</span>
+    <span class="s2">return </span><span class="s1">PyLong_FromVoidPtr(p);</span>
+<span class="s1">}</span>
+
+<span class="s2">static</span>
+<span class="s1">PyObject*</span>
+<span class="s1">MemInfo_get_parent(MemInfoObject *self, </span><span class="s2">void </span><span class="s1">*closure) {</span>
+    <span class="s2">void </span><span class="s1">*p = NRT_MemInfo_parent(self</span><span class="s5">-&gt;</span><span class="s1">meminfo);</span>
+    <span class="s2">if </span><span class="s1">(p) {</span>
+        <span class="s1">Py_INCREF(p);</span>
+        <span class="s2">return </span><span class="s1">(PyObject*)p;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">Py_INCREF(Py_None);</span>
+        <span class="s2">return </span><span class="s1">Py_None;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">static void</span>
+<span class="s1">MemInfo_dealloc(MemInfoObject *self)</span>
+<span class="s1">{</span>
+    <span class="s1">NRT_MemInfo_release(self</span><span class="s5">-&gt;</span><span class="s1">meminfo);</span>
+    <span class="s1">Py_TYPE(self)</span><span class="s5">-&gt;</span><span class="s1">tp_free((PyObject*)self);</span>
+<span class="s1">}</span>
+
+<span class="s2">static </span><span class="s1">PyMethodDef MemInfo_methods[] = {</span>
+    <span class="s1">{</span><span class="s3">&quot;acquire&quot;</span><span class="s1">, (PyCFunction)MemInfo_acquire, METH_NOARGS,</span>
+     <span class="s3">&quot;Increment the reference count&quot;</span>
+    <span class="s1">},</span>
+    <span class="s1">{</span><span class="s3">&quot;release&quot;</span><span class="s1">, (PyCFunction)MemInfo_release, METH_NOARGS,</span>
+     <span class="s3">&quot;Decrement the reference count&quot;</span>
+    <span class="s1">},</span>
+    <span class="s1">{NULL}  </span><span class="s0">/* Sentinel */</span>
+<span class="s1">};</span>
+
+
+<span class="s2">static </span><span class="s1">PyGetSetDef MemInfo_getsets[] = {</span>
+    <span class="s1">{</span><span class="s3">&quot;data&quot;</span><span class="s1">,</span>
+     <span class="s1">(getter)MemInfo_get_data, NULL,</span>
+     <span class="s3">&quot;Get the data pointer as an integer&quot;</span><span class="s1">,</span>
+     <span class="s1">NULL},</span>
+    <span class="s1">{</span><span class="s3">&quot;refcount&quot;</span><span class="s1">,</span>
+     <span class="s1">(getter)MemInfo_get_refcount, NULL,</span>
+     <span class="s3">&quot;Get the refcount&quot;</span><span class="s1">,</span>
+     <span class="s1">NULL},</span>
+    <span class="s1">{</span><span class="s3">&quot;external_allocator&quot;</span><span class="s1">,</span>
+     <span class="s1">(getter)MemInfo_get_external_allocator, NULL,</span>
+     <span class="s3">&quot;Get the external allocator&quot;</span><span class="s1">,</span>
+     <span class="s1">NULL},</span>
+    <span class="s1">{</span><span class="s3">&quot;parent&quot;</span><span class="s1">,</span>
+     <span class="s1">(getter)MemInfo_get_parent, NULL,</span>
+     <span class="s1">NULL},</span>
+    <span class="s1">{NULL}  </span><span class="s0">/* Sentinel */</span>
+<span class="s1">};</span>
+
+
+<span class="s2">static </span><span class="s1">PyTypeObject MemInfoType = {</span>
+    <span class="s1">PyVarObject_HEAD_INIT(NULL, </span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s3">&quot;_nrt_python._MemInfo&quot;</span><span class="s1">,                   </span><span class="s0">/* tp_name */</span>
+    <span class="s2">sizeof</span><span class="s1">(MemInfoObject),                    </span><span class="s0">/* tp_basicsize */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_itemsize */</span>
+    <span class="s1">(destructor)MemInfo_dealloc,              </span><span class="s0">/* tp_dealloc */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_vectorcall_offset */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_getattr */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_setattr */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_as_async */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_repr */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_as_number */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_as_sequence */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_as_mapping */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_hash */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_call */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_str */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_getattro */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_setattro */</span>
+    <span class="s1">&amp;MemInfo_bufferProcs,                     </span><span class="s0">/* tp_as_buffer */</span>
+    <span class="s1">Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE, </span><span class="s0">/* tp_flags */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_doc */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_traverse */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_clear */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_richcompare */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_weaklistoffset */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_iter */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_iternext */</span>
+    <span class="s1">MemInfo_methods,                          </span><span class="s0">/* tp_methods */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_members */</span>
+    <span class="s1">MemInfo_getsets,                          </span><span class="s0">/* tp_getset */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_base */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_dict */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_descr_get */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_descr_set */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_dictoffset */</span>
+    <span class="s1">(initproc)MemInfo_init,                   </span><span class="s0">/* tp_init */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_alloc */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_new */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_free */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_is_gc */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_bases */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_mro */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_cache */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_subclasses */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_weaklist */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_del */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_version_tag */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_finalize */</span>
+    <span class="s4">0</span><span class="s1">,                                        </span><span class="s0">/* tp_vectorcall */</span>
+<span class="s2">#if </span><span class="s1">(PY_MAJOR_VERSION == </span><span class="s4">3</span><span class="s1">) &amp;&amp; (PY_MINOR_VERSION == </span><span class="s4">12</span><span class="s1">)</span>
+<span class="s0">/* This was introduced first in 3.12 
+ * https://github.com/python/cpython/issues/91051 
+ */</span>
+    <span class="s4">0</span><span class="s1">,                                           </span><span class="s0">/* tp_watched */</span>
+<span class="s2">#endif</span>
+
+<span class="s0">/* WARNING: Do not remove this, only modify it! It is a version guard to 
+ * act as a reminder to update this struct on Python version update! */</span>
+<span class="s2">#if </span><span class="s1">(PY_MAJOR_VERSION == </span><span class="s4">3</span><span class="s1">)</span>
+<span class="s2">#if </span><span class="s1">! ((PY_MINOR_VERSION == </span><span class="s4">9</span><span class="s1">) || (PY_MINOR_VERSION == </span><span class="s4">10</span><span class="s1">) || (PY_MINOR_VERSION == </span><span class="s4">11</span><span class="s1">) || (PY_MINOR_VERSION == </span><span class="s4">12</span><span class="s1">))</span>
+<span class="s2">#error </span><span class="s3">&quot;Python minor version is not supported.&quot;</span>
+<span class="s2">#endif</span>
+<span class="s2">#else</span>
+<span class="s2">#error </span><span class="s3">&quot;Python major version is not supported.&quot;</span>
+<span class="s2">#endif</span>
+<span class="s0">/* END WARNING*/</span>
+<span class="s1">};</span>
+
+<span class="s0">/* 
+Return a MemInfo* as a MemInfoObject* 
+The NRT reference to the MemInfo is borrowed. 
+*/</span>
+<span class="s1">NUMBA_EXPORT_FUNC(MemInfoObject*)</span>
+<span class="s1">NRT_meminfo_as_pyobject(NRT_MemInfo *meminfo) {</span>
+    <span class="s1">MemInfoObject *mi;</span>
+    <span class="s1">PyObject *addr;</span>
+
+    <span class="s1">addr = PyLong_FromVoidPtr(meminfo);</span>
+    <span class="s2">if </span><span class="s1">(!addr) </span><span class="s2">return </span><span class="s1">NULL;</span>
+    <span class="s1">mi = (MemInfoObject*)PyObject_CallFunctionObjArgs((PyObject *)&amp;MemInfoType, addr, NULL);</span>
+    <span class="s1">Py_DECREF(addr);</span>
+    <span class="s2">if </span><span class="s1">(!mi) </span><span class="s2">return </span><span class="s1">NULL;</span>
+    <span class="s2">return </span><span class="s1">mi;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* 
+Return a MemInfo* from a MemInfoObject* 
+A new reference is returned. 
+*/</span>
+<span class="s1">NUMBA_EXPORT_FUNC(NRT_MemInfo*)</span>
+<span class="s1">NRT_meminfo_from_pyobject(MemInfoObject *miobj) {</span>
+    <span class="s1">NRT_MemInfo_acquire(miobj</span><span class="s5">-&gt;</span><span class="s1">meminfo);</span>
+    <span class="s2">return </span><span class="s1">miobj</span><span class="s5">-&gt;</span><span class="s1">meminfo;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* 
+ * Array adaptor code 
+ */</span>
+
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">int</span><span class="s1">)</span>
+<span class="s1">NRT_adapt_ndarray_from_python(PyObject *obj, arystruct_t* arystruct) {</span>
+    <span class="s1">PyArrayObject *ndary;</span>
+    <span class="s2">int </span><span class="s1">i, ndim;</span>
+    <span class="s1">npy_intp *p;</span>
+    <span class="s2">void </span><span class="s1">*data;</span>
+
+    <span class="s2">if </span><span class="s1">(!PyArray_Check(obj)) {</span>
+        <span class="s2">return </span><span class="s1">-</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">ndary = (PyArrayObject*)obj;</span>
+    <span class="s1">ndim = PyArray_NDIM(ndary);</span>
+    <span class="s1">data = PyArray_DATA(ndary);</span>
+
+    <span class="s1">arystruct</span><span class="s5">-&gt;</span><span class="s1">meminfo = NRT_meminfo_new_from_pyobject((</span><span class="s2">void</span><span class="s1">*)data, obj);</span>
+    <span class="s1">arystruct</span><span class="s5">-&gt;</span><span class="s1">data = data;</span>
+    <span class="s1">arystruct</span><span class="s5">-&gt;</span><span class="s1">nitems = PyArray_SIZE(ndary);</span>
+    <span class="s1">arystruct</span><span class="s5">-&gt;</span><span class="s1">itemsize = PyArray_ITEMSIZE(ndary);</span>
+    <span class="s1">arystruct</span><span class="s5">-&gt;</span><span class="s1">parent = obj;</span>
+    <span class="s1">p = arystruct</span><span class="s5">-&gt;</span><span class="s1">shape_and_strides;</span>
+    <span class="s2">for </span><span class="s1">(i = </span><span class="s4">0</span><span class="s1">; i &lt; ndim; i++, p++) {</span>
+        <span class="s1">*p = PyArray_DIM(ndary, i);</span>
+    <span class="s1">}</span>
+    <span class="s2">for </span><span class="s1">(i = </span><span class="s4">0</span><span class="s1">; i &lt; ndim; i++, p++) {</span>
+        <span class="s1">*p = PyArray_STRIDE(ndary, i);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_adapt_ndarray_from_python %p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">,</span>
+                              <span class="s1">arystruct</span><span class="s5">-&gt;</span><span class="s1">meminfo));</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s2">static</span>
+<span class="s1">PyObject* try_to_return_parent(arystruct_t *arystruct, </span><span class="s2">int </span><span class="s1">ndim,</span>
+                               <span class="s1">PyArray_Descr *descr)</span>
+<span class="s1">{</span>
+    <span class="s2">int </span><span class="s1">i;</span>
+    <span class="s1">PyArrayObject *array = (PyArrayObject *)arystruct</span><span class="s5">-&gt;</span><span class="s1">parent;</span>
+
+    <span class="s2">if </span><span class="s1">(!PyArray_Check(arystruct</span><span class="s5">-&gt;</span><span class="s1">parent))</span>
+        <span class="s0">/* Parent is a generic buffer-providing object */</span>
+        <span class="s2">goto </span><span class="s1">RETURN_ARRAY_COPY;</span>
+
+    <span class="s2">if </span><span class="s1">(PyArray_DATA(array) != arystruct</span><span class="s5">-&gt;</span><span class="s1">data)</span>
+        <span class="s2">goto </span><span class="s1">RETURN_ARRAY_COPY;</span>
+
+    <span class="s2">if </span><span class="s1">(PyArray_NDIM(array) != ndim)</span>
+        <span class="s2">goto </span><span class="s1">RETURN_ARRAY_COPY;</span>
+
+    <span class="s2">if </span><span class="s1">(PyObject_RichCompareBool((PyObject *) PyArray_DESCR(array),</span>
+                                 <span class="s1">(PyObject *) descr, Py_EQ) &lt;= </span><span class="s4">0</span><span class="s1">)</span>
+        <span class="s2">goto </span><span class="s1">RETURN_ARRAY_COPY;</span>
+
+    <span class="s2">for</span><span class="s1">(i = </span><span class="s4">0</span><span class="s1">; i &lt; ndim; ++i) {</span>
+        <span class="s2">if </span><span class="s1">(PyArray_DIMS(array)[i] != arystruct</span><span class="s5">-&gt;</span><span class="s1">shape_and_strides[i])</span>
+            <span class="s2">goto </span><span class="s1">RETURN_ARRAY_COPY;</span>
+        <span class="s2">if </span><span class="s1">(PyArray_STRIDES(array)[i] != arystruct</span><span class="s5">-&gt;</span><span class="s1">shape_and_strides[ndim + i])</span>
+            <span class="s2">goto </span><span class="s1">RETURN_ARRAY_COPY;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/* Yes, it is the same array 
+       Return new reference */</span>
+    <span class="s1">Py_INCREF((PyObject *)array);</span>
+    <span class="s2">return </span><span class="s1">(PyObject *)array;</span>
+
+<span class="s1">RETURN_ARRAY_COPY:</span>
+    <span class="s2">return </span><span class="s1">NULL;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * This function is used during the boxing of ndarray type. 
+ * `arystruct` is a structure containing essential information from the 
+ *             unboxed array. 
+ * `retty` is the subtype of the NumPy PyArray_Type this function should return. 
+ *         This is related to `numba.core.types.Array.box_type`. 
+ * `ndim` is the number of dimension of the array. 
+ * `writeable` corresponds to the &quot;writable&quot; flag in NumPy ndarray. 
+ * `descr` is the NumPy data type description. 
+ * 
+ * This function was renamed in 0.52.0 to specify that it acquires references. 
+ * It used to steal the reference of the arystruct. 
+ * Refer to https://github.com/numba/numba/pull/6446 
+ */</span>
+<span class="s1">NUMBA_EXPORT_FUNC(PyObject *)</span>
+<span class="s1">NRT_adapt_ndarray_to_python_acqref(arystruct_t* arystruct, PyTypeObject *retty,</span>
+                            <span class="s2">int </span><span class="s1">ndim, </span><span class="s2">int </span><span class="s1">writeable, PyArray_Descr *descr)</span>
+<span class="s1">{</span>
+    <span class="s1">PyArrayObject *array;</span>
+    <span class="s1">MemInfoObject *miobj = NULL;</span>
+    <span class="s1">PyObject *args;</span>
+    <span class="s1">npy_intp *shape, *strides;</span>
+    <span class="s2">int </span><span class="s1">flags = </span><span class="s4">0</span><span class="s1">;</span>
+
+    <span class="s2">if </span><span class="s1">(descr == NULL) {</span>
+        <span class="s1">PyErr_Format(PyExc_RuntimeError,</span>
+                     <span class="s3">&quot;In 'NRT_adapt_ndarray_to_python', 'descr' is NULL&quot;</span><span class="s1">);</span>
+        <span class="s2">return </span><span class="s1">NULL;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">if </span><span class="s1">(!NUMBA_PyArray_DescrCheck(descr)) {</span>
+        <span class="s1">PyErr_Format(PyExc_TypeError,</span>
+                     <span class="s3">&quot;expected dtype object, got '%.200s'&quot;</span><span class="s1">,</span>
+                     <span class="s1">Py_TYPE(descr)</span><span class="s5">-&gt;</span><span class="s1">tp_name);</span>
+        <span class="s2">return </span><span class="s1">NULL;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">if </span><span class="s1">(arystruct</span><span class="s5">-&gt;</span><span class="s1">parent) {</span>
+        <span class="s1">PyObject *obj = try_to_return_parent(arystruct, ndim, descr);</span>
+        <span class="s2">if </span><span class="s1">(obj) {</span>
+            <span class="s2">return </span><span class="s1">obj;</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s2">if </span><span class="s1">(arystruct</span><span class="s5">-&gt;</span><span class="s1">meminfo) {</span>
+        <span class="s0">/* wrap into MemInfoObject */</span>
+        <span class="s1">miobj = PyObject_New(MemInfoObject, &amp;MemInfoType);</span>
+        <span class="s1">args = PyTuple_New(</span><span class="s4">1</span><span class="s1">);</span>
+        <span class="s0">/* SETITEM steals reference */</span>
+        <span class="s1">PyTuple_SET_ITEM(args, </span><span class="s4">0</span><span class="s1">, PyLong_FromVoidPtr(arystruct</span><span class="s5">-&gt;</span><span class="s1">meminfo));</span>
+        <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_adapt_ndarray_to_python arystruct-&gt;meminfo=%p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, arystruct</span><span class="s5">-&gt;</span><span class="s1">meminfo));</span>
+        <span class="s0">/*  Note: MemInfo_init() does not incref.  This function steals the 
+         *        NRT reference, which we need to acquire. 
+         */</span>
+        <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;NRT_adapt_ndarray_to_python_acqref created MemInfo=%p</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">, miobj));</span>
+        <span class="s1">NRT_MemInfo_acquire(arystruct</span><span class="s5">-&gt;</span><span class="s1">meminfo);</span>
+        <span class="s2">if </span><span class="s1">(MemInfo_init(miobj, args, NULL)) {</span>
+            <span class="s1">NRT_Debug(nrt_debug_print(</span><span class="s3">&quot;MemInfo_init failed.</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">));</span>
+            <span class="s2">return </span><span class="s1">NULL;</span>
+        <span class="s1">}</span>
+        <span class="s1">Py_DECREF(args);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">shape = arystruct</span><span class="s5">-&gt;</span><span class="s1">shape_and_strides;</span>
+    <span class="s1">strides = shape + ndim;</span>
+    <span class="s1">Py_INCREF((PyObject *) descr);</span>
+    <span class="s1">array = (PyArrayObject *) PyArray_NewFromDescr(retty, descr, ndim,</span>
+                                                   <span class="s1">shape, strides, arystruct</span><span class="s5">-&gt;</span><span class="s1">data,</span>
+                                                   <span class="s1">flags, (PyObject *) miobj);</span>
+
+    <span class="s2">if </span><span class="s1">(array == NULL)</span>
+        <span class="s2">return </span><span class="s1">NULL;</span>
+
+    <span class="s0">/* Set writable */</span>
+<span class="s2">#if </span><span class="s1">NPY_API_VERSION &gt;= </span><span class="s4">0x00000007</span>
+    <span class="s2">if </span><span class="s1">(writeable) {</span>
+        <span class="s1">PyArray_ENABLEFLAGS(array, NPY_ARRAY_WRITEABLE);</span>
+    <span class="s1">}</span>
+    <span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">PyArray_CLEARFLAGS(array, NPY_ARRAY_WRITEABLE);</span>
+    <span class="s1">}</span>
+<span class="s2">#else</span>
+    <span class="s2">if </span><span class="s1">(writeable) {</span>
+        <span class="s1">array</span><span class="s5">-&gt;</span><span class="s1">flags |= NPY_WRITEABLE;</span>
+    <span class="s1">}</span>
+    <span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">array</span><span class="s5">-&gt;</span><span class="s1">flags &amp;= ~NPY_WRITEABLE;</span>
+    <span class="s1">}</span>
+<span class="s2">#endif</span>
+
+    <span class="s2">if </span><span class="s1">(miobj) {</span>
+        <span class="s0">/* Set the MemInfoObject as the base object */</span>
+<span class="s2">#if </span><span class="s1">NPY_API_VERSION &gt;= </span><span class="s4">0x00000007</span>
+        <span class="s2">if </span><span class="s1">(-</span><span class="s4">1 </span><span class="s1">== PyArray_SetBaseObject(array,</span>
+                                        <span class="s1">(PyObject *) miobj))</span>
+        <span class="s1">{</span>
+            <span class="s1">Py_DECREF(array);</span>
+            <span class="s1">Py_DECREF(miobj);</span>
+            <span class="s2">return </span><span class="s1">NULL;</span>
+        <span class="s1">}</span>
+<span class="s2">#else</span>
+        <span class="s1">PyArray_BASE(array) = (PyObject *) miobj;</span>
+<span class="s2">#endif</span>
+
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">(PyObject *) array;</span>
+<span class="s1">}</span>
+
+<span class="s1">NUMBA_EXPORT_FUNC(</span><span class="s2">void</span><span class="s1">)</span>
+<span class="s1">NRT_adapt_buffer_from_python(Py_buffer *buf, arystruct_t *arystruct)</span>
+<span class="s1">{</span>
+    <span class="s2">int </span><span class="s1">i;</span>
+    <span class="s1">npy_intp *p;</span>
+
+    <span class="s2">if </span><span class="s1">(buf</span><span class="s5">-&gt;</span><span class="s1">obj) {</span>
+        <span class="s0">/* Allocate new MemInfo only if the buffer has a parent */</span>
+        <span class="s1">arystruct</span><span class="s5">-&gt;</span><span class="s1">meminfo = NRT_meminfo_new_from_pyobject((</span><span class="s2">void</span><span class="s1">*)buf</span><span class="s5">-&gt;</span><span class="s1">buf, buf</span><span class="s5">-&gt;</span><span class="s1">obj);</span>
+    <span class="s1">}</span>
+    <span class="s1">arystruct</span><span class="s5">-&gt;</span><span class="s1">data = buf</span><span class="s5">-&gt;</span><span class="s1">buf;</span>
+    <span class="s1">arystruct</span><span class="s5">-&gt;</span><span class="s1">itemsize = buf</span><span class="s5">-&gt;</span><span class="s1">itemsize;</span>
+    <span class="s1">arystruct</span><span class="s5">-&gt;</span><span class="s1">parent = buf</span><span class="s5">-&gt;</span><span class="s1">obj;</span>
+    <span class="s1">arystruct</span><span class="s5">-&gt;</span><span class="s1">nitems = </span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">p = arystruct</span><span class="s5">-&gt;</span><span class="s1">shape_and_strides;</span>
+    <span class="s2">for </span><span class="s1">(i = </span><span class="s4">0</span><span class="s1">; i &lt; buf</span><span class="s5">-&gt;</span><span class="s1">ndim; i++, p++) {</span>
+        <span class="s1">*p = buf</span><span class="s5">-&gt;</span><span class="s1">shape[i];</span>
+        <span class="s1">arystruct</span><span class="s5">-&gt;</span><span class="s1">nitems *= buf</span><span class="s5">-&gt;</span><span class="s1">shape[i];</span>
+    <span class="s1">}</span>
+    <span class="s2">for </span><span class="s1">(i = </span><span class="s4">0</span><span class="s1">; i &lt; buf</span><span class="s5">-&gt;</span><span class="s1">ndim; i++, p++) {</span>
+        <span class="s1">*p = buf</span><span class="s5">-&gt;</span><span class="s1">strides[i];</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/* Initialization subroutines for modules including this source file */</span>
+
+<span class="s2">static int</span>
+<span class="s1">init_nrt_python_module(PyObject *module)</span>
+<span class="s1">{</span>
+    <span class="s1">MemInfoType.tp_new = PyType_GenericNew;</span>
+    <span class="s2">if </span><span class="s1">(PyType_Ready(&amp;MemInfoType))</span>
+        <span class="s2">return </span><span class="s1">-</span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s2">return </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

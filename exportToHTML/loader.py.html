@@ -1,0 +1,602 @@
+<html>
+<head>
+<title>loader.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #cf8e6d;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+loader.py</font>
+</center></td></tr></table>
+<pre><span class="s0">''' 
+Asynchronous data loader 
+======================== 
+ 
+This is the Asynchronous Loader. You can use it to load an image 
+and use it, even if data are not yet available. You must specify a default 
+loading image when using the loader:: 
+ 
+    from kivy.loader import Loader 
+    image = Loader.image('mysprite.png') 
+ 
+You can also load an image from a url:: 
+ 
+    image = Loader.image('http://mysite.com/test.png') 
+ 
+If you want to change the default loading image, you can do:: 
+ 
+    Loader.loading_image = Image('another_loading.png') 
+ 
+Tweaking the asynchronous loader 
+-------------------------------- 
+ 
+.. versionadded:: 1.6.0 
+ 
+You can tweak the loader to provide a better user experience or more 
+performance, depending of the images you are going to load. Take a look at the 
+parameters: 
+ 
+- :attr:`Loader.num_workers` - define the number of threads to start for 
+  loading images. 
+- :attr:`Loader.max_upload_per_frame` - define the maximum image uploads in 
+  GPU to do per frame. 
+ 
+'''</span>
+
+<span class="s1">__all__ </span><span class="s2">= (</span><span class="s3">'Loader'</span><span class="s2">, </span><span class="s3">'LoaderBase'</span><span class="s2">, </span><span class="s3">'ProxyImage'</span><span class="s2">)</span>
+
+<span class="s4">from </span><span class="s1">kivy </span><span class="s4">import </span><span class="s1">kivy_data_dir</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">logger </span><span class="s4">import </span><span class="s1">Logger</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">clock </span><span class="s4">import </span><span class="s1">Clock</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">cache </span><span class="s4">import </span><span class="s1">Cache</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">image </span><span class="s4">import </span><span class="s1">ImageLoader</span><span class="s2">, </span><span class="s1">Image</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">config </span><span class="s4">import </span><span class="s1">Config</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">utils </span><span class="s4">import </span><span class="s1">platform</span>
+
+<span class="s4">from </span><span class="s1">collections </span><span class="s4">import </span><span class="s1">deque</span>
+<span class="s4">from </span><span class="s1">time </span><span class="s4">import </span><span class="s1">sleep</span>
+<span class="s4">from </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path </span><span class="s4">import </span><span class="s1">join</span>
+<span class="s4">from </span><span class="s1">os </span><span class="s4">import </span><span class="s1">write</span><span class="s2">, </span><span class="s1">close</span><span class="s2">, </span><span class="s1">unlink</span><span class="s2">, </span><span class="s1">environ</span>
+<span class="s4">import </span><span class="s1">threading</span>
+<span class="s4">import </span><span class="s1">mimetypes</span>
+
+
+<span class="s5"># Register a cache for loader</span>
+<span class="s1">Cache</span><span class="s2">.</span><span class="s1">register</span><span class="s2">(</span><span class="s3">'kv.loader'</span><span class="s2">, </span><span class="s1">limit</span><span class="s2">=</span><span class="s6">500</span><span class="s2">, </span><span class="s1">timeout</span><span class="s2">=</span><span class="s6">60</span><span class="s2">)</span>
+
+
+<span class="s4">class </span><span class="s1">ProxyImage</span><span class="s2">(</span><span class="s1">Image</span><span class="s2">):</span>
+    <span class="s0">'''Image returned by the Loader.image() function. 
+ 
+    :Properties: 
+        `loaded`: bool, defaults to False 
+            This value may be True if the image is already cached. 
+ 
+    :Events: 
+        `on_load` 
+            Fired when the image is loaded or changed. 
+        `on_error` 
+            Fired when the image cannot be loaded. 
+            `error`: Exception data that occurred 
+    '''</span>
+
+    <span class="s1">__events__ </span><span class="s2">= (</span><span class="s3">'on_load'</span><span class="s2">, </span><span class="s3">'on_error'</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">arg</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s1">loaded </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">(</span><span class="s3">'loaded'</span><span class="s2">, </span><span class="s4">False</span><span class="s2">)</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">ProxyImage</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">arg</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">loaded </span><span class="s2">= </span><span class="s1">loaded</span>
+
+    <span class="s4">def </span><span class="s1">on_load</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">pass</span>
+
+    <span class="s4">def </span><span class="s1">on_error</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">error</span><span class="s2">):</span>
+        <span class="s4">pass</span>
+
+
+<span class="s4">class </span><span class="s1">LoaderBase</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+    <span class="s0">'''Common base for the Loader and specific implementations. 
+    By default, the Loader will be the best available loader implementation. 
+ 
+    The _update() function is called every 1 / 25.s or each frame if we have 
+    less than 25 FPS. 
+    '''</span>
+    <span class="s1">_trigger_update </span><span class="s2">= </span><span class="s4">None</span>
+
+    <span class="s3">'''Alias for mimetype extensions. 
+ 
+    If you have trouble to have the right extension to be detected, 
+    you can either add #.EXT at the end of the url, or use this array 
+    to correct the detection. 
+    For example, a zip-file on Windows can be detected as pyz. 
+ 
+    By default, '.pyz' is translated to '.zip' 
+ 
+    .. versionadded:: 1.11.0 
+    '''</span>
+    <span class="s1">EXT_ALIAS </span><span class="s2">= {</span>
+        <span class="s3">'.pyz'</span><span class="s2">: </span><span class="s3">'.zip'</span>
+    <span class="s2">}</span>
+
+    <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_loading_image </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_error_image </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_num_workers </span><span class="s2">= </span><span class="s6">2</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_max_upload_per_frame </span><span class="s2">= </span><span class="s6">2</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_paused </span><span class="s2">= </span><span class="s4">False</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_resume_cond </span><span class="s2">= </span><span class="s1">threading</span><span class="s2">.</span><span class="s1">Condition</span><span class="s2">()</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_q_load </span><span class="s2">= </span><span class="s1">deque</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_q_done </span><span class="s2">= </span><span class="s1">deque</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_client </span><span class="s2">= []</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_running </span><span class="s2">= </span><span class="s4">False</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_start_wanted </span><span class="s2">= </span><span class="s4">False</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_trigger_update </span><span class="s2">= </span><span class="s1">Clock</span><span class="s2">.</span><span class="s1">create_trigger</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_update</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">__del__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_trigger_update </span><span class="s4">is not None</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_trigger_update</span><span class="s2">.</span><span class="s1">cancel</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">_set_num_workers</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">num</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">num </span><span class="s2">&lt; </span><span class="s6">2</span><span class="s2">:</span>
+            <span class="s4">raise </span><span class="s1">Exception</span><span class="s2">(</span><span class="s3">'Must have at least 2 workers'</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_num_workers </span><span class="s2">= </span><span class="s1">num</span>
+
+    <span class="s4">def </span><span class="s1">_get_num_workers</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_num_workers</span>
+
+    <span class="s1">num_workers </span><span class="s2">= </span><span class="s1">property</span><span class="s2">(</span><span class="s1">_get_num_workers</span><span class="s2">, </span><span class="s1">_set_num_workers</span><span class="s2">)</span>
+    <span class="s3">'''Number of workers to use while loading (used only if the loader 
+    implementation supports it). This setting impacts the loader only on 
+    initialization. Once the loader is started, the setting has no impact:: 
+ 
+        from kivy.loader import Loader 
+        Loader.num_workers = 4 
+ 
+    The default value is 2 for giving a smooth user experience. You could 
+    increase the number of workers, then all the images will be loaded faster, 
+    but the user will not been able to use the application while loading. 
+    Prior to 1.6.0, the default number was 20, and loading many full-hd images 
+    was completely blocking the application. 
+ 
+    .. versionadded:: 1.6.0 
+    '''</span>
+
+    <span class="s4">def </span><span class="s1">_set_max_upload_per_frame</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">num</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">num </span><span class="s4">is not None and </span><span class="s1">num </span><span class="s2">&lt; </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s4">raise </span><span class="s1">Exception</span><span class="s2">(</span><span class="s3">'Must have at least 1 image processing per image'</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_max_upload_per_frame </span><span class="s2">= </span><span class="s1">num</span>
+
+    <span class="s4">def </span><span class="s1">_get_max_upload_per_frame</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_max_upload_per_frame</span>
+
+    <span class="s1">max_upload_per_frame </span><span class="s2">= </span><span class="s1">property</span><span class="s2">(</span><span class="s1">_get_max_upload_per_frame</span><span class="s2">,</span>
+                                    <span class="s1">_set_max_upload_per_frame</span><span class="s2">)</span>
+    <span class="s3">'''The number of images to upload per frame. By default, we'll 
+    upload only 2 images to the GPU per frame. If you are uploading many 
+    small images, you can easily increase this parameter to 10 or more. 
+    If you are loading multiple full HD images, the upload time may have 
+    consequences and block the application. If you want a 
+    smooth experience, use the default. 
+ 
+    As a matter of fact, a Full-HD RGB image will take ~6MB in memory, 
+    so it may take time. If you have activated mipmap=True too, then the 
+    GPU must calculate the mipmap of these big images too, in real time. 
+    Then it may be best to reduce the :attr:`max_upload_per_frame` to 1 
+    or 2. If you want to get rid of that (or reduce it a lot), take a 
+    look at the DDS format. 
+ 
+    .. versionadded:: 1.6.0 
+    '''</span>
+
+    <span class="s4">def </span><span class="s1">_get_loading_image</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_loading_image</span><span class="s2">:</span>
+            <span class="s1">loading_png_fn </span><span class="s2">= </span><span class="s1">join</span><span class="s2">(</span><span class="s1">kivy_data_dir</span><span class="s2">, </span><span class="s3">'images'</span><span class="s2">, </span><span class="s3">'image-loading.zip'</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_loading_image </span><span class="s2">= </span><span class="s1">ImageLoader</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">filename</span><span class="s2">=</span><span class="s1">loading_png_fn</span><span class="s2">)</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_loading_image</span>
+
+    <span class="s4">def </span><span class="s1">_set_loading_image</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">image</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">image</span><span class="s2">, </span><span class="s1">str</span><span class="s2">):</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_loading_image </span><span class="s2">= </span><span class="s1">ImageLoader</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">filename</span><span class="s2">=</span><span class="s1">image</span><span class="s2">)</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_loading_image </span><span class="s2">= </span><span class="s1">image</span>
+
+    <span class="s1">loading_image </span><span class="s2">= </span><span class="s1">property</span><span class="s2">(</span><span class="s1">_get_loading_image</span><span class="s2">, </span><span class="s1">_set_loading_image</span><span class="s2">)</span>
+    <span class="s3">'''Image used for loading. 
+    You can change it by doing:: 
+ 
+        Loader.loading_image = 'loading.png' 
+ 
+    .. versionchanged:: 1.6.0 
+        Not readonly anymore. 
+    '''</span>
+
+    <span class="s4">def </span><span class="s1">_get_error_image</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_error_image</span><span class="s2">:</span>
+            <span class="s1">error_png_fn </span><span class="s2">= </span><span class="s1">join</span><span class="s2">(</span>
+                <span class="s3">'atlas://data/images/defaulttheme/image-missing'</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_error_image </span><span class="s2">= </span><span class="s1">ImageLoader</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">filename</span><span class="s2">=</span><span class="s1">error_png_fn</span><span class="s2">)</span>
+        <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_error_image</span>
+
+    <span class="s4">def </span><span class="s1">_set_error_image</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">image</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">image</span><span class="s2">, </span><span class="s1">str</span><span class="s2">):</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_error_image </span><span class="s2">= </span><span class="s1">ImageLoader</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">filename</span><span class="s2">=</span><span class="s1">image</span><span class="s2">)</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_error_image </span><span class="s2">= </span><span class="s1">image</span>
+
+    <span class="s1">error_image </span><span class="s2">= </span><span class="s1">property</span><span class="s2">(</span><span class="s1">_get_error_image</span><span class="s2">, </span><span class="s1">_set_error_image</span><span class="s2">)</span>
+    <span class="s3">'''Image used for error. 
+    You can change it by doing:: 
+ 
+        Loader.error_image = 'error.png' 
+ 
+    .. versionchanged:: 1.6.0 
+        Not readonly anymore. 
+    '''</span>
+
+    <span class="s4">def </span><span class="s1">start</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Start the loader thread/process.'''</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_running </span><span class="s2">= </span><span class="s4">True</span>
+
+    <span class="s4">def </span><span class="s1">run</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">largs</span><span class="s2">):</span>
+        <span class="s0">'''Main loop for the loader.'''</span>
+        <span class="s4">pass</span>
+
+    <span class="s4">def </span><span class="s1">stop</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Stop the loader thread/process.'''</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_running </span><span class="s2">= </span><span class="s4">False</span>
+
+    <span class="s4">def </span><span class="s1">pause</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Pause the loader, can be useful during interactions. 
+ 
+        .. versionadded:: 1.6.0 
+        '''</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_paused </span><span class="s2">= </span><span class="s4">True</span>
+
+    <span class="s4">def </span><span class="s1">resume</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Resume the loader, after a :meth:`pause`. 
+ 
+        .. versionadded:: 1.6.0 
+        '''</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_paused </span><span class="s2">= </span><span class="s4">False</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_resume_cond</span><span class="s2">.</span><span class="s1">acquire</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_resume_cond</span><span class="s2">.</span><span class="s1">notify_all</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_resume_cond</span><span class="s2">.</span><span class="s1">release</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">_wait_for_resume</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">while </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_running </span><span class="s4">and </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_paused</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_resume_cond</span><span class="s2">.</span><span class="s1">acquire</span><span class="s2">()</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_resume_cond</span><span class="s2">.</span><span class="s1">wait</span><span class="s2">(</span><span class="s6">0.25</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_resume_cond</span><span class="s2">.</span><span class="s1">release</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">_load</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s0">'''(internal) Loading function, called by the thread. 
+        Will call _load_local() if the file is local, 
+        or _load_urllib() if the file is on Internet. 
+        '''</span>
+
+        <span class="s4">while </span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_q_done</span><span class="s2">) &gt;= (</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">max_upload_per_frame </span><span class="s2">* </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_num_workers</span><span class="s2">):</span>
+            <span class="s1">sleep</span><span class="s2">(</span><span class="s6">0.1</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_wait_for_resume</span><span class="s2">()</span>
+
+        <span class="s1">filename </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">[</span><span class="s3">'filename'</span><span class="s2">]</span>
+        <span class="s1">load_callback </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">[</span><span class="s3">'load_callback'</span><span class="s2">]</span>
+        <span class="s1">post_callback </span><span class="s2">= </span><span class="s1">kwargs</span><span class="s2">[</span><span class="s3">'post_callback'</span><span class="s2">]</span>
+        <span class="s4">try</span><span class="s2">:</span>
+            <span class="s1">proto </span><span class="s2">= </span><span class="s1">filename</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s3">':'</span><span class="s2">, </span><span class="s6">1</span><span class="s2">)[</span><span class="s6">0</span><span class="s2">]</span>
+        <span class="s4">except</span><span class="s2">:</span>
+            <span class="s5"># if blank filename then return</span>
+            <span class="s4">return</span>
+        <span class="s4">if </span><span class="s1">load_callback </span><span class="s4">is not None</span><span class="s2">:</span>
+            <span class="s1">data </span><span class="s2">= </span><span class="s1">load_callback</span><span class="s2">(</span><span class="s1">filename</span><span class="s2">)</span>
+        <span class="s4">elif </span><span class="s1">proto </span><span class="s4">in </span><span class="s2">(</span><span class="s3">'http'</span><span class="s2">, </span><span class="s3">'https'</span><span class="s2">, </span><span class="s3">'ftp'</span><span class="s2">, </span><span class="s3">'smb'</span><span class="s2">):</span>
+            <span class="s1">data </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_load_urllib</span><span class="s2">(</span><span class="s1">filename</span><span class="s2">, </span><span class="s1">kwargs</span><span class="s2">[</span><span class="s3">'kwargs'</span><span class="s2">])</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s1">data </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_load_local</span><span class="s2">(</span><span class="s1">filename</span><span class="s2">, </span><span class="s1">kwargs</span><span class="s2">[</span><span class="s3">'kwargs'</span><span class="s2">])</span>
+
+        <span class="s4">if </span><span class="s1">post_callback</span><span class="s2">:</span>
+            <span class="s1">data </span><span class="s2">= </span><span class="s1">post_callback</span><span class="s2">(</span><span class="s1">data</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_q_done</span><span class="s2">.</span><span class="s1">appendleft</span><span class="s2">((</span><span class="s1">filename</span><span class="s2">, </span><span class="s1">data</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_trigger_update</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">_load_local</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">, </span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s0">'''(internal) Loading a local file'''</span>
+        <span class="s5"># With recent changes to CoreImage, we must keep data otherwise,</span>
+        <span class="s5"># we might be unable to recreate the texture afterwise.</span>
+        <span class="s4">return </span><span class="s1">ImageLoader</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">filename</span><span class="s2">, </span><span class="s1">keep_data</span><span class="s2">=</span><span class="s4">True</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">_load_urllib</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">, </span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s0">'''(internal) Loading a network file. First download it, save it to a 
+        temporary file, and pass it to _load_local().'''</span>
+        <span class="s4">import </span><span class="s1">urllib</span><span class="s2">.</span><span class="s1">request</span>
+        <span class="s4">import </span><span class="s1">tempfile</span>
+
+        <span class="s1">proto </span><span class="s2">= </span><span class="s1">filename</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s3">':'</span><span class="s2">, </span><span class="s6">1</span><span class="s2">)[</span><span class="s6">0</span><span class="s2">]</span>
+        <span class="s4">if </span><span class="s1">proto </span><span class="s2">== </span><span class="s3">'smb'</span><span class="s2">:</span>
+            <span class="s4">try</span><span class="s2">:</span>
+                <span class="s5"># note: it's important to load SMBHandler every time</span>
+                <span class="s5"># otherwise the data is occasionally not loaded</span>
+                <span class="s4">from </span><span class="s1">smb</span><span class="s2">.</span><span class="s1">SMBHandler </span><span class="s4">import </span><span class="s1">SMBHandler</span>
+            <span class="s4">except </span><span class="s1">ImportError</span><span class="s2">:</span>
+                <span class="s1">Logger</span><span class="s2">.</span><span class="s1">warning</span><span class="s2">(</span>
+                    <span class="s3">'Loader: can not load PySMB: make sure it is installed'</span><span class="s2">)</span>
+                <span class="s4">return</span>
+
+        <span class="s1">data </span><span class="s2">= </span><span class="s1">fd </span><span class="s2">= </span><span class="s1">_out_osfd </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s4">try</span><span class="s2">:</span>
+            <span class="s1">_out_filename </span><span class="s2">= </span><span class="s3">''</span>
+
+            <span class="s4">if </span><span class="s1">proto </span><span class="s2">== </span><span class="s3">'smb'</span><span class="s2">:</span>
+                <span class="s5"># read from samba shares</span>
+                <span class="s1">fd </span><span class="s2">= </span><span class="s1">urllib</span><span class="s2">.</span><span class="s1">request</span><span class="s2">.</span><span class="s1">build_opener</span><span class="s2">(</span><span class="s1">SMBHandler</span><span class="s2">).</span><span class="s1">open</span><span class="s2">(</span><span class="s1">filename</span><span class="s2">)</span>
+            <span class="s4">else</span><span class="s2">:</span>
+                <span class="s5"># read from internet</span>
+                <span class="s1">request </span><span class="s2">= </span><span class="s1">urllib</span><span class="s2">.</span><span class="s1">request</span><span class="s2">.</span><span class="s1">Request</span><span class="s2">(</span><span class="s1">filename</span><span class="s2">)</span>
+                <span class="s4">if </span><span class="s1">Config</span><span class="s2">.</span><span class="s1">has_option</span><span class="s2">(</span><span class="s3">'network'</span><span class="s2">, </span><span class="s3">'useragent'</span><span class="s2">):</span>
+                    <span class="s1">useragent </span><span class="s2">= </span><span class="s1">Config</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'network'</span><span class="s2">, </span><span class="s3">'useragent'</span><span class="s2">)</span>
+                    <span class="s4">if </span><span class="s1">useragent</span><span class="s2">:</span>
+                        <span class="s1">request</span><span class="s2">.</span><span class="s1">add_header</span><span class="s2">(</span><span class="s3">'User-Agent'</span><span class="s2">, </span><span class="s1">useragent</span><span class="s2">)</span>
+
+                <span class="s5"># A custom context is only needed on Android and iOS</span>
+                <span class="s5"># as we need to use the certs provided via certifi.</span>
+                <span class="s1">ssl_ctx </span><span class="s2">= </span><span class="s4">None</span>
+                <span class="s4">if </span><span class="s1">platform </span><span class="s4">in </span><span class="s2">[</span><span class="s3">'android'</span><span class="s2">, </span><span class="s3">'ios'</span><span class="s2">]:</span>
+                    <span class="s4">import </span><span class="s1">certifi</span>
+                    <span class="s4">import </span><span class="s1">ssl</span>
+                    <span class="s1">ssl_ctx </span><span class="s2">= </span><span class="s1">ssl</span><span class="s2">.</span><span class="s1">create_default_context</span><span class="s2">(</span><span class="s1">cafile</span><span class="s2">=</span><span class="s1">certifi</span><span class="s2">.</span><span class="s1">where</span><span class="s2">())</span>
+                    <span class="s1">ssl_ctx</span><span class="s2">.</span><span class="s1">verify_mode </span><span class="s2">= </span><span class="s1">ssl</span><span class="s2">.</span><span class="s1">CERT_REQUIRED</span>
+
+                <span class="s1">fd </span><span class="s2">= </span><span class="s1">urllib</span><span class="s2">.</span><span class="s1">request</span><span class="s2">.</span><span class="s1">urlopen</span><span class="s2">(</span><span class="s1">request</span><span class="s2">, </span><span class="s1">context</span><span class="s2">=</span><span class="s1">ssl_ctx</span><span class="s2">)</span>
+
+            <span class="s4">if </span><span class="s3">'#.' </span><span class="s4">in </span><span class="s1">filename</span><span class="s2">:</span>
+                <span class="s5"># allow extension override from URL fragment</span>
+                <span class="s1">suffix </span><span class="s2">= </span><span class="s3">'.' </span><span class="s2">+ </span><span class="s1">filename</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s3">'#.'</span><span class="s2">)[-</span><span class="s6">1</span><span class="s2">]</span>
+            <span class="s4">else</span><span class="s2">:</span>
+                <span class="s1">ctype </span><span class="s2">= </span><span class="s1">fd</span><span class="s2">.</span><span class="s1">info</span><span class="s2">().</span><span class="s1">get_content_type</span><span class="s2">()</span>
+                <span class="s1">suffix </span><span class="s2">= </span><span class="s1">mimetypes</span><span class="s2">.</span><span class="s1">guess_extension</span><span class="s2">(</span><span class="s1">ctype</span><span class="s2">)</span>
+                <span class="s1">suffix </span><span class="s2">= </span><span class="s1">LoaderBase</span><span class="s2">.</span><span class="s1">EXT_ALIAS</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">suffix</span><span class="s2">, </span><span class="s1">suffix</span><span class="s2">)</span>
+                <span class="s4">if not </span><span class="s1">suffix</span><span class="s2">:</span>
+                    <span class="s5"># strip query string and split on path</span>
+                    <span class="s1">parts </span><span class="s2">= </span><span class="s1">filename</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s3">'?'</span><span class="s2">)[</span><span class="s6">0</span><span class="s2">].</span><span class="s1">split</span><span class="s2">(</span><span class="s3">'/'</span><span class="s2">)[</span><span class="s6">1</span><span class="s2">:]</span>
+                    <span class="s4">while </span><span class="s1">len</span><span class="s2">(</span><span class="s1">parts</span><span class="s2">) &gt; </span><span class="s6">1 </span><span class="s4">and not </span><span class="s1">parts</span><span class="s2">[</span><span class="s6">0</span><span class="s2">]:</span>
+                        <span class="s5"># strip out blanks from '//'</span>
+                        <span class="s1">parts </span><span class="s2">= </span><span class="s1">parts</span><span class="s2">[</span><span class="s6">1</span><span class="s2">:]</span>
+                    <span class="s4">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">parts</span><span class="s2">) &gt; </span><span class="s6">1 </span><span class="s4">and </span><span class="s3">'.' </span><span class="s4">in </span><span class="s1">parts</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">]:</span>
+                        <span class="s5"># we don't want '.com', '.net', etc. as the extension</span>
+                        <span class="s1">suffix </span><span class="s2">= </span><span class="s3">'.' </span><span class="s2">+ </span><span class="s1">parts</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">].</span><span class="s1">split</span><span class="s2">(</span><span class="s3">'.'</span><span class="s2">)[-</span><span class="s6">1</span><span class="s2">]</span>
+            <span class="s1">_out_osfd</span><span class="s2">, </span><span class="s1">_out_filename </span><span class="s2">= </span><span class="s1">tempfile</span><span class="s2">.</span><span class="s1">mkstemp</span><span class="s2">(</span>
+                <span class="s1">prefix</span><span class="s2">=</span><span class="s3">'kivyloader'</span><span class="s2">, </span><span class="s1">suffix</span><span class="s2">=</span><span class="s1">suffix</span><span class="s2">)</span>
+
+            <span class="s1">idata </span><span class="s2">= </span><span class="s1">fd</span><span class="s2">.</span><span class="s1">read</span><span class="s2">()</span>
+            <span class="s1">fd</span><span class="s2">.</span><span class="s1">close</span><span class="s2">()</span>
+            <span class="s1">fd </span><span class="s2">= </span><span class="s4">None</span>
+
+            <span class="s5"># write to local filename</span>
+            <span class="s1">write</span><span class="s2">(</span><span class="s1">_out_osfd</span><span class="s2">, </span><span class="s1">idata</span><span class="s2">)</span>
+            <span class="s1">close</span><span class="s2">(</span><span class="s1">_out_osfd</span><span class="s2">)</span>
+            <span class="s1">_out_osfd </span><span class="s2">= </span><span class="s4">None</span>
+
+            <span class="s5"># load data</span>
+            <span class="s1">data </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_load_local</span><span class="s2">(</span><span class="s1">_out_filename</span><span class="s2">, </span><span class="s1">kwargs</span><span class="s2">)</span>
+
+            <span class="s5"># FIXME create a clean API for that</span>
+            <span class="s4">for </span><span class="s1">imdata </span><span class="s4">in </span><span class="s1">data</span><span class="s2">.</span><span class="s1">_data</span><span class="s2">:</span>
+                <span class="s1">imdata</span><span class="s2">.</span><span class="s1">source </span><span class="s2">= </span><span class="s1">filename</span>
+        <span class="s4">except </span><span class="s1">Exception </span><span class="s4">as </span><span class="s1">ex</span><span class="s2">:</span>
+            <span class="s1">Logger</span><span class="s2">.</span><span class="s1">exception</span><span class="s2">(</span><span class="s3">'Loader: Failed to load image &lt;%s&gt;' </span><span class="s2">% </span><span class="s1">filename</span><span class="s2">)</span>
+            <span class="s5"># close file when remote file not found or download error</span>
+            <span class="s4">try</span><span class="s2">:</span>
+                <span class="s4">if </span><span class="s1">_out_osfd</span><span class="s2">:</span>
+                    <span class="s1">close</span><span class="s2">(</span><span class="s1">_out_osfd</span><span class="s2">)</span>
+            <span class="s4">except </span><span class="s1">OSError</span><span class="s2">:</span>
+                <span class="s4">pass</span>
+
+            <span class="s5"># update client</span>
+            <span class="s4">for </span><span class="s1">c_filename</span><span class="s2">, </span><span class="s1">client </span><span class="s4">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_client</span><span class="s2">[:]:</span>
+                <span class="s4">if </span><span class="s1">filename </span><span class="s2">!= </span><span class="s1">c_filename</span><span class="s2">:</span>
+                    <span class="s4">continue</span>
+                <span class="s5"># got one client to update</span>
+                <span class="s1">client</span><span class="s2">.</span><span class="s1">image </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">error_image</span>
+                <span class="s1">client</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_error'</span><span class="s2">, </span><span class="s1">error</span><span class="s2">=</span><span class="s1">ex</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_client</span><span class="s2">.</span><span class="s1">remove</span><span class="s2">((</span><span class="s1">c_filename</span><span class="s2">, </span><span class="s1">client</span><span class="s2">))</span>
+
+            <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">error_image</span>
+        <span class="s4">finally</span><span class="s2">:</span>
+            <span class="s4">if </span><span class="s1">fd</span><span class="s2">:</span>
+                <span class="s1">fd</span><span class="s2">.</span><span class="s1">close</span><span class="s2">()</span>
+            <span class="s4">if </span><span class="s1">_out_osfd</span><span class="s2">:</span>
+                <span class="s1">close</span><span class="s2">(</span><span class="s1">_out_osfd</span><span class="s2">)</span>
+            <span class="s4">if </span><span class="s1">_out_filename </span><span class="s2">!= </span><span class="s3">''</span><span class="s2">:</span>
+                <span class="s1">unlink</span><span class="s2">(</span><span class="s1">_out_filename</span><span class="s2">)</span>
+
+        <span class="s4">return </span><span class="s1">data</span>
+
+    <span class="s4">def </span><span class="s1">_update</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">largs</span><span class="s2">):</span>
+        <span class="s0">'''(internal) Check if a data is loaded, and pass to the client.'''</span>
+        <span class="s5"># want to start it ?</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_start_wanted</span><span class="s2">:</span>
+            <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_running</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">start</span><span class="s2">()</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_start_wanted </span><span class="s2">= </span><span class="s4">False</span>
+
+        <span class="s5"># in pause mode, don't unqueue anything.</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_paused</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_trigger_update</span><span class="s2">()</span>
+            <span class="s4">return</span>
+
+        <span class="s4">for </span><span class="s1">x </span><span class="s4">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">max_upload_per_frame</span><span class="s2">):</span>
+            <span class="s4">try</span><span class="s2">:</span>
+                <span class="s1">filename</span><span class="s2">, </span><span class="s1">data </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_q_done</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">()</span>
+            <span class="s4">except </span><span class="s1">IndexError</span><span class="s2">:</span>
+                <span class="s4">return</span>
+
+            <span class="s5"># create the image</span>
+            <span class="s1">image </span><span class="s2">= </span><span class="s1">data  </span><span class="s5"># ProxyImage(data)</span>
+            <span class="s4">if not </span><span class="s1">image</span><span class="s2">.</span><span class="s1">nocache</span><span class="s2">:</span>
+                <span class="s1">Cache</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s3">'kv.loader'</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">, </span><span class="s1">image</span><span class="s2">)</span>
+
+            <span class="s5"># update client</span>
+            <span class="s4">for </span><span class="s1">c_filename</span><span class="s2">, </span><span class="s1">client </span><span class="s4">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_client</span><span class="s2">[:]:</span>
+                <span class="s4">if </span><span class="s1">filename </span><span class="s2">!= </span><span class="s1">c_filename</span><span class="s2">:</span>
+                    <span class="s4">continue</span>
+                <span class="s5"># got one client to update</span>
+                <span class="s1">client</span><span class="s2">.</span><span class="s1">image </span><span class="s2">= </span><span class="s1">image</span>
+                <span class="s1">client</span><span class="s2">.</span><span class="s1">loaded </span><span class="s2">= </span><span class="s4">True</span>
+                <span class="s1">client</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_load'</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_client</span><span class="s2">.</span><span class="s1">remove</span><span class="s2">((</span><span class="s1">c_filename</span><span class="s2">, </span><span class="s1">client</span><span class="s2">))</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_trigger_update</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">image</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">, </span><span class="s1">load_callback</span><span class="s2">=</span><span class="s4">None</span><span class="s2">, </span><span class="s1">post_callback</span><span class="s2">=</span><span class="s4">None</span><span class="s2">,</span>
+              <span class="s2">**</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s0">'''Load a image using the Loader. A ProxyImage is returned with a 
+        loading image. You can use it as follows:: 
+ 
+            from kivy.app import App 
+            from kivy.uix.image import Image 
+            from kivy.loader import Loader 
+ 
+            class TestApp(App): 
+                def _image_loaded(self, proxyImage): 
+                    if proxyImage.image.texture: 
+                        self.image.texture = proxyImage.image.texture 
+ 
+                def build(self): 
+                    proxyImage = Loader.image(&quot;myPic.jpg&quot;) 
+                    proxyImage.bind(on_load=self._image_loaded) 
+                    self.image = Image() 
+                    return self.image 
+ 
+            TestApp().run() 
+ 
+        In order to cancel all background loading, call *Loader.stop()*. 
+        '''</span>
+        <span class="s1">data </span><span class="s2">= </span><span class="s1">Cache</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'kv.loader'</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">)</span>
+        <span class="s4">if </span><span class="s1">data </span><span class="s4">not in </span><span class="s2">(</span><span class="s4">None</span><span class="s2">, </span><span class="s4">False</span><span class="s2">):</span>
+            <span class="s5"># found image, if data is not here, need to reload.</span>
+            <span class="s4">return </span><span class="s1">ProxyImage</span><span class="s2">(</span><span class="s1">data</span><span class="s2">,</span>
+                              <span class="s1">loading_image</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">loading_image</span><span class="s2">,</span>
+                              <span class="s1">loaded</span><span class="s2">=</span><span class="s4">True</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">)</span>
+
+        <span class="s1">client </span><span class="s2">= </span><span class="s1">ProxyImage</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">loading_image</span><span class="s2">,</span>
+                            <span class="s1">loading_image</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">loading_image</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_client</span><span class="s2">.</span><span class="s1">append</span><span class="s2">((</span><span class="s1">filename</span><span class="s2">, </span><span class="s1">client</span><span class="s2">))</span>
+
+        <span class="s4">if </span><span class="s1">data </span><span class="s4">is None</span><span class="s2">:</span>
+            <span class="s5"># if data is None, this is really the first time</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_q_load</span><span class="s2">.</span><span class="s1">appendleft</span><span class="s2">({</span>
+                <span class="s3">'filename'</span><span class="s2">: </span><span class="s1">filename</span><span class="s2">,</span>
+                <span class="s3">'load_callback'</span><span class="s2">: </span><span class="s1">load_callback</span><span class="s2">,</span>
+                <span class="s3">'post_callback'</span><span class="s2">: </span><span class="s1">post_callback</span><span class="s2">,</span>
+                <span class="s3">'kwargs'</span><span class="s2">: </span><span class="s1">kwargs</span><span class="s2">})</span>
+            <span class="s4">if not </span><span class="s1">kwargs</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'nocache'</span><span class="s2">, </span><span class="s4">False</span><span class="s2">):</span>
+                <span class="s1">Cache</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s3">'kv.loader'</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">, </span><span class="s4">False</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_start_wanted </span><span class="s2">= </span><span class="s4">True</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_trigger_update</span><span class="s2">()</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s5"># already queued for loading</span>
+            <span class="s4">pass</span>
+
+        <span class="s4">return </span><span class="s1">client</span>
+
+    <span class="s4">def </span><span class="s1">remove_from_cache</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">):</span>
+        <span class="s1">Cache</span><span class="s2">.</span><span class="s1">remove</span><span class="s2">(</span><span class="s3">'kv.loader'</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">)</span>
+
+<span class="s5">#</span>
+<span class="s5"># Loader implementation</span>
+<span class="s5">#</span>
+
+
+<span class="s4">if </span><span class="s3">'KIVY_DOC' </span><span class="s4">in </span><span class="s1">environ</span><span class="s2">:</span>
+
+    <span class="s1">Loader </span><span class="s2">= </span><span class="s4">None</span>
+
+<span class="s4">else</span><span class="s2">:</span>
+
+    <span class="s5">#</span>
+    <span class="s5"># Try to use pygame as our first choice for loader</span>
+    <span class="s5">#</span>
+
+    <span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">compat </span><span class="s4">import </span><span class="s1">queue</span>
+    <span class="s4">from </span><span class="s1">threading </span><span class="s4">import </span><span class="s1">Thread</span>
+
+    <span class="s4">class </span><span class="s1">_Worker</span><span class="s2">(</span><span class="s1">Thread</span><span class="s2">):</span>
+        <span class="s0">'''Thread executing tasks from a given tasks queue 
+        '''</span>
+        <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">pool</span><span class="s2">, </span><span class="s1">tasks</span><span class="s2">):</span>
+            <span class="s1">Thread</span><span class="s2">.</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">tasks </span><span class="s2">= </span><span class="s1">tasks</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">daemon </span><span class="s2">= </span><span class="s4">True</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">pool </span><span class="s2">= </span><span class="s1">pool</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">start</span><span class="s2">()</span>
+
+        <span class="s4">def </span><span class="s1">run</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+            <span class="s4">while </span><span class="s1">self</span><span class="s2">.</span><span class="s1">pool</span><span class="s2">.</span><span class="s1">running</span><span class="s2">:</span>
+                <span class="s1">func</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kargs </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">tasks</span><span class="s2">.</span><span class="s1">get</span><span class="s2">()</span>
+                <span class="s4">try</span><span class="s2">:</span>
+                    <span class="s1">func</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kargs</span><span class="s2">)</span>
+                <span class="s4">except </span><span class="s1">Exception </span><span class="s4">as </span><span class="s1">e</span><span class="s2">:</span>
+                    <span class="s1">print</span><span class="s2">(</span><span class="s1">e</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">tasks</span><span class="s2">.</span><span class="s1">task_done</span><span class="s2">()</span>
+
+    <span class="s4">class </span><span class="s1">_ThreadPool</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+        <span class="s0">'''Pool of threads consuming tasks from a queue 
+        '''</span>
+        <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">num_threads</span><span class="s2">):</span>
+            <span class="s1">super</span><span class="s2">(</span><span class="s1">_ThreadPool</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">()</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">running </span><span class="s2">= </span><span class="s4">True</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">tasks </span><span class="s2">= </span><span class="s1">queue</span><span class="s2">.</span><span class="s1">Queue</span><span class="s2">()</span>
+            <span class="s4">for </span><span class="s1">_ </span><span class="s4">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">num_threads</span><span class="s2">):</span>
+                <span class="s1">_Worker</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">tasks</span><span class="s2">)</span>
+
+        <span class="s4">def </span><span class="s1">add_task</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kargs</span><span class="s2">):</span>
+            <span class="s0">'''Add a task to the queue 
+            '''</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">tasks</span><span class="s2">.</span><span class="s1">put</span><span class="s2">((</span><span class="s1">func</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kargs</span><span class="s2">))</span>
+
+        <span class="s4">def </span><span class="s1">stop</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">running </span><span class="s2">= </span><span class="s4">False</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">tasks</span><span class="s2">.</span><span class="s1">join</span><span class="s2">()</span>
+
+    <span class="s4">class </span><span class="s1">LoaderThreadPool</span><span class="s2">(</span><span class="s1">LoaderBase</span><span class="s2">):</span>
+        <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+            <span class="s1">super</span><span class="s2">(</span><span class="s1">LoaderThreadPool</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">()</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">pool </span><span class="s2">= </span><span class="s4">None</span>
+
+        <span class="s4">def </span><span class="s1">start</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+            <span class="s1">super</span><span class="s2">(</span><span class="s1">LoaderThreadPool</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">start</span><span class="s2">()</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">pool </span><span class="s2">= </span><span class="s1">_ThreadPool</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_num_workers</span><span class="s2">)</span>
+            <span class="s1">Clock</span><span class="s2">.</span><span class="s1">schedule_interval</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">run</span><span class="s2">, </span><span class="s6">0</span><span class="s2">)</span>
+
+        <span class="s4">def </span><span class="s1">stop</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+            <span class="s1">super</span><span class="s2">(</span><span class="s1">LoaderThreadPool</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">stop</span><span class="s2">()</span>
+            <span class="s1">Clock</span><span class="s2">.</span><span class="s1">unschedule</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">run</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">pool</span><span class="s2">.</span><span class="s1">stop</span><span class="s2">()</span>
+
+        <span class="s4">def </span><span class="s1">run</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">largs</span><span class="s2">):</span>
+            <span class="s4">while </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_running</span><span class="s2">:</span>
+                <span class="s4">try</span><span class="s2">:</span>
+                    <span class="s1">parameters </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_q_load</span><span class="s2">.</span><span class="s1">pop</span><span class="s2">()</span>
+                <span class="s4">except</span><span class="s2">:</span>
+                    <span class="s4">return</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">pool</span><span class="s2">.</span><span class="s1">add_task</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_load</span><span class="s2">, </span><span class="s1">parameters</span><span class="s2">)</span>
+
+    <span class="s1">Loader </span><span class="s2">= </span><span class="s1">LoaderThreadPool</span><span class="s2">()</span>
+    <span class="s1">Logger</span><span class="s2">.</span><span class="s1">info</span><span class="s2">(</span><span class="s3">'Loader: using a thread pool of {} workers'</span><span class="s2">.</span><span class="s1">format</span><span class="s2">(</span>
+        <span class="s1">Loader</span><span class="s2">.</span><span class="s1">num_workers</span><span class="s2">))</span>
+</pre>
+</body>
+</html>

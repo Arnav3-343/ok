@@ -1,0 +1,1192 @@
+<html>
+<head>
+<title>ufunc_db.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #7a7e85;}
+.s4 { color: #bcbec4;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ufunc_db.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;This file contains information on how to translate different ufuncs 
+into numba. It is a database of different ufuncs and how each of its 
+loops maps to a function that implements the inner kernel of that ufunc 
+(the inner kernel being the per-element function). 
+ 
+Use the function get_ufunc_info to get the information related to the 
+ufunc 
+&quot;&quot;&quot;</span>
+
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">import </span><span class="s1">sys</span>
+
+<span class="s3"># this is lazily initialized to avoid circular imports</span>
+<span class="s1">IS_WIN32 </span><span class="s4">= </span><span class="s1">sys</span><span class="s4">.</span><span class="s1">platform</span><span class="s4">.</span><span class="s1">startswith</span><span class="s4">(</span><span class="s5">'win32'</span><span class="s4">)</span>
+<span class="s1">numpy_version </span><span class="s4">= </span><span class="s1">tuple</span><span class="s4">(</span><span class="s1">map</span><span class="s4">(</span><span class="s1">int</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">__version__</span><span class="s4">.</span><span class="s1">split</span><span class="s4">(</span><span class="s5">'.'</span><span class="s4">)[:</span><span class="s6">2</span><span class="s4">]))</span>
+<span class="s1">_ufunc_db </span><span class="s4">= </span><span class="s2">None</span>
+
+
+<span class="s2">def </span><span class="s1">_lazy_init_db</span><span class="s4">():</span>
+    <span class="s2">global </span><span class="s1">_ufunc_db</span>
+
+    <span class="s2">if </span><span class="s1">_ufunc_db </span><span class="s2">is None</span><span class="s4">:</span>
+        <span class="s1">_ufunc_db </span><span class="s4">= {}</span>
+        <span class="s1">_fill_ufunc_db</span><span class="s4">(</span><span class="s1">_ufunc_db</span><span class="s4">)</span>
+
+
+<span class="s2">def </span><span class="s1">get_ufuncs</span><span class="s4">():</span>
+    <span class="s0">&quot;&quot;&quot;obtain a list of supported ufuncs in the db&quot;&quot;&quot;</span>
+    <span class="s1">_lazy_init_db</span><span class="s4">()</span>
+    <span class="s2">return </span><span class="s1">_ufunc_db</span><span class="s4">.</span><span class="s1">keys</span><span class="s4">()</span>
+
+
+<span class="s2">def </span><span class="s1">get_ufunc_info</span><span class="s4">(</span><span class="s1">ufunc_key</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;get the lowering information for the ufunc with key ufunc_key. 
+ 
+    The lowering information is a dictionary that maps from a numpy 
+    loop string (as given by the ufunc types attribute) to a function 
+    that handles code generation for a scalar version of the ufunc 
+    (that is, generates the &quot;per element&quot; operation&quot;). 
+ 
+    raises a KeyError if the ufunc is not in the ufunc_db 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_lazy_init_db</span><span class="s4">()</span>
+    <span class="s2">return </span><span class="s1">_ufunc_db</span><span class="s4">[</span><span class="s1">ufunc_key</span><span class="s4">]</span>
+
+
+<span class="s2">def </span><span class="s1">_fill_ufunc_db</span><span class="s4">(</span><span class="s1">ufunc_db</span><span class="s4">):</span>
+    <span class="s3"># some of these imports would cause a problem of circular</span>
+    <span class="s3"># imports if done at global scope when importing the numba</span>
+    <span class="s3"># module.</span>
+    <span class="s2">from </span><span class="s1">numba</span><span class="s4">.</span><span class="s1">np </span><span class="s2">import </span><span class="s1">npyfuncs</span>
+    <span class="s2">from </span><span class="s1">numba</span><span class="s4">.</span><span class="s1">np</span><span class="s4">.</span><span class="s1">math </span><span class="s2">import </span><span class="s1">cmathimpl</span><span class="s4">, </span><span class="s1">mathimpl</span><span class="s4">, </span><span class="s1">numbers</span>
+    <span class="s2">from </span><span class="s1">numba</span><span class="s4">.</span><span class="s1">np</span><span class="s4">.</span><span class="s1">numpy_support </span><span class="s2">import </span><span class="s1">numpy_version</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">isnat</span><span class="s4">] = {</span>
+        <span class="s3"># datetime &amp; timedelta</span>
+        <span class="s5">'M-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_datetime_isnat_impl</span><span class="s4">,</span>
+        <span class="s5">'m-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_datetime_isnat_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">negative</span><span class="s4">] = {</span>
+        <span class="s5">'?-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_invert_impl</span><span class="s4">,</span>
+        <span class="s5">'b-&gt;b'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_negate_impl</span><span class="s4">,</span>
+        <span class="s5">'B-&gt;B'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_negate_impl</span><span class="s4">,</span>
+        <span class="s5">'h-&gt;h'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_negate_impl</span><span class="s4">,</span>
+        <span class="s5">'H-&gt;H'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_negate_impl</span><span class="s4">,</span>
+        <span class="s5">'i-&gt;i'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_negate_impl</span><span class="s4">,</span>
+        <span class="s5">'I-&gt;I'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_negate_impl</span><span class="s4">,</span>
+        <span class="s5">'l-&gt;l'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_negate_impl</span><span class="s4">,</span>
+        <span class="s5">'L-&gt;L'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_negate_impl</span><span class="s4">,</span>
+        <span class="s5">'q-&gt;q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_negate_impl</span><span class="s4">,</span>
+        <span class="s5">'Q-&gt;Q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_negate_impl</span><span class="s4">,</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_negate_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_negate_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">complex_negate_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">complex_negate_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">positive</span><span class="s4">] = {</span>
+        <span class="s5">'?-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_positive_impl</span><span class="s4">,</span>
+        <span class="s5">'b-&gt;b'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_positive_impl</span><span class="s4">,</span>
+        <span class="s5">'B-&gt;B'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_positive_impl</span><span class="s4">,</span>
+        <span class="s5">'h-&gt;h'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_positive_impl</span><span class="s4">,</span>
+        <span class="s5">'H-&gt;H'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_positive_impl</span><span class="s4">,</span>
+        <span class="s5">'i-&gt;i'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_positive_impl</span><span class="s4">,</span>
+        <span class="s5">'I-&gt;I'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_positive_impl</span><span class="s4">,</span>
+        <span class="s5">'l-&gt;l'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_positive_impl</span><span class="s4">,</span>
+        <span class="s5">'L-&gt;L'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_positive_impl</span><span class="s4">,</span>
+        <span class="s5">'q-&gt;q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_positive_impl</span><span class="s4">,</span>
+        <span class="s5">'Q-&gt;Q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_positive_impl</span><span class="s4">,</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_positive_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_positive_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">complex_positive_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">complex_positive_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">absolute</span><span class="s4">] = {</span>
+        <span class="s5">'?-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_abs_impl</span><span class="s4">,</span>
+        <span class="s5">'b-&gt;b'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_abs_impl</span><span class="s4">,</span>
+        <span class="s5">'B-&gt;B'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">uint_abs_impl</span><span class="s4">,</span>
+        <span class="s5">'h-&gt;h'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_abs_impl</span><span class="s4">,</span>
+        <span class="s5">'H-&gt;H'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">uint_abs_impl</span><span class="s4">,</span>
+        <span class="s5">'i-&gt;i'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_abs_impl</span><span class="s4">,</span>
+        <span class="s5">'I-&gt;I'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">uint_abs_impl</span><span class="s4">,</span>
+        <span class="s5">'l-&gt;l'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_abs_impl</span><span class="s4">,</span>
+        <span class="s5">'L-&gt;L'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">uint_abs_impl</span><span class="s4">,</span>
+        <span class="s5">'q-&gt;q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_abs_impl</span><span class="s4">,</span>
+        <span class="s5">'Q-&gt;Q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">uint_abs_impl</span><span class="s4">,</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_abs_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_abs_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;f'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">complex_abs_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;d'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">complex_abs_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">sign</span><span class="s4">] = {</span>
+        <span class="s5">'b-&gt;b'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sign_impl</span><span class="s4">,</span>
+        <span class="s5">'B-&gt;B'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sign_impl</span><span class="s4">,</span>
+        <span class="s5">'h-&gt;h'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sign_impl</span><span class="s4">,</span>
+        <span class="s5">'H-&gt;H'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sign_impl</span><span class="s4">,</span>
+        <span class="s5">'i-&gt;i'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sign_impl</span><span class="s4">,</span>
+        <span class="s5">'I-&gt;I'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sign_impl</span><span class="s4">,</span>
+        <span class="s5">'l-&gt;l'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sign_impl</span><span class="s4">,</span>
+        <span class="s5">'L-&gt;L'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sign_impl</span><span class="s4">,</span>
+        <span class="s5">'q-&gt;q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sign_impl</span><span class="s4">,</span>
+        <span class="s5">'Q-&gt;Q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sign_impl</span><span class="s4">,</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_sign_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_sign_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_sign_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_sign_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">add</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_or_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_add_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_add_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_add_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_add_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_add_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_add_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_add_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_add_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_add_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_add_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_add_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_add_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;F'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">complex_add_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;D'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">complex_add_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">subtract</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sub_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sub_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sub_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sub_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sub_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sub_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sub_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sub_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sub_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sub_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_sub_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_sub_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;F'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">complex_sub_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;D'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">complex_sub_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">multiply</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_and_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_mul_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_mul_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_mul_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_mul_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_mul_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_mul_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_mul_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_mul_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_mul_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_mul_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_mul_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_mul_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;F'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">complex_mul_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;D'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">complex_mul_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s2">if </span><span class="s1">np</span><span class="s4">.</span><span class="s1">divide </span><span class="s4">!= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">true_divide</span><span class="s4">:</span>
+        <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">divide</span><span class="s4">] = {</span>
+            <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_sdiv_impl</span><span class="s4">,</span>
+            <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_udiv_impl</span><span class="s4">,</span>
+            <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_sdiv_impl</span><span class="s4">,</span>
+            <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_udiv_impl</span><span class="s4">,</span>
+            <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_sdiv_impl</span><span class="s4">,</span>
+            <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_udiv_impl</span><span class="s4">,</span>
+            <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_sdiv_impl</span><span class="s4">,</span>
+            <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_udiv_impl</span><span class="s4">,</span>
+            <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_sdiv_impl</span><span class="s4">,</span>
+            <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_udiv_impl</span><span class="s4">,</span>
+            <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_div_impl</span><span class="s4">,</span>
+            <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_div_impl</span><span class="s4">,</span>
+            <span class="s5">'FF-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_div_impl</span><span class="s4">,</span>
+            <span class="s5">'DD-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_div_impl</span><span class="s4">,</span>
+        <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">true_divide</span><span class="s4">] = {</span>
+        <span class="s5">'bb-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_truediv_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_truediv_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_truediv_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_truediv_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_truediv_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_truediv_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_truediv_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_truediv_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_truediv_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_truediv_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_div_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_div_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_div_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_div_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">floor_divide</span><span class="s4">] = {</span>
+        <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_sdiv_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_udiv_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_sdiv_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_udiv_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_sdiv_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_udiv_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_sdiv_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_udiv_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_sdiv_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_udiv_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_floor_div_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_floor_div_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">remainder</span><span class="s4">] = {</span>
+        <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_srem_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_urem_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_srem_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_urem_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_srem_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_urem_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_srem_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_urem_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_srem_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_urem_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_mod_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_mod_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">divmod</span><span class="s4">] = {</span>
+        <span class="s5">'bb-&gt;bb'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_sdivrem_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;BB'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_udivrem_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;hh'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_sdivrem_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;HH'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_udivrem_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;ii'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_sdivrem_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;II'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_udivrem_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;ll'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_sdivrem_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;LL'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_udivrem_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;qq'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_sdivrem_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;QQ'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_udivrem_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;ff'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_divmod_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;dd'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_divmod_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">fmod</span><span class="s4">] = {</span>
+        <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_fmod_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_fmod_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_fmod_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_fmod_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_fmod_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_fmod_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_fmod_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_fmod_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_fmod_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_fmod_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_fmod_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_fmod_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">logaddexp</span><span class="s4">] = {</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_logaddexp_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_logaddexp_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">logaddexp2</span><span class="s4">] = {</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_logaddexp2_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_logaddexp2_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">power</span><span class="s4">] = {</span>
+        <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_power_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_power_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_power_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_power_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_power_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_power_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_power_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_power_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_power_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_power_impl</span><span class="s4">,</span>
+        <span class="s3"># XXX we would like to use `int_power_impl` for real ** integer</span>
+        <span class="s3"># as well (for better performance), but the current ufunc typing</span>
+        <span class="s3"># rules forbid that</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_power_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_power_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_power_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_power_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float_power</span><span class="s4">] = {</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">real_float_power_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">real_float_power_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_float_power_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_float_power_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">gcd</span><span class="s4">] = {</span>
+        <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_gcd_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_gcd_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_gcd_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_gcd_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_gcd_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_gcd_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_gcd_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_gcd_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_gcd_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_gcd_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">lcm</span><span class="s4">] = {</span>
+        <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_lcm_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_lcm_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_lcm_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_lcm_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_lcm_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_lcm_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_lcm_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_lcm_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_lcm_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_lcm_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">rint</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_rint_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_rint_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_rint_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_rint_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">conjugate</span><span class="s4">] = {</span>
+        <span class="s5">'b-&gt;b'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_conjugate_impl</span><span class="s4">,</span>
+        <span class="s5">'B-&gt;B'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_conjugate_impl</span><span class="s4">,</span>
+        <span class="s5">'h-&gt;h'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_conjugate_impl</span><span class="s4">,</span>
+        <span class="s5">'H-&gt;H'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_conjugate_impl</span><span class="s4">,</span>
+        <span class="s5">'i-&gt;i'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_conjugate_impl</span><span class="s4">,</span>
+        <span class="s5">'I-&gt;I'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_conjugate_impl</span><span class="s4">,</span>
+        <span class="s5">'l-&gt;l'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_conjugate_impl</span><span class="s4">,</span>
+        <span class="s5">'L-&gt;L'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_conjugate_impl</span><span class="s4">,</span>
+        <span class="s5">'q-&gt;q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_conjugate_impl</span><span class="s4">,</span>
+        <span class="s5">'Q-&gt;Q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_conjugate_impl</span><span class="s4">,</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_conjugate_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_conjugate_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">complex_conjugate_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">complex_conjugate_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">exp</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_exp_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_exp_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_exp_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_exp_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">exp2</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_exp2_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_exp2_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_exp2_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_exp2_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">log</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_log_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_log_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_log_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_log_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">log2</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_log2_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_log2_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_log2_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_log2_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">log10</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_log10_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_log10_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_log10_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_log10_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">expm1</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_expm1_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_expm1_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_expm1_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_expm1_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">log1p</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_log1p_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_log1p_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_log1p_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_log1p_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">sqrt</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_sqrt_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_sqrt_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_sqrt_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_sqrt_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">square</span><span class="s4">] = {</span>
+        <span class="s5">'b-&gt;b'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_square_impl</span><span class="s4">,</span>
+        <span class="s5">'B-&gt;B'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_square_impl</span><span class="s4">,</span>
+        <span class="s5">'h-&gt;h'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_square_impl</span><span class="s4">,</span>
+        <span class="s5">'H-&gt;H'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_square_impl</span><span class="s4">,</span>
+        <span class="s5">'i-&gt;i'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_square_impl</span><span class="s4">,</span>
+        <span class="s5">'I-&gt;I'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_square_impl</span><span class="s4">,</span>
+        <span class="s5">'l-&gt;l'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_square_impl</span><span class="s4">,</span>
+        <span class="s5">'L-&gt;L'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_square_impl</span><span class="s4">,</span>
+        <span class="s5">'q-&gt;q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_square_impl</span><span class="s4">,</span>
+        <span class="s5">'Q-&gt;Q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_square_impl</span><span class="s4">,</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_square_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_square_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_square_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_square_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">cbrt</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_cbrt_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_cbrt_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">reciprocal</span><span class="s4">] = {</span>
+        <span class="s5">'b-&gt;b'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_reciprocal_impl</span><span class="s4">,</span>
+        <span class="s5">'B-&gt;B'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_reciprocal_impl</span><span class="s4">,</span>
+        <span class="s5">'h-&gt;h'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_reciprocal_impl</span><span class="s4">,</span>
+        <span class="s5">'H-&gt;H'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_reciprocal_impl</span><span class="s4">,</span>
+        <span class="s5">'i-&gt;i'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_reciprocal_impl</span><span class="s4">,</span>
+        <span class="s5">'I-&gt;I'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_reciprocal_impl</span><span class="s4">,</span>
+        <span class="s5">'l-&gt;l'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_reciprocal_impl</span><span class="s4">,</span>
+        <span class="s5">'L-&gt;L'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_reciprocal_impl</span><span class="s4">,</span>
+        <span class="s5">'q-&gt;q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_reciprocal_impl</span><span class="s4">,</span>
+        <span class="s5">'Q-&gt;Q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_reciprocal_impl</span><span class="s4">,</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_reciprocal_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_reciprocal_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_reciprocal_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_reciprocal_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">sin</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_sin_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_sin_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_sin_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_sin_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">cos</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_cos_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_cos_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_cos_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_cos_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">tan_impl </span><span class="s4">= </span><span class="s1">cmathimpl</span><span class="s4">.</span><span class="s1">tan_impl</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">tan</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_tan_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_tan_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">tan_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">tan_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">arcsin_impl </span><span class="s4">= </span><span class="s1">cmathimpl</span><span class="s4">.</span><span class="s1">asin_impl</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">arcsin</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_asin_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_asin_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">arcsin_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">arcsin_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">arccos</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_acos_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_acos_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">cmathimpl</span><span class="s4">.</span><span class="s1">acos_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">cmathimpl</span><span class="s4">.</span><span class="s1">acos_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">arctan_impl </span><span class="s4">= </span><span class="s1">cmathimpl</span><span class="s4">.</span><span class="s1">atan_impl</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">arctan</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_atan_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_atan_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">arctan_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">arctan_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">arctan2</span><span class="s4">] = {</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_atan2_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_atan2_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">hypot</span><span class="s4">] = {</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_hypot_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_hypot_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">sinh</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_sinh_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_sinh_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_sinh_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_sinh_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">cosh</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_cosh_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_cosh_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_cosh_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_cosh_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">tanh</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_tanh_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_tanh_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_tanh_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_tanh_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">arcsinh_impl </span><span class="s4">= </span><span class="s1">cmathimpl</span><span class="s4">.</span><span class="s1">asinh_impl</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">arcsinh</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_asinh_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_asinh_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">arcsinh_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">arcsinh_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">arccosh</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_acosh_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_acosh_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_acosh_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_acosh_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">arctanh_impl </span><span class="s4">= </span><span class="s1">cmathimpl</span><span class="s4">.</span><span class="s1">atanh_impl</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">arctanh</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_atanh_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_atanh_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;F'</span><span class="s4">: </span><span class="s1">arctanh_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;D'</span><span class="s4">: </span><span class="s1">arctanh_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">deg2rad</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">mathimpl</span><span class="s4">.</span><span class="s1">radians_float_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">mathimpl</span><span class="s4">.</span><span class="s1">radians_float_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">radians</span><span class="s4">] = </span><span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">deg2rad</span><span class="s4">]</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">rad2deg</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">mathimpl</span><span class="s4">.</span><span class="s1">degrees_float_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">mathimpl</span><span class="s4">.</span><span class="s1">degrees_float_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">degrees</span><span class="s4">] = </span><span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">rad2deg</span><span class="s4">]</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">floor</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_floor_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_floor_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">ceil</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_ceil_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_ceil_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">trunc</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_trunc_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_trunc_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">fabs</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_fabs_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_fabs_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s3"># logical ufuncs</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">greater</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ugt_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sgt_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ugt_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sgt_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ugt_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sgt_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ugt_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sgt_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ugt_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sgt_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ugt_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_gt_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_gt_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_gt_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_gt_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+    <span class="s2">if </span><span class="s1">numpy_version </span><span class="s4">&gt;= (</span><span class="s6">1</span><span class="s4">, </span><span class="s6">25</span><span class="s4">):</span>
+        <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">greater</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+            <span class="s5">'qQ-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_signed_unsigned_cmp</span><span class="s4">(</span><span class="s5">'&gt;'</span><span class="s4">),</span>
+            <span class="s5">'Qq-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_unsigned_signed_cmp</span><span class="s4">(</span><span class="s5">'&gt;'</span><span class="s4">)})</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">greater_equal</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_uge_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sge_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_uge_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sge_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_uge_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sge_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_uge_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sge_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_uge_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sge_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_uge_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_ge_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_ge_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_ge_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_ge_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+    <span class="s2">if </span><span class="s1">numpy_version </span><span class="s4">&gt;= (</span><span class="s6">1</span><span class="s4">, </span><span class="s6">25</span><span class="s4">):</span>
+        <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">greater_equal</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+            <span class="s5">'qQ-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_signed_unsigned_cmp</span><span class="s4">(</span><span class="s5">'&gt;='</span><span class="s4">),</span>
+            <span class="s5">'Qq-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_unsigned_signed_cmp</span><span class="s4">(</span><span class="s5">'&gt;='</span><span class="s4">)})</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">less</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ult_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_slt_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ult_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_slt_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ult_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_slt_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ult_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_slt_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ult_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_slt_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ult_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_lt_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_lt_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_lt_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_lt_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+    <span class="s2">if </span><span class="s1">numpy_version </span><span class="s4">&gt;= (</span><span class="s6">1</span><span class="s4">, </span><span class="s6">25</span><span class="s4">):</span>
+        <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">less</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+            <span class="s5">'qQ-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_signed_unsigned_cmp</span><span class="s4">(</span><span class="s5">'&lt;'</span><span class="s4">),</span>
+            <span class="s5">'Qq-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_unsigned_signed_cmp</span><span class="s4">(</span><span class="s5">'&lt;'</span><span class="s4">)})</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">less_equal</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ule_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sle_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ule_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sle_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ule_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sle_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ule_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sle_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ule_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_sle_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ule_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_le_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_le_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_le_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_le_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+    <span class="s2">if </span><span class="s1">numpy_version </span><span class="s4">&gt;= (</span><span class="s6">1</span><span class="s4">, </span><span class="s6">25</span><span class="s4">):</span>
+        <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">less_equal</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+            <span class="s5">'qQ-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_signed_unsigned_cmp</span><span class="s4">(</span><span class="s5">'&lt;='</span><span class="s4">),</span>
+            <span class="s5">'Qq-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_unsigned_signed_cmp</span><span class="s4">(</span><span class="s5">'&lt;='</span><span class="s4">)})</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">not_equal</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ne_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ne_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ne_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ne_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ne_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ne_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ne_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ne_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ne_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ne_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_ne_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_ne_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_ne_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_ne_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_ne_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+    <span class="s2">if </span><span class="s1">numpy_version </span><span class="s4">&gt;= (</span><span class="s6">1</span><span class="s4">, </span><span class="s6">25</span><span class="s4">):</span>
+        <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">not_equal</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+            <span class="s5">'qQ-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_signed_unsigned_cmp</span><span class="s4">(</span><span class="s5">'!='</span><span class="s4">),</span>
+            <span class="s5">'Qq-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_unsigned_signed_cmp</span><span class="s4">(</span><span class="s5">'!='</span><span class="s4">)})</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">equal</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_eq_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_eq_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_eq_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_eq_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_eq_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_eq_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_eq_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_eq_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_eq_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_eq_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_eq_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_eq_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">real_eq_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_eq_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_eq_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+    <span class="s2">if </span><span class="s1">numpy_version </span><span class="s4">&gt;= (</span><span class="s6">1</span><span class="s4">, </span><span class="s6">25</span><span class="s4">):</span>
+        <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">equal</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+            <span class="s5">'qQ-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_signed_unsigned_cmp</span><span class="s4">(</span><span class="s5">'=='</span><span class="s4">),</span>
+            <span class="s5">'Qq-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_unsigned_signed_cmp</span><span class="s4">(</span><span class="s5">'=='</span><span class="s4">)})</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">logical_and</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_and_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_and_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_and_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_and_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_and_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_and_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_and_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_and_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_and_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_and_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_and_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_and_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_and_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_logical_and_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_logical_and_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">logical_or</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_or_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_or_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_or_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_or_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_or_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_or_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_or_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_or_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_or_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_or_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_or_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_or_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_or_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_logical_or_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_logical_or_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">logical_xor</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_logical_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_logical_xor_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">logical_not</span><span class="s4">] = {</span>
+        <span class="s5">'?-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_not_impl</span><span class="s4">,</span>
+        <span class="s5">'b-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_not_impl</span><span class="s4">,</span>
+        <span class="s5">'B-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_not_impl</span><span class="s4">,</span>
+        <span class="s5">'h-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_not_impl</span><span class="s4">,</span>
+        <span class="s5">'H-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_not_impl</span><span class="s4">,</span>
+        <span class="s5">'i-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_not_impl</span><span class="s4">,</span>
+        <span class="s5">'I-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_not_impl</span><span class="s4">,</span>
+        <span class="s5">'l-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_not_impl</span><span class="s4">,</span>
+        <span class="s5">'L-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_not_impl</span><span class="s4">,</span>
+        <span class="s5">'q-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_not_impl</span><span class="s4">,</span>
+        <span class="s5">'Q-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_not_impl</span><span class="s4">,</span>
+        <span class="s5">'f-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_not_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_not_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_logical_not_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_logical_not_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">maximum</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_or_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smax_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umax_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smax_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umax_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smax_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umax_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smax_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umax_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smax_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umax_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_maximum_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_maximum_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_maximum_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_maximum_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">minimum</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_and_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smin_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umin_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smin_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umin_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smin_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umin_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smin_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umin_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smin_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umin_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_minimum_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_minimum_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_minimum_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_minimum_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">fmax</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_or_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smax_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umax_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smax_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umax_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smax_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umax_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smax_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umax_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smax_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umax_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_fmax_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_fmax_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_fmax_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_fmax_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">fmin</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_logical_and_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smin_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umin_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smin_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umin_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smin_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umin_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smin_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umin_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_smin_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_umin_impl</span><span class="s4">,</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_fmin_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_fmin_impl</span><span class="s4">,</span>
+        <span class="s5">'FF-&gt;F'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_fmin_impl</span><span class="s4">,</span>
+        <span class="s5">'DD-&gt;D'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_fmin_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s3"># misc floating functions</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">isnan</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_isnan_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_isnan_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_isnan_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_isnan_impl</span><span class="s4">,</span>
+        <span class="s3"># int8</span>
+        <span class="s5">'b-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isnan_impl</span><span class="s4">,</span>
+        <span class="s5">'B-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isnan_impl</span><span class="s4">,</span>
+        <span class="s3"># int16</span>
+        <span class="s5">'h-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isnan_impl</span><span class="s4">,</span>
+        <span class="s5">'H-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isnan_impl</span><span class="s4">,</span>
+        <span class="s3"># int32</span>
+        <span class="s5">'i-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isnan_impl</span><span class="s4">,</span>
+        <span class="s5">'I-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isnan_impl</span><span class="s4">,</span>
+        <span class="s3"># int64</span>
+        <span class="s5">'l-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isnan_impl</span><span class="s4">,</span>
+        <span class="s5">'L-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isnan_impl</span><span class="s4">,</span>
+        <span class="s3"># intp</span>
+        <span class="s5">'q-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isnan_impl</span><span class="s4">,</span>
+        <span class="s5">'Q-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isnan_impl</span><span class="s4">,</span>
+        <span class="s3"># boolean</span>
+        <span class="s5">'?-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isnan_impl</span><span class="s4">,</span>
+        <span class="s3"># datetime &amp; timedelta</span>
+        <span class="s5">'m-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_datetime_isnat_impl</span><span class="s4">,</span>
+        <span class="s5">'M-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_datetime_isnat_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">isinf</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_isinf_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_isinf_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_isinf_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_isinf_impl</span><span class="s4">,</span>
+        <span class="s3"># int8</span>
+        <span class="s5">'b-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isinf_impl</span><span class="s4">,</span>
+        <span class="s5">'B-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isinf_impl</span><span class="s4">,</span>
+        <span class="s3"># int16</span>
+        <span class="s5">'h-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isinf_impl</span><span class="s4">,</span>
+        <span class="s5">'H-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isinf_impl</span><span class="s4">,</span>
+        <span class="s3"># int32</span>
+        <span class="s5">'i-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isinf_impl</span><span class="s4">,</span>
+        <span class="s5">'I-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isinf_impl</span><span class="s4">,</span>
+        <span class="s3"># int64</span>
+        <span class="s5">'l-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isinf_impl</span><span class="s4">,</span>
+        <span class="s5">'L-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isinf_impl</span><span class="s4">,</span>
+        <span class="s3"># intp</span>
+        <span class="s5">'q-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isinf_impl</span><span class="s4">,</span>
+        <span class="s5">'Q-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isinf_impl</span><span class="s4">,</span>
+        <span class="s3"># boolean</span>
+        <span class="s5">'?-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isinf_impl</span><span class="s4">,</span>
+        <span class="s3"># datetime &amp; timedelta</span>
+        <span class="s5">'m-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isinf_impl</span><span class="s4">,</span>
+        <span class="s5">'M-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isinf_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">isfinite</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_isfinite_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_isfinite_impl</span><span class="s4">,</span>
+        <span class="s5">'F-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_isfinite_impl</span><span class="s4">,</span>
+        <span class="s5">'D-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_complex_isfinite_impl</span><span class="s4">,</span>
+        <span class="s3"># int8</span>
+        <span class="s5">'b-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isfinite_impl</span><span class="s4">,</span>
+        <span class="s5">'B-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isfinite_impl</span><span class="s4">,</span>
+        <span class="s3"># int16</span>
+        <span class="s5">'h-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isfinite_impl</span><span class="s4">,</span>
+        <span class="s5">'H-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isfinite_impl</span><span class="s4">,</span>
+        <span class="s3"># int32</span>
+        <span class="s5">'i-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isfinite_impl</span><span class="s4">,</span>
+        <span class="s5">'I-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isfinite_impl</span><span class="s4">,</span>
+        <span class="s3"># int64</span>
+        <span class="s5">'l-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isfinite_impl</span><span class="s4">,</span>
+        <span class="s5">'L-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isfinite_impl</span><span class="s4">,</span>
+        <span class="s3"># intp</span>
+        <span class="s5">'q-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isfinite_impl</span><span class="s4">,</span>
+        <span class="s5">'Q-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isfinite_impl</span><span class="s4">,</span>
+        <span class="s3"># boolean</span>
+        <span class="s5">'?-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_int_isfinite_impl</span><span class="s4">,</span>
+        <span class="s3"># datetime &amp; timedelta</span>
+        <span class="s5">'M-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_datetime_isfinite_impl</span><span class="s4">,</span>
+        <span class="s5">'m-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_datetime_isfinite_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">signbit</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_signbit_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;?'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_signbit_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">copysign</span><span class="s4">] = {</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_copysign_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_copysign_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">nextafter</span><span class="s4">] = {</span>
+        <span class="s5">'ff-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_nextafter_impl</span><span class="s4">,</span>
+        <span class="s5">'dd-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_nextafter_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">spacing</span><span class="s4">] = {</span>
+        <span class="s5">'f-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_spacing_impl</span><span class="s4">,</span>
+        <span class="s5">'d-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_spacing_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">ldexp</span><span class="s4">] = {</span>
+        <span class="s5">'fi-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_ldexp_impl</span><span class="s4">,</span>
+        <span class="s5">'fl-&gt;f'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_ldexp_impl</span><span class="s4">,</span>
+        <span class="s5">'di-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_ldexp_impl</span><span class="s4">,</span>
+        <span class="s5">'dl-&gt;d'</span><span class="s4">: </span><span class="s1">npyfuncs</span><span class="s4">.</span><span class="s1">np_real_ldexp_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+    <span class="s2">if </span><span class="s1">numpy_version </span><span class="s4">&gt;= (</span><span class="s6">2</span><span class="s4">, </span><span class="s6">0</span><span class="s4">) </span><span class="s2">and </span><span class="s1">IS_WIN32</span><span class="s4">:</span>
+        <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">ldexp</span><span class="s4">][</span><span class="s5">'fq-&gt;f'</span><span class="s4">] = </span><span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">ldexp</span><span class="s4">].</span><span class="s1">pop</span><span class="s4">(</span><span class="s5">'fl-&gt;f'</span><span class="s4">)</span>
+        <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">ldexp</span><span class="s4">][</span><span class="s5">'dq-&gt;d'</span><span class="s4">] = </span><span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">ldexp</span><span class="s4">].</span><span class="s1">pop</span><span class="s4">(</span><span class="s5">'dl-&gt;d'</span><span class="s4">)</span>
+
+    <span class="s3"># bit twiddling functions</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">bitwise_and</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_and_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_and_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_and_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_and_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_and_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_and_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_and_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_and_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_and_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_and_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_and_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">bitwise_or</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_or_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_or_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_or_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_or_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_or_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_or_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_or_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_or_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_or_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_or_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_or_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">bitwise_xor</span><span class="s4">] = {</span>
+        <span class="s5">'??-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_xor_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_xor_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">invert</span><span class="s4">] = {  </span><span class="s3"># aka np.bitwise_not</span>
+        <span class="s5">'?-&gt;?'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_invert_impl</span><span class="s4">,</span>
+        <span class="s5">'b-&gt;b'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_invert_impl</span><span class="s4">,</span>
+        <span class="s5">'B-&gt;B'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_invert_impl</span><span class="s4">,</span>
+        <span class="s5">'h-&gt;h'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_invert_impl</span><span class="s4">,</span>
+        <span class="s5">'H-&gt;H'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_invert_impl</span><span class="s4">,</span>
+        <span class="s5">'i-&gt;i'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_invert_impl</span><span class="s4">,</span>
+        <span class="s5">'I-&gt;I'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_invert_impl</span><span class="s4">,</span>
+        <span class="s5">'l-&gt;l'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_invert_impl</span><span class="s4">,</span>
+        <span class="s5">'L-&gt;L'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_invert_impl</span><span class="s4">,</span>
+        <span class="s5">'q-&gt;q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_invert_impl</span><span class="s4">,</span>
+        <span class="s5">'Q-&gt;Q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_invert_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">left_shift</span><span class="s4">] = {</span>
+        <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shl_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shl_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shl_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shl_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shl_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shl_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shl_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shl_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shl_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shl_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">right_shift</span><span class="s4">] = {</span>
+        <span class="s5">'bb-&gt;b'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shr_impl</span><span class="s4">,</span>
+        <span class="s5">'BB-&gt;B'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shr_impl</span><span class="s4">,</span>
+        <span class="s5">'hh-&gt;h'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shr_impl</span><span class="s4">,</span>
+        <span class="s5">'HH-&gt;H'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shr_impl</span><span class="s4">,</span>
+        <span class="s5">'ii-&gt;i'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shr_impl</span><span class="s4">,</span>
+        <span class="s5">'II-&gt;I'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shr_impl</span><span class="s4">,</span>
+        <span class="s5">'ll-&gt;l'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shr_impl</span><span class="s4">,</span>
+        <span class="s5">'LL-&gt;L'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shr_impl</span><span class="s4">,</span>
+        <span class="s5">'qq-&gt;q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shr_impl</span><span class="s4">,</span>
+        <span class="s5">'QQ-&gt;Q'</span><span class="s4">: </span><span class="s1">numbers</span><span class="s4">.</span><span class="s1">int_shr_impl</span><span class="s4">,</span>
+    <span class="s4">}</span>
+
+    <span class="s3"># Inject datetime64 support</span>
+    <span class="s2">from </span><span class="s1">numba</span><span class="s4">.</span><span class="s1">np </span><span class="s2">import </span><span class="s1">npdatetime</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">negative</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'m-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_neg_impl</span><span class="s4">,</span>
+    <span class="s4">})</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">positive</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'m-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_pos_impl</span><span class="s4">,</span>
+    <span class="s4">})</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">absolute</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'m-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_abs_impl</span><span class="s4">,</span>
+    <span class="s4">})</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">sign</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'m-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_sign_impl</span><span class="s4">,</span>
+    <span class="s4">})</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">add</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'mm-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_add_impl</span><span class="s4">,</span>
+        <span class="s5">'Mm-&gt;M'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">datetime_plus_timedelta</span><span class="s4">,</span>
+        <span class="s5">'mM-&gt;M'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_plus_datetime</span><span class="s4">,</span>
+    <span class="s4">})</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">subtract</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'mm-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_sub_impl</span><span class="s4">,</span>
+        <span class="s5">'Mm-&gt;M'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">datetime_minus_timedelta</span><span class="s4">,</span>
+        <span class="s5">'MM-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">datetime_minus_datetime</span><span class="s4">,</span>
+    <span class="s4">})</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">multiply</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'mq-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_times_number</span><span class="s4">,</span>
+        <span class="s5">'md-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_times_number</span><span class="s4">,</span>
+        <span class="s5">'qm-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">number_times_timedelta</span><span class="s4">,</span>
+        <span class="s5">'dm-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">number_times_timedelta</span><span class="s4">,</span>
+    <span class="s4">})</span>
+    <span class="s2">if </span><span class="s1">np</span><span class="s4">.</span><span class="s1">divide </span><span class="s4">!= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">true_divide</span><span class="s4">:</span>
+        <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">divide</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+            <span class="s5">'mq-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_over_number</span><span class="s4">,</span>
+            <span class="s5">'md-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_over_number</span><span class="s4">,</span>
+            <span class="s5">'mm-&gt;d'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_over_timedelta</span><span class="s4">,</span>
+        <span class="s4">})</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">true_divide</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'mq-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_over_number</span><span class="s4">,</span>
+        <span class="s5">'md-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_over_number</span><span class="s4">,</span>
+        <span class="s5">'mm-&gt;d'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_over_timedelta</span><span class="s4">,</span>
+    <span class="s4">})</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">floor_divide</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'mq-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_over_number</span><span class="s4">,</span>
+        <span class="s5">'md-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_over_number</span><span class="s4">,</span>
+    <span class="s4">})</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">floor_divide</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'mm-&gt;q'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_floor_div_timedelta</span><span class="s4">,</span>
+    <span class="s4">})</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">equal</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'MM-&gt;?'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">datetime_eq_datetime_impl</span><span class="s4">,</span>
+        <span class="s5">'mm-&gt;?'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_eq_timedelta_impl</span><span class="s4">,</span>
+    <span class="s4">})</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">not_equal</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'MM-&gt;?'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">datetime_ne_datetime_impl</span><span class="s4">,</span>
+        <span class="s5">'mm-&gt;?'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_ne_timedelta_impl</span><span class="s4">,</span>
+    <span class="s4">})</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">less</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'MM-&gt;?'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">datetime_lt_datetime_impl</span><span class="s4">,</span>
+        <span class="s5">'mm-&gt;?'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_lt_timedelta_impl</span><span class="s4">,</span>
+    <span class="s4">})</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">less_equal</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'MM-&gt;?'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">datetime_le_datetime_impl</span><span class="s4">,</span>
+        <span class="s5">'mm-&gt;?'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_le_timedelta_impl</span><span class="s4">,</span>
+    <span class="s4">})</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">greater</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'MM-&gt;?'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">datetime_gt_datetime_impl</span><span class="s4">,</span>
+        <span class="s5">'mm-&gt;?'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_gt_timedelta_impl</span><span class="s4">,</span>
+    <span class="s4">})</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">greater_equal</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'MM-&gt;?'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">datetime_ge_datetime_impl</span><span class="s4">,</span>
+        <span class="s5">'mm-&gt;?'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_ge_timedelta_impl</span><span class="s4">,</span>
+    <span class="s4">})</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">maximum</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'MM-&gt;M'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">datetime_maximum_impl</span><span class="s4">,</span>
+        <span class="s5">'mm-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_maximum_impl</span><span class="s4">,</span>
+    <span class="s4">})</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">minimum</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'MM-&gt;M'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">datetime_minimum_impl</span><span class="s4">,</span>
+        <span class="s5">'mm-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_minimum_impl</span><span class="s4">,</span>
+    <span class="s4">})</span>
+    <span class="s3"># there is no difference for datetime/timedelta in maximum/fmax</span>
+    <span class="s3"># and minimum/fmin</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">fmax</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'MM-&gt;M'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">datetime_fmax_impl</span><span class="s4">,</span>
+        <span class="s5">'mm-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_fmax_impl</span><span class="s4">,</span>
+    <span class="s4">})</span>
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">fmin</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'MM-&gt;M'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">datetime_fmin_impl</span><span class="s4">,</span>
+        <span class="s5">'mm-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_fmin_impl</span><span class="s4">,</span>
+    <span class="s4">})</span>
+
+    <span class="s1">ufunc_db</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">remainder</span><span class="s4">].</span><span class="s1">update</span><span class="s4">({</span>
+        <span class="s5">'mm-&gt;m'</span><span class="s4">: </span><span class="s1">npdatetime</span><span class="s4">.</span><span class="s1">timedelta_mod_timedelta</span><span class="s4">,</span>
+    <span class="s4">})</span>
+</pre>
+</body>
+</html>

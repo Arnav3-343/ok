@@ -1,0 +1,310 @@
+<html>
+<head>
+<title>kivy-mode.el</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #bcbec4;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+kivy-mode.el</font>
+</center></td></tr></table>
+<pre><span class="s0">;;; kivy-mode.el --- Emacs major mode for editing Kivy files</span>
+<span class="s0">;;</span>
+<span class="s0">;; Author: Dean Serenevy &lt;dean@serenevy.net&gt;</span>
+<span class="s0">;; Version: 0.1.0</span>
+<span class="s0">;;</span>
+<span class="s0">;; This document borrowed heavily from yaml-mode.el by Yoshiki Kurihara and</span>
+<span class="s0">;; Marshall Vandegrift.</span>
+<span class="s0">;;</span>
+<span class="s0">;; This file is not part of Emacs</span>
+
+
+<span class="s0">;; This file is free software; you can redistribute it and/or modify it</span>
+<span class="s0">;; under the terms of the GNU General Public License as published by the</span>
+<span class="s0">;; Free Software Foundation; version 3.</span>
+
+<span class="s0">;; This file is distributed in the hope that it will be useful, but WITHOUT</span>
+<span class="s0">;; ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</span>
+<span class="s0">;; FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for</span>
+<span class="s0">;; more details.</span>
+
+<span class="s0">;; You should have received a copy of the GNU General Public License along</span>
+<span class="s0">;; with GNU Emacs; see the file COPYING. If not, write to the Free Software</span>
+<span class="s0">;; Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,</span>
+<span class="s0">;; USA.</span>
+
+<span class="s0">;;; Installation:</span>
+
+<span class="s0">;; To install, just drop this file into a directory in your `load-path' and</span>
+<span class="s0">;; (optionally) byte-compile it. To automatically handle files ending in</span>
+<span class="s0">;; '.kv', add something like:</span>
+<span class="s0">;;</span>
+<span class="s0">;;    (require 'kivy-mode)</span>
+<span class="s0">;;    (add-to-list 'auto-mode-alist '(&quot;\\.kv$&quot; . kivy-mode))</span>
+<span class="s0">;;</span>
+<span class="s0">;; to your .emacs file.</span>
+<span class="s0">;;</span>
+<span class="s0">;; This mode does not enable electric-indent by default. To get this</span>
+<span class="s0">;; behavior, either enable electric-indent-mode globally or enable it only</span>
+<span class="s0">;; for kivy buffers using `kivy-mode-hook':</span>
+<span class="s0">;;</span>
+<span class="s0">;;    (add-hook 'kivy-mode-hook</span>
+<span class="s0">;;     '(lambda ()</span>
+<span class="s0">;;        (electric-indent-local-mode t)))</span>
+
+
+<span class="s0">;; User definable variables</span>
+
+<span class="s0">(defgroup kivy nil</span>
+  <span class="s0">&quot;Support for the kivy user interface definition format&quot;</span>
+  <span class="s0">:group 'languages</span>
+  <span class="s0">:prefix &quot;kivy-&quot;)</span>
+
+<span class="s0">(defcustom kivy-mode-hook nil</span>
+  <span class="s0">&quot;*Hook run by `kivy-mode'.&quot;</span>
+  <span class="s0">:type 'hook</span>
+  <span class="s0">:group 'kivy)</span>
+
+<span class="s0">(defcustom kivy-indent-offset 4</span>
+  <span class="s0">&quot;*Amount of offset per level of indentation.&quot;</span>
+  <span class="s0">:type 'integer</span>
+  <span class="s0">:group 'kivy)</span>
+
+<span class="s0">(defcustom kivy-backspace-function 'backward-delete-char-untabify</span>
+  <span class="s0">&quot;*Function called by `kivy-electric-backspace' when deleting backwards.&quot;</span>
+  <span class="s0">:type 'function</span>
+  <span class="s0">:group 'kivy)</span>
+
+<span class="s0">(defface kivy-tab-face</span>
+  <span class="s0">'((((class color)) (:background &quot;red&quot; :foreground &quot;red&quot; :bold t))</span>
+    <span class="s0">(t (:reverse-video t)))</span>
+  <span class="s0">&quot;Face to use for highlighting tabs in kivy files.&quot;</span>
+  <span class="s0">:group 'faces</span>
+  <span class="s0">:group 'kivy)</span>
+
+<span class="s0">(defcustom kivy-imenu-generic-expression</span>
+  <span class="s0">'((nil  &quot;^\\([&lt;&gt;a-zA-Z_-]+\\):&quot;          1))</span>
+  <span class="s0">&quot;The imenu regex to parse an outline of the kivy file.&quot;</span>
+  <span class="s0">:type 'string</span>
+  <span class="s0">:group 'kivy)</span>
+
+
+<span class="s0">;; Constants</span>
+
+<span class="s0">(defconst kivy-mode-version &quot;0.1.0&quot; &quot;Version of `kivy-mode.'&quot;)</span>
+
+<span class="s0">(defconst kivy-blank-line-re &quot;^ *$&quot;</span>
+  <span class="s0">&quot;Regexp matching a line containing only (valid) whitespace.&quot;)</span>
+
+<span class="s0">(defconst kivy-comment-re &quot;\\(?:^\\|\\s-+\\)\\(#.*\\)&quot;</span>
+  <span class="s0">&quot;Regexp matching a line containing a kivy comment or delimiter.&quot;)</span>
+
+<span class="s0">(defconst kivy-directive-re &quot;^\\(?:#:\\)\\(\\w+ +.*\\)&quot;</span>
+  <span class="s0">&quot;Regexp matching a line containing a kivy directive.&quot;)</span>
+
+<span class="s0">(defconst kivy-tag-re &quot;^ *id: *\\([^ \n]+\\)$&quot;</span>
+  <span class="s0">&quot;Rexexp matching a kivy tag.&quot;)</span>
+
+<span class="s0">(defconst kivy-bare-scalar-re</span>
+  <span class="s0">&quot;\\(?:[^-:,#!\n{\\[ ]\\|[^#!\n{\\[ ]\\S-\\)[^#\n]*?&quot;</span>
+  <span class="s0">&quot;Rexexp matching a kivy bare scalar.&quot;)</span>
+
+<span class="s0">(defconst kivy-hash-key-re</span>
+  <span class="s0">(concat &quot;^ *&quot;</span>
+          <span class="s0">&quot;\\(&quot; kivy-bare-scalar-re &quot;\\) *:&quot;</span>
+          <span class="s0">&quot;\\(?: +\\|$\\)&quot;)</span>
+  <span class="s0">&quot;Regexp matching a single kivy hash key.&quot;)</span>
+
+<span class="s0">(defconst kivy-nested-map-re</span>
+  <span class="s0">(concat &quot;.*: *$&quot;)</span>
+  <span class="s0">&quot;Regexp matching a line beginning a kivy nested structure.&quot;)</span>
+
+<span class="s0">(defconst kivy-constant-scalars-re</span>
+  <span class="s0">(concat &quot;\\(?:^\\|\\(?::\\|-\\|,\\|{\\|\\[\\) +\\) *&quot;</span>
+          <span class="s0">(regexp-opt</span>
+           <span class="s0">'(&quot;True&quot; &quot;False&quot; &quot;None&quot;) t)</span>
+          <span class="s0">&quot; *$&quot;)</span>
+  <span class="s0">&quot;Regexp matching certain scalar constants in scalar context&quot;)</span>
+
+
+
+<span class="s0">;; Mode setup</span>
+
+<span class="s0">(defvar kivy-mode-map ()</span>
+  <span class="s0">&quot;Keymap used in `kivy-mode' buffers.&quot;)</span>
+<span class="s0">(if kivy-mode-map</span>
+    <span class="s0">nil</span>
+  <span class="s0">(setq kivy-mode-map (make-sparse-keymap))</span>
+  <span class="s0">(define-key kivy-mode-map [backspace] 'kivy-electric-backspace)</span>
+  <span class="s0">(define-key kivy-mode-map &quot;\C-c&lt;&quot; 'kivy-indent-shift-left)</span>
+  <span class="s0">(define-key kivy-mode-map &quot;\C-c&gt;&quot; 'kivy-indent-shift-right)</span>
+  <span class="s0">)</span>
+
+<span class="s0">(defvar kivy-mode-syntax-table nil</span>
+  <span class="s0">&quot;Syntax table in use in kivy-mode buffers.&quot;)</span>
+<span class="s0">(if kivy-mode-syntax-table</span>
+    <span class="s0">nil</span>
+  <span class="s0">(setq kivy-mode-syntax-table (make-syntax-table))</span>
+  <span class="s0">(modify-syntax-entry ?\' &quot;\&quot;&quot; kivy-mode-syntax-table)</span>
+  <span class="s0">(modify-syntax-entry ?\&quot; &quot;\&quot;&quot; kivy-mode-syntax-table)</span>
+  <span class="s0">(modify-syntax-entry ?# &quot;&lt;&quot; kivy-mode-syntax-table)</span>
+  <span class="s0">(modify-syntax-entry ?\n &quot;&gt;&quot; kivy-mode-syntax-table)</span>
+  <span class="s0">(modify-syntax-entry ?\\ &quot;\\&quot; kivy-mode-syntax-table)</span>
+  <span class="s0">(modify-syntax-entry ?- &quot;_&quot; kivy-mode-syntax-table)</span>
+  <span class="s0">(modify-syntax-entry ?_ &quot;w&quot; kivy-mode-syntax-table)</span>
+  <span class="s0">(modify-syntax-entry ?&lt; &quot;.&quot; kivy-mode-syntax-table)</span>
+  <span class="s0">(modify-syntax-entry ?&gt; &quot;.&quot; kivy-mode-syntax-table)</span>
+  <span class="s0">(modify-syntax-entry ?_ &quot;_&quot; kivy-mode-syntax-table)</span>
+  <span class="s0">)</span>
+
+
+<span class="s0">;;;###autoload</span>
+<span class="s0">(add-to-list 'auto-mode-alist '(&quot;\\.kv$&quot; . kivy-mode))</span>
+
+
+<span class="s0">;;;###autoload</span>
+<span class="s0">(define-derived-mode kivy-mode fundamental-mode &quot;kivy&quot;</span>
+  <span class="s0">&quot;Simple mode to edit kivy.</span>
+
+<span class="s0">\\{kivy-mode-map}&quot;</span>
+  <span class="s0">(set (make-local-variable 'comment-start) &quot;# &quot;)</span>
+  <span class="s0">(set (make-local-variable 'comment-start-skip) &quot;#+ *&quot;)</span>
+  <span class="s0">(set (make-local-variable 'indent-line-function) 'kivy-indent-line)</span>
+  <span class="s0">(set (make-local-variable 'font-lock-defaults)</span>
+       <span class="s0">'(kivy-font-lock-keywords</span>
+         <span class="s0">nil nil nil nil</span>
+         <span class="s0">(font-lock-syntactic-keywords))))</span>
+
+
+<span class="s0">;; Font-lock support</span>
+
+<span class="s0">(defvar kivy-font-lock-keywords</span>
+  <span class="s0">(list</span>
+   <span class="s0">(cons kivy-comment-re '(1 font-lock-comment-face))</span>
+   <span class="s0">(cons kivy-constant-scalars-re '(1 font-lock-constant-face))</span>
+   <span class="s0">(cons kivy-tag-re '(1 font-lock-function-name-face))</span>
+   <span class="s0">(cons kivy-hash-key-re '(1 font-lock-variable-name-face t))</span>
+   <span class="s0">(cons kivy-directive-re '(1 font-lock-builtin-face))</span>
+   <span class="s0">'(&quot;^[\t]+&quot; 0 'kivy-tab-face t))</span>
+  <span class="s0">&quot;Additional expressions to highlight in kivy mode.&quot;)</span>
+
+<span class="s0">(defvar kivy-font-lock-syntactic-keywords</span>
+  <span class="s0">(list '())</span>
+  <span class="s0">&quot;Additional syntax features to highlight in kivy mode.&quot;)</span>
+
+
+<span class="s0">;; Indentation and electric keys</span>
+
+<span class="s0">(defun kivy-compute-indentation ()</span>
+  <span class="s0">&quot;Calculate the maximum sensible indentation for the current line.&quot;</span>
+  <span class="s0">(save-excursion</span>
+    <span class="s0">(beginning-of-line)</span>
+    <span class="s0">(forward-line -1)</span>
+    <span class="s0">(while (and (looking-at kivy-blank-line-re)</span>
+                <span class="s0">(&gt; (point) (point-min)))</span>
+      <span class="s0">(forward-line -1))</span>
+    <span class="s0">(+ (current-indentation)</span>
+       <span class="s0">(if (looking-at kivy-nested-map-re) kivy-indent-offset 0)</span>
+       <span class="s0">)))</span>
+
+<span class="s0">(defun kivy-indent-line ()</span>
+  <span class="s0">&quot;Indent the current line.</span>
+<span class="s0">The first time this command is used, the line will be indented to the</span>
+<span class="s0">maximum sensible indentation.  Each immediately subsequent usage will</span>
+<span class="s0">back-dent the line by `kivy-indent-offset' spaces.  On reaching column</span>
+<span class="s0">0, it will cycle back to the maximum sensible indentation.&quot;</span>
+  <span class="s0">(interactive &quot;*&quot;)</span>
+  <span class="s0">(let ((ci (current-indentation))</span>
+        <span class="s0">(cc (current-column))</span>
+        <span class="s0">(need (kivy-compute-indentation)))</span>
+    <span class="s0">(save-excursion</span>
+      <span class="s0">(beginning-of-line)</span>
+      <span class="s0">(delete-horizontal-space)</span>
+      <span class="s0">(if (and (equal last-command this-command) (/= ci 0))</span>
+          <span class="s0">(indent-to (* (/ (- ci 1) kivy-indent-offset) kivy-indent-offset))</span>
+        <span class="s0">(indent-to need)))</span>
+    <span class="s0">(if (&lt; (current-column) (current-indentation))</span>
+        <span class="s0">(forward-to-indentation 0))))</span>
+
+<span class="s0">(defun kivy-electric-backspace (arg)</span>
+  <span class="s0">&quot;Delete characters or back-dent the current line.</span>
+<span class="s0">If invoked following only whitespace on a line, will back-dent to the</span>
+<span class="s0">immediately previous multiple of `kivy-indent-offset' spaces.&quot;</span>
+  <span class="s0">(interactive &quot;*p&quot;)</span>
+  <span class="s0">(if (or (/= (current-indentation) (current-column)) (bolp))</span>
+      <span class="s0">(funcall kivy-backspace-function arg)</span>
+    <span class="s0">(let ((ci (current-column)))</span>
+      <span class="s0">(beginning-of-line)</span>
+      <span class="s0">(delete-horizontal-space)</span>
+      <span class="s0">(indent-to (* (/ (- ci (* arg kivy-indent-offset))</span>
+                       <span class="s0">kivy-indent-offset)</span>
+                    <span class="s0">kivy-indent-offset)))))</span>
+
+
+<span class="s0">(defun kivy-set-imenu-generic-expression ()</span>
+  <span class="s0">(make-local-variable 'imenu-generic-expression)</span>
+  <span class="s0">(make-local-variable 'imenu-create-index-function)</span>
+  <span class="s0">(setq imenu-create-index-function 'imenu-default-create-index-function)</span>
+  <span class="s0">(setq imenu-generic-expression kivy-imenu-generic-expression))</span>
+
+<span class="s0">(add-hook 'kivy-mode-hook 'kivy-set-imenu-generic-expression)</span>
+<span class="s0">(add-hook 'kivy-mode-hook</span>
+          <span class="s0">'(lambda ()</span>
+             <span class="s0">(setq indent-tabs-mode 'nil)))</span>
+
+
+<span class="s0">(defun kivy-mode-version ()</span>
+  <span class="s0">&quot;Display version of `kivy-mode'.&quot;</span>
+  <span class="s0">(interactive)</span>
+  <span class="s0">(message &quot;kivy-mode %s&quot; kivy-mode-version)</span>
+  <span class="s0">kivy-mode-version)</span>
+
+<span class="s0">(defun kivy-indent-shift-left (start end &amp;optional count)</span>
+  <span class="s0">&quot;Shift lines contained in region START END by COUNT columns to the left.</span>
+<span class="s0">COUNT defaults to `kivy-indent-offset'.  If region isn't</span>
+<span class="s0">active, the current line is shifted.  The shifted region includes</span>
+<span class="s0">the lines in which START and END lie.  An error is signaled if</span>
+<span class="s0">any lines in the region are indented less than COUNT columns.&quot;</span>
+  <span class="s0">(interactive</span>
+   <span class="s0">(if mark-active</span>
+       <span class="s0">(list (region-beginning) (region-end) current-prefix-arg)</span>
+     <span class="s0">(list (line-beginning-position) (line-end-position) current-prefix-arg)))</span>
+  <span class="s0">(if count</span>
+      <span class="s0">(setq count (prefix-numeric-value count))</span>
+    <span class="s0">(setq count kivy-indent-offset))</span>
+  <span class="s0">(when (&gt; count 0)</span>
+    <span class="s0">(let ((deactivate-mark nil))</span>
+      <span class="s0">(save-excursion</span>
+        <span class="s0">(goto-char start)</span>
+        <span class="s0">(while (&lt; (point) end)</span>
+          <span class="s0">(if (and (&lt; (current-indentation) count)</span>
+                   <span class="s0">(not (looking-at &quot;[ \t]*$&quot;)))</span>
+              <span class="s0">(error &quot;Can't shift all lines enough&quot;))</span>
+          <span class="s0">(forward-line))</span>
+        <span class="s0">(indent-rigidly start end (- count))))))</span>
+
+<span class="s0">(defun kivy-indent-shift-right (start end &amp;optional count)</span>
+  <span class="s0">&quot;Shift lines contained in region START END by COUNT columns to the left.</span>
+<span class="s0">COUNT defaults to `kivy-indent-offset'.  If region isn't</span>
+<span class="s0">active, the current line is shifted.  The shifted region includes</span>
+<span class="s0">the lines in which START and END lie.&quot;</span>
+  <span class="s0">(interactive</span>
+   <span class="s0">(if mark-active</span>
+       <span class="s0">(list (region-beginning) (region-end) current-prefix-arg)</span>
+     <span class="s0">(list (line-beginning-position) (line-end-position) current-prefix-arg)))</span>
+  <span class="s0">(let ((deactivate-mark nil))</span>
+    <span class="s0">(if count</span>
+        <span class="s0">(setq count (prefix-numeric-value count))</span>
+      <span class="s0">(setq count kivy-indent-offset))</span>
+    <span class="s0">(indent-rigidly start end count)))</span>
+
+<span class="s0">(provide 'kivy-mode)</span>
+
+<span class="s0">;;; kivy-mode.el ends here</span>
+</pre>
+</body>
+</html>

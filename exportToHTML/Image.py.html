@@ -1,0 +1,551 @@
+<html>
+<head>
+<title>image.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #cf8e6d;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+image.py</font>
+</center></td></tr></table>
+<pre><span class="s0">''' 
+Image 
+===== 
+ 
+The :class:`Image` widget is used to display an image:: 
+ 
+Example in python:: 
+ 
+    wimg = Image(source='mylogo.png') 
+ 
+Kv Example:: 
+ 
+    Image: 
+        source: 'mylogo.png' 
+        size: self.texture_size 
+ 
+ 
+Asynchronous Loading 
+-------------------- 
+ 
+To load an image asynchronously (for example from an external webserver), use 
+the :class:`AsyncImage` subclass:: 
+ 
+    aimg = AsyncImage(source='http://mywebsite.com/logo.png') 
+ 
+This can be useful as it prevents your application from waiting until the image 
+is loaded. If you want to display large images or retrieve them from URL's, 
+using :class:`AsyncImage` will allow these resources to be retrieved on a 
+background thread without blocking your application. 
+ 
+Alignment 
+--------- 
+ 
+By default, the image is centered inside the widget bounding box. 
+ 
+Adjustment 
+---------- 
+ 
+To control how the image should be adjusted to fit inside the widget box, you 
+should use the :attr:`~kivy.uix.image.Image.fit_mode` property. Available 
+options include: 
+ 
+- ``&quot;scale-down&quot;``: maintains aspect ratio without stretching. 
+- ``&quot;fill&quot;``: stretches to fill widget, may cause distortion. 
+- ``&quot;contain&quot;``: maintains aspect ratio and resizes to fit inside widget. 
+- ``&quot;cover&quot;``: maintains aspect ratio and stretches to fill widget, may clip 
+image. 
+ 
+For more details, refer to the :attr:`~kivy.uix.image.Image.fit_mode`. 
+ 
+ 
+You can also inherit from Image and create your own style. For example, if you 
+want your image to be greater than the size of your widget, you could do:: 
+ 
+    class FullImage(Image): 
+        pass 
+ 
+And in your kivy language file:: 
+ 
+    &lt;-FullImage&gt;: 
+        canvas: 
+            Color: 
+                rgb: (1, 1, 1) 
+            Rectangle: 
+                texture: self.texture 
+                size: self.width + 20, self.height + 20 
+                pos: self.x - 10, self.y - 10 
+ 
+'''</span>
+<span class="s1">__all__ </span><span class="s2">= (</span><span class="s3">'Image'</span><span class="s2">, </span><span class="s3">'AsyncImage'</span><span class="s2">)</span>
+
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">uix</span><span class="s2">.</span><span class="s1">widget </span><span class="s4">import </span><span class="s1">Widget</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">image </span><span class="s4">import </span><span class="s1">Image </span><span class="s4">as </span><span class="s1">CoreImage</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">resources </span><span class="s4">import </span><span class="s1">resource_find</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">properties </span><span class="s4">import </span><span class="s2">(</span>
+    <span class="s1">StringProperty</span><span class="s2">,</span>
+    <span class="s1">ObjectProperty</span><span class="s2">,</span>
+    <span class="s1">ListProperty</span><span class="s2">,</span>
+    <span class="s1">AliasProperty</span><span class="s2">,</span>
+    <span class="s1">BooleanProperty</span><span class="s2">,</span>
+    <span class="s1">NumericProperty</span><span class="s2">,</span>
+    <span class="s1">ColorProperty</span><span class="s2">,</span>
+    <span class="s1">OptionProperty</span>
+<span class="s2">)</span>
+<span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">logger </span><span class="s4">import </span><span class="s1">Logger</span>
+
+<span class="s5"># delayed imports</span>
+<span class="s1">Loader </span><span class="s2">= </span><span class="s4">None</span>
+
+
+<span class="s4">class </span><span class="s1">Image</span><span class="s2">(</span><span class="s1">Widget</span><span class="s2">):</span>
+    <span class="s0">'''Image class, see module documentation for more information.'''</span>
+
+    <span class="s1">source </span><span class="s2">= </span><span class="s1">StringProperty</span><span class="s2">(</span><span class="s4">None</span><span class="s2">)</span>
+    <span class="s3">'''Filename / source of your image. 
+ 
+    :attr:`source` is a :class:`~kivy.properties.StringProperty` and 
+    defaults to None. 
+    '''</span>
+
+    <span class="s1">texture </span><span class="s2">= </span><span class="s1">ObjectProperty</span><span class="s2">(</span><span class="s4">None</span><span class="s2">, </span><span class="s1">allownone</span><span class="s2">=</span><span class="s4">True</span><span class="s2">)</span>
+    <span class="s3">'''Texture object of the image. The texture represents the original, loaded 
+    image texture. It is stretched and positioned during rendering according to 
+    the :attr:`fit_mode` property. 
+ 
+    Depending of the texture creation, the value will be a 
+    :class:`~kivy.graphics.texture.Texture` or a 
+    :class:`~kivy.graphics.texture.TextureRegion` object. 
+ 
+    :attr:`texture` is an :class:`~kivy.properties.ObjectProperty` and defaults 
+    to None. 
+    '''</span>
+
+    <span class="s1">texture_size </span><span class="s2">= </span><span class="s1">ListProperty</span><span class="s2">([</span><span class="s6">0</span><span class="s2">, </span><span class="s6">0</span><span class="s2">])</span>
+    <span class="s3">'''Texture size of the image. This represents the original, loaded image 
+    texture size. 
+ 
+    .. warning:: 
+ 
+        The texture size is set after the texture property. So if you listen to 
+        the change on :attr:`texture`, the property texture_size will not be 
+        up-to-date. Use self.texture.size instead. 
+    '''</span>
+
+    <span class="s4">def </span><span class="s1">get_image_ratio</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">texture</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">texture</span><span class="s2">.</span><span class="s1">width </span><span class="s2">/ </span><span class="s1">float</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">texture</span><span class="s2">.</span><span class="s1">height</span><span class="s2">)</span>
+        <span class="s4">return </span><span class="s6">1.0</span>
+
+    <span class="s1">mipmap </span><span class="s2">= </span><span class="s1">BooleanProperty</span><span class="s2">(</span><span class="s4">False</span><span class="s2">)</span>
+    <span class="s3">'''Indicate if you want OpenGL mipmapping to be applied to the texture. 
+    Read :ref:`mipmap` for more information. 
+ 
+    .. versionadded:: 1.0.7 
+ 
+    :attr:`mipmap` is a :class:`~kivy.properties.BooleanProperty` and defaults 
+    to False. 
+    '''</span>
+
+    <span class="s1">image_ratio </span><span class="s2">= </span><span class="s1">AliasProperty</span><span class="s2">(</span><span class="s1">get_image_ratio</span><span class="s2">, </span><span class="s1">bind</span><span class="s2">=(</span><span class="s3">'texture'</span><span class="s2">,), </span><span class="s1">cache</span><span class="s2">=</span><span class="s4">True</span><span class="s2">)</span>
+    <span class="s3">'''Ratio of the image (width / float(height). 
+ 
+    :attr:`image_ratio` is an :class:`~kivy.properties.AliasProperty` and is 
+    read-only. 
+    '''</span>
+
+    <span class="s1">color </span><span class="s2">= </span><span class="s1">ColorProperty</span><span class="s2">([</span><span class="s6">1</span><span class="s2">, </span><span class="s6">1</span><span class="s2">, </span><span class="s6">1</span><span class="s2">, </span><span class="s6">1</span><span class="s2">])</span>
+    <span class="s3">'''Image color, in the format (r, g, b, a). This attribute can be used to 
+    'tint' an image. Be careful: if the source image is not gray/white, the 
+    color will not really work as expected. 
+ 
+    .. versionadded:: 1.0.6 
+ 
+    :attr:`color` is a :class:`~kivy.properties.ColorProperty` and defaults to 
+    [1, 1, 1, 1]. 
+ 
+    .. versionchanged:: 2.0.0 
+        Changed from :class:`~kivy.properties.ListProperty` to 
+        :class:`~kivy.properties.ColorProperty`. 
+    '''</span>
+
+    <span class="s1">allow_stretch </span><span class="s2">= </span><span class="s1">BooleanProperty</span><span class="s2">(</span><span class="s4">False</span><span class="s2">, </span><span class="s1">deprecated</span><span class="s2">=</span><span class="s4">True</span><span class="s2">)</span>
+    <span class="s3">'''If True, the normalized image size will be maximized to fit in the image 
+    box. Otherwise, if the box is too tall, the image will not be 
+    stretched more than 1:1 pixels. 
+ 
+    .. versionadded:: 1.0.7 
+ 
+    .. deprecated:: 2.2.0 
+        :attr:`allow_stretch` have been deprecated. Please use `fit_mode` 
+        instead. 
+ 
+    :attr:`allow_stretch` is a :class:`~kivy.properties.BooleanProperty` and 
+    defaults to False. 
+    '''</span>
+
+    <span class="s1">keep_ratio </span><span class="s2">= </span><span class="s1">BooleanProperty</span><span class="s2">(</span><span class="s4">True</span><span class="s2">, </span><span class="s1">deprecated</span><span class="s2">=</span><span class="s4">True</span><span class="s2">)</span>
+    <span class="s3">'''If False along with allow_stretch being True, the normalized image 
+    size will be maximized to fit in the image box and ignores the aspect 
+    ratio of the image. 
+    Otherwise, if the box is too tall, the image will not be stretched more 
+    than 1:1 pixels. 
+ 
+    .. versionadded:: 1.0.8 
+ 
+    .. deprecated:: 2.2.0 
+        :attr:`keep_ratio` have been deprecated. Please use `fit_mode` 
+        instead. 
+ 
+    :attr:`keep_ratio` is a :class:`~kivy.properties.BooleanProperty` and 
+    defaults to True. 
+    '''</span>
+
+    <span class="s1">fit_mode </span><span class="s2">= </span><span class="s1">OptionProperty</span><span class="s2">(</span>
+        <span class="s3">&quot;scale-down&quot;</span><span class="s2">, </span><span class="s1">options</span><span class="s2">=[</span><span class="s3">&quot;scale-down&quot;</span><span class="s2">, </span><span class="s3">&quot;fill&quot;</span><span class="s2">, </span><span class="s3">&quot;contain&quot;</span><span class="s2">, </span><span class="s3">&quot;cover&quot;</span><span class="s2">]</span>
+    <span class="s2">)</span>
+    <span class="s3">'''If the size of the image is different than the size of the widget, 
+    determine how the image should be resized to fit inside the widget box. 
+ 
+    Available options: 
+ 
+    - ``&quot;scale-down&quot;``: the image will be scaled down to fit inside the widget 
+    box, **maintaining its aspect ratio and without stretching**. If the size 
+    of the image is smaller than the widget, it will be displayed at its 
+    original size. If the image has a different aspect ratio than the widget, 
+    there will be blank areas on the widget box. 
+ 
+    - ``&quot;fill&quot;``: the image is stretched to fill the widget, **regardless of 
+    its aspect ratio or dimensions**. If the image has a different aspect ratio 
+    than the widget, this option can lead to distortion of the image. 
+ 
+    - ``&quot;contain&quot;``: the image is resized to fit inside the widget box, 
+    **maintaining its aspect ratio**. If the image size is larger than the 
+    widget size, the behavior will be similar to ``&quot;scale-down&quot;``. However, if 
+    the size of the image is smaller than the widget size, unlike 
+    ``&quot;scale-down``, the image will be resized to fit inside the widget. 
+    If the image has a different aspect ratio than the widget, there will be 
+    blank areas on the widget box. 
+ 
+    - ``&quot;cover&quot;``: the image will be stretched horizontally or vertically to 
+    fill the widget box, **maintaining its aspect ratio**. If the image has a 
+    different aspect ratio than the widget, then the image will be clipped to 
+    fit. 
+ 
+    :attr:`fit_mode` is a :class:`~kivy.properties.OptionProperty` and 
+    defaults to ``&quot;scale-down&quot;``. 
+    '''</span>
+
+    <span class="s1">keep_data </span><span class="s2">= </span><span class="s1">BooleanProperty</span><span class="s2">(</span><span class="s4">False</span><span class="s2">)</span>
+    <span class="s3">'''If True, the underlying _coreimage will store the raw image data. 
+    This is useful when performing pixel based collision detection. 
+ 
+    .. versionadded:: 1.3.0 
+ 
+    :attr:`keep_data` is a :class:`~kivy.properties.BooleanProperty` and 
+    defaults to False. 
+    '''</span>
+
+    <span class="s1">anim_delay </span><span class="s2">= </span><span class="s1">NumericProperty</span><span class="s2">(</span><span class="s6">0.25</span><span class="s2">)</span>
+    <span class="s3">'''Delay the animation if the image is sequenced (like an animated gif). 
+    If anim_delay is set to -1, the animation will be stopped. 
+ 
+    .. versionadded:: 1.0.8 
+ 
+    :attr:`anim_delay` is a :class:`~kivy.properties.NumericProperty` and 
+    defaults to 0.25 (4 FPS). 
+    '''</span>
+
+    <span class="s1">anim_loop </span><span class="s2">= </span><span class="s1">NumericProperty</span><span class="s2">(</span><span class="s6">0</span><span class="s2">)</span>
+    <span class="s3">'''Number of loops to play then stop animating. 0 means keep animating. 
+ 
+    .. versionadded:: 1.9.0 
+ 
+    :attr:`anim_loop` is a :class:`~kivy.properties.NumericProperty` and 
+    defaults to 0. 
+    '''</span>
+
+    <span class="s1">nocache </span><span class="s2">= </span><span class="s1">BooleanProperty</span><span class="s2">(</span><span class="s4">False</span><span class="s2">)</span>
+    <span class="s3">'''If this property is set True, the image will not be added to the 
+    internal cache. The cache will simply ignore any calls trying to 
+    append the core image. 
+ 
+    .. versionadded:: 1.6.0 
+ 
+    :attr:`nocache` is a :class:`~kivy.properties.BooleanProperty` and defaults 
+    to False. 
+    '''</span>
+
+    <span class="s4">def </span><span class="s1">get_norm_image_size</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">texture</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s1">list</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">size</span><span class="s2">)</span>
+
+        <span class="s1">ratio </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">image_ratio</span>
+        <span class="s1">w</span><span class="s2">, </span><span class="s1">h </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">size</span>
+        <span class="s1">tw</span><span class="s2">, </span><span class="s1">th </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">texture</span><span class="s2">.</span><span class="s1">size</span>
+
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">fit_mode </span><span class="s2">== </span><span class="s3">&quot;cover&quot;</span><span class="s2">:</span>
+            <span class="s1">widget_ratio </span><span class="s2">= </span><span class="s1">w </span><span class="s2">/ </span><span class="s1">max</span><span class="s2">(</span><span class="s6">1</span><span class="s2">, </span><span class="s1">h</span><span class="s2">)</span>
+            <span class="s4">if </span><span class="s1">widget_ratio </span><span class="s2">&gt; </span><span class="s1">ratio</span><span class="s2">:</span>
+                <span class="s4">return </span><span class="s2">[</span><span class="s1">w</span><span class="s2">, (</span><span class="s1">w </span><span class="s2">* </span><span class="s1">th</span><span class="s2">) / </span><span class="s1">tw</span><span class="s2">]</span>
+            <span class="s4">else</span><span class="s2">:</span>
+                <span class="s4">return </span><span class="s2">[(</span><span class="s1">h </span><span class="s2">* </span><span class="s1">tw</span><span class="s2">) / </span><span class="s1">th</span><span class="s2">, </span><span class="s1">h</span><span class="s2">]</span>
+        <span class="s4">elif </span><span class="s1">self</span><span class="s2">.</span><span class="s1">fit_mode </span><span class="s2">== </span><span class="s3">&quot;fill&quot;</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s2">[</span><span class="s1">w</span><span class="s2">, </span><span class="s1">h</span><span class="s2">]</span>
+        <span class="s4">elif </span><span class="s1">self</span><span class="s2">.</span><span class="s1">fit_mode </span><span class="s2">== </span><span class="s3">&quot;contain&quot;</span><span class="s2">:</span>
+            <span class="s1">iw </span><span class="s2">= </span><span class="s1">w</span>
+        <span class="s4">else</span><span class="s2">:</span>
+            <span class="s1">iw </span><span class="s2">= </span><span class="s1">min</span><span class="s2">(</span><span class="s1">w</span><span class="s2">, </span><span class="s1">tw</span><span class="s2">)</span>
+
+        <span class="s5"># calculate the appropriate height</span>
+        <span class="s1">ih </span><span class="s2">= </span><span class="s1">iw </span><span class="s2">/ </span><span class="s1">ratio</span>
+        <span class="s5"># if the height is too higher, take the height of the container</span>
+        <span class="s5"># and calculate appropriate width. no need to test further. :)</span>
+        <span class="s4">if </span><span class="s1">ih </span><span class="s2">&gt; </span><span class="s1">h</span><span class="s2">:</span>
+            <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">fit_mode </span><span class="s2">== </span><span class="s3">&quot;contain&quot;</span><span class="s2">:</span>
+                <span class="s1">ih </span><span class="s2">= </span><span class="s1">h</span>
+            <span class="s4">else</span><span class="s2">:</span>
+                <span class="s1">ih </span><span class="s2">= </span><span class="s1">min</span><span class="s2">(</span><span class="s1">h</span><span class="s2">, </span><span class="s1">th</span><span class="s2">)</span>
+            <span class="s1">iw </span><span class="s2">= </span><span class="s1">ih </span><span class="s2">* </span><span class="s1">ratio</span>
+        <span class="s4">return </span><span class="s2">[</span><span class="s1">iw</span><span class="s2">, </span><span class="s1">ih</span><span class="s2">]</span>
+
+    <span class="s1">norm_image_size </span><span class="s2">= </span><span class="s1">AliasProperty</span><span class="s2">(</span>
+        <span class="s1">get_norm_image_size</span><span class="s2">,</span>
+        <span class="s1">bind</span><span class="s2">=(</span>
+            <span class="s3">'texture'</span><span class="s2">,</span>
+            <span class="s3">'size'</span><span class="s2">,</span>
+            <span class="s3">'image_ratio'</span><span class="s2">,</span>
+            <span class="s3">'fit_mode'</span><span class="s2">,</span>
+        <span class="s2">),</span>
+        <span class="s1">cache</span><span class="s2">=</span><span class="s4">True</span><span class="s2">,</span>
+    <span class="s2">)</span>
+    <span class="s3">'''Normalized image size within the widget box. 
+ 
+    This size will always fit the widget size and will preserve the image 
+    ratio. 
+ 
+    :attr:`norm_image_size` is an :class:`~kivy.properties.AliasProperty` and 
+    is read-only. 
+    '''</span>
+
+    <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_loops </span><span class="s2">= </span><span class="s6">0</span>
+        <span class="s1">update </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">texture_update</span>
+        <span class="s1">fbind </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">fbind</span>
+        <span class="s1">fbind</span><span class="s2">(</span><span class="s3">'source'</span><span class="s2">, </span><span class="s1">update</span><span class="s2">)</span>
+        <span class="s1">fbind</span><span class="s2">(</span><span class="s3">'mipmap'</span><span class="s2">, </span><span class="s1">update</span><span class="s2">)</span>
+
+        <span class="s5"># NOTE: Compatibility code due to deprecated properties.</span>
+        <span class="s1">fbind</span><span class="s2">(</span><span class="s3">'keep_ratio'</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_update_fit_mode</span><span class="s2">)</span>
+        <span class="s1">fbind</span><span class="s2">(</span><span class="s3">'allow_stretch'</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_update_fit_mode</span><span class="s2">)</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">(**</span><span class="s1">kwargs</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">_update_fit_mode</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">):</span>
+        <span class="s1">keep_ratio </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">keep_ratio</span>
+        <span class="s1">allow_stretch </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">allow_stretch</span>
+        <span class="s4">if </span><span class="s2">(</span>
+            <span class="s4">not </span><span class="s1">keep_ratio </span><span class="s4">and not </span><span class="s1">allow_stretch</span>
+            <span class="s4">or </span><span class="s1">keep_ratio </span><span class="s4">and not </span><span class="s1">allow_stretch</span>
+        <span class="s2">):</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">fit_mode </span><span class="s2">= </span><span class="s3">&quot;scale-down&quot;</span>
+        <span class="s4">elif not </span><span class="s1">keep_ratio </span><span class="s4">and </span><span class="s1">allow_stretch</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">fit_mode </span><span class="s2">= </span><span class="s3">&quot;fill&quot;</span>
+        <span class="s4">elif </span><span class="s1">keep_ratio </span><span class="s4">and </span><span class="s1">allow_stretch</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">fit_mode </span><span class="s2">= </span><span class="s3">&quot;contain&quot;</span>
+
+    <span class="s4">def </span><span class="s1">texture_update</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">largs</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">set_texture_from_resource</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">source</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">set_texture_from_resource</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">resource</span><span class="s2">):</span>
+        <span class="s4">if not </span><span class="s1">resource</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_clear_core_image</span><span class="s2">()</span>
+            <span class="s4">return</span>
+        <span class="s1">source </span><span class="s2">= </span><span class="s1">resource_find</span><span class="s2">(</span><span class="s1">resource</span><span class="s2">)</span>
+        <span class="s4">if not </span><span class="s1">source</span><span class="s2">:</span>
+            <span class="s1">Logger</span><span class="s2">.</span><span class="s1">error</span><span class="s2">(</span><span class="s3">'Image: Not found &lt;%s&gt;' </span><span class="s2">% </span><span class="s1">resource</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_clear_core_image</span><span class="s2">()</span>
+            <span class="s4">return</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage</span><span class="s2">.</span><span class="s1">unbind</span><span class="s2">(</span><span class="s1">on_texture</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_on_tex_change</span><span class="s2">)</span>
+        <span class="s4">try</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage </span><span class="s2">= </span><span class="s1">image </span><span class="s2">= </span><span class="s1">CoreImage</span><span class="s2">(</span>
+                <span class="s1">source</span><span class="s2">,</span>
+                <span class="s1">mipmap</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">mipmap</span><span class="s2">,</span>
+                <span class="s1">anim_delay</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">anim_delay</span><span class="s2">,</span>
+                <span class="s1">keep_data</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">keep_data</span><span class="s2">,</span>
+                <span class="s1">nocache</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">nocache</span>
+            <span class="s2">)</span>
+        <span class="s4">except </span><span class="s1">Exception</span><span class="s2">:</span>
+            <span class="s1">Logger</span><span class="s2">.</span><span class="s1">error</span><span class="s2">(</span><span class="s3">'Image: Error loading &lt;%s&gt;' </span><span class="s2">% </span><span class="s1">resource</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_clear_core_image</span><span class="s2">()</span>
+            <span class="s1">image </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage</span>
+        <span class="s4">if </span><span class="s1">image</span><span class="s2">:</span>
+            <span class="s1">image</span><span class="s2">.</span><span class="s1">bind</span><span class="s2">(</span><span class="s1">on_texture</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_on_tex_change</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">texture </span><span class="s2">= </span><span class="s1">image</span><span class="s2">.</span><span class="s1">texture</span>
+
+    <span class="s4">def </span><span class="s1">on_anim_delay</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">instance</span><span class="s2">, </span><span class="s1">value</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage </span><span class="s4">is None</span><span class="s2">:</span>
+            <span class="s4">return</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage</span><span class="s2">.</span><span class="s1">anim_delay </span><span class="s2">= </span><span class="s1">value</span>
+        <span class="s4">if </span><span class="s1">value </span><span class="s2">&lt; </span><span class="s6">0</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage</span><span class="s2">.</span><span class="s1">anim_reset</span><span class="s2">(</span><span class="s4">False</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">on_texture</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">instance</span><span class="s2">, </span><span class="s1">value</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">texture_size </span><span class="s2">= </span><span class="s1">value</span><span class="s2">.</span><span class="s1">size </span><span class="s4">if </span><span class="s1">value </span><span class="s4">else </span><span class="s2">[</span><span class="s6">0</span><span class="s2">, </span><span class="s6">0</span><span class="s2">]</span>
+
+    <span class="s4">def </span><span class="s1">_clear_core_image</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage</span><span class="s2">.</span><span class="s1">unbind</span><span class="s2">(</span><span class="s1">on_texture</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_on_tex_change</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">texture </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_loops </span><span class="s2">= </span><span class="s6">0</span>
+
+    <span class="s4">def </span><span class="s1">_on_tex_change</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">largs</span><span class="s2">):</span>
+        <span class="s5"># update texture from core image</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">texture </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage</span><span class="s2">.</span><span class="s1">texture</span>
+        <span class="s1">ci </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">anim_loop </span><span class="s4">and </span><span class="s1">ci</span><span class="s2">.</span><span class="s1">_anim_index </span><span class="s2">== </span><span class="s1">len</span><span class="s2">(</span><span class="s1">ci</span><span class="s2">.</span><span class="s1">_image</span><span class="s2">.</span><span class="s1">textures</span><span class="s2">) - </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_loops </span><span class="s2">+= </span><span class="s6">1</span>
+            <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">anim_loop </span><span class="s2">== </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_loops</span><span class="s2">:</span>
+                <span class="s1">ci</span><span class="s2">.</span><span class="s1">anim_reset</span><span class="s2">(</span><span class="s4">False</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_loops </span><span class="s2">= </span><span class="s6">0</span>
+
+    <span class="s4">def </span><span class="s1">reload</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Reload image from disk. This facilitates re-loading of 
+        images from disk in case the image content changes. 
+ 
+        .. versionadded:: 1.3.0 
+ 
+        Usage:: 
+ 
+            im = Image(source = '1.jpg') 
+            # -- do something -- 
+            im.reload() 
+            # image will be re-loaded from disk 
+ 
+        '''</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">remove_from_cache</span><span class="s2">()</span>
+        <span class="s1">old_source </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">source</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">source </span><span class="s2">= </span><span class="s3">''</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">source </span><span class="s2">= </span><span class="s1">old_source</span>
+
+    <span class="s4">def </span><span class="s1">remove_from_cache</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">'''Remove image from cache. 
+ 
+        .. versionadded:: 2.0.0 
+        '''</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage</span><span class="s2">.</span><span class="s1">remove_from_cache</span><span class="s2">()</span>
+
+    <span class="s4">def </span><span class="s1">on_nocache</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">nocache</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">remove_from_cache</span><span class="s2">()</span>
+            <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage</span><span class="s2">.</span><span class="s1">_nocache </span><span class="s2">= </span><span class="s4">True</span>
+
+
+<span class="s4">class </span><span class="s1">AsyncImage</span><span class="s2">(</span><span class="s1">Image</span><span class="s2">):</span>
+    <span class="s0">'''Asynchronous Image class. See the module documentation for more 
+    information. 
+ 
+    .. note:: 
+ 
+        The AsyncImage is a specialized form of the Image class. You may 
+        want to refer to the :mod:`~kivy.loader` documentation and in 
+        particular, the :class:`~kivy.loader.ProxyImage` for more detail 
+        on how to handle events around asynchronous image loading. 
+ 
+    .. note:: 
+ 
+        AsyncImage currently does not support properties 
+        :attr:`anim_loop` and :attr:`mipmap` and setting those properties will 
+        have no effect. 
+    '''</span>
+
+    <span class="s1">__events__ </span><span class="s2">= (</span><span class="s3">'on_error'</span><span class="s2">, </span><span class="s3">'on_load'</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_found_source </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage </span><span class="s2">= </span><span class="s4">None</span>
+        <span class="s4">global </span><span class="s1">Loader</span>
+        <span class="s4">if not </span><span class="s1">Loader</span><span class="s2">:</span>
+            <span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">loader </span><span class="s4">import </span><span class="s1">Loader</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">fbind</span><span class="s2">(</span><span class="s3">'source'</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_load_source</span><span class="s2">)</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">(**</span><span class="s1">kwargs</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">_load_source</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">):</span>
+        <span class="s1">source </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">source</span>
+        <span class="s4">if not </span><span class="s1">source</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_clear_core_image</span><span class="s2">()</span>
+            <span class="s4">return</span>
+        <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">is_uri</span><span class="s2">(</span><span class="s1">source</span><span class="s2">):</span>
+            <span class="s1">source </span><span class="s2">= </span><span class="s1">resource_find</span><span class="s2">(</span><span class="s1">source</span><span class="s2">)</span>
+            <span class="s4">if not </span><span class="s1">source</span><span class="s2">:</span>
+                <span class="s1">Logger</span><span class="s2">.</span><span class="s1">error</span><span class="s2">(</span><span class="s3">'AsyncImage: Not found &lt;%s&gt;' </span><span class="s2">% </span><span class="s1">self</span><span class="s2">.</span><span class="s1">source</span><span class="s2">)</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_clear_core_image</span><span class="s2">()</span>
+                <span class="s4">return</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_found_source </span><span class="s2">= </span><span class="s1">source</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage </span><span class="s2">= </span><span class="s1">image </span><span class="s2">= </span><span class="s1">Loader</span><span class="s2">.</span><span class="s1">image</span><span class="s2">(</span>
+            <span class="s1">source</span><span class="s2">,</span>
+            <span class="s1">nocache</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">nocache</span><span class="s2">,</span>
+            <span class="s1">mipmap</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">mipmap</span><span class="s2">,</span>
+            <span class="s1">anim_delay</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">anim_delay</span>
+        <span class="s2">)</span>
+        <span class="s1">image</span><span class="s2">.</span><span class="s1">bind</span><span class="s2">(</span>
+            <span class="s1">on_load</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_on_source_load</span><span class="s2">,</span>
+            <span class="s1">on_error</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_on_source_error</span><span class="s2">,</span>
+            <span class="s1">on_texture</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_on_tex_change</span>
+        <span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">texture </span><span class="s2">= </span><span class="s1">image</span><span class="s2">.</span><span class="s1">texture</span>
+
+    <span class="s4">def </span><span class="s1">_on_source_load</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">value</span><span class="s2">):</span>
+        <span class="s1">image </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage</span><span class="s2">.</span><span class="s1">image</span>
+        <span class="s4">if not </span><span class="s1">image</span><span class="s2">:</span>
+            <span class="s4">return</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">texture </span><span class="s2">= </span><span class="s1">image</span><span class="s2">.</span><span class="s1">texture</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_load'</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">_on_source_error</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">instance</span><span class="s2">, </span><span class="s1">error</span><span class="s2">=</span><span class="s4">None</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_error'</span><span class="s2">, </span><span class="s1">error</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">on_error</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">error</span><span class="s2">):</span>
+        <span class="s4">pass</span>
+
+    <span class="s4">def </span><span class="s1">on_load</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">args</span><span class="s2">):</span>
+        <span class="s4">pass</span>
+
+    <span class="s4">def </span><span class="s1">is_uri</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">filename</span><span class="s2">):</span>
+        <span class="s1">proto </span><span class="s2">= </span><span class="s1">filename</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s3">'://'</span><span class="s2">, </span><span class="s6">1</span><span class="s2">)[</span><span class="s6">0</span><span class="s2">]</span>
+        <span class="s4">return </span><span class="s1">proto </span><span class="s4">in </span><span class="s2">(</span><span class="s3">'http'</span><span class="s2">, </span><span class="s3">'https'</span><span class="s2">, </span><span class="s3">'ftp'</span><span class="s2">, </span><span class="s3">'smb'</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">_clear_core_image</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage</span><span class="s2">.</span><span class="s1">unbind</span><span class="s2">(</span><span class="s1">on_load</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_on_source_load</span><span class="s2">)</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">_clear_core_image</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_found_source </span><span class="s2">= </span><span class="s4">None</span>
+
+    <span class="s4">def </span><span class="s1">_on_tex_change</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">largs</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">texture </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_coreimage</span><span class="s2">.</span><span class="s1">texture</span>
+
+    <span class="s4">def </span><span class="s1">texture_update</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, *</span><span class="s1">largs</span><span class="s2">):</span>
+        <span class="s4">pass</span>
+
+    <span class="s4">def </span><span class="s1">remove_from_cache</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_found_source</span><span class="s2">:</span>
+            <span class="s1">Loader</span><span class="s2">.</span><span class="s1">remove_from_cache</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_found_source</span><span class="s2">)</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">remove_from_cache</span><span class="s2">()</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,1022 @@
+<html>
+<head>
+<title>window_sdl2.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #5f826b; font-style: italic;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #cf8e6d;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+window_sdl2.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># found a way to include it more easily.</span>
+<span class="s2">''' 
+SDL2 Window 
+=========== 
+ 
+Windowing provider directly based on our own wrapped version of SDL. 
+ 
+TODO: 
+    - fix keys 
+    - support scrolling 
+    - clean code 
+    - manage correctly all sdl events 
+ 
+'''</span>
+
+<span class="s1">__all__ </span><span class="s3">= (</span><span class="s4">'WindowSDL'</span><span class="s3">, )</span>
+
+<span class="s5">from </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path </span><span class="s5">import </span><span class="s1">join</span>
+<span class="s5">import </span><span class="s1">sys</span>
+<span class="s5">from </span><span class="s1">typing </span><span class="s5">import </span><span class="s1">Optional</span>
+<span class="s5">from </span><span class="s1">kivy </span><span class="s5">import </span><span class="s1">kivy_data_dir</span>
+<span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">logger </span><span class="s5">import </span><span class="s1">Logger</span>
+<span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">base </span><span class="s5">import </span><span class="s1">EventLoop</span>
+<span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">clock </span><span class="s5">import </span><span class="s1">Clock</span>
+<span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">config </span><span class="s5">import </span><span class="s1">Config</span>
+<span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">window </span><span class="s5">import </span><span class="s1">WindowBase</span>
+<span class="s5">try</span><span class="s3">:</span>
+    <span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">window</span><span class="s3">.</span><span class="s1">_window_sdl2 </span><span class="s5">import </span><span class="s1">_WindowSDL2Storage</span>
+<span class="s5">except </span><span class="s1">ImportError</span><span class="s3">:</span>
+    <span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">core </span><span class="s5">import </span><span class="s1">handle_win_lib_import_error</span>
+    <span class="s1">handle_win_lib_import_error</span><span class="s3">(</span>
+        <span class="s4">'window'</span><span class="s3">, </span><span class="s4">'sdl2'</span><span class="s3">, </span><span class="s4">'kivy.core.window._window_sdl2'</span><span class="s3">)</span>
+    <span class="s5">raise</span>
+<span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">input</span><span class="s3">.</span><span class="s1">provider </span><span class="s5">import </span><span class="s1">MotionEventProvider</span>
+<span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">input</span><span class="s3">.</span><span class="s1">motionevent </span><span class="s5">import </span><span class="s1">MotionEvent</span>
+<span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">resources </span><span class="s5">import </span><span class="s1">resource_find</span>
+<span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">utils </span><span class="s5">import </span><span class="s1">platform</span><span class="s3">, </span><span class="s1">deprecated</span>
+<span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">compat </span><span class="s5">import </span><span class="s1">unichr</span>
+<span class="s5">from </span><span class="s1">collections </span><span class="s5">import </span><span class="s1">deque</span>
+
+
+<span class="s0"># SDL_keycode.h, https://wiki.libsdl.org/SDL_Keymod</span>
+<span class="s1">KMOD_NONE </span><span class="s3">= </span><span class="s6">0x0000</span>
+<span class="s1">KMOD_LSHIFT </span><span class="s3">= </span><span class="s6">0x0001</span>
+<span class="s1">KMOD_RSHIFT </span><span class="s3">= </span><span class="s6">0x0002</span>
+<span class="s1">KMOD_LCTRL </span><span class="s3">= </span><span class="s6">0x0040</span>
+<span class="s1">KMOD_RCTRL </span><span class="s3">= </span><span class="s6">0x0080</span>
+<span class="s1">KMOD_LALT </span><span class="s3">= </span><span class="s6">0x0100</span>
+<span class="s1">KMOD_RALT </span><span class="s3">= </span><span class="s6">0x0200</span>
+<span class="s1">KMOD_LGUI </span><span class="s3">= </span><span class="s6">0x0400</span>
+<span class="s1">KMOD_RGUI </span><span class="s3">= </span><span class="s6">0x0800</span>
+<span class="s1">KMOD_NUM </span><span class="s3">= </span><span class="s6">0x1000</span>
+<span class="s1">KMOD_CAPS </span><span class="s3">= </span><span class="s6">0x2000</span>
+<span class="s1">KMOD_MODE </span><span class="s3">= </span><span class="s6">0x4000</span>
+
+<span class="s1">SDLK_SHIFTL </span><span class="s3">= </span><span class="s6">1073742049</span>
+<span class="s1">SDLK_SHIFTR </span><span class="s3">= </span><span class="s6">1073742053</span>
+<span class="s1">SDLK_LCTRL </span><span class="s3">= </span><span class="s6">1073742048</span>
+<span class="s1">SDLK_RCTRL </span><span class="s3">= </span><span class="s6">1073742052</span>
+<span class="s1">SDLK_LALT </span><span class="s3">= </span><span class="s6">1073742050</span>
+<span class="s1">SDLK_RALT </span><span class="s3">= </span><span class="s6">1073742054</span>
+<span class="s1">SDLK_LEFT </span><span class="s3">= </span><span class="s6">1073741904</span>
+<span class="s1">SDLK_RIGHT </span><span class="s3">= </span><span class="s6">1073741903</span>
+<span class="s1">SDLK_UP </span><span class="s3">= </span><span class="s6">1073741906</span>
+<span class="s1">SDLK_DOWN </span><span class="s3">= </span><span class="s6">1073741905</span>
+<span class="s1">SDLK_HOME </span><span class="s3">= </span><span class="s6">1073741898</span>
+<span class="s1">SDLK_END </span><span class="s3">= </span><span class="s6">1073741901</span>
+<span class="s1">SDLK_PAGEUP </span><span class="s3">= </span><span class="s6">1073741899</span>
+<span class="s1">SDLK_PAGEDOWN </span><span class="s3">= </span><span class="s6">1073741902</span>
+<span class="s1">SDLK_SUPER </span><span class="s3">= </span><span class="s6">1073742051</span>
+<span class="s1">SDLK_CAPS </span><span class="s3">= </span><span class="s6">1073741881</span>
+<span class="s1">SDLK_INSERT </span><span class="s3">= </span><span class="s6">1073741897</span>
+<span class="s1">SDLK_KEYPADNUM </span><span class="s3">= </span><span class="s6">1073741907</span>
+<span class="s1">SDLK_KP_DIVIDE </span><span class="s3">= </span><span class="s6">1073741908</span>
+<span class="s1">SDLK_KP_MULTIPLY </span><span class="s3">= </span><span class="s6">1073741909</span>
+<span class="s1">SDLK_KP_MINUS </span><span class="s3">= </span><span class="s6">1073741910</span>
+<span class="s1">SDLK_KP_PLUS </span><span class="s3">= </span><span class="s6">1073741911</span>
+<span class="s1">SDLK_KP_ENTER </span><span class="s3">= </span><span class="s6">1073741912</span>
+<span class="s1">SDLK_KP_1 </span><span class="s3">= </span><span class="s6">1073741913</span>
+<span class="s1">SDLK_KP_2 </span><span class="s3">= </span><span class="s6">1073741914</span>
+<span class="s1">SDLK_KP_3 </span><span class="s3">= </span><span class="s6">1073741915</span>
+<span class="s1">SDLK_KP_4 </span><span class="s3">= </span><span class="s6">1073741916</span>
+<span class="s1">SDLK_KP_5 </span><span class="s3">= </span><span class="s6">1073741917</span>
+<span class="s1">SDLK_KP_6 </span><span class="s3">= </span><span class="s6">1073741918</span>
+<span class="s1">SDLK_KP_7 </span><span class="s3">= </span><span class="s6">1073741919</span>
+<span class="s1">SDLK_KP_8 </span><span class="s3">= </span><span class="s6">1073741920</span>
+<span class="s1">SDLK_KP_9 </span><span class="s3">= </span><span class="s6">1073741921</span>
+<span class="s1">SDLK_KP_0 </span><span class="s3">= </span><span class="s6">1073741922</span>
+<span class="s1">SDLK_KP_DOT </span><span class="s3">= </span><span class="s6">1073741923</span>
+<span class="s1">SDLK_F1 </span><span class="s3">= </span><span class="s6">1073741882</span>
+<span class="s1">SDLK_F2 </span><span class="s3">= </span><span class="s6">1073741883</span>
+<span class="s1">SDLK_F3 </span><span class="s3">= </span><span class="s6">1073741884</span>
+<span class="s1">SDLK_F4 </span><span class="s3">= </span><span class="s6">1073741885</span>
+<span class="s1">SDLK_F5 </span><span class="s3">= </span><span class="s6">1073741886</span>
+<span class="s1">SDLK_F6 </span><span class="s3">= </span><span class="s6">1073741887</span>
+<span class="s1">SDLK_F7 </span><span class="s3">= </span><span class="s6">1073741888</span>
+<span class="s1">SDLK_F8 </span><span class="s3">= </span><span class="s6">1073741889</span>
+<span class="s1">SDLK_F9 </span><span class="s3">= </span><span class="s6">1073741890</span>
+<span class="s1">SDLK_F10 </span><span class="s3">= </span><span class="s6">1073741891</span>
+<span class="s1">SDLK_F11 </span><span class="s3">= </span><span class="s6">1073741892</span>
+<span class="s1">SDLK_F12 </span><span class="s3">= </span><span class="s6">1073741893</span>
+<span class="s1">SDLK_F13 </span><span class="s3">= </span><span class="s6">1073741894</span>
+<span class="s1">SDLK_F14 </span><span class="s3">= </span><span class="s6">1073741895</span>
+<span class="s1">SDLK_F15 </span><span class="s3">= </span><span class="s6">1073741896</span>
+
+
+<span class="s5">class </span><span class="s1">SDL2MotionEvent</span><span class="s3">(</span><span class="s1">MotionEvent</span><span class="s3">):</span>
+
+    <span class="s5">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, *</span><span class="s1">args</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">):</span>
+        <span class="s1">kwargs</span><span class="s3">.</span><span class="s1">setdefault</span><span class="s3">(</span><span class="s4">'is_touch'</span><span class="s3">, </span><span class="s5">True</span><span class="s3">)</span>
+        <span class="s1">kwargs</span><span class="s3">.</span><span class="s1">setdefault</span><span class="s3">(</span><span class="s4">'type_id'</span><span class="s3">, </span><span class="s4">'touch'</span><span class="s3">)</span>
+        <span class="s1">super</span><span class="s3">().</span><span class="s1">__init__</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">profile </span><span class="s3">= (</span><span class="s4">'pos'</span><span class="s3">, </span><span class="s4">'pressure'</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">depack</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">args</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">sx</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">sy</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pressure </span><span class="s3">= </span><span class="s1">args</span>
+        <span class="s1">super</span><span class="s3">().</span><span class="s1">depack</span><span class="s3">(</span><span class="s1">args</span><span class="s3">)</span>
+
+
+<span class="s5">class </span><span class="s1">SDL2MotionEventProvider</span><span class="s3">(</span><span class="s1">MotionEventProvider</span><span class="s3">):</span>
+    <span class="s1">win </span><span class="s3">= </span><span class="s5">None</span>
+    <span class="s1">q </span><span class="s3">= </span><span class="s1">deque</span><span class="s3">()</span>
+    <span class="s1">touchmap </span><span class="s3">= {}</span>
+
+    <span class="s5">def </span><span class="s1">update</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">dispatch_fn</span><span class="s3">):</span>
+        <span class="s1">touchmap </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">touchmap</span>
+        <span class="s5">while True</span><span class="s3">:</span>
+            <span class="s5">try</span><span class="s3">:</span>
+                <span class="s1">value </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">q</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">()</span>
+            <span class="s5">except </span><span class="s1">IndexError</span><span class="s3">:</span>
+                <span class="s5">return</span>
+
+            <span class="s1">action</span><span class="s3">, </span><span class="s1">fid</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">pressure </span><span class="s3">= </span><span class="s1">value</span>
+            <span class="s1">y </span><span class="s3">= </span><span class="s6">1 </span><span class="s3">- </span><span class="s1">y</span>
+            <span class="s5">if </span><span class="s1">fid </span><span class="s5">not in </span><span class="s1">touchmap</span><span class="s3">:</span>
+                <span class="s1">touchmap</span><span class="s3">[</span><span class="s1">fid</span><span class="s3">] = </span><span class="s1">me </span><span class="s3">= </span><span class="s1">SDL2MotionEvent</span><span class="s3">(</span>
+                    <span class="s4">'sdl'</span><span class="s3">, </span><span class="s1">fid</span><span class="s3">, (</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">pressure</span><span class="s3">)</span>
+                <span class="s3">)</span>
+            <span class="s5">else</span><span class="s3">:</span>
+                <span class="s1">me </span><span class="s3">= </span><span class="s1">touchmap</span><span class="s3">[</span><span class="s1">fid</span><span class="s3">]</span>
+                <span class="s1">me</span><span class="s3">.</span><span class="s1">move</span><span class="s3">((</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">pressure</span><span class="s3">))</span>
+            <span class="s5">if </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'fingerdown'</span><span class="s3">:</span>
+                <span class="s1">dispatch_fn</span><span class="s3">(</span><span class="s4">'begin'</span><span class="s3">, </span><span class="s1">me</span><span class="s3">)</span>
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'fingerup'</span><span class="s3">:</span>
+                <span class="s1">me</span><span class="s3">.</span><span class="s1">update_time_end</span><span class="s3">()</span>
+                <span class="s1">dispatch_fn</span><span class="s3">(</span><span class="s4">'end'</span><span class="s3">, </span><span class="s1">me</span><span class="s3">)</span>
+                <span class="s5">del </span><span class="s1">touchmap</span><span class="s3">[</span><span class="s1">fid</span><span class="s3">]</span>
+            <span class="s5">else</span><span class="s3">:</span>
+                <span class="s1">dispatch_fn</span><span class="s3">(</span><span class="s4">'update'</span><span class="s3">, </span><span class="s1">me</span><span class="s3">)</span>
+
+
+<span class="s5">class </span><span class="s1">WindowSDL</span><span class="s3">(</span><span class="s1">WindowBase</span><span class="s3">):</span>
+
+    <span class="s1">_win_dpi_watch</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s4">'_WindowsSysDPIWatch'</span><span class="s3">] = </span><span class="s5">None</span>
+
+    <span class="s1">_do_resize_ev </span><span class="s3">= </span><span class="s5">None</span>
+
+    <span class="s1">managed_textinput </span><span class="s3">= </span><span class="s5">True</span>
+
+    <span class="s5">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_pause_loop </span><span class="s3">= </span><span class="s5">False</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_cursor_entered </span><span class="s3">= </span><span class="s5">False</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_drop_pos </span><span class="s3">= </span><span class="s5">None</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_win </span><span class="s3">= </span><span class="s1">_WindowSDL2Storage</span><span class="s3">()</span>
+        <span class="s1">super</span><span class="s3">(</span><span class="s1">WindowSDL</span><span class="s3">, </span><span class="s1">self</span><span class="s3">).</span><span class="s1">__init__</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">titlebar_widget </span><span class="s3">= </span><span class="s5">None</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_x </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_y </span><span class="s3">= -</span><span class="s6">1</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_meta_keys </span><span class="s3">= (</span>
+            <span class="s1">KMOD_LCTRL</span><span class="s3">, </span><span class="s1">KMOD_RCTRL</span><span class="s3">, </span><span class="s1">KMOD_RSHIFT</span><span class="s3">,</span>
+            <span class="s1">KMOD_LSHIFT</span><span class="s3">, </span><span class="s1">KMOD_RALT</span><span class="s3">, </span><span class="s1">KMOD_LALT</span><span class="s3">, </span><span class="s1">KMOD_LGUI</span><span class="s3">,</span>
+            <span class="s1">KMOD_RGUI</span><span class="s3">, </span><span class="s1">KMOD_NUM</span><span class="s3">, </span><span class="s1">KMOD_CAPS</span><span class="s3">, </span><span class="s1">KMOD_MODE</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">command_keys </span><span class="s3">= {</span>
+                    <span class="s6">27</span><span class="s3">: </span><span class="s4">'escape'</span><span class="s3">,</span>
+                    <span class="s6">9</span><span class="s3">: </span><span class="s4">'tab'</span><span class="s3">,</span>
+                    <span class="s6">8</span><span class="s3">: </span><span class="s4">'backspace'</span><span class="s3">,</span>
+                    <span class="s6">13</span><span class="s3">: </span><span class="s4">'enter'</span><span class="s3">,</span>
+                    <span class="s6">127</span><span class="s3">: </span><span class="s4">'del'</span><span class="s3">,</span>
+                    <span class="s6">271</span><span class="s3">: </span><span class="s4">'enter'</span><span class="s3">,</span>
+                    <span class="s6">273</span><span class="s3">: </span><span class="s4">'up'</span><span class="s3">,</span>
+                    <span class="s6">274</span><span class="s3">: </span><span class="s4">'down'</span><span class="s3">,</span>
+                    <span class="s6">275</span><span class="s3">: </span><span class="s4">'right'</span><span class="s3">,</span>
+                    <span class="s6">276</span><span class="s3">: </span><span class="s4">'left'</span><span class="s3">,</span>
+                    <span class="s6">278</span><span class="s3">: </span><span class="s4">'home'</span><span class="s3">,</span>
+                    <span class="s6">279</span><span class="s3">: </span><span class="s4">'end'</span><span class="s3">,</span>
+                    <span class="s6">280</span><span class="s3">: </span><span class="s4">'pgup'</span><span class="s3">,</span>
+                    <span class="s6">281</span><span class="s3">: </span><span class="s4">'pgdown'</span><span class="s3">}</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_buttons_down </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">key_map </span><span class="s3">= {</span><span class="s1">SDLK_LEFT</span><span class="s3">: </span><span class="s6">276</span><span class="s3">, </span><span class="s1">SDLK_RIGHT</span><span class="s3">: </span><span class="s6">275</span><span class="s3">, </span><span class="s1">SDLK_UP</span><span class="s3">: </span><span class="s6">273</span><span class="s3">,</span>
+                        <span class="s1">SDLK_DOWN</span><span class="s3">: </span><span class="s6">274</span><span class="s3">, </span><span class="s1">SDLK_HOME</span><span class="s3">: </span><span class="s6">278</span><span class="s3">, </span><span class="s1">SDLK_END</span><span class="s3">: </span><span class="s6">279</span><span class="s3">,</span>
+                        <span class="s1">SDLK_PAGEDOWN</span><span class="s3">: </span><span class="s6">281</span><span class="s3">, </span><span class="s1">SDLK_PAGEUP</span><span class="s3">: </span><span class="s6">280</span><span class="s3">, </span><span class="s1">SDLK_SHIFTR</span><span class="s3">: </span><span class="s6">303</span><span class="s3">,</span>
+                        <span class="s1">SDLK_SHIFTL</span><span class="s3">: </span><span class="s6">304</span><span class="s3">, </span><span class="s1">SDLK_SUPER</span><span class="s3">: </span><span class="s6">309</span><span class="s3">, </span><span class="s1">SDLK_LCTRL</span><span class="s3">: </span><span class="s6">305</span><span class="s3">,</span>
+                        <span class="s1">SDLK_RCTRL</span><span class="s3">: </span><span class="s6">306</span><span class="s3">, </span><span class="s1">SDLK_LALT</span><span class="s3">: </span><span class="s6">308</span><span class="s3">, </span><span class="s1">SDLK_RALT</span><span class="s3">: </span><span class="s6">307</span><span class="s3">,</span>
+                        <span class="s1">SDLK_CAPS</span><span class="s3">: </span><span class="s6">301</span><span class="s3">, </span><span class="s1">SDLK_INSERT</span><span class="s3">: </span><span class="s6">277</span><span class="s3">, </span><span class="s1">SDLK_F1</span><span class="s3">: </span><span class="s6">282</span><span class="s3">,</span>
+                        <span class="s1">SDLK_F2</span><span class="s3">: </span><span class="s6">283</span><span class="s3">, </span><span class="s1">SDLK_F3</span><span class="s3">: </span><span class="s6">284</span><span class="s3">, </span><span class="s1">SDLK_F4</span><span class="s3">: </span><span class="s6">285</span><span class="s3">, </span><span class="s1">SDLK_F5</span><span class="s3">: </span><span class="s6">286</span><span class="s3">,</span>
+                        <span class="s1">SDLK_F6</span><span class="s3">: </span><span class="s6">287</span><span class="s3">, </span><span class="s1">SDLK_F7</span><span class="s3">: </span><span class="s6">288</span><span class="s3">, </span><span class="s1">SDLK_F8</span><span class="s3">: </span><span class="s6">289</span><span class="s3">, </span><span class="s1">SDLK_F9</span><span class="s3">: </span><span class="s6">290</span><span class="s3">,</span>
+                        <span class="s1">SDLK_F10</span><span class="s3">: </span><span class="s6">291</span><span class="s3">, </span><span class="s1">SDLK_F11</span><span class="s3">: </span><span class="s6">292</span><span class="s3">, </span><span class="s1">SDLK_F12</span><span class="s3">: </span><span class="s6">293</span><span class="s3">,</span>
+                        <span class="s1">SDLK_F13</span><span class="s3">: </span><span class="s6">294</span><span class="s3">, </span><span class="s1">SDLK_F14</span><span class="s3">: </span><span class="s6">295</span><span class="s3">, </span><span class="s1">SDLK_F15</span><span class="s3">: </span><span class="s6">296</span><span class="s3">,</span>
+                        <span class="s1">SDLK_KEYPADNUM</span><span class="s3">: </span><span class="s6">300</span><span class="s3">, </span><span class="s1">SDLK_KP_DIVIDE</span><span class="s3">: </span><span class="s6">267</span><span class="s3">,</span>
+                        <span class="s1">SDLK_KP_MULTIPLY</span><span class="s3">: </span><span class="s6">268</span><span class="s3">, </span><span class="s1">SDLK_KP_MINUS</span><span class="s3">: </span><span class="s6">269</span><span class="s3">,</span>
+                        <span class="s1">SDLK_KP_PLUS</span><span class="s3">: </span><span class="s6">270</span><span class="s3">, </span><span class="s1">SDLK_KP_ENTER</span><span class="s3">: </span><span class="s6">271</span><span class="s3">,</span>
+                        <span class="s1">SDLK_KP_DOT</span><span class="s3">: </span><span class="s6">266</span><span class="s3">, </span><span class="s1">SDLK_KP_0</span><span class="s3">: </span><span class="s6">256</span><span class="s3">, </span><span class="s1">SDLK_KP_1</span><span class="s3">: </span><span class="s6">257</span><span class="s3">,</span>
+                        <span class="s1">SDLK_KP_2</span><span class="s3">: </span><span class="s6">258</span><span class="s3">, </span><span class="s1">SDLK_KP_3</span><span class="s3">: </span><span class="s6">259</span><span class="s3">, </span><span class="s1">SDLK_KP_4</span><span class="s3">: </span><span class="s6">260</span><span class="s3">,</span>
+                        <span class="s1">SDLK_KP_5</span><span class="s3">: </span><span class="s6">261</span><span class="s3">, </span><span class="s1">SDLK_KP_6</span><span class="s3">: </span><span class="s6">262</span><span class="s3">, </span><span class="s1">SDLK_KP_7</span><span class="s3">: </span><span class="s6">263</span><span class="s3">,</span>
+                        <span class="s1">SDLK_KP_8</span><span class="s3">: </span><span class="s6">264</span><span class="s3">, </span><span class="s1">SDLK_KP_9</span><span class="s3">: </span><span class="s6">265</span><span class="s3">}</span>
+        <span class="s5">if </span><span class="s1">platform </span><span class="s3">== </span><span class="s4">'ios'</span><span class="s3">:</span>
+            <span class="s0"># XXX ios keyboard suck, when backspace is hit, the delete</span>
+            <span class="s0"># keycode is sent. fix it.</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">key_map</span><span class="s3">[</span><span class="s6">127</span><span class="s3">] = </span><span class="s6">8</span>
+        <span class="s5">elif </span><span class="s1">platform </span><span class="s3">== </span><span class="s4">'android'</span><span class="s3">:</span>
+            <span class="s0"># map android back button to escape</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">key_map</span><span class="s3">[</span><span class="s6">1073742094</span><span class="s3">] = </span><span class="s6">27</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">bind</span><span class="s3">(</span><span class="s1">minimum_width</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_set_minimum_size</span><span class="s3">,</span>
+                  <span class="s1">minimum_height</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_set_minimum_size</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">bind</span><span class="s3">(</span><span class="s1">allow_screensaver</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_set_allow_screensaver</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">bind</span><span class="s3">(</span><span class="s1">always_on_top</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_set_always_on_top</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">get_window_info</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">get_window_info</span><span class="s3">()</span>
+
+    <span class="s5">def </span><span class="s1">_set_minimum_size</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, *</span><span class="s1">args</span><span class="s3">):</span>
+        <span class="s1">minimum_width </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">minimum_width</span>
+        <span class="s1">minimum_height </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">minimum_height</span>
+        <span class="s5">if </span><span class="s1">minimum_width </span><span class="s5">and </span><span class="s1">minimum_height</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">set_minimum_size</span><span class="s3">(</span><span class="s1">minimum_width</span><span class="s3">, </span><span class="s1">minimum_height</span><span class="s3">)</span>
+        <span class="s5">elif </span><span class="s1">minimum_width </span><span class="s5">or </span><span class="s1">minimum_height</span><span class="s3">:</span>
+            <span class="s1">Logger</span><span class="s3">.</span><span class="s1">warning</span><span class="s3">(</span>
+                <span class="s4">'Both Window.minimum_width and Window.minimum_height must be '</span>
+                <span class="s4">'bigger than 0 for the size restriction to take effect.'</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">_set_always_on_top</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, *</span><span class="s1">args</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">set_always_on_top</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">always_on_top</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">_set_allow_screensaver</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, *</span><span class="s1">args</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">set_allow_screensaver</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">allow_screensaver</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">_event_filter</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">action</span><span class="s3">, *</span><span class="s1">largs</span><span class="s3">):</span>
+        <span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">app </span><span class="s5">import </span><span class="s1">App</span>
+        <span class="s5">if </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'app_terminating'</span><span class="s3">:</span>
+            <span class="s1">EventLoop</span><span class="s3">.</span><span class="s1">quit </span><span class="s3">= </span><span class="s5">True</span>
+
+        <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'app_lowmemory'</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_memorywarning'</span><span class="s3">)</span>
+
+        <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'app_willenterbackground'</span><span class="s3">:</span>
+            <span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">base </span><span class="s5">import </span><span class="s1">stopTouchApp</span>
+            <span class="s1">app </span><span class="s3">= </span><span class="s1">App</span><span class="s3">.</span><span class="s1">get_running_app</span><span class="s3">()</span>
+            <span class="s5">if not </span><span class="s1">app</span><span class="s3">:</span>
+                <span class="s1">Logger</span><span class="s3">.</span><span class="s1">info</span><span class="s3">(</span><span class="s4">'WindowSDL: No running App found, pause.'</span><span class="s3">)</span>
+
+            <span class="s5">elif not </span><span class="s1">app</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_pause'</span><span class="s3">):</span>
+                <span class="s5">if </span><span class="s1">platform </span><span class="s3">== </span><span class="s4">'android'</span><span class="s3">:</span>
+                    <span class="s1">Logger</span><span class="s3">.</span><span class="s1">info</span><span class="s3">(</span>
+                        <span class="s4">'WindowSDL: App stopped, on_pause() returned False.'</span><span class="s3">)</span>
+                    <span class="s5">from </span><span class="s1">android </span><span class="s5">import </span><span class="s1">mActivity</span>
+                    <span class="s1">mActivity</span><span class="s3">.</span><span class="s1">finishAndRemoveTask</span><span class="s3">()</span>
+                <span class="s5">else</span><span class="s3">:</span>
+                    <span class="s1">Logger</span><span class="s3">.</span><span class="s1">info</span><span class="s3">(</span>
+                        <span class="s4">'WindowSDL: App doesn</span><span class="s5">\'</span><span class="s4">t support pause mode, stop.'</span><span class="s3">)</span>
+                    <span class="s1">stopTouchApp</span><span class="s3">()</span>
+                    <span class="s5">return </span><span class="s6">0</span>
+
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_pause_loop </span><span class="s3">= </span><span class="s5">True</span>
+
+        <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'app_didenterforeground'</span><span class="s3">:</span>
+            <span class="s0"># on iOS, the did enter foreground is launched at the start</span>
+            <span class="s0"># of the application. in our case, we want it only when the app</span>
+            <span class="s0"># is resumed</span>
+            <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pause_loop</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_pause_loop </span><span class="s3">= </span><span class="s5">False</span>
+                <span class="s1">app </span><span class="s3">= </span><span class="s1">App</span><span class="s3">.</span><span class="s1">get_running_app</span><span class="s3">()</span>
+                <span class="s5">if </span><span class="s1">app</span><span class="s3">:</span>
+                    <span class="s1">app</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_resume'</span><span class="s3">)</span>
+
+        <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'windowresized'</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_size </span><span class="s3">= </span><span class="s1">largs</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">resize_window</span><span class="s3">(*</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_size</span><span class="s3">)</span>
+            <span class="s0"># Force kivy to render the frame now, so that the canvas is drawn.</span>
+            <span class="s1">EventLoop</span><span class="s3">.</span><span class="s1">idle</span><span class="s3">()</span>
+
+        <span class="s5">return </span><span class="s6">0</span>
+
+    <span class="s5">def </span><span class="s1">create_window</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, *</span><span class="s1">largs</span><span class="s3">):</span>
+        <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fake_fullscreen</span><span class="s3">:</span>
+            <span class="s5">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">borderless</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">fullscreen </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fake_fullscreen </span><span class="s3">= </span><span class="s5">False</span>
+            <span class="s5">elif not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fullscreen </span><span class="s5">or </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fullscreen </span><span class="s3">== </span><span class="s4">'auto'</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">custom_titlebar </span><span class="s3">= </span><span class="s1">\</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">borderless </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fake_fullscreen </span><span class="s3">= </span><span class="s5">False</span>
+            <span class="s5">elif </span><span class="s1">self</span><span class="s3">.</span><span class="s1">custom_titlebar</span><span class="s3">:</span>
+                <span class="s5">if </span><span class="s1">platform </span><span class="s3">== </span><span class="s4">'win'</span><span class="s3">:</span>
+                    <span class="s0"># use custom behavior</span>
+                    <span class="s0"># To handle aero snapping and rounded corners</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">borderless </span><span class="s3">= </span><span class="s5">False</span>
+        <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fullscreen </span><span class="s3">== </span><span class="s4">'fake'</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">borderless </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fake_fullscreen </span><span class="s3">= </span><span class="s5">True</span>
+            <span class="s1">Logger</span><span class="s3">.</span><span class="s1">warning</span><span class="s3">(</span><span class="s4">&quot;The 'fake' fullscreen option has been &quot;</span>
+                           <span class="s4">&quot;deprecated, use Window.borderless or the &quot;</span>
+                           <span class="s4">&quot;borderless Config option instead.&quot;</span><span class="s3">)</span>
+
+        <span class="s5">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">initialized</span><span class="s3">:</span>
+            <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">position </span><span class="s3">== </span><span class="s4">'auto'</span><span class="s3">:</span>
+                <span class="s1">pos </span><span class="s3">= </span><span class="s5">None</span><span class="s3">, </span><span class="s5">None</span>
+            <span class="s5">elif </span><span class="s1">self</span><span class="s3">.</span><span class="s1">position </span><span class="s3">== </span><span class="s4">'custom'</span><span class="s3">:</span>
+                <span class="s1">pos </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">left</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">top</span>
+
+            <span class="s0"># ensure we have an event filter</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">set_event_filter</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_event_filter</span><span class="s3">)</span>
+
+            <span class="s0"># setup window</span>
+            <span class="s1">w</span><span class="s3">, </span><span class="s1">h </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">system_size</span>
+            <span class="s1">resizable </span><span class="s3">= </span><span class="s1">Config</span><span class="s3">.</span><span class="s1">getboolean</span><span class="s3">(</span><span class="s4">'graphics'</span><span class="s3">, </span><span class="s4">'resizable'</span><span class="s3">)</span>
+            <span class="s1">state </span><span class="s3">= (</span><span class="s1">Config</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s4">'graphics'</span><span class="s3">, </span><span class="s4">'window_state'</span><span class="s3">)</span>
+                     <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_is_desktop </span><span class="s5">else None</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">system_size </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">setup_window</span><span class="s3">(</span>
+                <span class="s1">pos</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">pos</span><span class="s3">[</span><span class="s6">1</span><span class="s3">], </span><span class="s1">w</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">borderless</span><span class="s3">,</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">fullscreen</span><span class="s3">, </span><span class="s1">resizable</span><span class="s3">, </span><span class="s1">state</span><span class="s3">,</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">get_gl_backend_name</span><span class="s3">())</span>
+
+            <span class="s0"># We don't have a density or dpi yet set, so let's ask for an update</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_update_density_and_dpi</span><span class="s3">()</span>
+
+            <span class="s0"># never stay with a None pos, application using w.center</span>
+            <span class="s0"># will be fired.</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_pos </span><span class="s3">= (</span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_set_minimum_size</span><span class="s3">()</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_set_allow_screensaver</span><span class="s3">()</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_set_always_on_top</span><span class="s3">()</span>
+
+            <span class="s5">if </span><span class="s1">state </span><span class="s3">== </span><span class="s4">'hidden'</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_focus </span><span class="s3">= </span><span class="s5">False</span>
+        <span class="s5">else</span><span class="s3">:</span>
+            <span class="s1">w</span><span class="s3">, </span><span class="s1">h </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">system_size</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">resize_window</span><span class="s3">(</span><span class="s1">w</span><span class="s3">, </span><span class="s1">h</span><span class="s3">)</span>
+            <span class="s5">if </span><span class="s1">platform </span><span class="s3">== </span><span class="s4">'win'</span><span class="s3">:</span>
+                <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">custom_titlebar</span><span class="s3">:</span>
+                    <span class="s0"># check dragging+resize or just dragging</span>
+                    <span class="s5">if </span><span class="s1">Config</span><span class="s3">.</span><span class="s1">getboolean</span><span class="s3">(</span><span class="s4">'graphics'</span><span class="s3">, </span><span class="s4">'resizable'</span><span class="s3">):</span>
+                        <span class="s5">import </span><span class="s1">win32con</span>
+                        <span class="s5">import </span><span class="s1">ctypes</span>
+                        <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">set_border_state</span><span class="s3">(</span><span class="s5">False</span><span class="s3">)</span>
+                        <span class="s0"># make windows dispatch,</span>
+                        <span class="s0"># WM_NCCALCSIZE explicitly</span>
+                        <span class="s1">ctypes</span><span class="s3">.</span><span class="s1">windll</span><span class="s3">.</span><span class="s1">user32</span><span class="s3">.</span><span class="s1">SetWindowPos</span><span class="s3">(</span>
+                            <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">get_window_info</span><span class="s3">().</span><span class="s1">window</span><span class="s3">,</span>
+                            <span class="s1">win32con</span><span class="s3">.</span><span class="s1">HWND_TOP</span><span class="s3">,</span>
+                            <span class="s3">*</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">get_window_pos</span><span class="s3">(),</span>
+                            <span class="s3">*</span><span class="s1">self</span><span class="s3">.</span><span class="s1">system_size</span><span class="s3">,</span>
+                            <span class="s1">win32con</span><span class="s3">.</span><span class="s1">SWP_FRAMECHANGED</span>
+                        <span class="s3">)</span>
+                    <span class="s5">else</span><span class="s3">:</span>
+                        <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">set_border_state</span><span class="s3">(</span><span class="s5">True</span><span class="s3">)</span>
+                <span class="s5">else</span><span class="s3">:</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">set_border_state</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">borderless</span><span class="s3">)</span>
+            <span class="s5">else</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">set_border_state</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">borderless</span>
+                                           <span class="s5">or </span><span class="s1">self</span><span class="s3">.</span><span class="s1">custom_titlebar</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">set_fullscreen_mode</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">fullscreen</span><span class="s3">)</span>
+
+        <span class="s1">super</span><span class="s3">(</span><span class="s1">WindowSDL</span><span class="s3">, </span><span class="s1">self</span><span class="s3">).</span><span class="s1">create_window</span><span class="s3">()</span>
+        <span class="s0"># set mouse visibility</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_set_cursor_state</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">show_cursor</span><span class="s3">)</span>
+
+        <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">initialized</span><span class="s3">:</span>
+            <span class="s5">return</span>
+
+        <span class="s0"># auto add input provider</span>
+        <span class="s1">Logger</span><span class="s3">.</span><span class="s1">info</span><span class="s3">(</span><span class="s4">'Window: auto add sdl2 input provider'</span><span class="s3">)</span>
+        <span class="s1">SDL2MotionEventProvider</span><span class="s3">.</span><span class="s1">win </span><span class="s3">= </span><span class="s1">self</span>
+        <span class="s1">EventLoop</span><span class="s3">.</span><span class="s1">add_input_provider</span><span class="s3">(</span><span class="s1">SDL2MotionEventProvider</span><span class="s3">(</span><span class="s4">'sdl'</span><span class="s3">, </span><span class="s4">''</span><span class="s3">))</span>
+
+        <span class="s0"># set window icon before calling set_mode</span>
+        <span class="s5">try</span><span class="s3">:</span>
+            <span class="s1">filename_icon </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">icon </span><span class="s5">or </span><span class="s1">Config</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s4">'kivy'</span><span class="s3">, </span><span class="s4">'window_icon'</span><span class="s3">)</span>
+            <span class="s5">if </span><span class="s1">filename_icon </span><span class="s3">== </span><span class="s4">''</span><span class="s3">:</span>
+                <span class="s1">logo_size </span><span class="s3">= </span><span class="s6">32</span>
+                <span class="s5">if </span><span class="s1">platform </span><span class="s3">== </span><span class="s4">'macosx'</span><span class="s3">:</span>
+                    <span class="s1">logo_size </span><span class="s3">= </span><span class="s6">512</span>
+                <span class="s5">elif </span><span class="s1">platform </span><span class="s3">== </span><span class="s4">'win'</span><span class="s3">:</span>
+                    <span class="s1">logo_size </span><span class="s3">= </span><span class="s6">64</span>
+                <span class="s1">filename_icon </span><span class="s3">= </span><span class="s4">'kivy-icon-{}.png'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">logo_size</span><span class="s3">)</span>
+                <span class="s1">filename_icon </span><span class="s3">= </span><span class="s1">resource_find</span><span class="s3">(</span>
+                        <span class="s1">join</span><span class="s3">(</span><span class="s1">kivy_data_dir</span><span class="s3">, </span><span class="s4">'logo'</span><span class="s3">, </span><span class="s1">filename_icon</span><span class="s3">))</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">set_icon</span><span class="s3">(</span><span class="s1">filename_icon</span><span class="s3">)</span>
+        <span class="s5">except</span><span class="s3">:</span>
+            <span class="s1">Logger</span><span class="s3">.</span><span class="s1">exception</span><span class="s3">(</span><span class="s4">'Window: cannot set icon'</span><span class="s3">)</span>
+
+        <span class="s5">if </span><span class="s1">platform </span><span class="s3">== </span><span class="s4">'win' </span><span class="s5">and </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win_dpi_watch </span><span class="s5">is None</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_win_dpi_watch </span><span class="s3">= </span><span class="s1">_WindowsSysDPIWatch</span><span class="s3">(</span><span class="s1">window</span><span class="s3">=</span><span class="s1">self</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_win_dpi_watch</span><span class="s3">.</span><span class="s1">start</span><span class="s3">()</span>
+
+    <span class="s5">def </span><span class="s1">_update_density_and_dpi</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">if </span><span class="s1">platform </span><span class="s3">== </span><span class="s4">'win'</span><span class="s3">:</span>
+            <span class="s5">from </span><span class="s1">ctypes </span><span class="s5">import </span><span class="s1">windll</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_density </span><span class="s3">= </span><span class="s6">1.</span>
+            <span class="s5">try</span><span class="s3">:</span>
+                <span class="s1">hwnd </span><span class="s3">= </span><span class="s1">windll</span><span class="s3">.</span><span class="s1">user32</span><span class="s3">.</span><span class="s1">GetActiveWindow</span><span class="s3">()</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dpi </span><span class="s3">= </span><span class="s1">float</span><span class="s3">(</span><span class="s1">windll</span><span class="s3">.</span><span class="s1">user32</span><span class="s3">.</span><span class="s1">GetDpiForWindow</span><span class="s3">(</span><span class="s1">hwnd</span><span class="s3">))</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_density </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">dpi </span><span class="s3">/ </span><span class="s6">96</span>
+            <span class="s5">except </span><span class="s1">AttributeError</span><span class="s3">:</span>
+                <span class="s5">pass</span>
+        <span class="s5">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_density </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">_get_gl_size</span><span class="s3">()[</span><span class="s6">0</span><span class="s3">] / </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_size</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+            <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_is_desktop</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dpi </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_density </span><span class="s3">* </span><span class="s6">96.</span>
+
+    <span class="s5">def </span><span class="s1">close</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">teardown_window</span><span class="s3">()</span>
+        <span class="s1">super</span><span class="s3">(</span><span class="s1">WindowSDL</span><span class="s3">, </span><span class="s1">self</span><span class="s3">).</span><span class="s1">close</span><span class="s3">()</span>
+        <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win_dpi_watch </span><span class="s5">is not None</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_win_dpi_watch</span><span class="s3">.</span><span class="s1">stop</span><span class="s3">()</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_win_dpi_watch </span><span class="s3">= </span><span class="s5">None</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">initialized </span><span class="s3">= </span><span class="s5">False</span>
+
+    <span class="s5">def </span><span class="s1">maximize</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_is_desktop</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">maximize_window</span><span class="s3">()</span>
+        <span class="s5">else</span><span class="s3">:</span>
+            <span class="s1">Logger</span><span class="s3">.</span><span class="s1">warning</span><span class="s3">(</span><span class="s4">'Window: maximize() is used only on desktop OSes.'</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">minimize</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_is_desktop</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">minimize_window</span><span class="s3">()</span>
+        <span class="s5">else</span><span class="s3">:</span>
+            <span class="s1">Logger</span><span class="s3">.</span><span class="s1">warning</span><span class="s3">(</span><span class="s4">'Window: minimize() is used only on desktop OSes.'</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">restore</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_is_desktop</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">restore_window</span><span class="s3">()</span>
+        <span class="s5">else</span><span class="s3">:</span>
+            <span class="s1">Logger</span><span class="s3">.</span><span class="s1">warning</span><span class="s3">(</span><span class="s4">'Window: restore() is used only on desktop OSes.'</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">hide</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_is_desktop</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">hide_window</span><span class="s3">()</span>
+        <span class="s5">else</span><span class="s3">:</span>
+            <span class="s1">Logger</span><span class="s3">.</span><span class="s1">warning</span><span class="s3">(</span><span class="s4">'Window: hide() is used only on desktop OSes.'</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">show</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_is_desktop</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">show_window</span><span class="s3">()</span>
+        <span class="s5">else</span><span class="s3">:</span>
+            <span class="s1">Logger</span><span class="s3">.</span><span class="s1">warning</span><span class="s3">(</span><span class="s4">'Window: show() is used only on desktop OSes.'</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">raise_window</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_is_desktop</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">raise_window</span><span class="s3">()</span>
+        <span class="s5">else</span><span class="s3">:</span>
+            <span class="s1">Logger</span><span class="s3">.</span><span class="s1">warning</span><span class="s3">(</span><span class="s4">'Window: show() is used only on desktop OSes.'</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">set_title</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">title</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">set_window_title</span><span class="s3">(</span><span class="s1">title</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">set_icon</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">set_window_icon</span><span class="s3">(</span><span class="s1">str</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">))</span>
+
+    <span class="s5">def </span><span class="s1">screenshot</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, *</span><span class="s1">largs</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">):</span>
+        <span class="s1">filename </span><span class="s3">= </span><span class="s1">super</span><span class="s3">(</span><span class="s1">WindowSDL</span><span class="s3">, </span><span class="s1">self</span><span class="s3">).</span><span class="s1">screenshot</span><span class="s3">(*</span><span class="s1">largs</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">)</span>
+        <span class="s5">if </span><span class="s1">filename </span><span class="s5">is None</span><span class="s3">:</span>
+            <span class="s5">return</span>
+
+        <span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">graphics</span><span class="s3">.</span><span class="s1">opengl </span><span class="s5">import </span><span class="s1">glReadPixels</span><span class="s3">, </span><span class="s1">GL_RGB</span><span class="s3">, </span><span class="s1">GL_UNSIGNED_BYTE</span>
+        <span class="s1">width</span><span class="s3">, </span><span class="s1">height </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">size</span>
+        <span class="s1">data </span><span class="s3">= </span><span class="s1">glReadPixels</span><span class="s3">(</span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s1">width</span><span class="s3">, </span><span class="s1">height</span><span class="s3">, </span><span class="s1">GL_RGB</span><span class="s3">, </span><span class="s1">GL_UNSIGNED_BYTE</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">save_bytes_in_png</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s1">data</span><span class="s3">, </span><span class="s1">width</span><span class="s3">, </span><span class="s1">height</span><span class="s3">)</span>
+        <span class="s1">Logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s4">'Window: Screenshot saved at &lt;%s&gt;' </span><span class="s3">% </span><span class="s1">filename</span><span class="s3">)</span>
+        <span class="s5">return </span><span class="s1">filename</span>
+
+    <span class="s5">def </span><span class="s1">flip</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">flip</span><span class="s3">()</span>
+        <span class="s1">super</span><span class="s3">(</span><span class="s1">WindowSDL</span><span class="s3">, </span><span class="s1">self</span><span class="s3">).</span><span class="s1">flip</span><span class="s3">()</span>
+
+    <span class="s5">def </span><span class="s1">set_system_cursor</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">cursor_name</span><span class="s3">):</span>
+        <span class="s1">result </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">set_system_cursor</span><span class="s3">(</span><span class="s1">cursor_name</span><span class="s3">)</span>
+        <span class="s5">return </span><span class="s1">result</span>
+
+    <span class="s5">def </span><span class="s1">_get_window_pos</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">get_window_pos</span><span class="s3">()</span>
+
+    <span class="s5">def </span><span class="s1">_set_window_pos</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">set_window_pos</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">_get_window_opacity</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">get_window_opacity</span><span class="s3">()</span>
+
+    <span class="s5">def </span><span class="s1">_set_window_opacity</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">opacity</span><span class="s3">):</span>
+        <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">opacity </span><span class="s3">!= </span><span class="s1">opacity</span><span class="s3">:</span>
+            <span class="s5">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">set_window_opacity</span><span class="s3">(</span><span class="s1">opacity</span><span class="s3">)</span>
+
+    <span class="s0"># Transparent Window background</span>
+    <span class="s5">def </span><span class="s1">_is_shaped</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">is_window_shaped</span><span class="s3">()</span>
+
+    <span class="s5">def </span><span class="s1">_set_shape</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">shape_image</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'default'</span><span class="s3">,</span>
+                   <span class="s1">cutoff</span><span class="s3">=</span><span class="s5">False</span><span class="s3">, </span><span class="s1">color_key</span><span class="s3">=</span><span class="s5">None</span><span class="s3">):</span>
+        <span class="s1">modes </span><span class="s3">= (</span><span class="s4">'default'</span><span class="s3">, </span><span class="s4">'binalpha'</span><span class="s3">, </span><span class="s4">'reversebinalpha'</span><span class="s3">, </span><span class="s4">'colorkey'</span><span class="s3">)</span>
+        <span class="s1">color_key </span><span class="s3">= </span><span class="s1">color_key </span><span class="s5">or </span><span class="s3">(</span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">1</span><span class="s3">)</span>
+        <span class="s5">if </span><span class="s1">mode </span><span class="s5">not in </span><span class="s1">modes</span><span class="s3">:</span>
+            <span class="s1">Logger</span><span class="s3">.</span><span class="s1">warning</span><span class="s3">(</span>
+                <span class="s4">'Window: shape mode can be only '</span>
+                <span class="s4">'{}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s4">', '</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">modes</span><span class="s3">))</span>
+            <span class="s3">)</span>
+            <span class="s5">return</span>
+        <span class="s5">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">color_key</span><span class="s3">, (</span><span class="s1">tuple</span><span class="s3">, </span><span class="s1">list</span><span class="s3">)):</span>
+            <span class="s5">return</span>
+        <span class="s5">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">color_key</span><span class="s3">) </span><span class="s5">not in </span><span class="s3">(</span><span class="s6">3</span><span class="s3">, </span><span class="s6">4</span><span class="s3">):</span>
+            <span class="s5">return</span>
+        <span class="s5">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">color_key</span><span class="s3">) == </span><span class="s6">3</span><span class="s3">:</span>
+            <span class="s1">color_key </span><span class="s3">= (</span><span class="s1">color_key</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">color_key</span><span class="s3">[</span><span class="s6">1</span><span class="s3">], </span><span class="s1">color_key</span><span class="s3">[</span><span class="s6">2</span><span class="s3">], </span><span class="s6">1</span><span class="s3">)</span>
+            <span class="s1">Logger</span><span class="s3">.</span><span class="s1">warning</span><span class="s3">(</span>
+                <span class="s4">'Window: Shape color_key must be only tuple or list'</span>
+            <span class="s3">)</span>
+            <span class="s5">return</span>
+        <span class="s1">color_key </span><span class="s3">= (</span>
+            <span class="s1">color_key</span><span class="s3">[</span><span class="s6">0</span><span class="s3">] * </span><span class="s6">255</span><span class="s3">,</span>
+            <span class="s1">color_key</span><span class="s3">[</span><span class="s6">1</span><span class="s3">] * </span><span class="s6">255</span><span class="s3">,</span>
+            <span class="s1">color_key</span><span class="s3">[</span><span class="s6">2</span><span class="s3">] * </span><span class="s6">255</span><span class="s3">,</span>
+            <span class="s1">color_key</span><span class="s3">[</span><span class="s6">3</span><span class="s3">] * </span><span class="s6">255</span>
+        <span class="s3">)</span>
+
+        <span class="s5">assert </span><span class="s1">cutoff </span><span class="s5">in </span><span class="s3">(</span><span class="s6">1</span><span class="s3">, </span><span class="s6">0</span><span class="s3">)</span>
+        <span class="s1">shape_image </span><span class="s3">= </span><span class="s1">shape_image </span><span class="s5">or </span><span class="s1">Config</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s4">'kivy'</span><span class="s3">, </span><span class="s4">'window_shape'</span><span class="s3">)</span>
+        <span class="s1">shape_image </span><span class="s3">= </span><span class="s1">resource_find</span><span class="s3">(</span><span class="s1">shape_image</span><span class="s3">) </span><span class="s5">or </span><span class="s1">shape_image</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">set_shape</span><span class="s3">(</span><span class="s1">shape_image</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">, </span><span class="s1">cutoff</span><span class="s3">, </span><span class="s1">color_key</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">_get_shaped_mode</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">get_shaped_mode</span><span class="s3">()</span>
+
+    <span class="s5">def </span><span class="s1">_set_shaped_mode</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">value</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_set_shape</span><span class="s3">(</span>
+            <span class="s1">shape_image</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">shape_image</span><span class="s3">,</span>
+            <span class="s1">mode</span><span class="s3">=</span><span class="s1">value</span><span class="s3">, </span><span class="s1">cutoff</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">shape_cutoff</span><span class="s3">,</span>
+            <span class="s1">color_key</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">shape_color_key</span>
+        <span class="s3">)</span>
+        <span class="s5">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">get_shaped_mode</span><span class="s3">()</span>
+    <span class="s0"># twb end</span>
+
+    <span class="s5">def </span><span class="s1">_set_cursor_state</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">value</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">_set_cursor_state</span><span class="s3">(</span><span class="s1">value</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">_fix_mouse_pos</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">mouse_pos </span><span class="s3">= (</span>
+            <span class="s1">x </span><span class="s3">* </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_density</span><span class="s3">,</span>
+            <span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">system_size</span><span class="s3">[</span><span class="s6">1</span><span class="s3">] - </span><span class="s6">1 </span><span class="s3">- </span><span class="s1">y</span><span class="s3">) * </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_density</span>
+        <span class="s3">)</span>
+        <span class="s5">return </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span>
+
+    <span class="s5">def </span><span class="s1">mainloop</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0"># for android/iOS, we don't want to have any event nor executing our</span>
+        <span class="s0"># main loop while the pause is going on. This loop wait any event (not</span>
+        <span class="s0"># handled by the event filter), and remove them from the queue.</span>
+        <span class="s0"># Nothing happen during the pause on iOS, except gyroscope value sent</span>
+        <span class="s0"># over joystick. So it's safe.</span>
+        <span class="s5">while </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pause_loop</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">wait_event</span><span class="s3">()</span>
+            <span class="s5">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pause_loop</span><span class="s3">:</span>
+                <span class="s5">break</span>
+            <span class="s1">event </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">poll</span><span class="s3">()</span>
+            <span class="s5">if </span><span class="s1">event </span><span class="s5">is None</span><span class="s3">:</span>
+                <span class="s5">continue</span>
+            <span class="s0"># A drop is send while the app is still in pause.loop</span>
+            <span class="s0"># we need to dispatch it</span>
+            <span class="s1">action</span><span class="s3">, </span><span class="s1">args </span><span class="s3">= </span><span class="s1">event</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">event</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:]</span>
+            <span class="s5">if </span><span class="s1">action</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s4">'drop'</span><span class="s3">):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_dispatch_drop_event</span><span class="s3">(</span><span class="s1">action</span><span class="s3">, </span><span class="s1">args</span><span class="s3">)</span>
+            <span class="s0"># app_terminating event might be received while the app is paused</span>
+            <span class="s0"># in this case EventLoop.quit will be set at _event_filter</span>
+            <span class="s5">elif </span><span class="s1">EventLoop</span><span class="s3">.</span><span class="s1">quit</span><span class="s3">:</span>
+                <span class="s5">return</span>
+
+        <span class="s5">while True</span><span class="s3">:</span>
+            <span class="s1">event </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">poll</span><span class="s3">()</span>
+            <span class="s5">if </span><span class="s1">event </span><span class="s5">is False</span><span class="s3">:</span>
+                <span class="s5">break</span>
+            <span class="s5">if </span><span class="s1">event </span><span class="s5">is None</span><span class="s3">:</span>
+                <span class="s5">continue</span>
+
+            <span class="s1">action</span><span class="s3">, </span><span class="s1">args </span><span class="s3">= </span><span class="s1">event</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">event</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:]</span>
+            <span class="s5">if </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'quit'</span><span class="s3">:</span>
+                <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_request_close'</span><span class="s3">):</span>
+                    <span class="s5">continue</span>
+                <span class="s1">EventLoop</span><span class="s3">.</span><span class="s1">quit </span><span class="s3">= </span><span class="s5">True</span>
+                <span class="s5">break</span>
+
+            <span class="s5">elif </span><span class="s1">action </span><span class="s5">in </span><span class="s3">(</span><span class="s4">'fingermotion'</span><span class="s3">, </span><span class="s4">'fingerdown'</span><span class="s3">, </span><span class="s4">'fingerup'</span><span class="s3">):</span>
+                <span class="s0"># for finger, pass the raw event to SDL motion event provider</span>
+                <span class="s0"># XXX this is problematic. On OSX, it generates touches with 0,</span>
+                <span class="s0"># 0 coordinates, at the same times as mouse. But it works.</span>
+                <span class="s0"># We have a conflict of using either the mouse or the finger.</span>
+                <span class="s0"># Right now, we have no mechanism that we could use to know</span>
+                <span class="s0"># which is the preferred one for the application.</span>
+                <span class="s5">if </span><span class="s1">platform </span><span class="s5">in </span><span class="s3">(</span><span class="s4">'ios'</span><span class="s3">, </span><span class="s4">'android'</span><span class="s3">):</span>
+                    <span class="s1">SDL2MotionEventProvider</span><span class="s3">.</span><span class="s1">q</span><span class="s3">.</span><span class="s1">appendleft</span><span class="s3">(</span><span class="s1">event</span><span class="s3">)</span>
+                <span class="s5">pass</span>
+
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'mousemotion'</span><span class="s3">:</span>
+                <span class="s1">x</span><span class="s3">, </span><span class="s1">y </span><span class="s3">= </span><span class="s1">args</span>
+                <span class="s1">x</span><span class="s3">, </span><span class="s1">y </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fix_mouse_pos</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_x </span><span class="s3">= </span><span class="s1">x</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_y </span><span class="s3">= </span><span class="s1">y</span>
+                <span class="s5">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cursor_entered</span><span class="s3">:</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_cursor_entered </span><span class="s3">= </span><span class="s5">True</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_cursor_enter'</span><span class="s3">)</span>
+                <span class="s0"># don't dispatch motion if no button are pressed</span>
+                <span class="s5">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_buttons_down</span><span class="s3">) == </span><span class="s6">0</span><span class="s3">:</span>
+                    <span class="s5">continue</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_meta </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">modifiers</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_mouse_move'</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">modifiers</span><span class="s3">)</span>
+
+            <span class="s5">elif </span><span class="s1">action </span><span class="s5">in </span><span class="s3">(</span><span class="s4">'mousebuttondown'</span><span class="s3">, </span><span class="s4">'mousebuttonup'</span><span class="s3">):</span>
+                <span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">button </span><span class="s3">= </span><span class="s1">args</span>
+                <span class="s1">x</span><span class="s3">, </span><span class="s1">y </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fix_mouse_pos</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_x </span><span class="s3">= </span><span class="s1">x</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_y </span><span class="s3">= </span><span class="s1">y</span>
+                <span class="s5">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cursor_entered</span><span class="s3">:</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_cursor_entered </span><span class="s3">= </span><span class="s5">True</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_cursor_enter'</span><span class="s3">)</span>
+                <span class="s1">btn </span><span class="s3">= </span><span class="s4">'left'</span>
+                <span class="s5">if </span><span class="s1">button </span><span class="s3">== </span><span class="s6">3</span><span class="s3">:</span>
+                    <span class="s1">btn </span><span class="s3">= </span><span class="s4">'right'</span>
+                <span class="s5">elif </span><span class="s1">button </span><span class="s3">== </span><span class="s6">2</span><span class="s3">:</span>
+                    <span class="s1">btn </span><span class="s3">= </span><span class="s4">'middle'</span>
+                <span class="s5">elif </span><span class="s1">button </span><span class="s3">== </span><span class="s6">4</span><span class="s3">:</span>
+                    <span class="s1">btn </span><span class="s3">= </span><span class="s4">&quot;mouse4&quot;</span>
+                <span class="s5">elif </span><span class="s1">button </span><span class="s3">== </span><span class="s6">5</span><span class="s3">:</span>
+                    <span class="s1">btn </span><span class="s3">= </span><span class="s4">&quot;mouse5&quot;</span>
+                <span class="s1">eventname </span><span class="s3">= </span><span class="s4">'on_mouse_down'</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_buttons_down</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">button</span><span class="s3">)</span>
+                <span class="s5">if </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'mousebuttonup'</span><span class="s3">:</span>
+                    <span class="s1">eventname </span><span class="s3">= </span><span class="s4">'on_mouse_up'</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_buttons_down</span><span class="s3">.</span><span class="s1">remove</span><span class="s3">(</span><span class="s1">button</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s1">eventname</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">btn</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">modifiers</span><span class="s3">)</span>
+            <span class="s5">elif </span><span class="s1">action</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s4">'mousewheel'</span><span class="s3">):</span>
+                <span class="s1">x</span><span class="s3">, </span><span class="s1">y </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">get_relative_mouse_pos</span><span class="s3">()</span>
+                <span class="s5">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_collide_and_dispatch_cursor_enter</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">):</span>
+                    <span class="s0"># Ignore if the cursor position is on the window title bar</span>
+                    <span class="s0"># or on its edges</span>
+                    <span class="s5">continue</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_update_modifiers</span><span class="s3">()</span>
+                <span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">button </span><span class="s3">= </span><span class="s1">args</span>
+                <span class="s1">btn </span><span class="s3">= </span><span class="s4">'scrolldown'</span>
+                <span class="s5">if </span><span class="s1">action</span><span class="s3">.</span><span class="s1">endswith</span><span class="s3">(</span><span class="s4">'up'</span><span class="s3">):</span>
+                    <span class="s1">btn </span><span class="s3">= </span><span class="s4">'scrollup'</span>
+                <span class="s5">elif </span><span class="s1">action</span><span class="s3">.</span><span class="s1">endswith</span><span class="s3">(</span><span class="s4">'right'</span><span class="s3">):</span>
+                    <span class="s1">btn </span><span class="s3">= </span><span class="s4">'scrollright'</span>
+                <span class="s5">elif </span><span class="s1">action</span><span class="s3">.</span><span class="s1">endswith</span><span class="s3">(</span><span class="s4">'left'</span><span class="s3">):</span>
+                    <span class="s1">btn </span><span class="s3">= </span><span class="s4">'scrollleft'</span>
+
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_meta </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">modifiers</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_btn </span><span class="s3">= </span><span class="s1">btn</span>
+                <span class="s0"># times = x if y == 0 else y</span>
+                <span class="s0"># times = min(abs(times), 100)</span>
+                <span class="s0"># for k in range(times):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_down </span><span class="s3">= </span><span class="s5">True</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_mouse_down'</span><span class="s3">,</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_x</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_y</span><span class="s3">, </span><span class="s1">btn</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">modifiers</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_down </span><span class="s3">= </span><span class="s5">False</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_mouse_up'</span><span class="s3">,</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_x</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_y</span><span class="s3">, </span><span class="s1">btn</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">modifiers</span><span class="s3">)</span>
+
+            <span class="s5">elif </span><span class="s1">action</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s4">'drop'</span><span class="s3">):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_dispatch_drop_event</span><span class="s3">(</span><span class="s1">action</span><span class="s3">, </span><span class="s1">args</span><span class="s3">)</span>
+            <span class="s0"># video resize</span>
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'windowresized'</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_size </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">window_size</span>
+                <span class="s0"># don't use trigger here, we want to delay the resize event</span>
+                <span class="s1">ev </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_do_resize_ev</span>
+                <span class="s5">if </span><span class="s1">ev </span><span class="s5">is None</span><span class="s3">:</span>
+                    <span class="s1">ev </span><span class="s3">= </span><span class="s1">Clock</span><span class="s3">.</span><span class="s1">schedule_once</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_do_resize</span><span class="s3">, </span><span class="s6">.1</span><span class="s3">)</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_do_resize_ev </span><span class="s3">= </span><span class="s1">ev</span>
+                <span class="s5">else</span><span class="s3">:</span>
+                    <span class="s1">ev</span><span class="s3">()</span>
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'windowdisplaychanged'</span><span class="s3">:</span>
+                <span class="s1">Logger</span><span class="s3">.</span><span class="s1">info</span><span class="s3">(</span><span class="s4">f&quot;WindowSDL: Window is now on display </span><span class="s5">{</span><span class="s1">args</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span><span class="s5">}</span><span class="s4">&quot;</span><span class="s3">)</span>
+
+                <span class="s0"># The display has changed, so the density and dpi</span>
+                <span class="s0"># may have changed too.</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_update_density_and_dpi</span><span class="s3">()</span>
+
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'windowmoved'</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_move'</span><span class="s3">)</span>
+
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'windowrestored'</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_restore'</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">canvas</span><span class="s3">.</span><span class="s1">ask_update</span><span class="s3">()</span>
+
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'windowexposed'</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">canvas</span><span class="s3">.</span><span class="s1">ask_update</span><span class="s3">()</span>
+
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'windowminimized'</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_minimize'</span><span class="s3">)</span>
+                <span class="s5">if </span><span class="s1">Config</span><span class="s3">.</span><span class="s1">getboolean</span><span class="s3">(</span><span class="s4">'kivy'</span><span class="s3">, </span><span class="s4">'pause_on_minimize'</span><span class="s3">):</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">do_pause</span><span class="s3">()</span>
+
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'windowmaximized'</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_maximize'</span><span class="s3">)</span>
+
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'windowhidden'</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_hide'</span><span class="s3">)</span>
+
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'windowshown'</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_show'</span><span class="s3">)</span>
+
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'windowfocusgained'</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_focus </span><span class="s3">= </span><span class="s5">True</span>
+
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'windowfocuslost'</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_focus </span><span class="s3">= </span><span class="s5">False</span>
+
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'windowenter'</span><span class="s3">:</span>
+                <span class="s1">x</span><span class="s3">, </span><span class="s1">y </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">get_relative_mouse_pos</span><span class="s3">()</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_collide_and_dispatch_cursor_enter</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'windowleave'</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_cursor_entered </span><span class="s3">= </span><span class="s5">False</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_cursor_leave'</span><span class="s3">)</span>
+
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'joyaxismotion'</span><span class="s3">:</span>
+                <span class="s1">stickid</span><span class="s3">, </span><span class="s1">axisid</span><span class="s3">, </span><span class="s1">value </span><span class="s3">= </span><span class="s1">args</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_joy_axis'</span><span class="s3">, </span><span class="s1">stickid</span><span class="s3">, </span><span class="s1">axisid</span><span class="s3">, </span><span class="s1">value</span><span class="s3">)</span>
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'joyhatmotion'</span><span class="s3">:</span>
+                <span class="s1">stickid</span><span class="s3">, </span><span class="s1">hatid</span><span class="s3">, </span><span class="s1">value </span><span class="s3">= </span><span class="s1">args</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_joy_hat'</span><span class="s3">, </span><span class="s1">stickid</span><span class="s3">, </span><span class="s1">hatid</span><span class="s3">, </span><span class="s1">value</span><span class="s3">)</span>
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'joyballmotion'</span><span class="s3">:</span>
+                <span class="s1">stickid</span><span class="s3">, </span><span class="s1">ballid</span><span class="s3">, </span><span class="s1">xrel</span><span class="s3">, </span><span class="s1">yrel </span><span class="s3">= </span><span class="s1">args</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_joy_ball'</span><span class="s3">, </span><span class="s1">stickid</span><span class="s3">, </span><span class="s1">ballid</span><span class="s3">, </span><span class="s1">xrel</span><span class="s3">, </span><span class="s1">yrel</span><span class="s3">)</span>
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'joybuttondown'</span><span class="s3">:</span>
+                <span class="s1">stickid</span><span class="s3">, </span><span class="s1">buttonid </span><span class="s3">= </span><span class="s1">args</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_joy_button_down'</span><span class="s3">, </span><span class="s1">stickid</span><span class="s3">, </span><span class="s1">buttonid</span><span class="s3">)</span>
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'joybuttonup'</span><span class="s3">:</span>
+                <span class="s1">stickid</span><span class="s3">, </span><span class="s1">buttonid </span><span class="s3">= </span><span class="s1">args</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_joy_button_up'</span><span class="s3">, </span><span class="s1">stickid</span><span class="s3">, </span><span class="s1">buttonid</span><span class="s3">)</span>
+
+            <span class="s5">elif </span><span class="s1">action </span><span class="s5">in </span><span class="s3">(</span><span class="s4">'keydown'</span><span class="s3">, </span><span class="s4">'keyup'</span><span class="s3">):</span>
+                <span class="s1">mod</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">scancode</span><span class="s3">, </span><span class="s1">kstr </span><span class="s3">= </span><span class="s1">args</span>
+
+                <span class="s5">try</span><span class="s3">:</span>
+                    <span class="s1">key </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">key_map</span><span class="s3">[</span><span class="s1">key</span><span class="s3">]</span>
+                <span class="s5">except </span><span class="s1">KeyError</span><span class="s3">:</span>
+                    <span class="s5">pass</span>
+
+                <span class="s5">if </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'keydown'</span><span class="s3">:</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_update_modifiers</span><span class="s3">(</span><span class="s1">mod</span><span class="s3">, </span><span class="s1">key</span><span class="s3">)</span>
+                <span class="s5">else</span><span class="s3">:</span>
+                    <span class="s0"># ignore the key, it has been released</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_update_modifiers</span><span class="s3">(</span><span class="s1">mod</span><span class="s3">)</span>
+
+                <span class="s0"># if mod in self._meta_keys:</span>
+                <span class="s5">if </span><span class="s3">(</span><span class="s1">key </span><span class="s5">not in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_modifiers </span><span class="s5">and</span>
+                        <span class="s1">key </span><span class="s5">not in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">command_keys</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">()):</span>
+                    <span class="s5">try</span><span class="s3">:</span>
+                        <span class="s1">kstr_chr </span><span class="s3">= </span><span class="s1">unichr</span><span class="s3">(</span><span class="s1">key</span><span class="s3">)</span>
+                        <span class="s5">try</span><span class="s3">:</span>
+                            <span class="s0"># On android, there is no 'encoding' attribute.</span>
+                            <span class="s0"># On other platforms, if stdout is redirected,</span>
+                            <span class="s0"># 'encoding' may be None</span>
+                            <span class="s1">encoding </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">sys</span><span class="s3">.</span><span class="s1">stdout</span><span class="s3">, </span><span class="s4">'encoding'</span><span class="s3">,</span>
+                                               <span class="s4">'utf8'</span><span class="s3">) </span><span class="s5">or </span><span class="s4">'utf8'</span>
+                            <span class="s1">kstr_chr</span><span class="s3">.</span><span class="s1">encode</span><span class="s3">(</span><span class="s1">encoding</span><span class="s3">)</span>
+                            <span class="s1">kstr </span><span class="s3">= </span><span class="s1">kstr_chr</span>
+                        <span class="s5">except </span><span class="s1">UnicodeError</span><span class="s3">:</span>
+                            <span class="s5">pass</span>
+                    <span class="s5">except </span><span class="s1">ValueError</span><span class="s3">:</span>
+                        <span class="s5">pass</span>
+                <span class="s0"># if 'shift' in self._modifiers and key\</span>
+                <span class="s0">#        not in self.command_keys.keys():</span>
+                <span class="s0">#    return</span>
+
+                <span class="s5">if </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'keyup'</span><span class="s3">:</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_key_up'</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">scancode</span><span class="s3">)</span>
+                    <span class="s5">continue</span>
+
+                <span class="s0"># don't dispatch more key if down event is accepted</span>
+                <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_key_down'</span><span class="s3">, </span><span class="s1">key</span><span class="s3">,</span>
+                                 <span class="s1">scancode</span><span class="s3">, </span><span class="s1">kstr</span><span class="s3">,</span>
+                                 <span class="s1">self</span><span class="s3">.</span><span class="s1">modifiers</span><span class="s3">):</span>
+                    <span class="s5">continue</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_keyboard'</span><span class="s3">, </span><span class="s1">key</span><span class="s3">,</span>
+                              <span class="s1">scancode</span><span class="s3">, </span><span class="s1">kstr</span><span class="s3">,</span>
+                              <span class="s1">self</span><span class="s3">.</span><span class="s1">modifiers</span><span class="s3">)</span>
+
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'textinput'</span><span class="s3">:</span>
+                <span class="s1">text </span><span class="s3">= </span><span class="s1">args</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_textinput'</span><span class="s3">, </span><span class="s1">text</span><span class="s3">)</span>
+
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'textedit'</span><span class="s3">:</span>
+                <span class="s1">text </span><span class="s3">= </span><span class="s1">args</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_textedit'</span><span class="s3">, </span><span class="s1">text</span><span class="s3">)</span>
+
+            <span class="s0"># unhandled event !</span>
+            <span class="s5">else</span><span class="s3">:</span>
+                <span class="s1">Logger</span><span class="s3">.</span><span class="s1">trace</span><span class="s3">(</span><span class="s4">'WindowSDL: Unhandled event %s' </span><span class="s3">% </span><span class="s1">str</span><span class="s3">(</span><span class="s1">event</span><span class="s3">))</span>
+
+    <span class="s5">def </span><span class="s1">_dispatch_drop_event</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">action</span><span class="s3">, </span><span class="s1">args</span><span class="s3">):</span>
+        <span class="s1">x</span><span class="s3">, </span><span class="s1">y </span><span class="s3">= (</span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">) </span><span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_drop_pos </span><span class="s5">is None else </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_drop_pos</span>
+        <span class="s5">if </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'dropfile'</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_drop_file'</span><span class="s3">, </span><span class="s1">args</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+        <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'droptext'</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_drop_text'</span><span class="s3">, </span><span class="s1">args</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+        <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'dropbegin'</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_drop_pos </span><span class="s3">= </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">get_relative_mouse_pos</span><span class="s3">()</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_collide_and_dispatch_cursor_enter</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_drop_begin'</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+        <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'dropend'</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_drop_pos </span><span class="s3">= </span><span class="s5">None</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_drop_end'</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">_collide_and_dispatch_cursor_enter</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">):</span>
+        <span class="s0"># x, y are relative to window left/top position</span>
+        <span class="s1">w</span><span class="s3">, </span><span class="s1">h </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">window_size</span>
+        <span class="s5">if </span><span class="s6">0 </span><span class="s3">&lt;= </span><span class="s1">x </span><span class="s3">&lt; </span><span class="s1">w </span><span class="s5">and </span><span class="s6">0 </span><span class="s3">&lt;= </span><span class="s1">y </span><span class="s3">&lt; </span><span class="s1">h</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_x</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_mouse_y </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fix_mouse_pos</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+            <span class="s5">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cursor_entered</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_cursor_entered </span><span class="s3">= </span><span class="s5">True</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_cursor_enter'</span><span class="s3">)</span>
+            <span class="s5">return True</span>
+
+    <span class="s5">def </span><span class="s1">_do_resize</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">dt</span><span class="s3">):</span>
+        <span class="s1">Logger</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s4">'Window: Resize window to %s' </span><span class="s3">% </span><span class="s1">str</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">size</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">resize_window</span><span class="s3">(*</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_size</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_pre_resize'</span><span class="s3">, *</span><span class="s1">self</span><span class="s3">.</span><span class="s1">size</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">do_pause</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0"># should go to app pause mode (desktop style)</span>
+        <span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">app </span><span class="s5">import </span><span class="s1">App</span>
+        <span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">base </span><span class="s5">import </span><span class="s1">stopTouchApp</span>
+        <span class="s1">app </span><span class="s3">= </span><span class="s1">App</span><span class="s3">.</span><span class="s1">get_running_app</span><span class="s3">()</span>
+        <span class="s5">if not </span><span class="s1">app</span><span class="s3">:</span>
+            <span class="s1">Logger</span><span class="s3">.</span><span class="s1">info</span><span class="s3">(</span><span class="s4">'WindowSDL: No running App found, pause.'</span><span class="s3">)</span>
+        <span class="s5">elif not </span><span class="s1">app</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_pause'</span><span class="s3">):</span>
+            <span class="s1">Logger</span><span class="s3">.</span><span class="s1">info</span><span class="s3">(</span><span class="s4">'WindowSDL: App doesn</span><span class="s5">\'</span><span class="s4">t support pause mode, stop.'</span><span class="s3">)</span>
+            <span class="s1">stopTouchApp</span><span class="s3">()</span>
+            <span class="s5">return</span>
+
+        <span class="s0"># XXX FIXME wait for sdl resume</span>
+        <span class="s5">while True</span><span class="s3">:</span>
+            <span class="s1">event </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">poll</span><span class="s3">()</span>
+            <span class="s5">if </span><span class="s1">event </span><span class="s5">is False</span><span class="s3">:</span>
+                <span class="s5">continue</span>
+            <span class="s5">if </span><span class="s1">event </span><span class="s5">is None</span><span class="s3">:</span>
+                <span class="s5">continue</span>
+
+            <span class="s1">action</span><span class="s3">, </span><span class="s1">args </span><span class="s3">= </span><span class="s1">event</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">event</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:]</span>
+            <span class="s5">if </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'quit'</span><span class="s3">:</span>
+                <span class="s1">EventLoop</span><span class="s3">.</span><span class="s1">quit </span><span class="s3">= </span><span class="s5">True</span>
+                <span class="s5">break</span>
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'app_willenterforeground'</span><span class="s3">:</span>
+                <span class="s5">break</span>
+            <span class="s5">elif </span><span class="s1">action </span><span class="s3">== </span><span class="s4">'windowrestored'</span><span class="s3">:</span>
+                <span class="s5">break</span>
+
+        <span class="s5">if </span><span class="s1">app</span><span class="s3">:</span>
+            <span class="s1">app</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">(</span><span class="s4">'on_resume'</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">_update_modifiers</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">mods</span><span class="s3">=</span><span class="s5">None</span><span class="s3">, </span><span class="s1">key</span><span class="s3">=</span><span class="s5">None</span><span class="s3">):</span>
+        <span class="s5">if </span><span class="s1">mods </span><span class="s5">is None and </span><span class="s1">key </span><span class="s5">is None</span><span class="s3">:</span>
+            <span class="s5">return</span>
+        <span class="s1">modifiers </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+
+        <span class="s5">if </span><span class="s1">mods </span><span class="s5">is not None</span><span class="s3">:</span>
+            <span class="s5">if </span><span class="s1">mods </span><span class="s3">&amp; (</span><span class="s1">KMOD_RSHIFT </span><span class="s3">| </span><span class="s1">KMOD_LSHIFT</span><span class="s3">):</span>
+                <span class="s1">modifiers</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s4">'shift'</span><span class="s3">)</span>
+            <span class="s5">if </span><span class="s1">mods </span><span class="s3">&amp; (</span><span class="s1">KMOD_RALT </span><span class="s3">| </span><span class="s1">KMOD_LALT </span><span class="s3">| </span><span class="s1">KMOD_MODE</span><span class="s3">):</span>
+                <span class="s1">modifiers</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s4">'alt'</span><span class="s3">)</span>
+            <span class="s5">if </span><span class="s1">mods </span><span class="s3">&amp; (</span><span class="s1">KMOD_RCTRL </span><span class="s3">| </span><span class="s1">KMOD_LCTRL</span><span class="s3">):</span>
+                <span class="s1">modifiers</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s4">'ctrl'</span><span class="s3">)</span>
+            <span class="s5">if </span><span class="s1">mods </span><span class="s3">&amp; (</span><span class="s1">KMOD_RGUI </span><span class="s3">| </span><span class="s1">KMOD_LGUI</span><span class="s3">):</span>
+                <span class="s1">modifiers</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s4">'meta'</span><span class="s3">)</span>
+            <span class="s5">if </span><span class="s1">mods </span><span class="s3">&amp; </span><span class="s1">KMOD_NUM</span><span class="s3">:</span>
+                <span class="s1">modifiers</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s4">'numlock'</span><span class="s3">)</span>
+            <span class="s5">if </span><span class="s1">mods </span><span class="s3">&amp; </span><span class="s1">KMOD_CAPS</span><span class="s3">:</span>
+                <span class="s1">modifiers</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s4">'capslock'</span><span class="s3">)</span>
+
+        <span class="s5">if </span><span class="s1">key </span><span class="s5">is not None</span><span class="s3">:</span>
+            <span class="s5">if </span><span class="s1">key </span><span class="s5">in </span><span class="s3">(</span><span class="s1">KMOD_RSHIFT</span><span class="s3">, </span><span class="s1">KMOD_LSHIFT</span><span class="s3">):</span>
+                <span class="s1">modifiers</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s4">'shift'</span><span class="s3">)</span>
+            <span class="s5">if </span><span class="s1">key </span><span class="s5">in </span><span class="s3">(</span><span class="s1">KMOD_RALT</span><span class="s3">, </span><span class="s1">KMOD_LALT</span><span class="s3">, </span><span class="s1">KMOD_MODE</span><span class="s3">):</span>
+                <span class="s1">modifiers</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s4">'alt'</span><span class="s3">)</span>
+            <span class="s5">if </span><span class="s1">key </span><span class="s5">in </span><span class="s3">(</span><span class="s1">KMOD_RCTRL</span><span class="s3">, </span><span class="s1">KMOD_LCTRL</span><span class="s3">):</span>
+                <span class="s1">modifiers</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s4">'ctrl'</span><span class="s3">)</span>
+            <span class="s5">if </span><span class="s1">key </span><span class="s5">in </span><span class="s3">(</span><span class="s1">KMOD_RGUI</span><span class="s3">, </span><span class="s1">KMOD_LGUI</span><span class="s3">):</span>
+                <span class="s1">modifiers</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s4">'meta'</span><span class="s3">)</span>
+            <span class="s5">if </span><span class="s1">key </span><span class="s3">== </span><span class="s1">KMOD_NUM</span><span class="s3">:</span>
+                <span class="s1">modifiers</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s4">'numlock'</span><span class="s3">)</span>
+            <span class="s5">if </span><span class="s1">key </span><span class="s3">== </span><span class="s1">KMOD_CAPS</span><span class="s3">:</span>
+                <span class="s1">modifiers</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s4">'capslock'</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_modifiers </span><span class="s3">= </span><span class="s1">list</span><span class="s3">(</span><span class="s1">modifiers</span><span class="s3">)</span>
+        <span class="s5">return</span>
+
+    <span class="s5">def </span><span class="s1">request_keyboard</span><span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">, </span><span class="s1">callback</span><span class="s3">, </span><span class="s1">target</span><span class="s3">, </span><span class="s1">input_type</span><span class="s3">=</span><span class="s4">'text'</span><span class="s3">, </span><span class="s1">keyboard_suggestions</span><span class="s3">=</span><span class="s5">True</span>
+    <span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_sdl_keyboard </span><span class="s3">= </span><span class="s1">super</span><span class="s3">(</span><span class="s1">WindowSDL</span><span class="s3">, </span><span class="s1">self</span><span class="s3">).</span><span class="s1">\</span>
+            <span class="s1">request_keyboard</span><span class="s3">(</span>
+            <span class="s1">callback</span><span class="s3">, </span><span class="s1">target</span><span class="s3">, </span><span class="s1">input_type</span><span class="s3">, </span><span class="s1">keyboard_suggestions</span>
+        <span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">show_keyboard</span><span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_system_keyboard</span><span class="s3">,</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">softinput_mode</span><span class="s3">,</span>
+            <span class="s1">input_type</span><span class="s3">,</span>
+            <span class="s1">keyboard_suggestions</span><span class="s3">,</span>
+        <span class="s3">)</span>
+        <span class="s1">Clock</span><span class="s3">.</span><span class="s1">schedule_interval</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_check_keyboard_shown</span><span class="s3">, </span><span class="s6">1 </span><span class="s3">/ </span><span class="s6">5.</span><span class="s3">)</span>
+        <span class="s5">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_sdl_keyboard</span>
+
+    <span class="s5">def </span><span class="s1">release_keyboard</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, *</span><span class="s1">largs</span><span class="s3">):</span>
+        <span class="s1">super</span><span class="s3">(</span><span class="s1">WindowSDL</span><span class="s3">, </span><span class="s1">self</span><span class="s3">).</span><span class="s1">release_keyboard</span><span class="s3">(*</span><span class="s1">largs</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">hide_keyboard</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_sdl_keyboard </span><span class="s3">= </span><span class="s5">None</span>
+        <span class="s5">return True</span>
+
+    <span class="s5">def </span><span class="s1">_check_keyboard_shown</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">dt</span><span class="s3">):</span>
+        <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_sdl_keyboard </span><span class="s5">is None</span><span class="s3">:</span>
+            <span class="s5">return False</span>
+        <span class="s5">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">is_keyboard_shown</span><span class="s3">():</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_sdl_keyboard</span><span class="s3">.</span><span class="s1">release</span><span class="s3">()</span>
+
+    <span class="s5">def </span><span class="s1">map_key</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">original_key</span><span class="s3">, </span><span class="s1">new_key</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">key_map</span><span class="s3">[</span><span class="s1">original_key</span><span class="s3">] = </span><span class="s1">new_key</span>
+
+    <span class="s5">def </span><span class="s1">unmap_key</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">key</span><span class="s3">):</span>
+        <span class="s5">if </span><span class="s1">key </span><span class="s5">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">key_map</span><span class="s3">:</span>
+            <span class="s5">del </span><span class="s1">self</span><span class="s3">.</span><span class="s1">key_map</span><span class="s3">[</span><span class="s1">key</span><span class="s3">]</span>
+
+    <span class="s5">def </span><span class="s1">grab_mouse</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">grab_mouse</span><span class="s3">(</span><span class="s5">True</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">ungrab_mouse</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">grab_mouse</span><span class="s3">(</span><span class="s5">False</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">set_custom_titlebar</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">titlebar_widget</span><span class="s3">):</span>
+        <span class="s5">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">custom_titlebar</span><span class="s3">:</span>
+            <span class="s1">Logger</span><span class="s3">.</span><span class="s1">warning</span><span class="s3">(</span><span class="s4">&quot;Window: Window.custom_titlebar not set to True… &quot;</span>
+                           <span class="s4">&quot;can't set custom titlebar&quot;</span><span class="s3">)</span>
+            <span class="s5">return</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">titlebar_widget </span><span class="s3">= </span><span class="s1">titlebar_widget</span>
+        <span class="s5">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_win</span><span class="s3">.</span><span class="s1">set_custom_titlebar</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">titlebar_widget</span><span class="s3">) == </span><span class="s6">0</span>
+
+
+<span class="s5">class </span><span class="s1">_WindowsSysDPIWatch</span><span class="s3">:</span>
+
+    <span class="s1">hwnd </span><span class="s3">= </span><span class="s5">None</span>
+
+    <span class="s1">new_windProc </span><span class="s3">= </span><span class="s5">None</span>
+
+    <span class="s1">old_windProc </span><span class="s3">= </span><span class="s5">None</span>
+
+    <span class="s1">window</span><span class="s3">: </span><span class="s1">WindowBase </span><span class="s3">= </span><span class="s5">None</span>
+
+    <span class="s5">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">window</span><span class="s3">: </span><span class="s1">WindowBase</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">window </span><span class="s3">= </span><span class="s1">window</span>
+
+    <span class="s5">def </span><span class="s1">start</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">input</span><span class="s3">.</span><span class="s1">providers</span><span class="s3">.</span><span class="s1">wm_common </span><span class="s5">import </span><span class="s1">WNDPROC</span><span class="s3">, </span><span class="s1">\</span>
+            <span class="s1">SetWindowLong_WndProc_wrapper</span>
+        <span class="s5">from </span><span class="s1">ctypes </span><span class="s5">import </span><span class="s1">windll</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">hwnd </span><span class="s3">= </span><span class="s1">windll</span><span class="s3">.</span><span class="s1">user32</span><span class="s3">.</span><span class="s1">GetActiveWindow</span><span class="s3">()</span>
+
+        <span class="s0"># inject our own handler to handle messages before window manager</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">new_windProc </span><span class="s3">= </span><span class="s1">WNDPROC</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_wnd_proc</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">old_windProc </span><span class="s3">= </span><span class="s1">SetWindowLong_WndProc_wrapper</span><span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">hwnd</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">new_windProc</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">stop</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">input</span><span class="s3">.</span><span class="s1">providers</span><span class="s3">.</span><span class="s1">wm_common </span><span class="s5">import </span><span class="s1">\</span>
+            <span class="s1">SetWindowLong_WndProc_wrapper</span>
+
+        <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">hwnd </span><span class="s5">is None</span><span class="s3">:</span>
+            <span class="s5">return</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">new_windProc </span><span class="s3">= </span><span class="s1">SetWindowLong_WndProc_wrapper</span><span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">hwnd</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">old_windProc</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">hwnd </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">new_windProc </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">old_windProc </span><span class="s3">= </span><span class="s5">None</span>
+
+    <span class="s5">def </span><span class="s1">_wnd_proc</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">hwnd</span><span class="s3">, </span><span class="s1">msg</span><span class="s3">, </span><span class="s1">wParam</span><span class="s3">, </span><span class="s1">lParam</span><span class="s3">):</span>
+        <span class="s5">from </span><span class="s1">kivy</span><span class="s3">.</span><span class="s1">input</span><span class="s3">.</span><span class="s1">providers</span><span class="s3">.</span><span class="s1">wm_common </span><span class="s5">import </span><span class="s1">WM_DPICHANGED</span><span class="s3">, </span><span class="s1">WM_NCCALCSIZE</span>
+        <span class="s5">from </span><span class="s1">ctypes </span><span class="s5">import </span><span class="s1">windll</span>
+
+        <span class="s5">if </span><span class="s1">msg </span><span class="s3">== </span><span class="s1">WM_DPICHANGED</span><span class="s3">:</span>
+
+            <span class="s5">def </span><span class="s1">clock_callback</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">):</span>
+                <span class="s5">if </span><span class="s1">x_dpi </span><span class="s3">!= </span><span class="s1">y_dpi</span><span class="s3">:</span>
+                    <span class="s5">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                        <span class="s4">'Can only handle DPI that are same for x and y'</span><span class="s3">)</span>
+
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">window</span><span class="s3">.</span><span class="s1">dpi </span><span class="s3">= </span><span class="s1">x_dpi</span>
+
+            <span class="s1">x_dpi </span><span class="s3">= </span><span class="s1">wParam </span><span class="s3">&amp; </span><span class="s6">0xFFFF</span>
+            <span class="s1">y_dpi </span><span class="s3">= </span><span class="s1">wParam </span><span class="s3">&gt;&gt; </span><span class="s6">16</span>
+            <span class="s1">Clock</span><span class="s3">.</span><span class="s1">schedule_once</span><span class="s3">(</span><span class="s1">clock_callback</span><span class="s3">, -</span><span class="s6">1</span><span class="s3">)</span>
+        <span class="s5">elif </span><span class="s1">Config</span><span class="s3">.</span><span class="s1">getboolean</span><span class="s3">(</span><span class="s4">'graphics'</span><span class="s3">, </span><span class="s4">'resizable'</span><span class="s3">) </span><span class="s1">\</span>
+                <span class="s5">and </span><span class="s1">msg </span><span class="s3">== </span><span class="s1">WM_NCCALCSIZE </span><span class="s5">and </span><span class="s1">self</span><span class="s3">.</span><span class="s1">window</span><span class="s3">.</span><span class="s1">custom_titlebar</span><span class="s3">:</span>
+            <span class="s5">return </span><span class="s6">0</span>
+        <span class="s5">return </span><span class="s1">windll</span><span class="s3">.</span><span class="s1">user32</span><span class="s3">.</span><span class="s1">CallWindowProcW</span><span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">old_windProc</span><span class="s3">, </span><span class="s1">hwnd</span><span class="s3">, </span><span class="s1">msg</span><span class="s3">, </span><span class="s1">wParam</span><span class="s3">, </span><span class="s1">lParam</span><span class="s3">)</span>
+</pre>
+</body>
+</html>

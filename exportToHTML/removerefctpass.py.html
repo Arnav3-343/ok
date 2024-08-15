@@ -1,0 +1,143 @@
+<html>
+<head>
+<title>removerefctpass.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+removerefctpass.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Implement a rewrite pass on a LLVM module to remove unnecessary  
+refcount operations. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">llvmlite</span><span class="s3">.</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">transforms </span><span class="s2">import </span><span class="s1">CallVisitor</span>
+
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">types</span>
+
+
+<span class="s2">class </span><span class="s1">_MarkNrtCallVisitor</span><span class="s3">(</span><span class="s1">CallVisitor</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A pass to mark all NRT_incref and NRT_decref. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">marked </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">visit_Call</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">instr</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">instr</span><span class="s3">.</span><span class="s1">callee</span><span class="s3">, </span><span class="s4">'name'</span><span class="s3">, </span><span class="s4">''</span><span class="s3">) </span><span class="s2">in </span><span class="s1">_accepted_nrtfns</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">marked</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">instr</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_rewrite_function</span><span class="s3">(</span><span class="s1">function</span><span class="s3">):</span>
+    <span class="s5"># Mark NRT usage</span>
+    <span class="s1">markpass </span><span class="s3">= </span><span class="s1">_MarkNrtCallVisitor</span><span class="s3">()</span>
+    <span class="s1">markpass</span><span class="s3">.</span><span class="s1">visit_Function</span><span class="s3">(</span><span class="s1">function</span><span class="s3">)</span>
+    <span class="s5"># Remove NRT usage</span>
+    <span class="s2">for </span><span class="s1">bb </span><span class="s2">in </span><span class="s1">function</span><span class="s3">.</span><span class="s1">basic_blocks</span><span class="s3">:</span>
+        <span class="s2">for </span><span class="s1">inst </span><span class="s2">in </span><span class="s1">list</span><span class="s3">(</span><span class="s1">bb</span><span class="s3">.</span><span class="s1">instructions</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">inst </span><span class="s2">in </span><span class="s1">markpass</span><span class="s3">.</span><span class="s1">marked</span><span class="s3">:</span>
+                <span class="s1">bb</span><span class="s3">.</span><span class="s1">instructions</span><span class="s3">.</span><span class="s1">remove</span><span class="s3">(</span><span class="s1">inst</span><span class="s3">)</span>
+
+
+<span class="s1">_accepted_nrtfns </span><span class="s3">= </span><span class="s4">'NRT_incref'</span><span class="s3">, </span><span class="s4">'NRT_decref'</span>
+
+
+<span class="s2">def </span><span class="s1">_legalize</span><span class="s3">(</span><span class="s1">module</span><span class="s3">, </span><span class="s1">dmm</span><span class="s3">, </span><span class="s1">fndesc</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Legalize the code in the module. 
+    Returns True if the module is legal for the rewrite pass that removes 
+    unnecessary refcounts. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">valid_output</span><span class="s3">(</span><span class="s1">ty</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Valid output are any type that does not need refcount 
+        &quot;&quot;&quot;</span>
+        <span class="s1">model </span><span class="s3">= </span><span class="s1">dmm</span><span class="s3">[</span><span class="s1">ty</span><span class="s3">]</span>
+        <span class="s2">return not </span><span class="s1">model</span><span class="s3">.</span><span class="s1">contains_nrt_meminfo</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">valid_input</span><span class="s3">(</span><span class="s1">ty</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Valid input are any type that does not need refcount except Array. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">valid_output</span><span class="s3">(</span><span class="s1">ty</span><span class="s3">) </span><span class="s2">or </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">ty</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">Array</span><span class="s3">)</span>
+
+
+    <span class="s5"># Ensure no reference to function marked as</span>
+    <span class="s5"># &quot;numba_args_may_always_need_nrt&quot;</span>
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s1">nmd </span><span class="s3">= </span><span class="s1">module</span><span class="s3">.</span><span class="s1">get_named_metadata</span><span class="s3">(</span><span class="s4">&quot;numba_args_may_always_need_nrt&quot;</span><span class="s3">)</span>
+    <span class="s2">except </span><span class="s1">KeyError</span><span class="s3">:</span>
+        <span class="s5"># Nothing marked</span>
+        <span class="s2">pass</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s5"># Has functions marked as &quot;numba_args_may_always_need_nrt&quot;</span>
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">nmd</span><span class="s3">.</span><span class="s1">operands</span><span class="s3">) &gt; </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s5"># The pass is illegal for this compilation unit.</span>
+            <span class="s2">return False</span>
+
+    <span class="s5"># More legalization base on function type</span>
+    <span class="s1">argtypes </span><span class="s3">= </span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">argtypes</span>
+    <span class="s1">restype </span><span class="s3">= </span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">restype</span>
+    <span class="s1">calltypes </span><span class="s3">= </span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">calltypes</span>
+
+    <span class="s5"># Legalize function arguments</span>
+    <span class="s2">for </span><span class="s1">argty </span><span class="s2">in </span><span class="s1">argtypes</span><span class="s3">:</span>
+        <span class="s2">if not </span><span class="s1">valid_input</span><span class="s3">(</span><span class="s1">argty</span><span class="s3">):</span>
+            <span class="s2">return False</span>
+
+    <span class="s5"># Legalize function return</span>
+    <span class="s2">if not </span><span class="s1">valid_output</span><span class="s3">(</span><span class="s1">restype</span><span class="s3">):</span>
+        <span class="s2">return False</span>
+
+    <span class="s5"># Legalize all called functions</span>
+    <span class="s2">for </span><span class="s1">callty </span><span class="s2">in </span><span class="s1">calltypes</span><span class="s3">.</span><span class="s1">values</span><span class="s3">():</span>
+        <span class="s2">if </span><span class="s1">callty </span><span class="s2">is not None and not </span><span class="s1">valid_output</span><span class="s3">(</span><span class="s1">callty</span><span class="s3">.</span><span class="s1">return_type</span><span class="s3">):</span>
+            <span class="s2">return False</span>
+
+    <span class="s5"># Ensure no allocation</span>
+    <span class="s2">for </span><span class="s1">fn </span><span class="s2">in </span><span class="s1">module</span><span class="s3">.</span><span class="s1">functions</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">fn</span><span class="s3">.</span><span class="s1">name</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s4">&quot;NRT_&quot;</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">fn</span><span class="s3">.</span><span class="s1">name </span><span class="s2">not in </span><span class="s1">_accepted_nrtfns</span><span class="s3">:</span>
+                <span class="s2">return False</span>
+
+    <span class="s2">return True</span>
+
+
+<span class="s2">def </span><span class="s1">remove_unnecessary_nrt_usage</span><span class="s3">(</span><span class="s1">function</span><span class="s3">, </span><span class="s1">context</span><span class="s3">, </span><span class="s1">fndesc</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Remove unnecessary NRT incref/decref in the given LLVM function. 
+    It uses highlevel type info to determine if the function does not need NRT. 
+    Such a function does not: 
+ 
+    - return array object(s); 
+    - take arguments that need refcounting except array; 
+    - call function(s) that return refcounted object. 
+ 
+    In effect, the function will not capture or create references that extend 
+    the lifetime of any refcounted objects beyond the lifetime of the function. 
+ 
+    The rewrite is performed in place. 
+    If rewrite has happened, this function returns True, otherwise, it returns False. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">dmm </span><span class="s3">= </span><span class="s1">context</span><span class="s3">.</span><span class="s1">data_model_manager</span>
+    <span class="s2">if </span><span class="s1">_legalize</span><span class="s3">(</span><span class="s1">function</span><span class="s3">.</span><span class="s1">module</span><span class="s3">, </span><span class="s1">dmm</span><span class="s3">, </span><span class="s1">fndesc</span><span class="s3">):</span>
+        <span class="s1">_rewrite_function</span><span class="s3">(</span><span class="s1">function</span><span class="s3">)</span>
+        <span class="s2">return True</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">return False</span>
+</pre>
+</body>
+</html>

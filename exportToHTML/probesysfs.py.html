@@ -1,0 +1,278 @@
+<html>
+<head>
+<title>probesysfs.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #cf8e6d;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+.s7 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+probesysfs.py</font>
+</center></td></tr></table>
+<pre><span class="s0">''' 
+Auto Create Input Provider Config Entry for Available MT Hardware (linux only). 
+=============================================================================== 
+ 
+Thanks to Marc Tardif for the probing code, taken from scan-for-mt-device. 
+ 
+The device discovery is done by this provider. However, the reading of 
+input can be performed by other providers like: hidinput, mtdev and 
+linuxwacom. mtdev is used prior to other providers. For more 
+information about mtdev, check :py:class:`~kivy.input.providers.mtdev`. 
+ 
+Here is an example of auto creation:: 
+ 
+    [input] 
+    # using mtdev 
+    device_%(name)s = probesysfs,provider=mtdev 
+    # using hidinput 
+    device_%(name)s = probesysfs,provider=hidinput 
+    # using mtdev with a match on name 
+    device_%(name)s = probesysfs,provider=mtdev,match=acer 
+ 
+    # using hidinput with custom parameters to hidinput (all on one line) 
+    %(name)s = probesysfs, 
+        provider=hidinput,param=min_pressure=1,param=max_pressure=99 
+ 
+    # you can also match your wacom touchscreen 
+    touch = probesysfs,match=E3 Finger,provider=linuxwacom, 
+        select_all=1,param=mode=touch 
+    # and your wacom pen 
+    pen = probesysfs,match=E3 Pen,provider=linuxwacom, 
+        select_all=1,param=mode=pen 
+ 
+By default, ProbeSysfs module will enumerate hardware from the /sys/class/input 
+device, and configure hardware with ABS_MT_POSITION_X capability. But for 
+example, the wacom screen doesn't support this capability. You can prevent this 
+behavior by putting select_all=1 in your config line. Add use_mouse=1 to also 
+include touchscreen hardware that offers core pointer functionality. 
+'''</span>
+
+<span class="s1">__all__ </span><span class="s2">= (</span><span class="s3">'ProbeSysfsHardwareProbe'</span><span class="s2">, )</span>
+
+<span class="s4">import </span><span class="s1">os</span>
+<span class="s4">from </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path </span><span class="s4">import </span><span class="s1">sep</span>
+
+<span class="s4">if </span><span class="s3">'KIVY_DOC' </span><span class="s4">in </span><span class="s1">os</span><span class="s2">.</span><span class="s1">environ</span><span class="s2">:</span>
+
+    <span class="s1">ProbeSysfsHardwareProbe </span><span class="s2">= </span><span class="s4">None</span>
+
+<span class="s4">else</span><span class="s2">:</span>
+    <span class="s4">import </span><span class="s1">ctypes</span>
+    <span class="s4">from </span><span class="s1">re </span><span class="s4">import </span><span class="s1">match</span><span class="s2">, </span><span class="s1">IGNORECASE</span>
+    <span class="s4">from </span><span class="s1">glob </span><span class="s4">import </span><span class="s1">glob</span>
+    <span class="s4">from </span><span class="s1">subprocess </span><span class="s4">import </span><span class="s1">Popen</span><span class="s2">, </span><span class="s1">PIPE</span>
+    <span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">logger </span><span class="s4">import </span><span class="s1">Logger</span>
+    <span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">input</span><span class="s2">.</span><span class="s1">provider </span><span class="s4">import </span><span class="s1">MotionEventProvider</span>
+    <span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">input</span><span class="s2">.</span><span class="s1">providers</span><span class="s2">.</span><span class="s1">mouse </span><span class="s4">import </span><span class="s1">MouseMotionEventProvider</span>
+    <span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">input</span><span class="s2">.</span><span class="s1">factory </span><span class="s4">import </span><span class="s1">MotionEventFactory</span>
+    <span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">config </span><span class="s4">import </span><span class="s1">_is_rpi</span>
+
+    <span class="s1">EventLoop </span><span class="s2">= </span><span class="s4">None</span>
+
+    <span class="s5"># See linux/input.h</span>
+    <span class="s1">ABS_MT_POSITION_X </span><span class="s2">= </span><span class="s6">0x35</span>
+
+    <span class="s1">_cache_input </span><span class="s2">= </span><span class="s4">None</span>
+    <span class="s1">_cache_xinput </span><span class="s2">= </span><span class="s4">None</span>
+
+    <span class="s4">class </span><span class="s1">Input</span><span class="s2">(</span><span class="s1">object</span><span class="s2">):</span>
+
+        <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">path</span><span class="s2">):</span>
+            <span class="s1">query_xinput</span><span class="s2">()</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">path </span><span class="s2">= </span><span class="s1">path</span>
+
+        <span class="s2">@</span><span class="s1">property</span>
+        <span class="s4">def </span><span class="s1">device</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+            <span class="s1">base </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">basename</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">path</span><span class="s2">)</span>
+            <span class="s4">return </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s3">&quot;/dev&quot;</span><span class="s2">, </span><span class="s3">&quot;input&quot;</span><span class="s2">, </span><span class="s1">base</span><span class="s2">)</span>
+
+        <span class="s2">@</span><span class="s1">property</span>
+        <span class="s4">def </span><span class="s1">name</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+            <span class="s1">path </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">path</span><span class="s2">, </span><span class="s3">&quot;device&quot;</span><span class="s2">, </span><span class="s3">&quot;name&quot;</span><span class="s2">)</span>
+            <span class="s4">return </span><span class="s1">read_line</span><span class="s2">(</span><span class="s1">path</span><span class="s2">)</span>
+
+        <span class="s4">def </span><span class="s1">get_capabilities</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+            <span class="s1">path </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">path</span><span class="s2">, </span><span class="s3">&quot;device&quot;</span><span class="s2">, </span><span class="s3">&quot;capabilities&quot;</span><span class="s2">, </span><span class="s3">&quot;abs&quot;</span><span class="s2">)</span>
+            <span class="s1">line </span><span class="s2">= </span><span class="s3">&quot;0&quot;</span>
+            <span class="s4">try</span><span class="s2">:</span>
+                <span class="s1">line </span><span class="s2">= </span><span class="s1">read_line</span><span class="s2">(</span><span class="s1">path</span><span class="s2">)</span>
+            <span class="s4">except </span><span class="s2">(</span><span class="s1">IOError</span><span class="s2">, </span><span class="s1">OSError</span><span class="s2">):</span>
+                <span class="s4">return </span><span class="s2">[]</span>
+
+            <span class="s1">capabilities </span><span class="s2">= []</span>
+            <span class="s1">long_bit </span><span class="s2">= </span><span class="s1">ctypes</span><span class="s2">.</span><span class="s1">sizeof</span><span class="s2">(</span><span class="s1">ctypes</span><span class="s2">.</span><span class="s1">c_long</span><span class="s2">) * </span><span class="s6">8</span>
+            <span class="s4">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">word </span><span class="s4">in </span><span class="s1">enumerate</span><span class="s2">(</span><span class="s1">line</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s3">&quot; &quot;</span><span class="s2">)):</span>
+                <span class="s1">word </span><span class="s2">= </span><span class="s1">int</span><span class="s2">(</span><span class="s1">word</span><span class="s2">, </span><span class="s6">16</span><span class="s2">)</span>
+                <span class="s1">subcapabilities </span><span class="s2">= [</span><span class="s1">bool</span><span class="s2">(</span><span class="s1">word </span><span class="s2">&amp; </span><span class="s6">1 </span><span class="s2">&lt;&lt; </span><span class="s1">i</span><span class="s2">)</span>
+                                   <span class="s4">for </span><span class="s1">i </span><span class="s4">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">long_bit</span><span class="s2">)]</span>
+                <span class="s1">capabilities</span><span class="s2">[:</span><span class="s6">0</span><span class="s2">] = </span><span class="s1">subcapabilities</span>
+
+            <span class="s4">return </span><span class="s1">capabilities</span>
+
+        <span class="s4">def </span><span class="s1">has_capability</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">capability</span><span class="s2">):</span>
+            <span class="s1">capabilities </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">get_capabilities</span><span class="s2">()</span>
+            <span class="s4">return </span><span class="s1">len</span><span class="s2">(</span><span class="s1">capabilities</span><span class="s2">) &gt; </span><span class="s1">capability </span><span class="s4">and </span><span class="s1">capabilities</span><span class="s2">[</span><span class="s1">capability</span><span class="s2">]</span>
+
+        <span class="s2">@</span><span class="s1">property</span>
+        <span class="s4">def </span><span class="s1">is_mouse</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+            <span class="s4">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">device </span><span class="s4">in </span><span class="s1">_cache_xinput</span>
+
+    <span class="s4">def </span><span class="s1">getout</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">):</span>
+        <span class="s4">try</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s1">Popen</span><span class="s2">(</span><span class="s1">args</span><span class="s2">, </span><span class="s1">stdout</span><span class="s2">=</span><span class="s1">PIPE</span><span class="s2">).</span><span class="s1">communicate</span><span class="s2">()[</span><span class="s6">0</span><span class="s2">]</span>
+        <span class="s4">except </span><span class="s1">OSError</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s3">''</span>
+
+    <span class="s4">def </span><span class="s1">query_xinput</span><span class="s2">():</span>
+        <span class="s4">global </span><span class="s1">_cache_xinput</span>
+        <span class="s4">if </span><span class="s1">_cache_xinput </span><span class="s4">is None</span><span class="s2">:</span>
+            <span class="s1">_cache_xinput </span><span class="s2">= []</span>
+            <span class="s1">devids </span><span class="s2">= </span><span class="s1">getout</span><span class="s2">(</span><span class="s3">'xinput'</span><span class="s2">, </span><span class="s3">'--list'</span><span class="s2">, </span><span class="s3">'--id-only'</span><span class="s2">)</span>
+            <span class="s4">for </span><span class="s1">did </span><span class="s4">in </span><span class="s1">devids</span><span class="s2">.</span><span class="s1">splitlines</span><span class="s2">():</span>
+                <span class="s1">devprops </span><span class="s2">= </span><span class="s1">getout</span><span class="s2">(</span><span class="s3">'xinput'</span><span class="s2">, </span><span class="s3">'--list-props'</span><span class="s2">, </span><span class="s1">did</span><span class="s2">)</span>
+                <span class="s1">evpath </span><span class="s2">= </span><span class="s4">None</span>
+                <span class="s4">for </span><span class="s1">prop </span><span class="s4">in </span><span class="s1">devprops</span><span class="s2">.</span><span class="s1">splitlines</span><span class="s2">():</span>
+                    <span class="s1">prop </span><span class="s2">= </span><span class="s1">prop</span><span class="s2">.</span><span class="s1">strip</span><span class="s2">()</span>
+                    <span class="s4">if </span><span class="s2">(</span><span class="s1">prop</span><span class="s2">.</span><span class="s1">startswith</span><span class="s2">(</span><span class="s7">b'Device Enabled'</span><span class="s2">) </span><span class="s4">and</span>
+                            <span class="s1">prop</span><span class="s2">.</span><span class="s1">endswith</span><span class="s2">(</span><span class="s7">b'0'</span><span class="s2">)):</span>
+                        <span class="s1">evpath </span><span class="s2">= </span><span class="s4">None</span>
+                        <span class="s4">break</span>
+                    <span class="s4">if </span><span class="s1">prop</span><span class="s2">.</span><span class="s1">startswith</span><span class="s2">(</span><span class="s7">b'Device Node'</span><span class="s2">):</span>
+                        <span class="s4">try</span><span class="s2">:</span>
+                            <span class="s1">evpath </span><span class="s2">= </span><span class="s1">prop</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s3">'&quot;'</span><span class="s2">)[</span><span class="s6">1</span><span class="s2">]</span>
+                        <span class="s4">except </span><span class="s1">Exception</span><span class="s2">:</span>
+                            <span class="s1">evpath </span><span class="s2">= </span><span class="s4">None</span>
+                <span class="s4">if </span><span class="s1">evpath</span><span class="s2">:</span>
+                    <span class="s1">_cache_xinput</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">evpath</span><span class="s2">)</span>
+
+    <span class="s4">def </span><span class="s1">get_inputs</span><span class="s2">(</span><span class="s1">path</span><span class="s2">):</span>
+        <span class="s4">global </span><span class="s1">_cache_input</span>
+        <span class="s4">if </span><span class="s1">_cache_input </span><span class="s4">is None</span><span class="s2">:</span>
+            <span class="s1">event_glob </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">path</span><span class="s2">, </span><span class="s3">&quot;event*&quot;</span><span class="s2">)</span>
+            <span class="s1">_cache_input </span><span class="s2">= [</span><span class="s1">Input</span><span class="s2">(</span><span class="s1">x</span><span class="s2">) </span><span class="s4">for </span><span class="s1">x </span><span class="s4">in </span><span class="s1">glob</span><span class="s2">(</span><span class="s1">event_glob</span><span class="s2">)]</span>
+        <span class="s4">return </span><span class="s1">_cache_input</span>
+
+    <span class="s4">def </span><span class="s1">read_line</span><span class="s2">(</span><span class="s1">path</span><span class="s2">):</span>
+        <span class="s1">f </span><span class="s2">= </span><span class="s1">open</span><span class="s2">(</span><span class="s1">path</span><span class="s2">)</span>
+        <span class="s4">try</span><span class="s2">:</span>
+            <span class="s4">return </span><span class="s1">f</span><span class="s2">.</span><span class="s1">readline</span><span class="s2">().</span><span class="s1">strip</span><span class="s2">()</span>
+        <span class="s4">finally</span><span class="s2">:</span>
+            <span class="s1">f</span><span class="s2">.</span><span class="s1">close</span><span class="s2">()</span>
+
+    <span class="s4">class </span><span class="s1">ProbeSysfsHardwareProbe</span><span class="s2">(</span><span class="s1">MotionEventProvider</span><span class="s2">):</span>
+
+        <span class="s4">def </span><span class="s1">__new__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">device</span><span class="s2">, </span><span class="s1">args</span><span class="s2">):</span>
+            <span class="s5"># hack to not return an instance of this provider.</span>
+            <span class="s5"># :)</span>
+            <span class="s1">instance </span><span class="s2">= </span><span class="s1">super</span><span class="s2">(</span><span class="s1">ProbeSysfsHardwareProbe</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__new__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">)</span>
+            <span class="s1">instance</span><span class="s2">.</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">device</span><span class="s2">, </span><span class="s1">args</span><span class="s2">)</span>
+
+        <span class="s4">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">device</span><span class="s2">, </span><span class="s1">args</span><span class="s2">):</span>
+            <span class="s1">super</span><span class="s2">(</span><span class="s1">ProbeSysfsHardwareProbe</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">device</span><span class="s2">, </span><span class="s1">args</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">provider </span><span class="s2">= </span><span class="s3">'mtdev'</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">match </span><span class="s2">= </span><span class="s4">None</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">input_path </span><span class="s2">= </span><span class="s3">'/sys/class/input'</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">select_all </span><span class="s2">= </span><span class="s4">True if </span><span class="s1">_is_rpi </span><span class="s4">else False</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">use_mouse </span><span class="s2">= </span><span class="s4">False</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">use_regex </span><span class="s2">= </span><span class="s4">False</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">args </span><span class="s2">= []</span>
+
+            <span class="s1">args </span><span class="s2">= </span><span class="s1">args</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s3">','</span><span class="s2">)</span>
+            <span class="s4">for </span><span class="s1">arg </span><span class="s4">in </span><span class="s1">args</span><span class="s2">:</span>
+                <span class="s4">if </span><span class="s1">arg </span><span class="s2">== </span><span class="s3">''</span><span class="s2">:</span>
+                    <span class="s4">continue</span>
+                <span class="s1">arg </span><span class="s2">= </span><span class="s1">arg</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s3">'='</span><span class="s2">, </span><span class="s6">1</span><span class="s2">)</span>
+                <span class="s5"># ensure it's a key = value</span>
+                <span class="s4">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">arg</span><span class="s2">) != </span><span class="s6">2</span><span class="s2">:</span>
+                    <span class="s1">Logger</span><span class="s2">.</span><span class="s1">error</span><span class="s2">(</span><span class="s3">'ProbeSysfs: invalid parameters %s, not'</span>
+                                 <span class="s3">' key=value format' </span><span class="s2">% </span><span class="s1">arg</span><span class="s2">)</span>
+                    <span class="s4">continue</span>
+
+                <span class="s1">key</span><span class="s2">, </span><span class="s1">value </span><span class="s2">= </span><span class="s1">arg</span>
+                <span class="s4">if </span><span class="s1">key </span><span class="s2">== </span><span class="s3">'match'</span><span class="s2">:</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">match </span><span class="s2">= </span><span class="s1">value</span>
+                <span class="s4">elif </span><span class="s1">key </span><span class="s2">== </span><span class="s3">'provider'</span><span class="s2">:</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">provider </span><span class="s2">= </span><span class="s1">value</span>
+                <span class="s4">elif </span><span class="s1">key </span><span class="s2">== </span><span class="s3">'use_regex'</span><span class="s2">:</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">use_regex </span><span class="s2">= </span><span class="s1">bool</span><span class="s2">(</span><span class="s1">int</span><span class="s2">(</span><span class="s1">value</span><span class="s2">))</span>
+                <span class="s4">elif </span><span class="s1">key </span><span class="s2">== </span><span class="s3">'select_all'</span><span class="s2">:</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">select_all </span><span class="s2">= </span><span class="s1">bool</span><span class="s2">(</span><span class="s1">int</span><span class="s2">(</span><span class="s1">value</span><span class="s2">))</span>
+                <span class="s4">elif </span><span class="s1">key </span><span class="s2">== </span><span class="s3">'use_mouse'</span><span class="s2">:</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">use_mouse </span><span class="s2">= </span><span class="s1">bool</span><span class="s2">(</span><span class="s1">int</span><span class="s2">(</span><span class="s1">value</span><span class="s2">))</span>
+                <span class="s4">elif </span><span class="s1">key </span><span class="s2">== </span><span class="s3">'param'</span><span class="s2">:</span>
+                    <span class="s1">self</span><span class="s2">.</span><span class="s1">args</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">value</span><span class="s2">)</span>
+                <span class="s4">else</span><span class="s2">:</span>
+                    <span class="s1">Logger</span><span class="s2">.</span><span class="s1">error</span><span class="s2">(</span><span class="s3">'ProbeSysfs: unknown %s option' </span><span class="s2">% </span><span class="s1">key</span><span class="s2">)</span>
+                    <span class="s4">continue</span>
+
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">probe</span><span class="s2">()</span>
+
+        <span class="s4">def </span><span class="s1">should_use_mouse</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+            <span class="s4">return </span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">use_mouse </span><span class="s4">or</span>
+                    <span class="s4">not </span><span class="s1">any</span><span class="s2">(</span><span class="s1">p </span><span class="s4">for </span><span class="s1">p </span><span class="s4">in </span><span class="s1">EventLoop</span><span class="s2">.</span><span class="s1">input_providers</span>
+                            <span class="s4">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">p</span><span class="s2">, </span><span class="s1">MouseMotionEventProvider</span><span class="s2">)))</span>
+
+        <span class="s4">def </span><span class="s1">probe</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+            <span class="s4">global </span><span class="s1">EventLoop</span>
+            <span class="s4">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">base </span><span class="s4">import </span><span class="s1">EventLoop</span>
+
+            <span class="s1">inputs </span><span class="s2">= </span><span class="s1">get_inputs</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">input_path</span><span class="s2">)</span>
+            <span class="s1">Logger</span><span class="s2">.</span><span class="s1">debug</span><span class="s2">(</span><span class="s3">'ProbeSysfs: using probesysfs!'</span><span class="s2">)</span>
+
+            <span class="s1">use_mouse </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">should_use_mouse</span><span class="s2">()</span>
+
+            <span class="s4">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">select_all</span><span class="s2">:</span>
+                <span class="s1">inputs </span><span class="s2">= [</span><span class="s1">x </span><span class="s4">for </span><span class="s1">x </span><span class="s4">in </span><span class="s1">inputs </span><span class="s4">if</span>
+                          <span class="s1">x</span><span class="s2">.</span><span class="s1">has_capability</span><span class="s2">(</span><span class="s1">ABS_MT_POSITION_X</span><span class="s2">) </span><span class="s4">and</span>
+                          <span class="s2">(</span><span class="s1">use_mouse </span><span class="s4">or not </span><span class="s1">x</span><span class="s2">.</span><span class="s1">is_mouse</span><span class="s2">)]</span>
+            <span class="s4">for </span><span class="s1">device </span><span class="s4">in </span><span class="s1">inputs</span><span class="s2">:</span>
+                <span class="s1">Logger</span><span class="s2">.</span><span class="s1">debug</span><span class="s2">(</span><span class="s3">'ProbeSysfs: found device: %s at %s' </span><span class="s2">% (</span>
+                    <span class="s1">device</span><span class="s2">.</span><span class="s1">name</span><span class="s2">, </span><span class="s1">device</span><span class="s2">.</span><span class="s1">device</span><span class="s2">))</span>
+
+                <span class="s5"># must ignore ?</span>
+                <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">match</span><span class="s2">:</span>
+                    <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">use_regex</span><span class="s2">:</span>
+                        <span class="s4">if not </span><span class="s1">match</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">match</span><span class="s2">, </span><span class="s1">device</span><span class="s2">.</span><span class="s1">name</span><span class="s2">, </span><span class="s1">IGNORECASE</span><span class="s2">):</span>
+                            <span class="s1">Logger</span><span class="s2">.</span><span class="s1">debug</span><span class="s2">(</span><span class="s3">'ProbeSysfs: device not match the'</span>
+                                         <span class="s3">' rule in config, ignoring.'</span><span class="s2">)</span>
+                            <span class="s4">continue</span>
+                    <span class="s4">else</span><span class="s2">:</span>
+                        <span class="s4">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">match </span><span class="s4">not in </span><span class="s1">device</span><span class="s2">.</span><span class="s1">name</span><span class="s2">:</span>
+                            <span class="s4">continue</span>
+
+                <span class="s1">Logger</span><span class="s2">.</span><span class="s1">info</span><span class="s2">(</span><span class="s3">'ProbeSysfs: device match: %s' </span><span class="s2">% </span><span class="s1">device</span><span class="s2">.</span><span class="s1">device</span><span class="s2">)</span>
+
+                <span class="s1">d </span><span class="s2">= </span><span class="s1">device</span><span class="s2">.</span><span class="s1">device</span>
+                <span class="s1">devicename </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">device </span><span class="s2">% </span><span class="s1">dict</span><span class="s2">(</span><span class="s1">name</span><span class="s2">=</span><span class="s1">d</span><span class="s2">.</span><span class="s1">split</span><span class="s2">(</span><span class="s1">sep</span><span class="s2">)[-</span><span class="s6">1</span><span class="s2">])</span>
+
+                <span class="s1">provider </span><span class="s2">= </span><span class="s1">MotionEventFactory</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">provider</span><span class="s2">)</span>
+                <span class="s4">if </span><span class="s1">provider </span><span class="s4">is None</span><span class="s2">:</span>
+                    <span class="s1">Logger</span><span class="s2">.</span><span class="s1">info</span><span class="s2">(</span><span class="s3">'ProbeSysfs: Unable to find provider %s' </span><span class="s2">%</span>
+                                <span class="s1">self</span><span class="s2">.</span><span class="s1">provider</span><span class="s2">)</span>
+                    <span class="s1">Logger</span><span class="s2">.</span><span class="s1">info</span><span class="s2">(</span><span class="s3">'ProbeSysfs: fallback on hidinput'</span><span class="s2">)</span>
+                    <span class="s1">provider </span><span class="s2">= </span><span class="s1">MotionEventFactory</span><span class="s2">.</span><span class="s1">get</span><span class="s2">(</span><span class="s3">'hidinput'</span><span class="s2">)</span>
+                <span class="s4">if </span><span class="s1">provider </span><span class="s4">is None</span><span class="s2">:</span>
+                    <span class="s1">Logger</span><span class="s2">.</span><span class="s1">critical</span><span class="s2">(</span><span class="s3">'ProbeSysfs: no input provider found'</span>
+                                    <span class="s3">' to handle this device !'</span><span class="s2">)</span>
+                    <span class="s4">continue</span>
+
+                <span class="s1">instance </span><span class="s2">= </span><span class="s1">provider</span><span class="s2">(</span><span class="s1">devicename</span><span class="s2">, </span><span class="s3">'%s,%s' </span><span class="s2">% (</span>
+                    <span class="s1">device</span><span class="s2">.</span><span class="s1">device</span><span class="s2">, </span><span class="s3">','</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">args</span><span class="s2">)))</span>
+                <span class="s4">if </span><span class="s1">instance</span><span class="s2">:</span>
+                    <span class="s1">EventLoop</span><span class="s2">.</span><span class="s1">add_input_provider</span><span class="s2">(</span><span class="s1">instance</span><span class="s2">)</span>
+
+    <span class="s1">MotionEventFactory</span><span class="s2">.</span><span class="s1">register</span><span class="s2">(</span><span class="s3">'probesysfs'</span><span class="s2">, </span><span class="s1">ProbeSysfsHardwareProbe</span><span class="s2">)</span>
+</pre>
+</body>
+</html>

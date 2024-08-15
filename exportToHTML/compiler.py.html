@@ -1,0 +1,500 @@
+<html>
+<head>
+<title>compiler.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+.s6 { color: #5f826b; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+compiler.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># -*- coding: utf-8 -*-</span>
+
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">sys</span>
+
+<span class="s2">from </span><span class="s1">llvmlite </span><span class="s2">import </span><span class="s1">ir</span>
+<span class="s2">from </span><span class="s1">llvmlite</span><span class="s3">.</span><span class="s1">binding </span><span class="s2">import </span><span class="s1">Linkage</span>
+
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">pycc </span><span class="s2">import </span><span class="s1">llvm_types </span><span class="s2">as </span><span class="s1">lt</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">cgutils </span><span class="s2">import </span><span class="s1">create_constant_array</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">compiler </span><span class="s2">import </span><span class="s1">compile_extra</span><span class="s3">, </span><span class="s1">Flags</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">compiler_lock </span><span class="s2">import </span><span class="s1">global_compiler_lock</span>
+
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">registry </span><span class="s2">import </span><span class="s1">cpu_target</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core</span><span class="s3">.</span><span class="s1">runtime </span><span class="s2">import </span><span class="s1">nrtdynmod</span>
+<span class="s2">from </span><span class="s1">numba</span><span class="s3">.</span><span class="s1">core </span><span class="s2">import </span><span class="s1">cgutils</span>
+
+
+<span class="s1">logger </span><span class="s3">= </span><span class="s1">logging</span><span class="s3">.</span><span class="s1">getLogger</span><span class="s3">(</span><span class="s1">__name__</span><span class="s3">)</span>
+
+<span class="s1">__all__ </span><span class="s3">= [</span><span class="s4">'Compiler'</span><span class="s3">]</span>
+
+<span class="s1">NULL </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_void_star</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+<span class="s1">ZERO </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_int32</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+<span class="s1">ONE </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_int32</span><span class="s3">, </span><span class="s5">1</span><span class="s3">)</span>
+<span class="s1">METH_VARARGS_AND_KEYWORDS </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_int32</span><span class="s3">, </span><span class="s5">1</span><span class="s3">|</span><span class="s5">2</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">get_header</span><span class="s3">():</span>
+    <span class="s2">import </span><span class="s1">numpy</span>
+    <span class="s2">import </span><span class="s1">textwrap</span>
+
+    <span class="s2">return </span><span class="s1">textwrap</span><span class="s3">.</span><span class="s1">dedent</span><span class="s3">(</span><span class="s4">&quot;&quot;&quot;</span><span class="s2">\ 
+    </span><span class="s4">#include &lt;stdint.h&gt; 
+ 
+    #ifndef HAVE_LONGDOUBLE 
+        #define HAVE_LONGDOUBLE %d 
+    #endif 
+ 
+    typedef struct { 
+        float real; 
+        float imag; 
+    } complex64; 
+ 
+    typedef struct { 
+        double real; 
+        double imag; 
+    } complex128; 
+ 
+    #if HAVE_LONGDOUBLE 
+    typedef struct { 
+        long double real; 
+        long double imag; 
+    } complex256; 
+    #endif 
+ 
+    typedef float float32; 
+    typedef double float64; 
+    #if HAVE_LONGDOUBLE 
+    typedef long double float128; 
+    #endif 
+    &quot;&quot;&quot; </span><span class="s3">% </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">numpy</span><span class="s3">, </span><span class="s4">'complex256'</span><span class="s3">))</span>
+
+
+<span class="s2">class </span><span class="s1">ExportEntry</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s6">&quot;&quot;&quot; 
+    A simple record for exporting symbols. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">symbol</span><span class="s3">, </span><span class="s1">signature</span><span class="s3">, </span><span class="s1">function</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">symbol </span><span class="s3">= </span><span class="s1">symbol</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">signature </span><span class="s3">= </span><span class="s1">signature</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">function </span><span class="s3">= </span><span class="s1">function</span>
+
+    <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s4">&quot;ExportEntry(%r, %r)&quot; </span><span class="s3">% (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">symbol</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">signature</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">_ModuleCompiler</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s6">&quot;&quot;&quot;A base class to compile Python modules to a single shared library or 
+    extension module. 
+ 
+    :param export_entries: a list of ExportEntry instances. 
+    :param module_name: the name of the exported module. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">#: Structure used to describe a method of an extension type.</span>
+    <span class="s0">#: struct PyMethodDef {</span>
+    <span class="s0">#:     const char  *ml_name;       /* The name of the built-in function/method */</span>
+    <span class="s0">#:     PyCFunction  ml_meth;       /* The C function that implements it */</span>
+    <span class="s0">#:     int          ml_flags;      /* Combination of METH_xxx flags, which mostly</span>
+    <span class="s0">#:                                    describe the args expected by the C func */</span>
+    <span class="s0">#:     const char  *ml_doc;        /* The __doc__ attribute, or NULL */</span>
+    <span class="s0">#: };</span>
+    <span class="s1">method_def_ty </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">LiteralStructType</span><span class="s3">((</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_int8_star</span><span class="s3">,</span>
+                                          <span class="s1">lt</span><span class="s3">.</span><span class="s1">_void_star</span><span class="s3">,</span>
+                                          <span class="s1">lt</span><span class="s3">.</span><span class="s1">_int32</span><span class="s3">,</span>
+                                          <span class="s1">lt</span><span class="s3">.</span><span class="s1">_int8_star</span><span class="s3">))</span>
+
+    <span class="s1">method_def_ptr </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">PointerType</span><span class="s3">(</span><span class="s1">method_def_ty</span><span class="s3">)</span>
+    <span class="s0"># The structure type constructed by PythonAPI.serialize_uncached()</span>
+    <span class="s0"># when updating this, also make sure to update `env_def_t` struct in</span>
+    <span class="s0"># numba/pycc/modulemixin.c</span>
+    <span class="s1">env_def_ty </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">LiteralStructType</span><span class="s3">((</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_void_star</span><span class="s3">,</span>
+                                       <span class="s1">lt</span><span class="s3">.</span><span class="s1">_int32</span><span class="s3">,</span>
+                                       <span class="s1">lt</span><span class="s3">.</span><span class="s1">_void_star</span><span class="s3">,</span>
+                                       <span class="s1">lt</span><span class="s3">.</span><span class="s1">_void_star</span><span class="s3">,</span>
+                                       <span class="s1">lt</span><span class="s3">.</span><span class="s1">_int32</span><span class="s3">))</span>
+    <span class="s1">env_def_ptr </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">PointerType</span><span class="s3">(</span><span class="s1">env_def_ty</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">export_entries</span><span class="s3">, </span><span class="s1">module_name</span><span class="s3">, </span><span class="s1">use_nrt</span><span class="s3">=</span><span class="s2">False</span><span class="s3">,</span>
+                 <span class="s3">**</span><span class="s1">aot_options</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">module_name </span><span class="s3">= </span><span class="s1">module_name</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">export_python_wrap </span><span class="s3">= </span><span class="s2">False</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">dll_exports </span><span class="s3">= []</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">export_entries </span><span class="s3">= </span><span class="s1">export_entries</span>
+        <span class="s0"># Used by the CC API but not the legacy API</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">external_init_function </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">use_nrt </span><span class="s3">= </span><span class="s1">use_nrt</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">typing_context </span><span class="s3">= </span><span class="s1">cpu_target</span><span class="s3">.</span><span class="s1">typing_context</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">context </span><span class="s3">= </span><span class="s1">cpu_target</span><span class="s3">.</span><span class="s1">target_context</span><span class="s3">.</span><span class="s1">with_aot_codegen</span><span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">module_name</span><span class="s3">, **</span><span class="s1">aot_options</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_mangle_method_symbol</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">func_name</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s4">&quot;._pycc_method_%s&quot; </span><span class="s3">% (</span><span class="s1">func_name</span><span class="s3">,)</span>
+
+    <span class="s2">def </span><span class="s1">_emit_python_wrapper</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">llvm_module</span><span class="s3">):</span>
+        <span class="s6">&quot;&quot;&quot;Emit generated Python wrapper and extension module code. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s3">@</span><span class="s1">global_compiler_lock</span>
+    <span class="s2">def </span><span class="s1">_cull_exports</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s6">&quot;&quot;&quot;Read all the exported functions/modules in the translator 
+        environment, and join them into a single LLVM module. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">exported_function_types </span><span class="s3">= {}</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">function_environments </span><span class="s3">= {}</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">environment_gvs </span><span class="s3">= {}</span>
+
+        <span class="s1">codegen </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">codegen</span><span class="s3">()</span>
+        <span class="s1">library </span><span class="s3">= </span><span class="s1">codegen</span><span class="s3">.</span><span class="s1">create_library</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">module_name</span><span class="s3">)</span>
+
+        <span class="s0"># Generate IR for all exported functions</span>
+        <span class="s1">flags </span><span class="s3">= </span><span class="s1">Flags</span><span class="s3">()</span>
+        <span class="s1">flags</span><span class="s3">.</span><span class="s1">no_compile </span><span class="s3">= </span><span class="s2">True</span>
+        <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">export_python_wrap</span><span class="s3">:</span>
+            <span class="s1">flags</span><span class="s3">.</span><span class="s1">no_cpython_wrapper </span><span class="s3">= </span><span class="s2">True</span>
+            <span class="s1">flags</span><span class="s3">.</span><span class="s1">no_cfunc_wrapper </span><span class="s3">= </span><span class="s2">True</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">use_nrt</span><span class="s3">:</span>
+            <span class="s1">flags</span><span class="s3">.</span><span class="s1">nrt </span><span class="s3">= </span><span class="s2">True</span>
+            <span class="s0"># Compile NRT helpers</span>
+            <span class="s1">nrt_module</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">= </span><span class="s1">nrtdynmod</span><span class="s3">.</span><span class="s1">create_nrt_module</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">)</span>
+            <span class="s1">library</span><span class="s3">.</span><span class="s1">add_ir_module</span><span class="s3">(</span><span class="s1">nrt_module</span><span class="s3">)</span>
+
+        <span class="s2">for </span><span class="s1">entry </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">export_entries</span><span class="s3">:</span>
+            <span class="s1">cres </span><span class="s3">= </span><span class="s1">compile_extra</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">typing_context</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">,</span>
+                                <span class="s1">entry</span><span class="s3">.</span><span class="s1">function</span><span class="s3">,</span>
+                                <span class="s1">entry</span><span class="s3">.</span><span class="s1">signature</span><span class="s3">.</span><span class="s1">args</span><span class="s3">,</span>
+                                <span class="s1">entry</span><span class="s3">.</span><span class="s1">signature</span><span class="s3">.</span><span class="s1">return_type</span><span class="s3">, </span><span class="s1">flags</span><span class="s3">,</span>
+                                <span class="s1">locals</span><span class="s3">={}, </span><span class="s1">library</span><span class="s3">=</span><span class="s1">library</span><span class="s3">)</span>
+
+            <span class="s1">func_name </span><span class="s3">= </span><span class="s1">cres</span><span class="s3">.</span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">llvm_func_name</span>
+            <span class="s1">llvm_func </span><span class="s3">= </span><span class="s1">cres</span><span class="s3">.</span><span class="s1">library</span><span class="s3">.</span><span class="s1">get_function</span><span class="s3">(</span><span class="s1">func_name</span><span class="s3">)</span>
+
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">export_python_wrap</span><span class="s3">:</span>
+                <span class="s1">llvm_func</span><span class="s3">.</span><span class="s1">linkage </span><span class="s3">= </span><span class="s4">'internal'</span>
+                <span class="s1">wrappername </span><span class="s3">= </span><span class="s1">cres</span><span class="s3">.</span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">llvm_cpython_wrapper_name</span>
+                <span class="s1">wrapper </span><span class="s3">= </span><span class="s1">cres</span><span class="s3">.</span><span class="s1">library</span><span class="s3">.</span><span class="s1">get_function</span><span class="s3">(</span><span class="s1">wrappername</span><span class="s3">)</span>
+                <span class="s1">wrapper</span><span class="s3">.</span><span class="s1">name </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_mangle_method_symbol</span><span class="s3">(</span><span class="s1">entry</span><span class="s3">.</span><span class="s1">symbol</span><span class="s3">)</span>
+                <span class="s1">wrapper</span><span class="s3">.</span><span class="s1">linkage </span><span class="s3">= </span><span class="s4">'external'</span>
+                <span class="s1">fnty </span><span class="s3">= </span><span class="s1">cres</span><span class="s3">.</span><span class="s1">target_context</span><span class="s3">.</span><span class="s1">call_conv</span><span class="s3">.</span><span class="s1">get_function_type</span><span class="s3">(</span>
+                    <span class="s1">cres</span><span class="s3">.</span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">restype</span><span class="s3">, </span><span class="s1">cres</span><span class="s3">.</span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">argtypes</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">exported_function_types</span><span class="s3">[</span><span class="s1">entry</span><span class="s3">] = </span><span class="s1">fnty</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">function_environments</span><span class="s3">[</span><span class="s1">entry</span><span class="s3">] = </span><span class="s1">cres</span><span class="s3">.</span><span class="s1">environment</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">environment_gvs</span><span class="s3">[</span><span class="s1">entry</span><span class="s3">] = </span><span class="s1">cres</span><span class="s3">.</span><span class="s1">fndesc</span><span class="s3">.</span><span class="s1">env_name</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">llvm_func</span><span class="s3">.</span><span class="s1">name </span><span class="s3">= </span><span class="s1">entry</span><span class="s3">.</span><span class="s1">symbol</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">dll_exports</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">entry</span><span class="s3">.</span><span class="s1">symbol</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">export_python_wrap</span><span class="s3">:</span>
+            <span class="s1">wrapper_module </span><span class="s3">= </span><span class="s1">library</span><span class="s3">.</span><span class="s1">create_ir_module</span><span class="s3">(</span><span class="s4">&quot;wrapper&quot;</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_emit_python_wrapper</span><span class="s3">(</span><span class="s1">wrapper_module</span><span class="s3">)</span>
+            <span class="s1">library</span><span class="s3">.</span><span class="s1">add_ir_module</span><span class="s3">(</span><span class="s1">wrapper_module</span><span class="s3">)</span>
+
+        <span class="s0"># Hide all functions in the DLL except those explicitly exported</span>
+        <span class="s1">library</span><span class="s3">.</span><span class="s1">finalize</span><span class="s3">()</span>
+        <span class="s2">for </span><span class="s1">fn </span><span class="s2">in </span><span class="s1">library</span><span class="s3">.</span><span class="s1">get_defined_functions</span><span class="s3">():</span>
+            <span class="s2">if </span><span class="s1">fn</span><span class="s3">.</span><span class="s1">name </span><span class="s2">not in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">dll_exports</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">fn</span><span class="s3">.</span><span class="s1">linkage </span><span class="s2">in </span><span class="s3">{</span><span class="s1">Linkage</span><span class="s3">.</span><span class="s1">private</span><span class="s3">, </span><span class="s1">Linkage</span><span class="s3">.</span><span class="s1">internal</span><span class="s3">}:</span>
+                    <span class="s0"># Private/Internal linkage must have &quot;default&quot; visibility</span>
+                    <span class="s1">fn</span><span class="s3">.</span><span class="s1">visibility </span><span class="s3">= </span><span class="s4">&quot;default&quot;</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">fn</span><span class="s3">.</span><span class="s1">visibility </span><span class="s3">= </span><span class="s4">'hidden'</span>
+        <span class="s2">return </span><span class="s1">library</span>
+
+    <span class="s2">def </span><span class="s1">write_llvm_bitcode</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">output</span><span class="s3">, </span><span class="s1">wrap</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, **</span><span class="s1">kws</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">export_python_wrap </span><span class="s3">= </span><span class="s1">wrap</span>
+        <span class="s1">library </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cull_exports</span><span class="s3">()</span>
+        <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">output</span><span class="s3">, </span><span class="s4">'wb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">fout</span><span class="s3">:</span>
+            <span class="s1">fout</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">library</span><span class="s3">.</span><span class="s1">emit_bitcode</span><span class="s3">())</span>
+
+    <span class="s2">def </span><span class="s1">write_native_object</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">output</span><span class="s3">, </span><span class="s1">wrap</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, **</span><span class="s1">kws</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">export_python_wrap </span><span class="s3">= </span><span class="s1">wrap</span>
+        <span class="s1">library </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cull_exports</span><span class="s3">()</span>
+        <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">output</span><span class="s3">, </span><span class="s4">'wb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">fout</span><span class="s3">:</span>
+            <span class="s1">fout</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">library</span><span class="s3">.</span><span class="s1">emit_native_object</span><span class="s3">())</span>
+
+    <span class="s2">def </span><span class="s1">emit_type</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">tyobj</span><span class="s3">):</span>
+        <span class="s1">ret_val </span><span class="s3">= </span><span class="s1">str</span><span class="s3">(</span><span class="s1">tyobj</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s4">'int' </span><span class="s2">in </span><span class="s1">ret_val</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">ret_val</span><span class="s3">.</span><span class="s1">endswith</span><span class="s3">((</span><span class="s4">'8'</span><span class="s3">, </span><span class="s4">'16'</span><span class="s3">, </span><span class="s4">'32'</span><span class="s3">, </span><span class="s4">'64'</span><span class="s3">)):</span>
+                <span class="s1">ret_val </span><span class="s3">+= </span><span class="s4">&quot;_t&quot;</span>
+        <span class="s2">return </span><span class="s1">ret_val</span>
+
+    <span class="s2">def </span><span class="s1">emit_header</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">output</span><span class="s3">):</span>
+        <span class="s1">fname</span><span class="s3">, </span><span class="s1">ext </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">splitext</span><span class="s3">(</span><span class="s1">output</span><span class="s3">)</span>
+        <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">fname </span><span class="s3">+ </span><span class="s4">'.h'</span><span class="s3">, </span><span class="s4">'w'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">fout</span><span class="s3">:</span>
+            <span class="s1">fout</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">get_header</span><span class="s3">())</span>
+            <span class="s1">fout</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s4">&quot;</span><span class="s2">\n</span><span class="s4">/* Prototypes */</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s3">)</span>
+            <span class="s2">for </span><span class="s1">export_entry </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">export_entries</span><span class="s3">:</span>
+                <span class="s1">name </span><span class="s3">= </span><span class="s1">export_entry</span><span class="s3">.</span><span class="s1">symbol</span>
+                <span class="s1">restype </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">emit_type</span><span class="s3">(</span><span class="s1">export_entry</span><span class="s3">.</span><span class="s1">signature</span><span class="s3">.</span><span class="s1">return_type</span><span class="s3">)</span>
+                <span class="s1">args </span><span class="s3">= </span><span class="s4">&quot;, &quot;</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">emit_type</span><span class="s3">(</span><span class="s1">argtype</span><span class="s3">)</span>
+                                 <span class="s2">for </span><span class="s1">argtype </span><span class="s2">in </span><span class="s1">export_entry</span><span class="s3">.</span><span class="s1">signature</span><span class="s3">.</span><span class="s1">args</span><span class="s3">)</span>
+                <span class="s1">fout</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s4">&quot;extern %s %s(%s);</span><span class="s2">\n</span><span class="s4">&quot; </span><span class="s3">% (</span><span class="s1">restype</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">args</span><span class="s3">))</span>
+
+    <span class="s2">def </span><span class="s1">_emit_method_array</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">llvm_module</span><span class="s3">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Collect exported methods and emit a PyMethodDef array. 
+ 
+        :returns: a pointer to the PyMethodDef array. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">method_defs </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">entry </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">export_entries</span><span class="s3">:</span>
+            <span class="s1">name </span><span class="s3">= </span><span class="s1">entry</span><span class="s3">.</span><span class="s1">symbol</span>
+            <span class="s1">llvm_func_name </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_mangle_method_symbol</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">fnty </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">exported_function_types</span><span class="s3">[</span><span class="s1">entry</span><span class="s3">]</span>
+            <span class="s1">lfunc </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Function</span><span class="s3">(</span><span class="s1">llvm_module</span><span class="s3">, </span><span class="s1">fnty</span><span class="s3">, </span><span class="s1">llvm_func_name</span><span class="s3">)</span>
+
+            <span class="s1">method_name </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">insert_const_string</span><span class="s3">(</span><span class="s1">llvm_module</span><span class="s3">, </span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s1">method_def_const </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">.</span><span class="s1">literal_struct</span><span class="s3">(</span>
+                <span class="s3">(</span><span class="s1">method_name</span><span class="s3">,</span>
+                 <span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">.</span><span class="s1">bitcast</span><span class="s3">(</span><span class="s1">lfunc</span><span class="s3">, </span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_void_star</span><span class="s3">),</span>
+                 <span class="s1">METH_VARARGS_AND_KEYWORDS</span><span class="s3">,</span>
+                 <span class="s1">NULL</span><span class="s3">))</span>
+            <span class="s1">method_defs</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">method_def_const</span><span class="s3">)</span>
+
+        <span class="s1">sentinel </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">.</span><span class="s1">literal_struct</span><span class="s3">([</span><span class="s1">NULL</span><span class="s3">, </span><span class="s1">NULL</span><span class="s3">, </span><span class="s1">ZERO</span><span class="s3">, </span><span class="s1">NULL</span><span class="s3">])</span>
+        <span class="s1">method_defs</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">sentinel</span><span class="s3">)</span>
+        <span class="s1">method_array_init </span><span class="s3">= </span><span class="s1">create_constant_array</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">method_def_ty</span><span class="s3">, </span><span class="s1">method_defs</span><span class="s3">)</span>
+        <span class="s1">method_array </span><span class="s3">= </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">add_global_variable</span><span class="s3">(</span><span class="s1">llvm_module</span><span class="s3">,</span>
+                                                   <span class="s1">method_array_init</span><span class="s3">.</span><span class="s1">type</span><span class="s3">,</span>
+                                                   <span class="s4">'.module_methods'</span><span class="s3">)</span>
+        <span class="s1">method_array</span><span class="s3">.</span><span class="s1">initializer </span><span class="s3">= </span><span class="s1">method_array_init</span>
+        <span class="s1">method_array</span><span class="s3">.</span><span class="s1">linkage </span><span class="s3">= </span><span class="s4">'internal'</span>
+        <span class="s1">method_array_ptr </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">.</span><span class="s1">gep</span><span class="s3">(</span><span class="s1">method_array</span><span class="s3">, [</span><span class="s1">ZERO</span><span class="s3">, </span><span class="s1">ZERO</span><span class="s3">])</span>
+        <span class="s2">return </span><span class="s1">method_array_ptr</span>
+
+    <span class="s2">def </span><span class="s1">_emit_environment_array</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">llvm_module</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">, </span><span class="s1">pyapi</span><span class="s3">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Emit an array of env_def_t structures (see modulemixin.c) 
+        storing the pickled environment constants for each of the 
+        exported functions. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">env_defs </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">entry </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">export_entries</span><span class="s3">:</span>
+            <span class="s1">env </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">function_environments</span><span class="s3">[</span><span class="s1">entry</span><span class="s3">]</span>
+            <span class="s0"># Constants may be unhashable so avoid trying to cache them</span>
+            <span class="s1">env_def </span><span class="s3">= </span><span class="s1">pyapi</span><span class="s3">.</span><span class="s1">serialize_uncached</span><span class="s3">(</span><span class="s1">env</span><span class="s3">.</span><span class="s1">consts</span><span class="s3">)</span>
+            <span class="s1">env_defs</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">env_def</span><span class="s3">)</span>
+        <span class="s1">env_defs_init </span><span class="s3">= </span><span class="s1">create_constant_array</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">env_def_ty</span><span class="s3">, </span><span class="s1">env_defs</span><span class="s3">)</span>
+        <span class="s1">gv </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">insert_unique_const</span><span class="s3">(</span><span class="s1">llvm_module</span><span class="s3">,</span>
+                                              <span class="s4">'.module_environments'</span><span class="s3">,</span>
+                                              <span class="s1">env_defs_init</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">gv</span><span class="s3">.</span><span class="s1">gep</span><span class="s3">([</span><span class="s1">ZERO</span><span class="s3">, </span><span class="s1">ZERO</span><span class="s3">])</span>
+
+    <span class="s2">def </span><span class="s1">_emit_envgvs_array</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">llvm_module</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">, </span><span class="s1">pyapi</span><span class="s3">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Emit an array of Environment pointers that needs to be filled at 
+        initialization. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">env_setters </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">entry </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">export_entries</span><span class="s3">:</span>
+            <span class="s1">envgv_name </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">environment_gvs</span><span class="s3">[</span><span class="s1">entry</span><span class="s3">]</span>
+            <span class="s1">gv </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">declare_env_global</span><span class="s3">(</span><span class="s1">llvm_module</span><span class="s3">, </span><span class="s1">envgv_name</span><span class="s3">)</span>
+            <span class="s1">envgv </span><span class="s3">= </span><span class="s1">gv</span><span class="s3">.</span><span class="s1">bitcast</span><span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_void_star</span><span class="s3">)</span>
+            <span class="s1">env_setters</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">envgv</span><span class="s3">)</span>
+
+        <span class="s1">env_setters_init </span><span class="s3">= </span><span class="s1">create_constant_array</span><span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_void_star</span><span class="s3">, </span><span class="s1">env_setters</span><span class="s3">)</span>
+        <span class="s1">gv </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">insert_unique_const</span><span class="s3">(</span><span class="s1">llvm_module</span><span class="s3">,</span>
+                                              <span class="s4">'.module_envgvs'</span><span class="s3">,</span>
+                                              <span class="s1">env_setters_init</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">gv</span><span class="s3">.</span><span class="s1">gep</span><span class="s3">([</span><span class="s1">ZERO</span><span class="s3">, </span><span class="s1">ZERO</span><span class="s3">])</span>
+
+    <span class="s2">def </span><span class="s1">_emit_module_init_code</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">llvm_module</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">, </span><span class="s1">modobj</span><span class="s3">,</span>
+                               <span class="s1">method_array</span><span class="s3">, </span><span class="s1">env_array</span><span class="s3">, </span><span class="s1">envgv_array</span><span class="s3">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Emit call to &quot;external&quot; init function, if any. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">external_init_function</span><span class="s3">:</span>
+            <span class="s1">fnty </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">FunctionType</span><span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_int32</span><span class="s3">,</span>
+                                   <span class="s3">[</span><span class="s1">modobj</span><span class="s3">.</span><span class="s1">type</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">method_def_ptr</span><span class="s3">,</span>
+                                    <span class="s1">self</span><span class="s3">.</span><span class="s1">env_def_ptr</span><span class="s3">, </span><span class="s1">envgv_array</span><span class="s3">.</span><span class="s1">type</span><span class="s3">])</span>
+            <span class="s1">fn </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Function</span><span class="s3">(</span><span class="s1">llvm_module</span><span class="s3">, </span><span class="s1">fnty</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">external_init_function</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">builder</span><span class="s3">.</span><span class="s1">call</span><span class="s3">(</span><span class="s1">fn</span><span class="s3">, [</span><span class="s1">modobj</span><span class="s3">, </span><span class="s1">method_array</span><span class="s3">, </span><span class="s1">env_array</span><span class="s3">,</span>
+                                     <span class="s1">envgv_array</span><span class="s3">])</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">return None</span>
+
+
+<span class="s2">class </span><span class="s1">ModuleCompiler</span><span class="s3">(</span><span class="s1">_ModuleCompiler</span><span class="s3">):</span>
+
+    <span class="s1">_ptr_fun </span><span class="s3">= </span><span class="s2">lambda </span><span class="s1">ret</span><span class="s3">, *</span><span class="s1">args</span><span class="s3">: </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">PointerType</span><span class="s3">(</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">FunctionType</span><span class="s3">(</span><span class="s1">ret</span><span class="s3">, </span><span class="s1">args</span><span class="s3">))</span>
+
+    <span class="s0">#: typedef int (*visitproc)(PyObject *, void *);</span>
+    <span class="s1">visitproc_ty </span><span class="s3">= </span><span class="s1">_ptr_fun</span><span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_int8</span><span class="s3">,</span>
+                            <span class="s1">lt</span><span class="s3">.</span><span class="s1">_pyobject_head_p</span><span class="s3">)</span>
+
+    <span class="s0">#: typedef int (*inquiry)(PyObject *);</span>
+    <span class="s1">inquiry_ty </span><span class="s3">= </span><span class="s1">_ptr_fun</span><span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_int8</span><span class="s3">,</span>
+                          <span class="s1">lt</span><span class="s3">.</span><span class="s1">_pyobject_head_p</span><span class="s3">)</span>
+
+    <span class="s0">#: typedef int (*traverseproc)(PyObject *, visitproc, void *);</span>
+    <span class="s1">traverseproc_ty </span><span class="s3">= </span><span class="s1">_ptr_fun</span><span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_int8</span><span class="s3">,</span>
+                               <span class="s1">lt</span><span class="s3">.</span><span class="s1">_pyobject_head_p</span><span class="s3">,</span>
+                               <span class="s1">visitproc_ty</span><span class="s3">,</span>
+                               <span class="s1">lt</span><span class="s3">.</span><span class="s1">_void_star</span><span class="s3">)</span>
+
+    <span class="s0">#  typedef void (*freefunc)(void *)</span>
+    <span class="s1">freefunc_ty </span><span class="s3">= </span><span class="s1">_ptr_fun</span><span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_int8</span><span class="s3">,</span>
+                           <span class="s1">lt</span><span class="s3">.</span><span class="s1">_void_star</span><span class="s3">)</span>
+
+    <span class="s0"># PyObject* (*m_init)(void);</span>
+    <span class="s1">m_init_ty </span><span class="s3">= </span><span class="s1">_ptr_fun</span><span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_int8</span><span class="s3">)</span>
+
+    <span class="s1">_char_star </span><span class="s3">= </span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_int8_star</span>
+
+    <span class="s0">#: typedef struct PyModuleDef_Base {</span>
+    <span class="s0">#:   PyObject_HEAD</span>
+    <span class="s0">#:   PyObject* (*m_init)(void);</span>
+    <span class="s0">#:   Py_ssize_t m_index;</span>
+    <span class="s0">#:   PyObject* m_copy;</span>
+    <span class="s0">#: } PyModuleDef_Base;</span>
+    <span class="s1">module_def_base_ty </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">LiteralStructType</span><span class="s3">(</span>
+        <span class="s3">(</span>
+            <span class="s1">lt</span><span class="s3">.</span><span class="s1">_pyobject_head</span><span class="s3">,</span>
+            <span class="s1">m_init_ty</span><span class="s3">,</span>
+            <span class="s1">lt</span><span class="s3">.</span><span class="s1">_llvm_py_ssize_t</span><span class="s3">,</span>
+            <span class="s1">lt</span><span class="s3">.</span><span class="s1">_pyobject_head_p</span>
+        <span class="s3">))</span>
+
+    <span class="s0">#: This struct holds all information that is needed to create a module object.</span>
+    <span class="s0">#: typedef struct PyModuleDef{</span>
+    <span class="s0">#:   PyModuleDef_Base m_base;</span>
+    <span class="s0">#:   const char* m_name;</span>
+    <span class="s0">#:   const char* m_doc;</span>
+    <span class="s0">#:   Py_ssize_t m_size;</span>
+    <span class="s0">#:   PyMethodDef *m_methods;</span>
+    <span class="s0">#:   inquiry m_reload;</span>
+    <span class="s0">#:   traverseproc m_traverse;</span>
+    <span class="s0">#:   inquiry m_clear;</span>
+    <span class="s0">#:   freefunc m_free;</span>
+    <span class="s0">#: }PyModuleDef;</span>
+    <span class="s1">module_def_ty </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">LiteralStructType</span><span class="s3">(</span>
+        <span class="s3">(</span>
+            <span class="s1">module_def_base_ty</span><span class="s3">,</span>
+            <span class="s1">_char_star</span><span class="s3">,</span>
+            <span class="s1">_char_star</span><span class="s3">,</span>
+            <span class="s1">lt</span><span class="s3">.</span><span class="s1">_llvm_py_ssize_t</span><span class="s3">,</span>
+            <span class="s1">_ModuleCompiler</span><span class="s3">.</span><span class="s1">method_def_ptr</span><span class="s3">,</span>
+            <span class="s1">inquiry_ty</span><span class="s3">,</span>
+            <span class="s1">traverseproc_ty</span><span class="s3">,</span>
+            <span class="s1">inquiry_ty</span><span class="s3">,</span>
+            <span class="s1">freefunc_ty</span>
+        <span class="s3">))</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">module_create_definition</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Return the signature and name of the Python C API function to 
+        initialize the module. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">signature </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">FunctionType</span><span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_pyobject_head_p</span><span class="s3">,</span>
+                                    <span class="s3">(</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">PointerType</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">module_def_ty</span><span class="s3">),</span>
+                                     <span class="s1">lt</span><span class="s3">.</span><span class="s1">_int32</span><span class="s3">))</span>
+
+        <span class="s1">name </span><span class="s3">= </span><span class="s4">&quot;PyModule_Create2&quot;</span>
+        <span class="s2">if </span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_trace_refs_</span><span class="s3">:</span>
+            <span class="s1">name </span><span class="s3">+= </span><span class="s4">&quot;TraceRefs&quot;</span>
+
+        <span class="s2">return </span><span class="s1">signature</span><span class="s3">, </span><span class="s1">name</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">module_init_definition</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s6">&quot;&quot;&quot; 
+        Return the name and signature of the module's initialization function. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">signature </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">FunctionType</span><span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_pyobject_head_p</span><span class="s3">, ())</span>
+
+        <span class="s2">return </span><span class="s1">signature</span><span class="s3">, </span><span class="s4">&quot;PyInit_&quot; </span><span class="s3">+ </span><span class="s1">self</span><span class="s3">.</span><span class="s1">module_name</span>
+
+    <span class="s2">def </span><span class="s1">_emit_python_wrapper</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">llvm_module</span><span class="s3">):</span>
+        <span class="s0"># Figure out the Python C API module creation function, and</span>
+        <span class="s0"># get a LLVM function for it.</span>
+        <span class="s1">create_module_fn </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Function</span><span class="s3">(</span><span class="s1">llvm_module</span><span class="s3">, *</span><span class="s1">self</span><span class="s3">.</span><span class="s1">module_create_definition</span><span class="s3">)</span>
+        <span class="s1">create_module_fn</span><span class="s3">.</span><span class="s1">linkage </span><span class="s3">= </span><span class="s4">'external'</span>
+
+        <span class="s0"># Define a constant string for the module name.</span>
+        <span class="s1">mod_name_const </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">insert_const_string</span><span class="s3">(</span><span class="s1">llvm_module</span><span class="s3">,</span>
+                                                          <span class="s1">self</span><span class="s3">.</span><span class="s1">module_name</span><span class="s3">)</span>
+
+        <span class="s1">mod_def_base_init </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">.</span><span class="s1">literal_struct</span><span class="s3">(</span>
+            <span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_pyobject_head_init</span><span class="s3">,                        </span><span class="s0"># PyObject_HEAD</span>
+             <span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">m_init_ty</span><span class="s3">, </span><span class="s2">None</span><span class="s3">),             </span><span class="s0"># m_init</span>
+             <span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_llvm_py_ssize_t</span><span class="s3">, </span><span class="s2">None</span><span class="s3">),        </span><span class="s0"># m_index</span>
+             <span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_pyobject_head_p</span><span class="s3">, </span><span class="s2">None</span><span class="s3">),        </span><span class="s0"># m_copy</span>
+            <span class="s3">)</span>
+        <span class="s3">)</span>
+        <span class="s1">mod_def_base </span><span class="s3">= </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">add_global_variable</span><span class="s3">(</span><span class="s1">llvm_module</span><span class="s3">,</span>
+                                                   <span class="s1">mod_def_base_init</span><span class="s3">.</span><span class="s1">type</span><span class="s3">,</span>
+                                                   <span class="s4">'.module_def_base'</span><span class="s3">)</span>
+        <span class="s1">mod_def_base</span><span class="s3">.</span><span class="s1">initializer </span><span class="s3">= </span><span class="s1">mod_def_base_init</span>
+        <span class="s1">mod_def_base</span><span class="s3">.</span><span class="s1">linkage </span><span class="s3">= </span><span class="s4">'internal'</span>
+
+        <span class="s1">method_array </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_emit_method_array</span><span class="s3">(</span><span class="s1">llvm_module</span><span class="s3">)</span>
+
+        <span class="s1">mod_def_init </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">.</span><span class="s1">literal_struct</span><span class="s3">(</span>
+            <span class="s3">(</span><span class="s1">mod_def_base_init</span><span class="s3">,                              </span><span class="s0"># m_base</span>
+             <span class="s1">mod_name_const</span><span class="s3">,                                 </span><span class="s0"># m_name</span>
+             <span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_char_star</span><span class="s3">, </span><span class="s2">None</span><span class="s3">),             </span><span class="s0"># m_doc</span>
+             <span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_llvm_py_ssize_t</span><span class="s3">, -</span><span class="s5">1</span><span class="s3">),           </span><span class="s0"># m_size</span>
+             <span class="s1">method_array</span><span class="s3">,                                   </span><span class="s0"># m_methods</span>
+             <span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">inquiry_ty</span><span class="s3">, </span><span class="s2">None</span><span class="s3">),             </span><span class="s0"># m_reload</span>
+             <span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">traverseproc_ty</span><span class="s3">, </span><span class="s2">None</span><span class="s3">),        </span><span class="s0"># m_traverse</span>
+             <span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">inquiry_ty</span><span class="s3">, </span><span class="s2">None</span><span class="s3">),             </span><span class="s0"># m_clear</span>
+             <span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">freefunc_ty</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)             </span><span class="s0"># m_free</span>
+            <span class="s3">)</span>
+        <span class="s3">)</span>
+
+        <span class="s0"># Define a constant string for the module name.</span>
+        <span class="s1">mod_def </span><span class="s3">= </span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">add_global_variable</span><span class="s3">(</span><span class="s1">llvm_module</span><span class="s3">, </span><span class="s1">mod_def_init</span><span class="s3">.</span><span class="s1">type</span><span class="s3">,</span>
+                                              <span class="s4">'.module_def'</span><span class="s3">)</span>
+        <span class="s1">mod_def</span><span class="s3">.</span><span class="s1">initializer </span><span class="s3">= </span><span class="s1">mod_def_init</span>
+        <span class="s1">mod_def</span><span class="s3">.</span><span class="s1">linkage </span><span class="s3">= </span><span class="s4">'internal'</span>
+
+        <span class="s0"># Define the module initialization function.</span>
+        <span class="s1">mod_init_fn </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Function</span><span class="s3">(</span><span class="s1">llvm_module</span><span class="s3">, *</span><span class="s1">self</span><span class="s3">.</span><span class="s1">module_init_definition</span><span class="s3">)</span>
+        <span class="s1">entry </span><span class="s3">= </span><span class="s1">mod_init_fn</span><span class="s3">.</span><span class="s1">append_basic_block</span><span class="s3">(</span><span class="s4">'Entry'</span><span class="s3">)</span>
+        <span class="s1">builder </span><span class="s3">= </span><span class="s1">ir</span><span class="s3">.</span><span class="s1">IRBuilder</span><span class="s3">(</span><span class="s1">entry</span><span class="s3">)</span>
+        <span class="s1">pyapi </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">context</span><span class="s3">.</span><span class="s1">get_python_api</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">)</span>
+
+        <span class="s1">mod </span><span class="s3">= </span><span class="s1">builder</span><span class="s3">.</span><span class="s1">call</span><span class="s3">(</span><span class="s1">create_module_fn</span><span class="s3">,</span>
+                           <span class="s3">(</span><span class="s1">mod_def</span><span class="s3">,</span>
+                            <span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">lt</span><span class="s3">.</span><span class="s1">_int32</span><span class="s3">, </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">api_version</span><span class="s3">)))</span>
+
+        <span class="s0"># Test if module has been created correctly.</span>
+        <span class="s0"># (XXX for some reason comparing with the NULL constant fails llvm</span>
+        <span class="s0">#  with an assertion in pydebug mode)</span>
+        <span class="s2">with </span><span class="s1">builder</span><span class="s3">.</span><span class="s1">if_then</span><span class="s3">(</span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">is_null</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">mod</span><span class="s3">)):</span>
+            <span class="s1">builder</span><span class="s3">.</span><span class="s1">ret</span><span class="s3">(</span><span class="s1">NULL</span><span class="s3">.</span><span class="s1">bitcast</span><span class="s3">(</span><span class="s1">mod_init_fn</span><span class="s3">.</span><span class="s1">type</span><span class="s3">.</span><span class="s1">pointee</span><span class="s3">.</span><span class="s1">return_type</span><span class="s3">))</span>
+
+        <span class="s1">env_array </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_emit_environment_array</span><span class="s3">(</span><span class="s1">llvm_module</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">, </span><span class="s1">pyapi</span><span class="s3">)</span>
+        <span class="s1">envgv_array </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_emit_envgvs_array</span><span class="s3">(</span><span class="s1">llvm_module</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">, </span><span class="s1">pyapi</span><span class="s3">)</span>
+        <span class="s1">ret </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_emit_module_init_code</span><span class="s3">(</span><span class="s1">llvm_module</span><span class="s3">, </span><span class="s1">builder</span><span class="s3">, </span><span class="s1">mod</span><span class="s3">,</span>
+                                          <span class="s1">method_array</span><span class="s3">, </span><span class="s1">env_array</span><span class="s3">, </span><span class="s1">envgv_array</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">ret </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s2">with </span><span class="s1">builder</span><span class="s3">.</span><span class="s1">if_then</span><span class="s3">(</span><span class="s1">cgutils</span><span class="s3">.</span><span class="s1">is_not_null</span><span class="s3">(</span><span class="s1">builder</span><span class="s3">, </span><span class="s1">ret</span><span class="s3">)):</span>
+                <span class="s0"># Init function errored out</span>
+                <span class="s1">builder</span><span class="s3">.</span><span class="s1">ret</span><span class="s3">(</span><span class="s1">ir</span><span class="s3">.</span><span class="s1">Constant</span><span class="s3">(</span><span class="s1">mod</span><span class="s3">.</span><span class="s1">type</span><span class="s3">, </span><span class="s2">None</span><span class="s3">))</span>
+
+        <span class="s1">builder</span><span class="s3">.</span><span class="s1">ret</span><span class="s3">(</span><span class="s1">mod</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">dll_exports</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">mod_init_fn</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+
+</pre>
+</body>
+</html>

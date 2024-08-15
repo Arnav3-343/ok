@@ -1,0 +1,230 @@
+<html>
+<head>
+<title>camera_android.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #5f826b; font-style: italic;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+.s7 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+camera_android.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">jnius </span><span class="s0">import </span><span class="s1">autoclass</span><span class="s2">, </span><span class="s1">PythonJavaClass</span><span class="s2">, </span><span class="s1">java_method</span>
+<span class="s0">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">clock </span><span class="s0">import </span><span class="s1">Clock</span>
+<span class="s0">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">graphics</span><span class="s2">.</span><span class="s1">texture </span><span class="s0">import </span><span class="s1">Texture</span>
+<span class="s0">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">graphics </span><span class="s0">import </span><span class="s1">Fbo</span><span class="s2">, </span><span class="s1">Callback</span><span class="s2">, </span><span class="s1">Rectangle</span>
+<span class="s0">from </span><span class="s1">kivy</span><span class="s2">.</span><span class="s1">core</span><span class="s2">.</span><span class="s1">camera </span><span class="s0">import </span><span class="s1">CameraBase</span>
+<span class="s0">import </span><span class="s1">threading</span>
+
+
+<span class="s1">Camera </span><span class="s2">= </span><span class="s1">autoclass</span><span class="s2">(</span><span class="s3">'android.hardware.Camera'</span><span class="s2">)</span>
+<span class="s1">SurfaceTexture </span><span class="s2">= </span><span class="s1">autoclass</span><span class="s2">(</span><span class="s3">'android.graphics.SurfaceTexture'</span><span class="s2">)</span>
+<span class="s1">GL_TEXTURE_EXTERNAL_OES </span><span class="s2">= </span><span class="s1">autoclass</span><span class="s2">(</span>
+    <span class="s3">'android.opengl.GLES11Ext'</span><span class="s2">).</span><span class="s1">GL_TEXTURE_EXTERNAL_OES</span>
+<span class="s1">ImageFormat </span><span class="s2">= </span><span class="s1">autoclass</span><span class="s2">(</span><span class="s3">'android.graphics.ImageFormat'</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">PreviewCallback</span><span class="s2">(</span><span class="s1">PythonJavaClass</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Interface used to get back the preview frame of the Android Camera 
+    &quot;&quot;&quot;</span>
+    <span class="s1">__javainterfaces__ </span><span class="s2">= (</span><span class="s3">'android.hardware.Camera$PreviewCallback'</span><span class="s2">, )</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">callback</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">PreviewCallback</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_callback </span><span class="s2">= </span><span class="s1">callback</span>
+
+    <span class="s2">@</span><span class="s1">java_method</span><span class="s2">(</span><span class="s3">'([BLandroid/hardware/Camera;)V'</span><span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">onPreviewFrame</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">camera</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_callback</span><span class="s2">(</span><span class="s1">data</span><span class="s2">, </span><span class="s1">camera</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">CameraAndroid</span><span class="s2">(</span><span class="s1">CameraBase</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Implementation of CameraBase using Android API 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_update_ev </span><span class="s2">= </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_android_camera </span><span class="s2">= </span><span class="s0">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_preview_cb </span><span class="s2">= </span><span class="s1">PreviewCallback</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_on_preview_frame</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_buflock </span><span class="s2">= </span><span class="s1">threading</span><span class="s2">.</span><span class="s1">Lock</span><span class="s2">()</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">CameraAndroid</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">__init__</span><span class="s2">(**</span><span class="s1">kwargs</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__del__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_release_camera</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">init_camera</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_release_camera</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_android_camera </span><span class="s2">= </span><span class="s1">Camera</span><span class="s2">.</span><span class="s1">open</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_index</span><span class="s2">)</span>
+        <span class="s1">params </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_android_camera</span><span class="s2">.</span><span class="s1">getParameters</span><span class="s2">()</span>
+        <span class="s1">width</span><span class="s2">, </span><span class="s1">height </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_resolution</span>
+        <span class="s1">params</span><span class="s2">.</span><span class="s1">setPreviewSize</span><span class="s2">(</span><span class="s1">width</span><span class="s2">, </span><span class="s1">height</span><span class="s2">)</span>
+        <span class="s1">supported_focus_modes </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_android_camera</span><span class="s2">.</span><span class="s1">getParameters</span><span class="s2">() </span><span class="s1">\</span>
+            <span class="s2">.</span><span class="s1">getSupportedFocusModes</span><span class="s2">()</span>
+        <span class="s0">if </span><span class="s1">supported_focus_modes</span><span class="s2">.</span><span class="s1">contains</span><span class="s2">(</span><span class="s3">'continuous-picture'</span><span class="s2">):</span>
+            <span class="s1">params</span><span class="s2">.</span><span class="s1">setFocusMode</span><span class="s2">(</span><span class="s3">'continuous-picture'</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_android_camera</span><span class="s2">.</span><span class="s1">setParameters</span><span class="s2">(</span><span class="s1">params</span><span class="s2">)</span>
+        <span class="s5"># self._android_camera.setDisplayOrientation()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">fps </span><span class="s2">= </span><span class="s6">30.</span>
+
+        <span class="s1">pf </span><span class="s2">= </span><span class="s1">params</span><span class="s2">.</span><span class="s1">getPreviewFormat</span><span class="s2">()</span>
+        <span class="s0">assert </span><span class="s1">pf </span><span class="s2">== </span><span class="s1">ImageFormat</span><span class="s2">.</span><span class="s1">NV21  </span><span class="s5"># default format is NV21</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_bufsize </span><span class="s2">= </span><span class="s1">int</span><span class="s2">(</span><span class="s1">ImageFormat</span><span class="s2">.</span><span class="s1">getBitsPerPixel</span><span class="s2">(</span><span class="s1">pf</span><span class="s2">) / </span><span class="s6">8. </span><span class="s2">*</span>
+                            <span class="s1">width </span><span class="s2">* </span><span class="s1">height</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_camera_texture </span><span class="s2">= </span><span class="s1">Texture</span><span class="s2">(</span><span class="s1">width</span><span class="s2">=</span><span class="s1">width</span><span class="s2">, </span><span class="s1">height</span><span class="s2">=</span><span class="s1">height</span><span class="s2">,</span>
+                                       <span class="s1">target</span><span class="s2">=</span><span class="s1">GL_TEXTURE_EXTERNAL_OES</span><span class="s2">,</span>
+                                       <span class="s1">colorfmt</span><span class="s2">=</span><span class="s3">'rgba'</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_surface_texture </span><span class="s2">= </span><span class="s1">SurfaceTexture</span><span class="s2">(</span><span class="s1">int</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_camera_texture</span><span class="s2">.</span><span class="s1">id</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_android_camera</span><span class="s2">.</span><span class="s1">setPreviewTexture</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_surface_texture</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_fbo </span><span class="s2">= </span><span class="s1">Fbo</span><span class="s2">(</span><span class="s1">size</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_resolution</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_fbo</span><span class="s2">[</span><span class="s3">'resolution'</span><span class="s2">] = (</span><span class="s1">float</span><span class="s2">(</span><span class="s1">width</span><span class="s2">), </span><span class="s1">float</span><span class="s2">(</span><span class="s1">height</span><span class="s2">))</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_fbo</span><span class="s2">.</span><span class="s1">shader</span><span class="s2">.</span><span class="s1">fs </span><span class="s2">= </span><span class="s3">''' 
+            #extension GL_OES_EGL_image_external : require 
+            #ifdef GL_ES 
+                precision highp float; 
+            #endif 
+ 
+            /* Outputs from the vertex shader */ 
+            varying vec4 frag_color; 
+            varying vec2 tex_coord0; 
+ 
+            /* uniform texture samplers */ 
+            uniform sampler2D texture0; 
+            uniform samplerExternalOES texture1; 
+            uniform vec2 resolution; 
+ 
+            void main() 
+            { 
+                vec2 coord = vec2(tex_coord0.y * ( 
+                    resolution.y / resolution.x), 1. -tex_coord0.x); 
+                gl_FragColor = texture2D(texture1, tex_coord0); 
+            } 
+        '''</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_fbo</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_texture_cb </span><span class="s2">= </span><span class="s1">Callback</span><span class="s2">(</span><span class="s0">lambda </span><span class="s1">instr</span><span class="s2">:</span>
+                                        <span class="s1">self</span><span class="s2">.</span><span class="s1">_camera_texture</span><span class="s2">.</span><span class="s1">bind</span><span class="s2">)</span>
+            <span class="s1">Rectangle</span><span class="s2">(</span><span class="s1">size</span><span class="s2">=</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_resolution</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">_release_camera</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_android_camera </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s0">return</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">stop</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_android_camera</span><span class="s2">.</span><span class="s1">release</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_android_camera </span><span class="s2">= </span><span class="s0">None</span>
+
+        <span class="s5"># clear texture and it'll be reset in `_update` pointing to new FBO</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_texture </span><span class="s2">= </span><span class="s0">None</span>
+        <span class="s0">del </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_fbo</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_surface_texture</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_camera_texture</span>
+
+    <span class="s0">def </span><span class="s1">_on_preview_frame</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">camera</span><span class="s2">):</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_buflock</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_buffer </span><span class="s0">is not None</span><span class="s2">:</span>
+                <span class="s5"># add buffer back for reuse</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">_android_camera</span><span class="s2">.</span><span class="s1">addCallbackBuffer</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_buffer</span><span class="s2">)</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_buffer </span><span class="s2">= </span><span class="s1">data</span>
+        <span class="s5"># check if frame grabbing works</span>
+        <span class="s5"># print self._buffer, len(self.frame_data)</span>
+
+    <span class="s0">def </span><span class="s1">_refresh_fbo</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_texture_cb</span><span class="s2">.</span><span class="s1">ask_update</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_fbo</span><span class="s2">.</span><span class="s1">draw</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">start</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">CameraAndroid</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">start</span><span class="s2">()</span>
+
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_buflock</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_buffer </span><span class="s2">= </span><span class="s0">None</span>
+        <span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s6">2</span><span class="s2">):  </span><span class="s5"># double buffer</span>
+            <span class="s1">buf </span><span class="s2">= </span><span class="s7">b'</span><span class="s0">\x00</span><span class="s7">' </span><span class="s2">* </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_bufsize</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_android_camera</span><span class="s2">.</span><span class="s1">addCallbackBuffer</span><span class="s2">(</span><span class="s1">buf</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_android_camera</span><span class="s2">.</span><span class="s1">setPreviewCallbackWithBuffer</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_preview_cb</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_android_camera</span><span class="s2">.</span><span class="s1">startPreview</span><span class="s2">()</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_update_ev </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_update_ev</span><span class="s2">.</span><span class="s1">cancel</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_update_ev </span><span class="s2">= </span><span class="s1">Clock</span><span class="s2">.</span><span class="s1">schedule_interval</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_update</span><span class="s2">, </span><span class="s6">1 </span><span class="s2">/ </span><span class="s1">self</span><span class="s2">.</span><span class="s1">fps</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">stop</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">(</span><span class="s1">CameraAndroid</span><span class="s2">, </span><span class="s1">self</span><span class="s2">).</span><span class="s1">stop</span><span class="s2">()</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_update_ev </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_update_ev</span><span class="s2">.</span><span class="s1">cancel</span><span class="s2">()</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_update_ev </span><span class="s2">= </span><span class="s0">None</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_android_camera</span><span class="s2">.</span><span class="s1">stopPreview</span><span class="s2">()</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_android_camera</span><span class="s2">.</span><span class="s1">setPreviewCallbackWithBuffer</span><span class="s2">(</span><span class="s0">None</span><span class="s2">)</span>
+        <span class="s5"># buffer queue cleared as well, to be recreated on next start</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_buflock</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_buffer </span><span class="s2">= </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">_update</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">dt</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_surface_texture</span><span class="s2">.</span><span class="s1">updateTexImage</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_refresh_fbo</span><span class="s2">()</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_texture </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_texture </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_fbo</span><span class="s2">.</span><span class="s1">texture</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_load'</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_copy_to_gpu</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">_copy_to_gpu</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        A dummy placeholder (the image is already in GPU) to be consistent 
+        with other providers. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">dispatch</span><span class="s2">(</span><span class="s3">'on_texture'</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">grab_frame</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Grab current frame (thread-safe, minimal overhead) 
+        &quot;&quot;&quot;</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_buflock</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_buffer </span><span class="s0">is None</span><span class="s2">:</span>
+                <span class="s0">return None</span>
+            <span class="s1">buf </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_buffer</span><span class="s2">.</span><span class="s1">tostring</span><span class="s2">()</span>
+            <span class="s0">return </span><span class="s1">buf</span>
+
+    <span class="s0">def </span><span class="s1">decode_frame</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">buf</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Decode image data from grabbed frame. 
+ 
+        This method depends on OpenCV and NumPy - however it is only used for 
+        fetching the current frame as a NumPy array, and not required when 
+        this :class:`CameraAndroid` provider is simply used by a 
+        :class:`~kivy.uix.camera.Camera` widget. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+        <span class="s0">from </span><span class="s1">cv2 </span><span class="s0">import </span><span class="s1">cvtColor</span>
+
+        <span class="s1">w</span><span class="s2">, </span><span class="s1">h </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_resolution</span>
+        <span class="s1">arr </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">fromstring</span><span class="s2">(</span><span class="s1">buf</span><span class="s2">, </span><span class="s3">'uint8'</span><span class="s2">).</span><span class="s1">reshape</span><span class="s2">((</span><span class="s1">h </span><span class="s2">+ </span><span class="s1">h </span><span class="s2">/ </span><span class="s6">2</span><span class="s2">, </span><span class="s1">w</span><span class="s2">))</span>
+        <span class="s1">arr </span><span class="s2">= </span><span class="s1">cvtColor</span><span class="s2">(</span><span class="s1">arr</span><span class="s2">, </span><span class="s6">93</span><span class="s2">)  </span><span class="s5"># NV21 -&gt; BGR</span>
+        <span class="s0">return </span><span class="s1">arr</span>
+
+    <span class="s0">def </span><span class="s1">read_frame</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Grab and decode frame in one call 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self</span><span class="s2">.</span><span class="s1">decode_frame</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">grab_frame</span><span class="s2">())</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s0">def </span><span class="s1">get_camera_count</span><span class="s2">():</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Get the number of available cameras. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">Camera</span><span class="s2">.</span><span class="s1">getNumberOfCameras</span><span class="s2">()</span>
+</pre>
+</body>
+</html>

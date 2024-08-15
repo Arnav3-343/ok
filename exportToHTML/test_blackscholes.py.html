@@ -1,0 +1,142 @@
+<html>
+<head>
+<title>test_blackscholes.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #2aacb8;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_blackscholes.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">import </span><span class="s1">math</span>
+<span class="s0">from </span><span class="s1">numba </span><span class="s0">import </span><span class="s1">cuda</span><span class="s2">, </span><span class="s1">double</span><span class="s2">, </span><span class="s1">void</span>
+<span class="s0">from </span><span class="s1">numba</span><span class="s2">.</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">testing </span><span class="s0">import </span><span class="s1">unittest</span><span class="s2">, </span><span class="s1">CUDATestCase</span>
+
+
+<span class="s1">RISKFREE </span><span class="s2">= </span><span class="s3">0.02</span>
+<span class="s1">VOLATILITY </span><span class="s2">= </span><span class="s3">0.30</span>
+
+<span class="s1">A1 </span><span class="s2">= </span><span class="s3">0.31938153</span>
+<span class="s1">A2 </span><span class="s2">= -</span><span class="s3">0.356563782</span>
+<span class="s1">A3 </span><span class="s2">= </span><span class="s3">1.781477937</span>
+<span class="s1">A4 </span><span class="s2">= -</span><span class="s3">1.821255978</span>
+<span class="s1">A5 </span><span class="s2">= </span><span class="s3">1.330274429</span>
+<span class="s1">RSQRT2PI </span><span class="s2">= </span><span class="s3">0.39894228040143267793994605993438</span>
+
+
+<span class="s0">def </span><span class="s1">cnd</span><span class="s2">(</span><span class="s1">d</span><span class="s2">):</span>
+    <span class="s1">K </span><span class="s2">= </span><span class="s3">1.0 </span><span class="s2">/ (</span><span class="s3">1.0 </span><span class="s2">+ </span><span class="s3">0.2316419 </span><span class="s2">* </span><span class="s1">np</span><span class="s2">.</span><span class="s1">abs</span><span class="s2">(</span><span class="s1">d</span><span class="s2">))</span>
+    <span class="s1">ret_val </span><span class="s2">= (</span><span class="s1">RSQRT2PI </span><span class="s2">* </span><span class="s1">np</span><span class="s2">.</span><span class="s1">exp</span><span class="s2">(-</span><span class="s3">0.5 </span><span class="s2">* </span><span class="s1">d </span><span class="s2">* </span><span class="s1">d</span><span class="s2">) *</span>
+               <span class="s2">(</span><span class="s1">K </span><span class="s2">* (</span><span class="s1">A1 </span><span class="s2">+ </span><span class="s1">K </span><span class="s2">* (</span><span class="s1">A2 </span><span class="s2">+ </span><span class="s1">K </span><span class="s2">* (</span><span class="s1">A3 </span><span class="s2">+ </span><span class="s1">K </span><span class="s2">* (</span><span class="s1">A4 </span><span class="s2">+ </span><span class="s1">K </span><span class="s2">* </span><span class="s1">A5</span><span class="s2">))))))</span>
+    <span class="s0">return </span><span class="s1">np</span><span class="s2">.</span><span class="s1">where</span><span class="s2">(</span><span class="s1">d </span><span class="s2">&gt; </span><span class="s3">0</span><span class="s2">, </span><span class="s3">1.0 </span><span class="s2">- </span><span class="s1">ret_val</span><span class="s2">, </span><span class="s1">ret_val</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">black_scholes</span><span class="s2">(</span><span class="s1">callResult</span><span class="s2">, </span><span class="s1">putResult</span><span class="s2">, </span><span class="s1">stockPrice</span><span class="s2">, </span><span class="s1">optionStrike</span><span class="s2">, </span><span class="s1">optionYears</span><span class="s2">,</span>
+                  <span class="s1">Riskfree</span><span class="s2">, </span><span class="s1">Volatility</span><span class="s2">):</span>
+    <span class="s1">S </span><span class="s2">= </span><span class="s1">stockPrice</span>
+    <span class="s1">X </span><span class="s2">= </span><span class="s1">optionStrike</span>
+    <span class="s1">T </span><span class="s2">= </span><span class="s1">optionYears</span>
+    <span class="s1">R </span><span class="s2">= </span><span class="s1">Riskfree</span>
+    <span class="s1">V </span><span class="s2">= </span><span class="s1">Volatility</span>
+    <span class="s1">sqrtT </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">sqrt</span><span class="s2">(</span><span class="s1">T</span><span class="s2">)</span>
+    <span class="s1">d1 </span><span class="s2">= (</span><span class="s1">np</span><span class="s2">.</span><span class="s1">log</span><span class="s2">(</span><span class="s1">S </span><span class="s2">/ </span><span class="s1">X</span><span class="s2">) + (</span><span class="s1">R </span><span class="s2">+ </span><span class="s3">0.5 </span><span class="s2">* </span><span class="s1">V </span><span class="s2">* </span><span class="s1">V</span><span class="s2">) * </span><span class="s1">T</span><span class="s2">) / (</span><span class="s1">V </span><span class="s2">* </span><span class="s1">sqrtT</span><span class="s2">)</span>
+    <span class="s1">d2 </span><span class="s2">= </span><span class="s1">d1 </span><span class="s2">- </span><span class="s1">V </span><span class="s2">* </span><span class="s1">sqrtT</span>
+    <span class="s1">cndd1 </span><span class="s2">= </span><span class="s1">cnd</span><span class="s2">(</span><span class="s1">d1</span><span class="s2">)</span>
+    <span class="s1">cndd2 </span><span class="s2">= </span><span class="s1">cnd</span><span class="s2">(</span><span class="s1">d2</span><span class="s2">)</span>
+
+    <span class="s1">expRT </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">exp</span><span class="s2">(- </span><span class="s1">R </span><span class="s2">* </span><span class="s1">T</span><span class="s2">)</span>
+    <span class="s1">callResult</span><span class="s2">[:] = (</span><span class="s1">S </span><span class="s2">* </span><span class="s1">cndd1 </span><span class="s2">- </span><span class="s1">X </span><span class="s2">* </span><span class="s1">expRT </span><span class="s2">* </span><span class="s1">cndd2</span><span class="s2">)</span>
+    <span class="s1">putResult</span><span class="s2">[:] = (</span><span class="s1">X </span><span class="s2">* </span><span class="s1">expRT </span><span class="s2">* (</span><span class="s3">1.0 </span><span class="s2">- </span><span class="s1">cndd2</span><span class="s2">) - </span><span class="s1">S </span><span class="s2">* (</span><span class="s3">1.0 </span><span class="s2">- </span><span class="s1">cndd1</span><span class="s2">))</span>
+
+
+<span class="s0">def </span><span class="s1">randfloat</span><span class="s2">(</span><span class="s1">rand_var</span><span class="s2">, </span><span class="s1">low</span><span class="s2">, </span><span class="s1">high</span><span class="s2">):</span>
+    <span class="s0">return </span><span class="s2">(</span><span class="s3">1.0 </span><span class="s2">- </span><span class="s1">rand_var</span><span class="s2">) * </span><span class="s1">low </span><span class="s2">+ </span><span class="s1">rand_var </span><span class="s2">* </span><span class="s1">high</span>
+
+
+<span class="s0">class </span><span class="s1">TestBlackScholes</span><span class="s2">(</span><span class="s1">CUDATestCase</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">test_blackscholes</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">OPT_N </span><span class="s2">= </span><span class="s3">400</span>
+        <span class="s1">iterations </span><span class="s2">= </span><span class="s3">2</span>
+
+        <span class="s1">stockPrice </span><span class="s2">= </span><span class="s1">randfloat</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">random</span><span class="s2">.</span><span class="s1">random</span><span class="s2">(</span><span class="s1">OPT_N</span><span class="s2">), </span><span class="s3">5.0</span><span class="s2">, </span><span class="s3">30.0</span><span class="s2">)</span>
+        <span class="s1">optionStrike </span><span class="s2">= </span><span class="s1">randfloat</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">random</span><span class="s2">.</span><span class="s1">random</span><span class="s2">(</span><span class="s1">OPT_N</span><span class="s2">), </span><span class="s3">1.0</span><span class="s2">, </span><span class="s3">100.0</span><span class="s2">)</span>
+        <span class="s1">optionYears </span><span class="s2">= </span><span class="s1">randfloat</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">random</span><span class="s2">.</span><span class="s1">random</span><span class="s2">(</span><span class="s1">OPT_N</span><span class="s2">), </span><span class="s3">0.25</span><span class="s2">, </span><span class="s3">10.0</span><span class="s2">)</span>
+
+        <span class="s1">callResultNumpy </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s1">OPT_N</span><span class="s2">)</span>
+        <span class="s1">putResultNumpy </span><span class="s2">= -</span><span class="s1">np</span><span class="s2">.</span><span class="s1">ones</span><span class="s2">(</span><span class="s1">OPT_N</span><span class="s2">)</span>
+
+        <span class="s1">callResultNumba </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span><span class="s1">OPT_N</span><span class="s2">)</span>
+        <span class="s1">putResultNumba </span><span class="s2">= -</span><span class="s1">np</span><span class="s2">.</span><span class="s1">ones</span><span class="s2">(</span><span class="s1">OPT_N</span><span class="s2">)</span>
+
+        <span class="s4"># numpy</span>
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">iterations</span><span class="s2">):</span>
+            <span class="s1">black_scholes</span><span class="s2">(</span><span class="s1">callResultNumpy</span><span class="s2">, </span><span class="s1">putResultNumpy</span><span class="s2">, </span><span class="s1">stockPrice</span><span class="s2">,</span>
+                          <span class="s1">optionStrike</span><span class="s2">, </span><span class="s1">optionYears</span><span class="s2">, </span><span class="s1">RISKFREE</span><span class="s2">, </span><span class="s1">VOLATILITY</span><span class="s2">)</span>
+
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">double</span><span class="s2">(</span><span class="s1">double</span><span class="s2">), </span><span class="s1">device</span><span class="s2">=</span><span class="s0">True</span><span class="s2">, </span><span class="s1">inline</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">cnd_cuda</span><span class="s2">(</span><span class="s1">d</span><span class="s2">):</span>
+            <span class="s1">K </span><span class="s2">= </span><span class="s3">1.0 </span><span class="s2">/ (</span><span class="s3">1.0 </span><span class="s2">+ </span><span class="s3">0.2316419 </span><span class="s2">* </span><span class="s1">math</span><span class="s2">.</span><span class="s1">fabs</span><span class="s2">(</span><span class="s1">d</span><span class="s2">))</span>
+            <span class="s1">ret_val </span><span class="s2">= (</span><span class="s1">RSQRT2PI </span><span class="s2">* </span><span class="s1">math</span><span class="s2">.</span><span class="s1">exp</span><span class="s2">(-</span><span class="s3">0.5 </span><span class="s2">* </span><span class="s1">d </span><span class="s2">* </span><span class="s1">d</span><span class="s2">) *</span>
+                       <span class="s2">(</span><span class="s1">K </span><span class="s2">* (</span><span class="s1">A1 </span><span class="s2">+ </span><span class="s1">K </span><span class="s2">* (</span><span class="s1">A2 </span><span class="s2">+ </span><span class="s1">K </span><span class="s2">* (</span><span class="s1">A3 </span><span class="s2">+ </span><span class="s1">K </span><span class="s2">* (</span><span class="s1">A4 </span><span class="s2">+ </span><span class="s1">K </span><span class="s2">* </span><span class="s1">A5</span><span class="s2">))))))</span>
+            <span class="s0">if </span><span class="s1">d </span><span class="s2">&gt; </span><span class="s3">0</span><span class="s2">:</span>
+                <span class="s1">ret_val </span><span class="s2">= </span><span class="s3">1.0 </span><span class="s2">- </span><span class="s1">ret_val</span>
+            <span class="s0">return </span><span class="s1">ret_val</span>
+
+        <span class="s2">@</span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">jit</span><span class="s2">(</span><span class="s1">void</span><span class="s2">(</span><span class="s1">double</span><span class="s2">[:], </span><span class="s1">double</span><span class="s2">[:], </span><span class="s1">double</span><span class="s2">[:], </span><span class="s1">double</span><span class="s2">[:], </span><span class="s1">double</span><span class="s2">[:],</span>
+                       <span class="s1">double</span><span class="s2">, </span><span class="s1">double</span><span class="s2">))</span>
+        <span class="s0">def </span><span class="s1">black_scholes_cuda</span><span class="s2">(</span><span class="s1">callResult</span><span class="s2">, </span><span class="s1">putResult</span><span class="s2">, </span><span class="s1">S</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">T</span><span class="s2">, </span><span class="s1">R</span><span class="s2">, </span><span class="s1">V</span><span class="s2">):</span>
+            <span class="s1">i </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">threadIdx</span><span class="s2">.</span><span class="s1">x </span><span class="s2">+ </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">blockIdx</span><span class="s2">.</span><span class="s1">x </span><span class="s2">* </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">blockDim</span><span class="s2">.</span><span class="s1">x</span>
+            <span class="s0">if </span><span class="s1">i </span><span class="s2">&gt;= </span><span class="s1">S</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s3">0</span><span class="s2">]:</span>
+                <span class="s0">return</span>
+            <span class="s1">sqrtT </span><span class="s2">= </span><span class="s1">math</span><span class="s2">.</span><span class="s1">sqrt</span><span class="s2">(</span><span class="s1">T</span><span class="s2">[</span><span class="s1">i</span><span class="s2">])</span>
+            <span class="s1">d1 </span><span class="s2">= ((</span><span class="s1">math</span><span class="s2">.</span><span class="s1">log</span><span class="s2">(</span><span class="s1">S</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] / </span><span class="s1">X</span><span class="s2">[</span><span class="s1">i</span><span class="s2">]) + (</span><span class="s1">R </span><span class="s2">+ </span><span class="s3">0.5 </span><span class="s2">* </span><span class="s1">V </span><span class="s2">* </span><span class="s1">V</span><span class="s2">) * </span><span class="s1">T</span><span class="s2">[</span><span class="s1">i</span><span class="s2">])</span>
+                  <span class="s2">/ (</span><span class="s1">V </span><span class="s2">* </span><span class="s1">sqrtT</span><span class="s2">))</span>
+            <span class="s1">d2 </span><span class="s2">= </span><span class="s1">d1 </span><span class="s2">- </span><span class="s1">V </span><span class="s2">* </span><span class="s1">sqrtT</span>
+            <span class="s1">cndd1 </span><span class="s2">= </span><span class="s1">cnd_cuda</span><span class="s2">(</span><span class="s1">d1</span><span class="s2">)</span>
+            <span class="s1">cndd2 </span><span class="s2">= </span><span class="s1">cnd_cuda</span><span class="s2">(</span><span class="s1">d2</span><span class="s2">)</span>
+
+            <span class="s1">expRT </span><span class="s2">= </span><span class="s1">math</span><span class="s2">.</span><span class="s1">exp</span><span class="s2">((-</span><span class="s3">1. </span><span class="s2">* </span><span class="s1">R</span><span class="s2">) * </span><span class="s1">T</span><span class="s2">[</span><span class="s1">i</span><span class="s2">])</span>
+            <span class="s1">callResult</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] = (</span><span class="s1">S</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] * </span><span class="s1">cndd1 </span><span class="s2">- </span><span class="s1">X</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] * </span><span class="s1">expRT </span><span class="s2">* </span><span class="s1">cndd2</span><span class="s2">)</span>
+            <span class="s1">putResult</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] = (</span><span class="s1">X</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] * </span><span class="s1">expRT </span><span class="s2">* (</span><span class="s3">1.0 </span><span class="s2">- </span><span class="s1">cndd2</span><span class="s2">) - </span><span class="s1">S</span><span class="s2">[</span><span class="s1">i</span><span class="s2">] * (</span><span class="s3">1.0 </span><span class="s2">- </span><span class="s1">cndd1</span><span class="s2">))</span>
+
+        <span class="s4"># numba</span>
+        <span class="s1">blockdim </span><span class="s2">= </span><span class="s3">512</span><span class="s2">, </span><span class="s3">1</span>
+        <span class="s1">griddim </span><span class="s2">= </span><span class="s1">int</span><span class="s2">(</span><span class="s1">math</span><span class="s2">.</span><span class="s1">ceil</span><span class="s2">(</span><span class="s1">float</span><span class="s2">(</span><span class="s1">OPT_N</span><span class="s2">) / </span><span class="s1">blockdim</span><span class="s2">[</span><span class="s3">0</span><span class="s2">])), </span><span class="s3">1</span>
+        <span class="s1">stream </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">stream</span><span class="s2">()</span>
+        <span class="s1">d_callResult </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">callResultNumba</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">)</span>
+        <span class="s1">d_putResult </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">putResultNumba</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">)</span>
+        <span class="s1">d_stockPrice </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">stockPrice</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">)</span>
+        <span class="s1">d_optionStrike </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">optionStrike</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">)</span>
+        <span class="s1">d_optionYears </span><span class="s2">= </span><span class="s1">cuda</span><span class="s2">.</span><span class="s1">to_device</span><span class="s2">(</span><span class="s1">optionYears</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">)</span>
+
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">iterations</span><span class="s2">):</span>
+            <span class="s1">black_scholes_cuda</span><span class="s2">[</span><span class="s1">griddim</span><span class="s2">, </span><span class="s1">blockdim</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">](</span>
+                <span class="s1">d_callResult</span><span class="s2">, </span><span class="s1">d_putResult</span><span class="s2">, </span><span class="s1">d_stockPrice</span><span class="s2">, </span><span class="s1">d_optionStrike</span><span class="s2">,</span>
+                <span class="s1">d_optionYears</span><span class="s2">, </span><span class="s1">RISKFREE</span><span class="s2">, </span><span class="s1">VOLATILITY</span><span class="s2">)</span>
+        <span class="s1">d_callResult</span><span class="s2">.</span><span class="s1">copy_to_host</span><span class="s2">(</span><span class="s1">callResultNumba</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">)</span>
+        <span class="s1">d_putResult</span><span class="s2">.</span><span class="s1">copy_to_host</span><span class="s2">(</span><span class="s1">putResultNumba</span><span class="s2">, </span><span class="s1">stream</span><span class="s2">)</span>
+        <span class="s1">stream</span><span class="s2">.</span><span class="s1">synchronize</span><span class="s2">()</span>
+
+        <span class="s1">delta </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">abs</span><span class="s2">(</span><span class="s1">callResultNumpy </span><span class="s2">- </span><span class="s1">callResultNumba</span><span class="s2">)</span>
+        <span class="s1">L1norm </span><span class="s2">= </span><span class="s1">delta</span><span class="s2">.</span><span class="s1">sum</span><span class="s2">() / </span><span class="s1">np</span><span class="s2">.</span><span class="s1">abs</span><span class="s2">(</span><span class="s1">callResultNumpy</span><span class="s2">).</span><span class="s1">sum</span><span class="s2">()</span>
+
+        <span class="s1">max_abs_err </span><span class="s2">= </span><span class="s1">delta</span><span class="s2">.</span><span class="s1">max</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">L1norm </span><span class="s2">&lt; </span><span class="s3">1e-13</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">assertTrue</span><span class="s2">(</span><span class="s1">max_abs_err </span><span class="s2">&lt; </span><span class="s3">1e-13</span><span class="s2">)</span>
+
+
+<span class="s0">if </span><span class="s1">__name__ </span><span class="s2">== </span><span class="s5">'__main__'</span><span class="s2">:</span>
+    <span class="s1">unittest</span><span class="s2">.</span><span class="s1">main</span><span class="s2">()</span>
+</pre>
+</body>
+</html>
